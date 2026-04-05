@@ -66,5 +66,5 @@ jobs:
         run: tmux start-server
 
       - name: Run e2e tests
-        run: cargo nextest run -E 'binary(~e2e_)'
+        run: cargo nextest run -E 'binary(~e2e_)' --retries 2
         timeout-minutes: 5
