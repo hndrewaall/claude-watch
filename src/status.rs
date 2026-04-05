@@ -335,14 +335,14 @@ mod tests {
 
     #[test]
     fn test_parse_status_bar_tokens_no_commas() {
-        let input = "5000 tokens";
+        let input = "-- INSERT -- 5000 tokens";
         let parsed = parse_status_bar(input);
         assert_eq!(parsed.tokens, Some(5000));
     }
 
     #[test]
     fn test_parse_status_bar_large_tokens() {
-        let input = "1,234,567 tokens";
+        let input = "bypass permissions on · 1,234,567 tokens";
         let parsed = parse_status_bar(input);
         assert_eq!(parsed.tokens, Some(1234567));
     }
