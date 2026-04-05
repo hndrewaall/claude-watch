@@ -1,0 +1,27 @@
+     repros this issue
+       [2026-03-17T04:11:59.665699+00:00] [sig_ts:1773720719612]
+     [DM:c7a32065-3a75-4835-bdab-50ac04dba932] GB (sent): On it -- launching agent to
+     create an e2e test that captures the actual tmux pane output during thinking and
+     verifies detection.
+       [2026-03-17T04:13:25.704302+00:00] [sig_ts:1773720805559] Andrew Hall (he/him):
+     your agent might not realize that you ARENT thinking while its checking. "Baked for"
+     is you idling
+
+● Good point from Andrew — the agent might capture the pane while I'm idle, not thinking. Let
+  me pass that context to the agent.
+
+● Can't send messages to running agents. The agent will have to figure it out from context — it
+   should notice "Baked for" in the tmux capture and check journalctl logs for actual thinking
+  captures. Andrew's point is valid but the agent's prompt already asks it to capture different
+   states and check logs.
+
+  Standing by for agent completion.
+
+✻ Brewed for 38s · 11 background tasks still running (↓ to manage)
+
+───────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+───────────────────────────────────────────────────────────────────────────────────────────────
+  -- INSERT --⏵⏵ bypass permissions on · 11 background tasks                   141197 tokens
+                                                             current: 2.1.77 · latest: 2.1.…
+

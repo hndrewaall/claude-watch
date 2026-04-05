@@ -1,0 +1,6 @@
+[profile.default]
+# e2e tests spawn tmux sessions and do real sleeps — need longer timeout
+slow-timeout = { period = "60s", terminate-after = 2 }
+
+# Parallelize e2e tests (they use unique tmux session names)
+test-threads = "num-cpus"

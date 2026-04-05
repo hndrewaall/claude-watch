@@ -1,0 +1,18 @@
+[Unit]
+Description=Claude Watch - Claude Code health monitor daemon
+After=network.target
+
+[Service]
+Type=simple
+# Set User and Group to your username
+User=your-username
+Group=your-username
+ExecStart=%h/repos/claude-watch/target/release/claude-watch
+WorkingDirectory=%h
+Restart=on-failure
+RestartSec=10
+Environment=RUST_LOG=debug
+Environment=PATH=%h/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+
+[Install]
+WantedBy=multi-user.target
