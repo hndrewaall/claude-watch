@@ -657,6 +657,18 @@ fn multicall_rewrite_args() -> Vec<String> {
             new_args.extend_from_slice(&args[1..]);
             new_args
         }
+        "watcher-status" => {
+            // watcher-status → claude-watch watcher status
+            let mut new_args = vec!["claude-watch".to_string(), "watcher".to_string(), "status".to_string()];
+            new_args.extend_from_slice(&args[1..]);
+            new_args
+        }
+        "watcher-restart" => {
+            // watcher-restart → claude-watch watcher restart
+            let mut new_args = vec!["claude-watch".to_string(), "watcher".to_string(), "restart".to_string()];
+            new_args.extend_from_slice(&args[1..]);
+            new_args
+        }
         "session-event" => {
             // Backward compat: if first arg is a known event type, insert "log"
             // session-event boot --note X → claude-watch event log boot --note X
