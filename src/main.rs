@@ -25,9 +25,11 @@ mod cmd;
 mod config;
 mod logging;
 mod policy;
+mod proc_util;
 mod session_event;
 mod state;
 mod status;
+mod task_watch;
 mod tmux;
 
 use clap::{Parser, Subcommand};
@@ -82,6 +84,11 @@ enum Commands {
         #[command(subcommand)]
         action: AgentAction,
     },
+    /// Manage task-watch (background task tmux panes)
+    Task {
+        #[command(subcommand)]
+        action: TaskAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -121,6 +128,23 @@ enum EventAction {
         /// Number of tasks to show
         #[arg(short, long, default_value = "10")]
         count: usize,
+    },
+}
+
+#[derive(Subcommand)]
+enum TaskAction {
+    /// Create/reinit the tasks tmux session
+    Init {
+        /// Show all tasks including persistent watchers
+        #[arg(long, short)]
+        all: bool,
+    },
+    /// List tracked tasks
+    #[command(alias = "ls")]
+    List {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -351,6 +375,16 @@ async fn run_daemon() {
         }
     });
 
+    // Spawn task-watch loop if enabled
+    if config.task_watch.enabled {
+        let tw_config = config.task_watch.clone();
+        let tw_shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            task_watch::run_task_watch_loop(tw_config, tw_shutdown).await;
+        });
+        info!("task-watch loop spawned");
+    }
+
     // Main loop
     //
     // The loop sleeps for the foreground_monitor.check_interval (or general.check_interval
@@ -505,6 +539,18 @@ async fn run_event(action: EventAction) {
     }
 }
 
+async fn run_task(action: TaskAction) {
+    let config = load_config();
+    match action {
+        TaskAction::Init { all } => {
+            task_watch::cmd_task_init(&config.task_watch.session, all).await;
+        }
+        TaskAction::List { json } => {
+            task_watch::cmd_task_list(&config.task_watch.session, json).await;
+        }
+    }
+}
+
 fn run_agent(action: AgentAction) {
     let exit_code = match action {
         AgentAction::List { all } => agent::cmd_list(all),
@@ -532,6 +578,12 @@ fn multicall_rewrite_args() -> Vec<String> {
         "agent-ctl" => {
             // agent-ctl <args...> → claude-watch agent <args...>
             let mut new_args = vec!["claude-watch".to_string(), "agent".to_string()];
+            new_args.extend_from_slice(&args[1..]);
+            new_args
+        }
+        "task-watch-ctl" => {
+            // task-watch-ctl <args...> → claude-watch task <args...>
+            let mut new_args = vec!["claude-watch".to_string(), "task".to_string()];
             new_args.extend_from_slice(&args[1..]);
             new_args
         }
@@ -573,6 +625,9 @@ async fn main() {
         }
         Some(Commands::Agent { action }) => {
             run_agent(action);
+        }
+        Some(Commands::Task { action }) => {
+            run_task(action).await;
         }
         None => {
             run_daemon().await;
