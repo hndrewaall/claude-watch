@@ -228,6 +228,9 @@ pub fn load_config() -> Config {
             continue;
         }
         if let Ok(content) = std::fs::read_to_string(path) {
+            // Expand ~ to $HOME in config values before parsing
+            let home = std::env::var("HOME").unwrap_or_else(|_| "/home/user".to_string());
+            let content = content.replace("~/", &format!("{}/", home));
             match toml::from_str::<Config>(&content) {
                 Ok(config) => {
                     tracing::info!(path, "loaded config");
