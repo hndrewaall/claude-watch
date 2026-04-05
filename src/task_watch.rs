@@ -663,6 +663,8 @@ pub async fn run_task_watch_loop(config: TaskWatchConfig, shutdown: Arc<AtomicBo
             break;
         }
 
+        debug!(tracked = state.tracked.len(), pending = state.pending_removal.len(), "task-watch poll cycle");
+
         // Detect UUID directory change (new Claude Code session)
         if let Some(new_dir) = find_tasks_dir() {
             if new_dir != state.tasks_dir {
@@ -750,6 +752,7 @@ pub async fn run_task_watch_loop(config: TaskWatchConfig, shutdown: Arc<AtomicBo
                 .await
                 .unwrap_or_default()
         };
+        debug!(active_count = active_tids.len(), "proc scan results");
 
         // Detect completed tasks
         let tracked_ids: Vec<String> = state.tracked.keys().cloned().collect();
