@@ -52,7 +52,8 @@ pub(crate) fn parse_status_bar(pane_text: &str) -> ParsedStatusBar {
     let lines: Vec<&str> = pane_text.lines().collect();
     let start = if lines.len() > 10 { lines.len() - 10 } else { 0 };
 
-    let token_re = Regex::new(r"(\d[\d,]*)\s+tokens").unwrap();
+    // Match "N tokens" or truncated "N toke" (tmux may truncate at pane width)
+    let token_re = Regex::new(r"(\d[\d,]*)\s+toke").unwrap();
     let bash_re = Regex::new(r"(\d+)\s+(?:bashes|background\s+tasks)").unwrap();
     let compact_re = Regex::new(r"Context left until auto-compact:\s*(\d+)%").unwrap();
 
