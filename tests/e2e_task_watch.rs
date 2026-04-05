@@ -407,6 +407,25 @@ async fn test_run_task_watch_loop_survives_session_disappearance() {
     std::os::unix::fs::symlink(&jsonl_file, &output_file)
         .expect("failed to create .output symlink");
 
+    // Diagnostic: verify setup is correct
+    eprintln!("[test] tasks_dir: {}", tasks_dir.display());
+    eprintln!(
+        "[test] is_agent_output: {}",
+        claude_watch::task_watch::is_agent_output(&tasks_dir, "reconnect-loop-task")
+    );
+    eprintln!(
+        "[test] has_output: {}",
+        claude_watch::task_watch::has_output(&tasks_dir, "reconnect-loop-task")
+    );
+    eprintln!(
+        "[test] agent_is_active: {}",
+        claude_watch::task_watch::agent_is_active(&tasks_dir, "reconnect-loop-task")
+    );
+    eprintln!(
+        "[test] agent_conversation_complete: {}",
+        claude_watch::task_watch::agent_conversation_complete(&tasks_dir, "reconnect-loop-task")
+    );
+
     // --- Spawn the actual daemon loop ---
     let shutdown = Arc::new(AtomicBool::new(false));
     let config = TaskWatchConfig {
@@ -480,6 +499,176 @@ async fn test_run_task_watch_loop_survives_session_disappearance() {
     // Give the loop a moment to notice the shutdown flag
     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
     // Guard drop handles tmux session cleanup
+}
+
+/// E2E test for orphan pane cleanup on daemon startup.
+///
+/// After a daemon restart, existing panes in the "tasks" tmux session from the
+/// old daemon instance aren't tracked by the new daemon. These orphan panes
+/// persist forever because:
+///   1. GC only removes panes that ARE tracked but dead
+///   2. The initial scan only picks up tasks with active writers
+///   3. Orphan panes (tail -f on completed task output) have no writer,
+///      aren't tracked, so they're invisible to both GC and removal logic
+///
+/// This test:
+///   1. Creates a tmux session with a manually-created orphan pane
+///      (simulating a leftover from a previous daemon instance)
+///   2. Spawns run_task_watch_loop
+///   3. Verifies the orphan pane gets cleaned up during initial sync
+#[tokio::test]
+async fn test_orphan_panes_cleaned_on_startup() {
+    use claude_watch::config::TaskWatchConfig;
+    use std::process::Command;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let pid = std::process::id();
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let session = format!("tw-orphan-{}-{}", pid, n);
+
+    // Cleanup guard for the tmux session
+    struct TestGuard {
+        session: String,
+    }
+    impl Drop for TestGuard {
+        fn drop(&mut self) {
+            let _ = Command::new("tmux")
+                .args(["kill-session", "-t", &self.session])
+                .output();
+        }
+    }
+
+    let _guard = TestGuard {
+        session: session.clone(),
+    };
+
+    // --- Setup: create tmux session ---
+    eprintln!("[test-orphan] creating tmux session: {}", session);
+    let create = Command::new("tmux")
+        .args(["new-session", "-d", "-s", &session, "-x", "120", "-y", "40"])
+        .output()
+        .expect("failed to create tmux session");
+    assert!(
+        create.status.success(),
+        "tmux new-session failed: {}",
+        String::from_utf8_lossy(&create.stderr)
+    );
+
+    // --- Setup: create tasks_dir (empty — no active tasks) ---
+    let (_base, tasks_dir) = create_mock_tasks_dir();
+
+    // Create a .output file for the orphan task (so the pane command references a real file)
+    let orphan_tid = "orphan123abc";
+    let orphan_output = tasks_dir.join(format!("{}.output", orphan_tid));
+    fs::write(&orphan_output, "old task output from previous daemon\n").unwrap();
+
+    // --- Create an orphan pane manually (simulating leftover from old daemon) ---
+    // This mimics what add_pane() creates: echo header with [task_id], then tail -f
+    let orphan_cmd = format!(
+        "echo '=== Old Task [{}] ==='; tail -f {}",
+        orphan_tid,
+        orphan_output.display()
+    );
+    let split = Command::new("tmux")
+        .args([
+            "split-window",
+            "-t",
+            &session,
+            "-v",
+            "-P",
+            "-F",
+            "#{pane_id}",
+            &orphan_cmd,
+        ])
+        .output()
+        .expect("failed to create orphan pane");
+    assert!(
+        split.status.success(),
+        "tmux split-window for orphan failed: {}",
+        String::from_utf8_lossy(&split.stderr)
+    );
+    let orphan_pane_id = String::from_utf8_lossy(&split.stdout).trim().to_string();
+    eprintln!(
+        "[test-orphan] created orphan pane {} for task {}",
+        orphan_pane_id, orphan_tid
+    );
+
+    // Verify: session has 2 panes (pane 0 + orphan)
+    let initial_count = count_panes(&session);
+    assert_eq!(
+        initial_count, 2,
+        "session should have 2 panes before daemon starts (pane 0 + orphan)"
+    );
+
+    // --- Spawn the daemon loop ---
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let config = TaskWatchConfig {
+        enabled: true,
+        session: session.clone(),
+        poll_interval: 1,
+        done_delay: 5,
+        agent_done_delay: 5,
+        max_panes: 10,
+        show_all: true,
+        tasks_dir_override: Some(tasks_dir.clone()),
+    };
+
+    let shutdown_clone = shutdown.clone();
+    let _loop_handle = tokio::spawn(async move {
+        claude_watch::task_watch::run_task_watch_loop(config, shutdown_clone).await;
+    });
+
+    // --- Wait for initial sync + orphan cleanup ---
+    // The daemon should detect the orphan pane (no active writer for orphan123abc)
+    // and kill it during initial sync, leaving only pane 0.
+    eprintln!("[test-orphan] waiting for orphan pane to be cleaned up...");
+    let orphan_cleaned = wait_for_pane_count_exact(&session, 1, 10).await;
+    assert!(
+        orphan_cleaned,
+        "BUG: orphan pane was NOT cleaned up during initial sync — \
+         session still has {} panes (expected 1). The orphan pane [{}] persists \
+         because the daemon doesn't scan existing panes for adoption/cleanup.",
+        count_panes(&session),
+        orphan_tid
+    );
+    eprintln!("[test-orphan] orphan pane cleaned up successfully");
+
+    // --- Cleanup ---
+    shutdown.store(true, Ordering::Relaxed);
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+}
+
+/// Count panes in a tmux session.
+fn count_panes(session: &str) -> usize {
+    use std::process::Command;
+    let output = Command::new("tmux")
+        .args(["list-panes", "-t", session, "-F", "#{pane_id}"])
+        .output();
+    match output {
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .count(),
+        _ => 0,
+    }
+}
+
+/// Poll tmux list-panes until the session has exactly `target` panes,
+/// or timeout after `timeout_secs` seconds.
+async fn wait_for_pane_count_exact(session: &str, target: usize, timeout_secs: u64) -> bool {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    loop {
+        let count = count_panes(session);
+        if count == target {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
 }
 
 /// Poll tmux list-panes until the session has at least `min_panes` panes,
