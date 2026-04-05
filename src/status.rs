@@ -200,7 +200,8 @@ pub async fn get_claude_status() -> Option<ClaudeStatus> {
     if let Some(pane) = find_claude_pane().await {
         debug!(pane = %pane, "found claude pane (native)");
 
-        if let Some(capture) = crate::tmux::capture_pane(&pane).await {
+        // Use joined capture (-J) for status bar parsing to avoid truncation
+        if let Some(capture) = crate::tmux::capture_pane_joined(&pane).await {
             let parsed = parse_status_bar(&capture);
 
             let version_info = tokio::task::spawn_blocking(get_version_info)
