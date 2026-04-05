@@ -407,24 +407,26 @@ async fn test_run_task_watch_loop_survives_session_disappearance() {
     std::os::unix::fs::symlink(&jsonl_file, &output_file)
         .expect("failed to create .output symlink");
 
-    // Diagnostic: verify setup is correct
-    eprintln!("[test] tasks_dir: {}", tasks_dir.display());
-    eprintln!(
-        "[test] is_agent_output: {}",
-        claude_watch::task_watch::is_agent_output(&tasks_dir, "reconnect-loop-task")
-    );
-    eprintln!(
-        "[test] has_output: {}",
-        claude_watch::task_watch::has_output(&tasks_dir, "reconnect-loop-task")
-    );
-    eprintln!(
-        "[test] agent_is_active: {}",
-        claude_watch::task_watch::agent_is_active(&tasks_dir, "reconnect-loop-task")
-    );
-    eprintln!(
-        "[test] agent_conversation_complete: {}",
-        claude_watch::task_watch::agent_conversation_complete(&tasks_dir, "reconnect-loop-task")
-    );
+    // Create a mock `task-watch` script and inject it into the tmux session's PATH.
+    // The real task-watch binary is a separate tool not available in CI.
+    // The daemon's add_pane pipes through `task-watch format-jsonl` and
+    // `task-watch timestamp-lines`, so we need a shim that passes through stdin.
+    let mock_bin_dir = _base.path().join("mock-bin");
+    fs::create_dir_all(&mock_bin_dir).unwrap();
+    let mock_script = mock_bin_dir.join("task-watch");
+    fs::write(&mock_script, "#!/bin/sh\nexec cat\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&mock_script, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    // Update the tmux session's PATH so split-window subshells find the mock
+    let new_path = format!("{}:{}", mock_bin_dir.display(), std::env::var("PATH").unwrap_or_default());
+    let set_env = Command::new("tmux")
+        .args(["set-environment", "-t", &session, "PATH", &new_path])
+        .output()
+        .expect("failed to set tmux PATH");
+    assert!(set_env.status.success(), "tmux set-environment failed");
 
     // --- Spawn the actual daemon loop ---
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -484,6 +486,12 @@ async fn test_run_task_watch_loop_survives_session_disappearance() {
         "tmux new-session (recreate) failed: {}",
         String::from_utf8_lossy(&recreate.stderr)
     );
+    // Re-inject PATH for the new session so split-window finds the mock task-watch
+    let set_env2 = Command::new("tmux")
+        .args(["set-environment", "-t", &session, "PATH", &new_path])
+        .output()
+        .expect("failed to set tmux PATH on recreated session");
+    assert!(set_env2.status.success());
 
     // --- Phase 5: Wait for the loop to reconnect and add a pane ---
     eprintln!("[test] waiting for pane to reappear after reconnect...");
