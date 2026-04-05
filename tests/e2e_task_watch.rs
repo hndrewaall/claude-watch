@@ -354,7 +354,6 @@ fn session_reconnect_after_disappearance() {
 ///   8. Wait for a new pane to appear (proves reconnect worked)
 ///   9. Shut down via the AtomicBool flag
 #[tokio::test]
-#[ignore] // Requires /proc fd visibility — fails in CI containers
 async fn test_run_task_watch_loop_survives_session_disappearance() {
     use claude_watch::config::TaskWatchConfig;
     use std::process::Command;
@@ -364,25 +363,20 @@ async fn test_run_task_watch_loop_survives_session_disappearance() {
     let pid = std::process::id();
     let session = format!("tw-loop-reconnect-{}", pid);
 
-    // Cleanup guard for the tmux session + writer process
+    // Cleanup guard for the tmux session
     struct TestGuard {
         session: String,
-        writer_pid: Option<u32>,
     }
     impl Drop for TestGuard {
         fn drop(&mut self) {
             let _ = Command::new("tmux")
                 .args(["kill-session", "-t", &self.session])
                 .output();
-            if let Some(pid) = self.writer_pid {
-                let _ = Command::new("kill").arg(pid.to_string()).output();
-            }
         }
     }
 
-    let mut guard = TestGuard {
+    let _guard = TestGuard {
         session: session.clone(),
-        writer_pid: None,
     };
 
     // --- Setup: create tmux session ---
@@ -397,25 +391,21 @@ async fn test_run_task_watch_loop_survives_session_disappearance() {
         String::from_utf8_lossy(&create.stderr)
     );
 
-    // --- Setup: create tasks_dir with a mock .output file ---
+    // --- Setup: create tasks_dir with a mock agent .output file ---
+    // Use agent-style detection (symlink to .jsonl + mtime) instead of /proc fd
+    // scanning, which is unreliable in CI containers.
     let (_base, tasks_dir) = create_mock_tasks_dir();
+    let jsonl_file = tasks_dir.join("reconnect-loop-task.jsonl");
     let output_file = tasks_dir.join("reconnect-loop-task.output");
 
-    // Start a writer process that holds the file open (simulates active task)
-    let writer = Command::new("bash")
-        .args([
-            "-c",
-            &format!(
-                "exec 3>>'{}'; echo 'test task output' >&3; while true; do sleep 1; done",
-                output_file.display()
-            ),
-        ])
-        .spawn()
-        .expect("failed to spawn writer process");
-    guard.writer_pid = Some(writer.id());
+    // Write an incomplete agent conversation (last role = "user" means not complete)
+    let jsonl_content = r#"{"message": {"role": "user", "content": [{"type": "text", "text": "test task"}]}}"#;
+    fs::write(&jsonl_file, format!("{}\n", jsonl_content)).unwrap();
 
-    // Give the writer a moment to open the file and write initial content
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    // Create symlink: .output -> .jsonl (marks it as an agent output)
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&jsonl_file, &output_file)
+        .expect("failed to create .output symlink");
 
     // --- Spawn the actual daemon loop ---
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -489,7 +479,7 @@ async fn test_run_task_watch_loop_survives_session_disappearance() {
     shutdown.store(true, Ordering::Relaxed);
     // Give the loop a moment to notice the shutdown flag
     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-    // Guard drop handles tmux session and writer process cleanup
+    // Guard drop handles tmux session cleanup
 }
 
 /// Poll tmux list-panes until the session has at least `min_panes` panes,
