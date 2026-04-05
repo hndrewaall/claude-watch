@@ -1,0 +1,118 @@
+# claude-watch configuration
+# Default location: ~/.config/claude-watch/config.toml
+
+[general]
+# Main check interval in seconds
+check_interval = 10
+# Path to persist state across restarts
+state_file = "~/.config/claude-watch/state.json"
+# Structured log output (JSON lines)
+log_file = "/var/log/claude/claude-watch.jsonl"
+# Also log to the legacy plain-text log for backwards compat
+legacy_log_file = "/var/log/claude/claude-watch.log"
+
+[tmux]
+# Known dashboard pane for Claude Code
+dashboard_pane = "dashboard:0.2"
+# Tmux session name
+dashboard_session = "dashboard"
+
+[claude]
+# Max context window tokens
+max_context_tokens = 1000000
+# Heartbeat file written by memory-remind
+heartbeat_file = "/var/run/claude/heartbeat"
+# Relaunch script path (written on restart)
+relaunch_script = "/tmp/claude-relaunch.sh"
+
+[dead_process]
+# Consecutive zero-token checks before declaring dead
+checks_required = 3
+# Cooldown between restart attempts (seconds)
+restart_cooldown = 300
+
+[fresh_clear]
+# Token range for detecting a fresh /clear
+min_tokens = 2000
+max_tokens = 5000
+# Consecutive detections required before acting
+detections_required = 2
+# Cooldown between fast-path alerts (seconds)
+cooldown = 120
+
+[heartbeat]
+# Minutes before heartbeat is considered stale
+stale_minutes = 10
+
+[token_stall]
+# Consecutive checks with unchanged tokens before declaring stall
+checks_required = 5
+# Max token variation to consider "unchanged"
+max_range = 500
+# Only trigger above this fraction of max context
+min_usage_fraction = 0.70
+
+[alerts]
+# Initial cooldown between heartbeat-path alerts (seconds)
+initial_cooldown = 600
+# Escalation tiers: [cooldown_seconds, ...]
+# After initial_cooldown fires twice, escalate
+escalation_tiers = [600, 600, 1800, 3600, 3600, 3600]
+# Stop push notifications (pingme) after this many alerts
+max_pingme_alerts = 6
+# Resume prompt injected into Claude Code
+resume_prompt = "[CLAUDE-WATCH] Daemon detected stuck state: no background tasks running and not thinking. Please run the cleanup skill (/cleanup) to restart all watchers. If this alert fired incorrectly, DM Andrew with the details."
+
+[foreground_monitor]
+# Enable foreground blocking pattern detection
+enabled = true
+# Seconds of continuous foreground activity before warning
+threshold_seconds = 180
+# Check interval for foreground state (seconds) — independent of general.check_interval
+check_interval = 3
+# Interrupt when blocking/prolonged thinking detected (false = log-only mode)
+interrupt_enabled = true
+# Message injected after interrupting
+interrupt_message = "The foreground command was backgrounded by claude-watch because it exceeded the timeout. Use run_in_background for long commands."
+
+[watcher_monitor]
+# Enable individual watcher health tracking
+enabled = true
+# Watchers config file (same format as watchmen)
+watchers_config = "~/.config/watchmen/watchers.conf"
+# Expected watchmen supervisor count
+expected_watchmen = 0
+# Consecutive missing checks before injecting restart (6 = ~60s at 10s interval)
+inject_threshold = 6
+# Cooldown between watcher-missing injections (seconds)
+inject_cooldown = 120
+
+[context_monitor]
+# Enable context usage monitoring and deferred self-clear
+enabled = true
+# Fixed token margin from max: trigger when tokens >= max - margin (overrides threshold_percent)
+threshold_margin = 30000
+# Token percentage threshold (legacy fallback, ignored when threshold_margin is set)
+threshold_percent = 75
+# Compact remaining % at which to trigger (primary — "Context left until auto-compact: N%")
+compact_trigger_percent = 5
+# Grace period before forced self-clear (seconds)
+grace_period = 120
+# Minimum interval between context clear triggers (seconds)
+cooldown = 300
+
+[auto_update]
+# Enable automatic version update checks
+enabled = true
+# Minute of hour (0-59) to check for updates
+check_minute = 10
+# Minimum hours between update attempts
+cooldown_hours = 1
+# Text injected into Claude Code after restart completes
+resume_prompt = "resume"
+
+[reauth]
+# Detect when Claude Code needs API reauth and send high-priority alerts
+enabled = true
+# Interval between repeated alerts (seconds); 10800 = 3 hours
+alert_interval_seconds = 10800

@@ -1,0 +1,13 @@
+#!/bin/bash
+toplevel="$(git rev-parse --show-toplevel)"
+cd "$toplevel" || exit 1
+
+# Use nextest for parallel test execution
+# Skip e2e tests in pre-commit (they take 30-40s due to real sleeps)
+# Run full suite with: cargo nextest run
+if command -v cargo-nextest &>/dev/null; then
+    cargo nextest run -E 'not binary(~e2e_)' --status-level=fail 2>&1
+else
+    # Fallback: run only lib + fixture tests (skip e2e binaries)
+    cargo test --lib --test unit_activity_detection --quiet 2>&1
+fi

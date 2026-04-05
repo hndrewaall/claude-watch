@@ -1,0 +1,180 @@
+#!/usr/bin/env python3
+"""Write Prometheus metrics from claude-watch state to node-exporter textfile.
+
+Reads ~/.config/claude-watch/state.json and writes a .prom file for
+node-exporter's textfile collector. Designed to run from cron every 30s.
+"""
+
+import json
+import sys
+import os
+import tempfile
+from datetime import datetime, timezone
+from pathlib import Path
+
+STATE_FILE = Path(
+    os.environ.get(
+        "CLAUDE_WATCH_STATE",
+        str(Path.home() / ".config/claude-watch/state.json"),
+    )
+)
+PROM_DIR = Path("/var/lib/node-exporter/textfile")
+PROM_FILE = PROM_DIR / "claude_watch.prom"
+
+
+def parse_iso_timestamp(ts: str) -> float:
+    """Parse ISO 8601 timestamp to epoch seconds."""
+    if ts is None:
+        return 0.0
+    # Handle Rust's chrono format with timezone offset like -04:00
+    ts = ts.strip()
+    try:
+        dt = datetime.fromisoformat(ts)
+        return dt.timestamp()
+    except ValueError:
+        return 0.0
+
+
+def main():
+    try:
+        state = json.loads(STATE_FILE.read_text())
+    except (FileNotFoundError, json.JSONDecodeError) as e:
+        # Write a metric indicating the state file is unreadable
+        lines = [
+            "# HELP claude_watch_up Whether claude-watch state file is readable",
+            "# TYPE claude_watch_up gauge",
+            "claude_watch_up 0",
+        ]
+        write_prom(lines)
+        print(f"Error reading state file: {e}", file=sys.stderr)
+        return 1
+
+    last_check = parse_iso_timestamp(state.get("last_check"))
+
+    # Get version info from claude-watch status
+    current_version = "unknown"
+    latest_version = "unknown"
+    try:
+        import subprocess
+        result = subprocess.run(
+            ["claude-watch", "status", "--json"],
+            capture_output=True, text=True, timeout=5)
+        if result.returncode == 0:
+            status = json.loads(result.stdout)
+            current_version = status.get("version", "unknown")
+            latest_version = status.get("latest", "unknown")
+    except Exception:
+        pass
+
+    last_context_clear = parse_iso_timestamp(state.get("last_context_clear"))
+
+    last_known_tokens = state.get("last_known_tokens", 0) or 0
+    last_known_bashes = state.get("last_known_bashes", 0) or 0
+    consecutive_failures = state.get("consecutive_failures", 0) or 0
+    consecutive_dead = state.get("consecutive_dead_checks", 0) or 0
+    alert_count = state.get("alert_count", 0) or 0
+    restart_count = state.get("restart_count", 0) or 0
+
+    # Watcher health: count missing watchers
+    watcher_health = state.get("watcher_health", {})
+    watchers_missing = sum(
+        1 for w in watcher_health.values()
+        if w.get("enabled") and w.get("consecutive_missing", 0) > 3
+    )
+    watchers_total = sum(1 for w in watcher_health.values() if w.get("enabled"))
+
+    lines = [
+        "# HELP claude_watch_up Whether claude-watch state file is readable",
+        "# TYPE claude_watch_up gauge",
+        "claude_watch_up 1",
+        "",
+        "# HELP claude_heartbeat_timestamp_seconds Epoch of last successful claude-watch check",
+        "# TYPE claude_heartbeat_timestamp_seconds gauge",
+        f"claude_heartbeat_timestamp_seconds {last_check:.3f}",
+        "",
+        "# HELP claude_context_tokens Current context token count",
+        "# TYPE claude_context_tokens gauge",
+        f"claude_context_tokens {last_known_tokens}",
+        "",
+        "# HELP claude_bash_count Number of bash calls in current context",
+        "# TYPE claude_bash_count gauge",
+        f"claude_bash_count {last_known_bashes}",
+        "",
+        "# HELP claude_consecutive_failures Number of consecutive check failures",
+        "# TYPE claude_consecutive_failures gauge",
+        f"claude_consecutive_failures {consecutive_failures}",
+        "",
+        "# HELP claude_consecutive_dead_checks Number of consecutive dead-process checks",
+        "# TYPE claude_consecutive_dead_checks gauge",
+        f"claude_consecutive_dead_checks {consecutive_dead}",
+        "",
+        "# HELP claude_alert_count Total alerts fired this session",
+        "# TYPE claude_alert_count gauge",
+        f"claude_alert_count {alert_count}",
+        "",
+        "# HELP claude_restart_count Total restarts performed",
+        "# TYPE claude_restart_count gauge",
+        f"claude_restart_count {restart_count}",
+        "",
+        "# HELP claude_watchers_missing Number of enabled watchers currently missing",
+        "# TYPE claude_watchers_missing gauge",
+        f"claude_watchers_missing {watchers_missing}",
+        "",
+        "# HELP claude_watchers_total Total number of enabled watchers",
+        "# TYPE claude_watchers_total gauge",
+        f"claude_watchers_total {watchers_total}",
+        "",
+        "# HELP claude_last_context_clear_timestamp_seconds Epoch of last context clear",
+        "# TYPE claude_last_context_clear_timestamp_seconds gauge",
+        f"claude_last_context_clear_timestamp_seconds {last_context_clear:.3f}",
+        "",
+        "# HELP claude_version_info Claude Code version info",
+        "# TYPE claude_version_info gauge",
+        f'claude_version_info{{current="{current_version}",latest="{latest_version}"}} 1',
+        "",
+        "# HELP claude_watcher_inject_total Total watcher inject events",
+        "# TYPE claude_watcher_inject_total counter",
+        f"claude_watcher_inject_total {state.get('watcher_inject_count', 0) or 0}",
+        "",
+        "# HELP claude_thinking_interrupt_total Total thinking interrupt events",
+        "# TYPE claude_thinking_interrupt_total counter",
+        f"claude_thinking_interrupt_total {state.get('thinking_interrupt_count', 0) or 0}",
+        "",
+        "# HELP claude_auto_update_total Total auto-update events",
+        "# TYPE claude_auto_update_total counter",
+        f"claude_auto_update_total {state.get('auto_update_count', 0) or 0}",
+        "",
+        "# HELP claude_heartbeat_stale_total Total heartbeat stale events",
+        "# TYPE claude_heartbeat_stale_total counter",
+        f"claude_heartbeat_stale_total {state.get('heartbeat_stale_count', 0) or 0}",
+    ]
+
+    write_prom(lines)
+    return 0
+
+
+def write_prom(lines: list[str]):
+    """Atomically write .prom file via temp file + rename."""
+    PROM_DIR.mkdir(parents=True, exist_ok=True)
+    content = "\n".join(lines) + "\n"
+    # Write to temp file in same dir, then rename (atomic on same filesystem)
+    fd, tmp_path = tempfile.mkstemp(dir=PROM_DIR, suffix=".prom.tmp")
+    try:
+        os.write(fd, content.encode())
+        os.fchmod(fd, 0o644)
+        os.close(fd)
+        os.rename(tmp_path, PROM_FILE)
+    except Exception:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+if __name__ == "__main__":
+    sys.exit(main() or 0)

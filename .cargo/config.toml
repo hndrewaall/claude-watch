@@ -1,0 +1,14 @@
+# Parallel test execution for `cargo test` (built-in runner).
+# cargo-nextest is preferred (see .config/nextest.toml) but this ensures
+# `cargo test` also runs in parallel when nextest isn't available.
+#
+# e2e tests use unique tmux session names (PID + atomic counter),
+# so full parallelism is safe.
+
+[env]
+# Note: cargo test's built-in runner already defaults to num_cpus when
+# RUST_TEST_THREADS is unset. We don't set it here so the default applies.
+# To force serial execution: RUST_TEST_THREADS=1 cargo test
+#
+# cargo-nextest (preferred runner) has its own config in .config/nextest.toml
+# with test-threads = "num-cpus" explicitly set.
