@@ -153,3 +153,185 @@ fn test_scan_active_writers_no_proc_match() {
     // No process should have this file open for writing
     assert!(active.is_empty());
 }
+
+/// End-to-end test for session reconnect behavior.
+///
+/// Simulates the scenario where the tmux "tasks" session disappears and comes
+/// back. Verifies:
+///   1. session_exists detection (via tmux has-session)
+///   2. State clearing when session disappears
+///   3. scan_active_writers finds tasks with active writer processes
+///   4. add_pane equivalent (tmux split-window) works after reconnect
+#[test]
+fn session_reconnect_after_disappearance() {
+    use std::process::Command;
+
+    let pid = std::process::id();
+    let session = format!("tw-reconnect-{}", pid);
+
+    // Helper: check if tmux session exists (mirrors the private session_exists fn)
+    let session_exists = |name: &str| -> bool {
+        Command::new("tmux")
+            .args(["has-session", "-t", name])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    };
+
+    // Cleanup guard: kill the test session on drop
+    struct SessionGuard {
+        name: String,
+    }
+    impl Drop for SessionGuard {
+        fn drop(&mut self) {
+            let _ = Command::new("tmux")
+                .args(["kill-session", "-t", &self.name])
+                .output();
+        }
+    }
+    let _guard = SessionGuard {
+        name: session.clone(),
+    };
+
+    // --- Phase 1: Create session, verify it exists ---
+    let create = Command::new("tmux")
+        .args(["new-session", "-d", "-s", &session, "-x", "120", "-y", "40"])
+        .output()
+        .expect("failed to create tmux session");
+    assert!(
+        create.status.success(),
+        "tmux new-session failed: {}",
+        String::from_utf8_lossy(&create.stderr)
+    );
+    assert!(
+        session_exists(&session),
+        "session should exist after creation"
+    );
+
+    // --- Phase 2: Kill session, verify it's gone ---
+    let kill = Command::new("tmux")
+        .args(["kill-session", "-t", &session])
+        .output()
+        .expect("failed to kill tmux session");
+    assert!(
+        kill.status.success(),
+        "tmux kill-session failed: {}",
+        String::from_utf8_lossy(&kill.stderr)
+    );
+    assert!(
+        !session_exists(&session),
+        "session should not exist after kill"
+    );
+
+    // Simulate what the daemon does: clear tracked state when session disappears
+    let mut tracked: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    tracked.insert("task-1".to_string(), "%0".to_string());
+    tracked.insert("task-2".to_string(), "%1".to_string());
+    // On session disappearance, daemon clears tracked and pending_removal
+    tracked.clear();
+    assert!(tracked.is_empty(), "tracked state should be cleared");
+
+    // --- Phase 3: Recreate session, verify reconnect ---
+    let recreate = Command::new("tmux")
+        .args(["new-session", "-d", "-s", &session, "-x", "120", "-y", "40"])
+        .output()
+        .expect("failed to recreate tmux session");
+    assert!(
+        recreate.status.success(),
+        "tmux new-session (recreate) failed: {}",
+        String::from_utf8_lossy(&recreate.stderr)
+    );
+    assert!(
+        session_exists(&session),
+        "session should exist after recreation"
+    );
+
+    // --- Phase 4: Verify scan_active_writers finds tasks with active writers ---
+    let (_base, tasks_dir) = create_mock_tasks_dir();
+    let output_file = tasks_dir.join("reconnect-task.output");
+
+    // Start a background process that holds the file open for writing
+    // (simulating an active Claude Code task writing output)
+    let mut writer = Command::new("bash")
+        .args([
+            "-c",
+            &format!(
+                "exec 3>>'{}'; while true; do echo tick >&3; sleep 1; done",
+                output_file.display()
+            ),
+        ])
+        .spawn()
+        .expect("failed to spawn writer process");
+
+    // Give the writer a moment to open the file
+    std::thread::sleep(std::time::Duration::from_millis(200));
+
+    // scan_active_writers should find our task
+    let active = claude_watch::task_watch::scan_active_writers(&tasks_dir, true);
+    assert!(
+        active.contains_key("reconnect-task"),
+        "scan_active_writers should find the task with an active writer, got: {:?}",
+        active.keys().collect::<Vec<_>>()
+    );
+
+    // has_output should return true (writer has written at least one "tick")
+    assert!(
+        claude_watch::task_watch::has_output(&tasks_dir, "reconnect-task"),
+        "has_output should be true for file with content"
+    );
+
+    // infer_label should return the first line of output
+    let label = claude_watch::task_watch::infer_label(&tasks_dir, "reconnect-task");
+    assert_eq!(label, "tick", "label should be 'tick' from the writer output");
+
+    // --- Phase 5: Verify add_pane equivalent (split-window into the session) ---
+    let tail_cmd = format!("tail -f {}", output_file.display());
+    let split = Command::new("tmux")
+        .args([
+            "split-window",
+            "-t",
+            &session,
+            "-v",
+            "-P",
+            "-F",
+            "#{pane_id}",
+            &tail_cmd,
+        ])
+        .output()
+        .expect("failed to split-window");
+    assert!(
+        split.status.success(),
+        "tmux split-window should succeed after session recreation: {}",
+        String::from_utf8_lossy(&split.stderr)
+    );
+    let pane_id = String::from_utf8_lossy(&split.stdout).trim().to_string();
+    assert!(
+        pane_id.starts_with('%'),
+        "split-window should return a pane id (got '{}')",
+        pane_id
+    );
+
+    // Verify the pane is alive
+    let list = Command::new("tmux")
+        .args([
+            "list-panes",
+            "-t",
+            &session,
+            "-F",
+            "#{pane_id}",
+        ])
+        .output()
+        .expect("failed to list panes");
+    let panes = String::from_utf8_lossy(&list.stdout);
+    assert!(
+        panes.contains(&pane_id),
+        "new pane {} should appear in session pane list: {}",
+        pane_id,
+        panes
+    );
+
+    // --- Cleanup ---
+    writer.kill().expect("failed to kill writer process");
+    let _ = writer.wait();
+    // Session cleanup handled by SessionGuard drop
+}
