@@ -420,13 +420,17 @@ async fn test_run_task_watch_loop_survives_session_disappearance() {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&mock_script, fs::Permissions::from_mode(0o755)).unwrap();
     }
-    // Update the tmux session's PATH so split-window subshells find the mock
+    // Update the tmux session's PATH so split-window subshells find the mock.
+    // Also set remain-on-exit so panes survive even if the command exits.
     let new_path = format!("{}:{}", mock_bin_dir.display(), std::env::var("PATH").unwrap_or_default());
     let set_env = Command::new("tmux")
         .args(["set-environment", "-t", &session, "PATH", &new_path])
         .output()
         .expect("failed to set tmux PATH");
     assert!(set_env.status.success(), "tmux set-environment failed");
+    let _ = Command::new("tmux")
+        .args(["set-option", "-t", &session, "remain-on-exit", "on"])
+        .output();
 
     // --- Spawn the actual daemon loop ---
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -486,12 +490,15 @@ async fn test_run_task_watch_loop_survives_session_disappearance() {
         "tmux new-session (recreate) failed: {}",
         String::from_utf8_lossy(&recreate.stderr)
     );
-    // Re-inject PATH for the new session so split-window finds the mock task-watch
+    // Re-inject PATH and remain-on-exit for the new session
     let set_env2 = Command::new("tmux")
         .args(["set-environment", "-t", &session, "PATH", &new_path])
         .output()
         .expect("failed to set tmux PATH on recreated session");
     assert!(set_env2.status.success());
+    let _ = Command::new("tmux")
+        .args(["set-option", "-t", &session, "remain-on-exit", "on"])
+        .output();
 
     // --- Phase 5: Wait for the loop to reconnect and add a pane ---
     eprintln!("[test] waiting for pane to reappear after reconnect...");
