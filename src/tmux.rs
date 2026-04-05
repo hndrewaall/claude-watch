@@ -46,6 +46,12 @@ pub async fn capture_pane(pane: &str) -> Option<String> {
     run_cmd(&["tmux", "capture-pane", "-t", pane, "-p"], 5).await
 }
 
+/// Capture pane with -J flag to join wrapped lines. Use for status bar parsing
+/// where text may be truncated at pane width (e.g. "275898 tokens" → "275898 toke…").
+pub async fn capture_pane_joined(pane: &str) -> Option<String> {
+    run_cmd(&["tmux", "capture-pane", "-t", pane, "-p", "-J"], 5).await
+}
+
 pub async fn capture_pane_history(pane: &str, lines: i32) -> Option<String> {
     let start = format!("-{}", lines);
     run_cmd(
