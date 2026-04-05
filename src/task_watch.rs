@@ -874,10 +874,36 @@ pub async fn run_task_watch_loop(config: TaskWatchConfig, shutdown: Arc<AtomicBo
             info!(task_id = %tid, "removed");
         }
 
-        // Self-heal: verify session still exists
+        // Self-heal: if session disappeared, wait for it to come back
         if !session_exists(&session).await {
-            warn!("tasks session disappeared, exiting task-watch loop");
-            break;
+            warn!("tasks session disappeared, waiting for it to return...");
+            // Clear tracked state since panes are gone
+            state.tracked.clear();
+            state.pending_removal.clear();
+
+            loop {
+                if shutdown.load(Ordering::Relaxed) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                if session_exists(&session).await {
+                    info!("tasks session is back, resuming");
+                    // Re-scan for active tasks
+                    let td = state.tasks_dir.clone();
+                    let active = tokio::task::spawn_blocking(move || scan_active_writers(&td, show_all))
+                        .await
+                        .unwrap_or_default();
+                    for (tid, _) in &active {
+                        if has_output(&state.tasks_dir, tid) {
+                            let label = infer_label(&state.tasks_dir, tid);
+                            if let Some(pane_id) = add_pane(&mut state, tid, &label).await {
+                                info!(task_id = %tid, label = %label, pane_id = %pane_id, "reconnected task");
+                            }
+                        }
+                    }
+                    break;
+                }
+            }
         }
     }
 
