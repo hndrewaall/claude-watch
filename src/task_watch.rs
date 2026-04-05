@@ -892,11 +892,38 @@ pub async fn run_task_watch_loop(config: TaskWatchConfig, shutdown: Arc<AtomicBo
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                 if session_exists(&session).await {
                     info!("tasks session is back, resuming");
-                    // Re-scan for active tasks
+                    // Re-scan for active tasks (both /proc writers and agents)
                     let td = state.tasks_dir.clone();
-                    let active = tokio::task::spawn_blocking(move || scan_active_writers(&td, show_all))
+                    let mut active: HashMap<String, bool> = tokio::task::spawn_blocking(move || scan_active_writers(&td, show_all))
                         .await
                         .unwrap_or_default();
+
+                    // Also discover active agents via mtime
+                    {
+                        let td = state.tasks_dir.clone();
+                        let extra_agents = tokio::task::spawn_blocking(move || {
+                            let mut agents = Vec::new();
+                            if let Ok(entries) = std::fs::read_dir(&td) {
+                                for entry in entries.flatten() {
+                                    let fname = entry.file_name().to_string_lossy().to_string();
+                                    if fname.ends_with(".output") {
+                                        let tid = fname.strip_suffix(".output").unwrap_or(&fname).to_string();
+                                        if is_agent_output(&td, &tid) && agent_is_active(&td, &tid) {
+                                            agents.push(tid);
+                                        }
+                                    }
+                                }
+                            }
+                            agents
+                        })
+                        .await
+                        .unwrap_or_default();
+
+                        for tid in extra_agents {
+                            active.entry(tid).or_insert(false);
+                        }
+                    }
+
                     for (tid, _) in &active {
                         if has_output(&state.tasks_dir, tid) {
                             let label = infer_label(&state.tasks_dir, tid);
