@@ -43,7 +43,9 @@ pub async fn send_literal(pane: &str, text: &str) {
 }
 
 pub async fn capture_pane(pane: &str) -> Option<String> {
-    run_cmd(&["tmux", "capture-pane", "-t", pane, "-p"], 5).await
+    // Use -J to join wrapped lines — ensures status bar text isn't truncated
+    // at pane width (e.g. "275898 tokens" not cut to "275898 toke…")
+    run_cmd(&["tmux", "capture-pane", "-t", pane, "-p", "-J"], 5).await
 }
 
 pub async fn capture_pane_history(pane: &str, lines: i32) -> Option<String> {
