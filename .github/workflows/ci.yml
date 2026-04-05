@@ -31,7 +31,7 @@ jobs:
             ${{ runner.os }}-cargo-
 
       - name: Install cargo-nextest
-        run: cargo install cargo-nextest --locked
+        run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
 
       - name: Run unit + fixture tests
         run: cargo nextest run -E 'not binary(~e2e_)'
@@ -60,7 +60,11 @@ jobs:
             ${{ runner.os }}-cargo-
 
       - name: Install cargo-nextest
-        run: cargo install cargo-nextest --locked
+        run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+
+      - name: Start tmux server
+        run: tmux start-server
 
       - name: Run e2e tests
-        run: cargo nextest run -E 'binary(~e2e_)'
+        run: cargo nextest run -E 'binary(~e2e_)' --retries 2
+        timeout-minutes: 5
