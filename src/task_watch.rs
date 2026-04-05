@@ -383,6 +383,87 @@ async fn get_alive_panes(session: &str) -> std::collections::HashSet<String> {
     }
 }
 
+/// Info about an existing pane in the tmux session.
+#[derive(Debug)]
+struct ExistingPane {
+    pane_index: usize,
+    pane_id: String,
+    task_id: Option<String>,
+}
+
+/// List all panes in the session with their index, id, and parsed task_id.
+///
+/// Pane start commands follow the pattern:
+///   echo '=== LABEL [TASK_ID] ==='; tail -f PATH
+/// We extract TASK_ID from the `[...]` part.
+async fn list_existing_panes(session: &str) -> Vec<ExistingPane> {
+    let args: Vec<&str> = vec![
+        "tmux",
+        "list-panes",
+        "-t",
+        session,
+        "-F",
+        "#{pane_index}\t#{pane_id}\t#{pane_start_command}",
+    ];
+    let output = match run_cmd(&args, 5).await {
+        Some(o) => o,
+        None => return Vec::new(),
+    };
+
+    output
+        .lines()
+        .filter_map(|line| {
+            let parts: Vec<&str> = line.splitn(3, '\t').collect();
+            if parts.len() < 3 {
+                return None;
+            }
+            let pane_index: usize = parts[0].trim().parse().ok()?;
+            let pane_id = parts[1].trim().to_string();
+            let start_cmd = parts[2];
+
+            // Extract task_id from [TASK_ID] in the start command
+            let task_id = extract_task_id_from_pane_cmd(start_cmd);
+
+            Some(ExistingPane {
+                pane_index,
+                pane_id,
+                task_id,
+            })
+        })
+        .collect()
+}
+
+/// Extract a task_id from a pane start command.
+///
+/// Looks for `[TASK_ID]` pattern in strings like:
+///   echo '=== Some Label [abc123def] ==='; tail -f /path/to/file
+fn extract_task_id_from_pane_cmd(cmd: &str) -> Option<String> {
+    // Find the last occurrence of [...] in the command
+    // (to avoid matching other brackets that might appear)
+    let mut last_open = None;
+    let mut last_close = None;
+    for (i, c) in cmd.char_indices() {
+        if c == '[' {
+            last_open = Some(i);
+            last_close = None; // reset close for this open
+        }
+        if c == ']' && last_open.is_some() {
+            last_close = Some(i);
+        }
+    }
+
+    if let (Some(open), Some(close)) = (last_open, last_close) {
+        if close > open + 1 {
+            let tid = &cmd[open + 1..close];
+            // Validate: task IDs are alphanumeric hex-ish strings
+            if !tid.is_empty() && tid.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_') {
+                return Some(tid.to_string());
+            }
+        }
+    }
+    None
+}
+
 /// Check if the tmux session exists.
 async fn session_exists(session: &str) -> bool {
     run_cmd(&["tmux", "has-session", "-t", session], 5)
@@ -649,6 +730,56 @@ pub async fn run_task_watch_loop(config: TaskWatchConfig, shutdown: Arc<AtomicBo
 
     let active_count = state.tracked.len();
     info!(active_count, "initial sync complete");
+
+    // Orphan pane cleanup: scan existing panes in the session and kill any
+    // that aren't tracked (leftover from a previous daemon instance).
+    // Pane 0 is the daemon/status pane — never kill it.
+    let existing_panes = list_existing_panes(&session).await;
+    let tracked_pane_ids: std::collections::HashSet<String> = state
+        .tracked
+        .values()
+        .map(|t| t.pane_id.clone())
+        .collect();
+    let mut orphan_count = 0;
+    for pane in &existing_panes {
+        // Skip pane 0 (daemon pane)
+        if pane.pane_index == 0 {
+            continue;
+        }
+        // Skip panes we just adopted during initial sync
+        if tracked_pane_ids.contains(&pane.pane_id) {
+            continue;
+        }
+        // This pane is untracked — it's an orphan from a previous daemon instance.
+        // Kill it.
+        info!(
+            pane_id = %pane.pane_id,
+            pane_index = pane.pane_index,
+            task_id = ?pane.task_id,
+            "killing orphan pane from previous daemon"
+        );
+        let _ = run_cmd(
+            &["tmux", "kill-pane", "-t", &pane.pane_id],
+            5,
+        )
+        .await;
+        orphan_count += 1;
+    }
+    if orphan_count > 0 {
+        info!(orphan_count, "orphan pane cleanup complete");
+        // Rebalance after killing orphans
+        let _ = run_cmd(
+            &[
+                "tmux",
+                "select-layout",
+                "-t",
+                &session,
+                "even-vertical",
+            ],
+            5,
+        )
+        .await;
+    }
 
     // Set up file watcher for new .output files
     let (notify_tx, mut notify_rx) = mpsc::unbounded_channel::<String>();
@@ -1286,5 +1417,35 @@ mod tests {
     fn test_has_output_no_file() {
         let dir = Path::new("/tmp/nonexistent-task-watch-test");
         assert!(!has_output(dir, "fake-id"));
+    }
+
+    #[test]
+    fn test_extract_task_id_from_pane_cmd_standard() {
+        let cmd = "echo '=== Some Label [abc123def] ==='; tail -f /tmp/tasks/abc123def.output";
+        assert_eq!(extract_task_id_from_pane_cmd(cmd), Some("abc123def".to_string()));
+    }
+
+    #[test]
+    fn test_extract_task_id_from_pane_cmd_agent() {
+        let cmd = "echo '=== agent:tracker-search [a644bc543a7a9e8a6] ==='; tail -f /tmp/tasks/a644bc543a7a9e8a6.output | task-watch format-jsonl | task-watch timestamp-lines";
+        assert_eq!(extract_task_id_from_pane_cmd(cmd), Some("a644bc543a7a9e8a6".to_string()));
+    }
+
+    #[test]
+    fn test_extract_task_id_from_pane_cmd_no_brackets() {
+        let cmd = "echo 'task-watch daemon handled by claude-watch'; sleep infinity";
+        assert_eq!(extract_task_id_from_pane_cmd(cmd), None);
+    }
+
+    #[test]
+    fn test_extract_task_id_from_pane_cmd_empty_brackets() {
+        let cmd = "echo '=== [] ==='; tail -f /dev/null";
+        assert_eq!(extract_task_id_from_pane_cmd(cmd), None);
+    }
+
+    #[test]
+    fn test_extract_task_id_from_pane_cmd_with_hyphens() {
+        let cmd = "echo '=== Build Task [my-task-123] ==='; tail -f /tmp/out";
+        assert_eq!(extract_task_id_from_pane_cmd(cmd), Some("my-task-123".to_string()));
     }
 }
