@@ -19,6 +19,8 @@ pub struct Config {
     pub auto_update: AutoUpdateConfig,
     #[serde(default)]
     pub reauth: ReauthConfig,
+    #[serde(default)]
+    pub task_watch: TaskWatchConfig,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -178,6 +180,62 @@ fn default_reauth_alert_interval() -> u64 {
     10800 // 3 hours
 }
 
+#[derive(Debug, Deserialize, Clone)]
+pub struct TaskWatchConfig {
+    #[serde(default = "default_tw_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_tw_session")]
+    pub session: String,
+    #[serde(default = "default_tw_poll_interval")]
+    pub poll_interval: u64,
+    #[serde(default = "default_tw_done_delay")]
+    pub done_delay: u64,
+    #[serde(default = "default_tw_agent_done_delay")]
+    pub agent_done_delay: u64,
+    #[serde(default = "default_tw_max_panes")]
+    pub max_panes: usize,
+    #[serde(default)]
+    pub show_all: bool,
+}
+
+impl Default for TaskWatchConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_tw_enabled(),
+            session: default_tw_session(),
+            poll_interval: default_tw_poll_interval(),
+            done_delay: default_tw_done_delay(),
+            agent_done_delay: default_tw_agent_done_delay(),
+            max_panes: default_tw_max_panes(),
+            show_all: false,
+        }
+    }
+}
+
+fn default_tw_enabled() -> bool {
+    false
+}
+
+fn default_tw_session() -> String {
+    "tasks".to_string()
+}
+
+fn default_tw_poll_interval() -> u64 {
+    5
+}
+
+fn default_tw_done_delay() -> u64 {
+    10
+}
+
+fn default_tw_agent_done_delay() -> u64 {
+    120
+}
+
+fn default_tw_max_panes() -> usize {
+    20
+}
+
 fn default_check_minute() -> u32 {
     10
 }
@@ -324,6 +382,15 @@ resume_prompt = "resume"
 [reauth]
 enabled = true
 alert_interval_seconds = 10800
+
+[task_watch]
+enabled = true
+session = "tasks"
+poll_interval = 5
+done_delay = 10
+agent_done_delay = 120
+max_panes = 20
+show_all = false
 "#;
 
     #[test]
@@ -341,6 +408,13 @@ alert_interval_seconds = 10800
         assert!(config.watcher_monitor.enabled);
         assert!(config.reauth.enabled);
         assert_eq!(config.reauth.alert_interval_seconds, 10800);
+        assert!(config.task_watch.enabled);
+        assert_eq!(config.task_watch.session, "tasks");
+        assert_eq!(config.task_watch.poll_interval, 5);
+        assert_eq!(config.task_watch.done_delay, 10);
+        assert_eq!(config.task_watch.agent_done_delay, 120);
+        assert_eq!(config.task_watch.max_panes, 20);
+        assert!(!config.task_watch.show_all);
     }
 
     #[test]
