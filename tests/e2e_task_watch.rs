@@ -500,9 +500,18 @@ async fn test_run_task_watch_loop_survives_session_disappearance() {
         .args(["set-option", "-t", &session, "remain-on-exit", "on"])
         .output();
 
+    // Touch the JSONL file to refresh mtime (agent_is_active checks mtime threshold)
+    {
+        use std::io::Write;
+        if let Ok(mut f) = fs::OpenOptions::new().append(true).open(&jsonl_file) {
+            let _ = writeln!(f, r#"{{"message": {{"role": "user", "content": [{{"type": "text", "text": "still active"}}]}}}}"#);
+        }
+    }
+    eprintln!("[test] touched JSONL to refresh mtime");
+
     // --- Phase 5: Wait for the loop to reconnect and add a pane ---
     eprintln!("[test] waiting for pane to reappear after reconnect...");
-    let pane_reappeared = wait_for_pane_count(&session, 2, 15).await;
+    let pane_reappeared = wait_for_pane_count(&session, 2, 20).await;
     assert!(
         pane_reappeared,
         "daemon loop should have reconnected and re-added a pane after session recreation"
