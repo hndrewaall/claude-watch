@@ -335,3 +335,185 @@ fn session_reconnect_after_disappearance() {
     let _ = writer.wait();
     // Session cleanup handled by SessionGuard drop
 }
+
+/// E2E test for the actual `run_task_watch_loop` function's session reconnect behavior.
+///
+/// This test verifies that the daemon loop SURVIVES tmux session disappearance
+/// and reconnects when the session comes back. With the old `break` code, the
+/// loop would exit when the session disappeared. With the fix (wait + reconnect),
+/// the loop stays alive and re-adds task panes when the session returns.
+///
+/// Steps:
+///   1. Create a unique tmux session
+///   2. Set up a tasks_dir with an .output file held open by a writer process
+///   3. Spawn run_task_watch_loop as a tokio task
+///   4. Wait for the initial pane to appear (proves loop is running)
+///   5. Kill the tmux session (session disappears)
+///   6. Wait a few seconds, assert the loop is NOT finished (would have exited with old `break`)
+///   7. Recreate the tmux session
+///   8. Wait for a new pane to appear (proves reconnect worked)
+///   9. Shut down via the AtomicBool flag
+#[tokio::test]
+async fn test_run_task_watch_loop_survives_session_disappearance() {
+    use claude_watch::config::TaskWatchConfig;
+    use std::process::Command;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    let pid = std::process::id();
+    let session = format!("tw-loop-reconnect-{}", pid);
+
+    // Cleanup guard for the tmux session + writer process
+    struct TestGuard {
+        session: String,
+        writer_pid: Option<u32>,
+    }
+    impl Drop for TestGuard {
+        fn drop(&mut self) {
+            let _ = Command::new("tmux")
+                .args(["kill-session", "-t", &self.session])
+                .output();
+            if let Some(pid) = self.writer_pid {
+                let _ = Command::new("kill").arg(pid.to_string()).output();
+            }
+        }
+    }
+
+    let mut guard = TestGuard {
+        session: session.clone(),
+        writer_pid: None,
+    };
+
+    // --- Setup: create tmux session ---
+    eprintln!("[test] creating tmux session: {}", session);
+    let create = Command::new("tmux")
+        .args(["new-session", "-d", "-s", &session, "-x", "120", "-y", "40"])
+        .output()
+        .expect("failed to create tmux session");
+    assert!(
+        create.status.success(),
+        "tmux new-session failed: {}",
+        String::from_utf8_lossy(&create.stderr)
+    );
+
+    // --- Setup: create tasks_dir with a mock .output file ---
+    let (_base, tasks_dir) = create_mock_tasks_dir();
+    let output_file = tasks_dir.join("reconnect-loop-task.output");
+
+    // Start a writer process that holds the file open (simulates active task)
+    let writer = Command::new("bash")
+        .args([
+            "-c",
+            &format!(
+                "exec 3>>'{}'; echo 'test task output' >&3; while true; do sleep 1; done",
+                output_file.display()
+            ),
+        ])
+        .spawn()
+        .expect("failed to spawn writer process");
+    guard.writer_pid = Some(writer.id());
+
+    // Give the writer a moment to open the file and write initial content
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    // --- Spawn the actual daemon loop ---
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let config = TaskWatchConfig {
+        enabled: true,
+        session: session.clone(),
+        poll_interval: 1,
+        done_delay: 60,
+        agent_done_delay: 60,
+        max_panes: 10,
+        show_all: true, // show all tasks (not just workloads)
+        tasks_dir_override: Some(tasks_dir.clone()),
+    };
+
+    let shutdown_clone = shutdown.clone();
+    let loop_handle = tokio::spawn(async move {
+        claude_watch::task_watch::run_task_watch_loop(config, shutdown_clone).await;
+    });
+
+    // --- Phase 1: Wait for the loop to create an initial pane ---
+    eprintln!("[test] waiting for initial pane to appear...");
+    let pane_appeared = wait_for_pane_count(&session, 2, 10).await;
+    assert!(
+        pane_appeared,
+        "daemon loop should have created a pane for the active task within 10s"
+    );
+    eprintln!("[test] initial pane appeared");
+
+    // --- Phase 2: Kill the tmux session ---
+    eprintln!("[test] killing tmux session to simulate disappearance...");
+    let kill = Command::new("tmux")
+        .args(["kill-session", "-t", &session])
+        .output()
+        .expect("failed to kill tmux session");
+    assert!(kill.status.success(), "tmux kill-session failed");
+
+    // --- Phase 3: Wait a few seconds, verify loop is still running ---
+    // With the old `break` code, the loop would exit here.
+    // With the fix, it waits for the session to come back.
+    eprintln!("[test] waiting 4s to verify loop doesn't exit...");
+    tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+    assert!(
+        !loop_handle.is_finished(),
+        "BUG: run_task_watch_loop exited when session disappeared — \
+         it should wait for the session to return (the old `break` behavior)"
+    );
+    eprintln!("[test] loop is still alive (session reconnect wait is working)");
+
+    // --- Phase 4: Recreate the tmux session ---
+    eprintln!("[test] recreating tmux session...");
+    let recreate = Command::new("tmux")
+        .args(["new-session", "-d", "-s", &session, "-x", "120", "-y", "40"])
+        .output()
+        .expect("failed to recreate tmux session");
+    assert!(
+        recreate.status.success(),
+        "tmux new-session (recreate) failed: {}",
+        String::from_utf8_lossy(&recreate.stderr)
+    );
+
+    // --- Phase 5: Wait for the loop to reconnect and add a pane ---
+    eprintln!("[test] waiting for pane to reappear after reconnect...");
+    let pane_reappeared = wait_for_pane_count(&session, 2, 15).await;
+    assert!(
+        pane_reappeared,
+        "daemon loop should have reconnected and re-added a pane after session recreation"
+    );
+    eprintln!("[test] pane reappeared — reconnect successful");
+
+    // --- Cleanup ---
+    shutdown.store(true, Ordering::Relaxed);
+    // Give the loop a moment to notice the shutdown flag
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    // Guard drop handles tmux session and writer process cleanup
+}
+
+/// Poll tmux list-panes until the session has at least `min_panes` panes,
+/// or timeout after `timeout_secs` seconds.
+async fn wait_for_pane_count(session: &str, min_panes: usize, timeout_secs: u64) -> bool {
+    use std::process::Command;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    loop {
+        let output = Command::new("tmux")
+            .args(["list-panes", "-t", session, "-F", "#{pane_id}"])
+            .output();
+        if let Ok(out) = output {
+            if out.status.success() {
+                let count = String::from_utf8_lossy(&out.stdout)
+                    .lines()
+                    .filter(|l| !l.trim().is_empty())
+                    .count();
+                if count >= min_panes {
+                    return true;
+                }
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+}
