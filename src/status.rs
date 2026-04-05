@@ -52,17 +52,29 @@ pub(crate) fn parse_status_bar(pane_text: &str) -> ParsedStatusBar {
     let lines: Vec<&str> = pane_text.lines().collect();
     let start = if lines.len() > 10 { lines.len() - 10 } else { 0 };
 
-    // Match "N tokens" or truncated "N toke" (tmux may truncate at pane width)
+    // Match "N tokens" or truncated "N toke" — but ONLY on status bar lines
+    // (contain permission mode, INSERT, or background tasks indicator).
+    // This prevents matching thinking indicator text ("↓ 400 tokens") or
+    // Claude's output text that mentions tokens.
     let token_re = Regex::new(r"(\d[\d,]*)\s+toke").unwrap();
     let bash_re = Regex::new(r"(\d+)\s+(?:bashes|background\s+tasks)").unwrap();
     let compact_re = Regex::new(r"Context left until auto-compact:\s*(\d+)%").unwrap();
 
     for line in &lines[start..] {
-        if let Some(caps) = token_re.captures(line) {
-            if let Some(m) = caps.get(1) {
-                let cleaned = m.as_str().replace(',', "");
-                if let Ok(v) = cleaned.parse::<u64>() {
-                    result.tokens = Some(v);
+        // Only parse tokens from status bar lines (contain mode indicators)
+        let is_status_bar = line.contains("bypass permissions")
+            || line.contains("-- INSERT --")
+            || line.contains("background tasks")
+            || line.contains("bashes")
+            || line.contains("auto-compact");
+
+        if is_status_bar {
+            if let Some(caps) = token_re.captures(line) {
+                if let Some(m) = caps.get(1) {
+                    let cleaned = m.as_str().replace(',', "");
+                    if let Ok(v) = cleaned.parse::<u64>() {
+                        result.tokens = Some(v);
+                    }
                 }
             }
         }
