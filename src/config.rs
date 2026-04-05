@@ -196,6 +196,9 @@ pub struct TaskWatchConfig {
     pub max_panes: usize,
     #[serde(default)]
     pub show_all: bool,
+    /// Override tasks directory for testing (bypasses find_tasks_dir discovery).
+    #[serde(skip)]
+    pub tasks_dir_override: Option<std::path::PathBuf>,
 }
 
 impl Default for TaskWatchConfig {
@@ -208,6 +211,7 @@ impl Default for TaskWatchConfig {
             agent_done_delay: default_tw_agent_done_delay(),
             max_panes: default_tw_max_panes(),
             show_all: false,
+            tasks_dir_override: None,
         }
     }
 }

@@ -555,19 +555,23 @@ pub async fn run_task_watch_loop(config: TaskWatchConfig, shutdown: Arc<AtomicBo
         "task-watch loop started"
     );
 
-    // Find initial tasks directory
-    let tasks_dir = match find_tasks_dir() {
-        Some(d) => d,
-        None => {
-            warn!("No Claude Code tasks directory found, waiting...");
-            // Wait and retry
-            loop {
-                if shutdown.load(Ordering::Relaxed) {
-                    return;
-                }
-                tokio::time::sleep(std::time::Duration::from_secs(poll_interval)).await;
-                if let Some(d) = find_tasks_dir() {
-                    break d;
+    // Find initial tasks directory (use override if provided, e.g. for testing)
+    let tasks_dir = if let Some(ref override_dir) = config.tasks_dir_override {
+        override_dir.clone()
+    } else {
+        match find_tasks_dir() {
+            Some(d) => d,
+            None => {
+                warn!("No Claude Code tasks directory found, waiting...");
+                // Wait and retry
+                loop {
+                    if shutdown.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(poll_interval)).await;
+                    if let Some(d) = find_tasks_dir() {
+                        break d;
+                    }
                 }
             }
         }
