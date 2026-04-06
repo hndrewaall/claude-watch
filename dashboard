@@ -226,6 +226,7 @@ if [ "$CONTINUE" = 1 ]; then
         CLAUDE_CMD="claude --continue $APPEND"
     fi
 else
+    APPEND='--append-system-prompt "You were just restarted via dashboard (fresh session). Immediately run your full session start checklist from MEMORY.md without waiting for user input."'
     CLAUDE_CMD="claude $APPEND"
 fi
 tmux send-keys -t "$CLAUDE" "cd ~ &&$CLAUDE_CMD" Enter
