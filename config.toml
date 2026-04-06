@@ -32,6 +32,9 @@ relaunch_script = "/tmp/claude-relaunch.sh"
 checks_required = 3
 # Cooldown between restart attempts (seconds)
 restart_cooldown = 300
+# After this many dead checks with idle prompt (no shell), inject "resume"
+# for externally-launched sessions (e.g. dashboard --fresh)
+fresh_inject_checks = 5
 
 [fresh_clear]
 # Token range for detecting a fresh /clear

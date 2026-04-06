@@ -822,6 +822,12 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
             &config.general.legacy_log_file,
             "claude-status returned None -- not running",
         );
+        // Claude Code not running at all — if a new session starts later,
+        // it should be eligible for fresh inject regardless of old state.
+        if state.fresh_session_injected {
+            debug!("resetting fresh_session_injected — no Claude Code running");
+            state.fresh_session_injected = false;
+        }
         state.last_check = Some(now);
         state.consecutive_failures = 0;
         crate::state::save_state(&config.general.state_file, state);
@@ -881,6 +887,22 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
         pane.clone()
     };
 
+    // Detect pane change (new Claude Code session, e.g. dashboard --recreate).
+    // Reset fresh_session_injected so the new session can get its resume inject,
+    // and reset dead_checks so the countdown restarts for the new session.
+    if !effective_pane.is_empty()
+        && !state.last_known_pane.is_empty()
+        && effective_pane != state.last_known_pane
+    {
+        info!(
+            old_pane = %state.last_known_pane,
+            new_pane = %effective_pane,
+            "pane change detected — resetting fresh_session_injected"
+        );
+        state.fresh_session_injected = false;
+        state.consecutive_dead_checks = 0;
+    }
+
     // Store last known values for foreground polling between full check cycles.
     // Only update tokens/bashes when we got a valid parse (non-zero) to avoid
     // writing 0 to Prometheus during transient status bar parsing failures.
@@ -928,6 +950,25 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                 state.consecutive_dead_checks = 0;
                 state.consecutive_failures = 0;
                 state.alert_count = 0;
+            } else if dead_checks >= config.dead_process.fresh_inject_checks
+                && !state.fresh_session_injected
+                && tmux::is_idle(&effective_pane).await
+            {
+                // Claude Code is running (idle prompt visible) but tokens=0 — this is
+                // a fresh session launched externally (e.g. dashboard --fresh), not by
+                // claude-watch. Inject "resume" to kick-start the checklist.
+                info!(dead_checks, "fresh external session detected — injecting resume");
+                tmux::inject_text(&effective_pane, "resume").await;
+                state.fresh_session_injected = true;
+                state.consecutive_dead_checks = 0;
+                write_jsonl_log(
+                    &config.general.log_file,
+                    "fresh_session_inject",
+                    serde_json::json!({
+                        "dead_checks": dead_checks,
+                        "pane": &effective_pane,
+                    }),
+                );
             } else {
                 debug!("dead but no shell prompt -- Claude may be starting up");
             }
@@ -938,6 +979,10 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
         return;
     }
     state.consecutive_dead_checks = 0;
+    // Reset fresh_session_injected once the session is active (tokens > 0)
+    if state.fresh_session_injected {
+        state.fresh_session_injected = false;
+    }
 
     // --- Check for manual update trigger ---
     check_update_trigger(config, state, &effective_pane).await;
