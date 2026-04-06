@@ -14,7 +14,7 @@ legacy_log_file = "/var/log/claude/claude-watch.log"
 [tmux]
 # Override: pin Claude Code to a specific tmux pane (e.g. "dashboard:0.2").
 # Leave empty or omit to auto-detect via find_claude_pane().
-dashboard_pane = "dashboard:0.2"
+dashboard_pane = "dashboard:0.0"
 # Override: tmux session name where Claude Code runs (e.g. "dashboard").
 # Leave empty or omit to auto-detect across all sessions.
 dashboard_session = "dashboard"
