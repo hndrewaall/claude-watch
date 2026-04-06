@@ -928,6 +928,25 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                 state.consecutive_dead_checks = 0;
                 state.consecutive_failures = 0;
                 state.alert_count = 0;
+            } else if dead_checks >= config.dead_process.fresh_inject_checks
+                && !state.fresh_session_injected
+                && tmux::is_idle(&effective_pane).await
+            {
+                // Claude Code is running (idle prompt visible) but tokens=0 — this is
+                // a fresh session launched externally (e.g. dashboard --fresh), not by
+                // claude-watch. Inject "resume" to kick-start the checklist.
+                info!(dead_checks, "fresh external session detected — injecting resume");
+                tmux::inject_text(&effective_pane, "resume").await;
+                state.fresh_session_injected = true;
+                state.consecutive_dead_checks = 0;
+                write_jsonl_log(
+                    &config.general.log_file,
+                    "fresh_session_inject",
+                    serde_json::json!({
+                        "dead_checks": dead_checks,
+                        "pane": &effective_pane,
+                    }),
+                );
             } else {
                 debug!("dead but no shell prompt -- Claude may be starting up");
             }
@@ -938,6 +957,10 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
         return;
     }
     state.consecutive_dead_checks = 0;
+    // Reset fresh_session_injected once the session is active (tokens > 0)
+    if state.fresh_session_injected {
+        state.fresh_session_injected = false;
+    }
 
     // --- Check for manual update trigger ---
     check_update_trigger(config, state, &effective_pane).await;
