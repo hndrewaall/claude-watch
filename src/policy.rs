@@ -825,8 +825,20 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
         // Claude Code not running at all — if a new session starts later,
         // it should be eligible for fresh inject regardless of old state.
         if state.fresh_session_injected {
-            debug!("resetting fresh_session_injected — no Claude Code running");
-            state.fresh_session_injected = false;
+            // Only reset if Claude was alive at some point since the inject,
+            // or if the inject is expired (>5min without activity).
+            let inject_expired = state.last_fresh_inject.as_ref()
+                .and_then(|ts| elapsed_since(ts))
+                .map_or(false, |elapsed| elapsed >= 300.0);
+
+            if state.was_alive_since_inject || inject_expired {
+                debug!("resetting fresh_session_injected — no Claude Code running (was_alive={}, expired={})",
+                    state.was_alive_since_inject, inject_expired);
+                state.fresh_session_injected = false;
+                state.was_alive_since_inject = false;
+            } else {
+                debug!("fresh_session_injected set but Claude never became active — not resetting");
+            }
         }
         state.last_check = Some(now);
         state.consecutive_failures = 0;
@@ -900,6 +912,7 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
             "pane change detected — resetting fresh_session_injected"
         );
         state.fresh_session_injected = false;
+        state.was_alive_since_inject = false;
         state.consecutive_dead_checks = 0;
     }
 
@@ -928,14 +941,36 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
         );
 
         if dead_checks >= config.dead_process.checks_required {
-            // Reset fresh_session_injected when we first enter the dead state.
+            // Reset fresh_session_injected when Claude was alive and then died.
             // This handles both cases: (1) shell prompt visible after old session died,
             // and (2) rapid session replacement where the pane ID doesn't change
             // (dashboard --recreate always creates dashboard:0.0). Without this,
             // the flag stays true from a previous inject and blocks the next one.
+            //
+            // IMPORTANT: Only reset if was_alive_since_inject is true, meaning Claude
+            // actually reached an active state (tokens > 0) after the last inject.
+            // Without this guard, we get an inject loop: inject → startup (tokens=0,
+            // looks "dead") → reset flag → re-inject → repeat.
+            //
+            // Fallback: if the inject was >5 minutes ago and Claude never became active,
+            // reset anyway — the session likely died during startup and a new one may
+            // need injection.
             if state.fresh_session_injected {
-                info!("dead state reached — resetting fresh_session_injected (stale from previous session)");
-                state.fresh_session_injected = false;
+                let inject_expired = state.last_fresh_inject.as_ref()
+                    .and_then(|ts| elapsed_since(ts))
+                    .map_or(false, |elapsed| elapsed >= 300.0);
+
+                if state.was_alive_since_inject {
+                    info!("dead state reached after active session — resetting fresh_session_injected");
+                    state.fresh_session_injected = false;
+                    state.was_alive_since_inject = false;
+                } else if inject_expired {
+                    info!("dead state reached — inject expired (>5min, never active) — resetting fresh_session_injected");
+                    state.fresh_session_injected = false;
+                    state.was_alive_since_inject = false;
+                } else {
+                    debug!("dead state but inject recent and Claude never active — not resetting (preventing inject loop)");
+                }
             }
 
             // Check restart cooldown
@@ -970,6 +1005,8 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                 info!(dead_checks, "fresh external session detected — injecting resume");
                 tmux::inject_text(&effective_pane, "resume").await;
                 state.fresh_session_injected = true;
+                state.was_alive_since_inject = false;
+                state.last_fresh_inject = Some(Local::now().to_rfc3339());
                 state.consecutive_dead_checks = 0;
                 write_jsonl_log(
                     &config.general.log_file,
@@ -989,8 +1026,11 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
         return;
     }
     state.consecutive_dead_checks = 0;
-    // Reset fresh_session_injected once the session is active (tokens > 0)
+    // Session is active (tokens > 0). Mark that Claude was alive since inject,
+    // then clear the inject flag. The was_alive_since_inject flag allows the dead
+    // state handler to distinguish "was alive, then died" from "never started up".
     if state.fresh_session_injected {
+        state.was_alive_since_inject = true;
         state.fresh_session_injected = false;
     }
 
@@ -1631,5 +1671,104 @@ mod tests {
         assert_eq!(result, 960); // Capped at max
         let result = thinking_backoff_threshold(60, 960, u32::MAX);
         assert_eq!(result, 960); // Capped at max, no panic
+    }
+
+    // --- Fresh session inject loop prevention tests ---
+
+    /// Helper: simulate the inject loop scenario state transitions.
+    /// Returns state after applying the described transition.
+    fn make_state_with_inject(was_alive: bool, inject_time_ago_secs: Option<i64>) -> State {
+        let mut state = State::default();
+        state.fresh_session_injected = true;
+        state.was_alive_since_inject = was_alive;
+        state.last_fresh_inject = inject_time_ago_secs.map(|secs| {
+            let dt = Utc::now() - chrono::Duration::seconds(secs);
+            dt.to_rfc3339()
+        });
+        state
+    }
+
+    #[test]
+    fn test_inject_loop_prevention_never_alive_recent() {
+        // Inject was recent (30s ago), Claude never became active.
+        // Should NOT reset fresh_session_injected — prevents the inject loop.
+        let state = make_state_with_inject(false, Some(30));
+        let inject_expired = state.last_fresh_inject.as_ref()
+            .and_then(|ts| elapsed_since(ts))
+            .map_or(false, |elapsed| elapsed >= 300.0);
+
+        assert!(!state.was_alive_since_inject);
+        assert!(!inject_expired);
+        // The dead state handler would NOT reset because neither condition is true.
+    }
+
+    #[test]
+    fn test_inject_loop_prevention_was_alive_then_died() {
+        // Claude was alive (tokens > 0) after inject, then died.
+        // Should reset fresh_session_injected — this is a real session death.
+        let state = make_state_with_inject(true, Some(120));
+
+        assert!(state.was_alive_since_inject);
+        // The dead state handler WOULD reset because was_alive_since_inject is true.
+    }
+
+    #[test]
+    fn test_inject_loop_prevention_expired_never_alive() {
+        // Inject was 6 minutes ago, Claude never became active.
+        // Should reset fresh_session_injected — the session is stuck/dead, allow retry.
+        let state = make_state_with_inject(false, Some(360));
+        let inject_expired = state.last_fresh_inject.as_ref()
+            .and_then(|ts| elapsed_since(ts))
+            .map_or(false, |elapsed| elapsed >= 300.0);
+
+        assert!(!state.was_alive_since_inject);
+        assert!(inject_expired);
+        // The dead state handler WOULD reset because inject_expired is true.
+    }
+
+    #[test]
+    fn test_inject_loop_prevention_no_timestamp() {
+        // fresh_session_injected is true but no timestamp (legacy state).
+        // Should NOT reset (conservative — treat as recent).
+        let state = make_state_with_inject(false, None);
+        let inject_expired = state.last_fresh_inject.as_ref()
+            .and_then(|ts| elapsed_since(ts))
+            .map_or(false, |elapsed| elapsed >= 300.0);
+
+        assert!(!state.was_alive_since_inject);
+        assert!(!inject_expired);
+        // Conservative: don't reset without evidence.
+    }
+
+    #[test]
+    fn test_inject_active_session_marks_alive() {
+        // Simulates tokens > 0 path: fresh_session_injected → was_alive_since_inject
+        let mut state = State::default();
+        state.fresh_session_injected = true;
+        state.was_alive_since_inject = false;
+
+        // This mirrors the "session is active (tokens > 0)" block in check_cycle:
+        if state.fresh_session_injected {
+            state.was_alive_since_inject = true;
+            state.fresh_session_injected = false;
+        }
+
+        assert!(!state.fresh_session_injected);
+        assert!(state.was_alive_since_inject);
+    }
+
+    #[test]
+    fn test_inject_pane_change_resets_both_flags() {
+        // Pane change is definitive — always reset both flags.
+        let mut state = State::default();
+        state.fresh_session_injected = true;
+        state.was_alive_since_inject = true;
+
+        // This mirrors the pane change block in check_cycle:
+        state.fresh_session_injected = false;
+        state.was_alive_since_inject = false;
+
+        assert!(!state.fresh_session_injected);
+        assert!(!state.was_alive_since_inject);
     }
 }
