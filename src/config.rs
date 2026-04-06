@@ -64,6 +64,16 @@ pub struct ClaudeConfig {
 pub struct DeadProcessConfig {
     pub checks_required: u32,
     pub restart_cooldown: u64,
+    /// After this many dead checks without a shell prompt, check if Claude Code's
+    /// idle prompt is visible and inject "resume" to kick-start a fresh session.
+    /// This handles the case where dashboard --fresh launches Claude Code externally
+    /// (not via claude-watch restart), so pending_resume_inject is never set.
+    #[serde(default = "default_fresh_inject_checks")]
+    pub fresh_inject_checks: u32,
+}
+
+fn default_fresh_inject_checks() -> u32 {
+    5 // ~60s at 12s intervals
 }
 
 #[derive(Debug, Deserialize, Clone)]
