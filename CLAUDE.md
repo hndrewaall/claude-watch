@@ -55,12 +55,47 @@ Full test suite (including e2e): `cargo nextest run` (~49s, 292 tests in paralle
 
 ## Dashboard Scripts
 
-The repo also includes shell scripts that manage the tmux session claude-watch operates in:
+claude-watch monitors Claude Code by capturing its tmux pane. The `dashboard` and `dashboard-refit` scripts manage that tmux session, creating a consistent layout that claude-watch knows how to find and observe.
 
-- **`dashboard`** — Creates and manages the `dashboard` tmux session where Claude Code runs. Reads layout from `~/.config/dashboard/layout.conf` to configure panes (sidebar, extra windows for monitoring). Supports `--recreate`, `--attach`, `--read-only`, and `--detach` (systemd boot) modes.
-- **`dashboard-refit`** — Snaps the sidebar pane to its configured width. Called by tmux hooks on resize/attach events.
+### `dashboard`
 
-These scripts live here (rather than in server-config) because the dashboard layout is tightly coupled to claude-watch's pane detection and monitoring. claude-watch's `[tmux]` config section (`dashboard_pane`, `dashboard_session`) must match the layout these scripts create. The layout config file (`~/.config/dashboard/layout.conf`) controls both the dashboard structure and how claude-watch finds the Claude Code pane.
+Creates a tmux session called `dashboard` with Claude Code and optional companion panes (system monitor sidebar, extra windows). The layout is configured via `~/.config/dashboard/layout.conf`:
+
+```ini
+[main]
+top_left = htop              # command for left pane (optional)
+top_right = sidebar          # command for right pane (optional)
+sidebar_width = 25           # right pane width in columns
+claude_percent = 45          # claude pane height % (when using top/bottom split)
+
+[windows]
+monitor_top = glances        # window 1 top pane (optional)
+monitor_bottom = sudo htop   # window 1 bottom pane (optional)
+logs = journalctl -f         # window 2 (optional)
+```
+
+**Layout modes** (determined by which `[main]` keys are present):
+- No `top_left` or `top_right`: Claude Code only (single full-screen pane)
+- `top_right` only: Side-by-side — Claude Code on the left, sidebar on the right
+- Both `top_left` and `top_right`: Three panes — two on top, Claude Code below
+
+**Usage:**
+```bash
+dashboard                # create layout or refit+attach if it exists
+dashboard --recreate     # kill and rebuild the session (restarts Claude Code)
+dashboard --attach       # read-write attach (SSH / phone)
+dashboard --attach --cc  # read-write attach (iTerm2 -CC mode)
+dashboard --read-only    # safe monitoring attach
+dashboard --detach       # headless start for systemd (no layout, just Claude Code)
+```
+
+### `dashboard-refit`
+
+Resizes the sidebar pane to its configured width. Intended to be called by tmux hooks (`client-resized`, `client-attached`) so the sidebar stays fixed when the terminal is resized. No-op if there's no sidebar pane.
+
+### Why these live in claude-watch
+
+The dashboard layout determines which tmux pane claude-watch monitors. claude-watch's `[tmux]` config (`dashboard_pane`, `dashboard_session`) must match the layout these scripts create. Keeping them together prevents the layout and the monitor from drifting out of sync.
 
 ## Service Management
 
