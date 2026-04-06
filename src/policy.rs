@@ -928,6 +928,16 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
         );
 
         if dead_checks >= config.dead_process.checks_required {
+            // Reset fresh_session_injected when we first enter the dead state.
+            // This handles both cases: (1) shell prompt visible after old session died,
+            // and (2) rapid session replacement where the pane ID doesn't change
+            // (dashboard --recreate always creates dashboard:0.0). Without this,
+            // the flag stays true from a previous inject and blocks the next one.
+            if state.fresh_session_injected {
+                info!("dead state reached — resetting fresh_session_injected (stale from previous session)");
+                state.fresh_session_injected = false;
+            }
+
             // Check restart cooldown
             if let Some(ref last) = state.last_restart {
                 if let Some(elapsed) = elapsed_since(last) {
