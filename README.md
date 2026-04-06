@@ -22,7 +22,7 @@ claude-watch (systemd service)
     |       Tracks: tokens, bashes, dead checks, thinking duration
     |
     +-- task-watch loop (5s interval)
-    |       Monitors /tmp/claude-1000/.../tasks/ via inotify
+    |       Monitors Claude Code's task output directory via inotify
     |       Tracks task lifecycle, cleans up done tasks
     |
     +-- dashboard / dashboard-refit (shell scripts)
@@ -86,6 +86,11 @@ make deploy     # build + systemctl restart
 dashboard_session = "dashboard"
 dashboard_pane = ""   # auto-detected from /var/run/claude/pane-id
 
+[tasks]
+# Claude Code writes background task output here. claude-watch auto-discovers
+# the path by scanning /proc for the Claude Code process, but you can override:
+# tasks_dir = "/run/user/1000/claude/tasks"
+
 [thresholds]
 dead_process_checks = 5        # consecutive dead checks before action
 thinking_interrupt_secs = 180  # prolonged thinking threshold
@@ -95,6 +100,8 @@ fg_block_secs = 15             # foreground bash block threshold
 pushover_user = "..."
 pushover_token = "..."
 ```
+
+Claude Code stores task output in `/tmp/claude-<UID>/<HOME>/UUID/tasks/`. claude-watch auto-discovers this path via `/proc/<PID>/fd` scanning. The path changes on every Claude Code restart (new UUID), so auto-discovery is the default. A manual override (`tasks_dir`) is useful for testing or non-standard setups.
 
 ## License
 
