@@ -96,13 +96,7 @@ if [ "$1" = "--detach" ]; then
         APPEND='--append-system-prompt "You were just restarted via systemd boot (fresh session). Immediately run your full session start checklist from MEMORY.md without waiting for user input."'
     fi
     if [ "$CONTINUE" = 1 ]; then
-        # Resume the most recent large session (--continue creates empty sessions after /exit)
-        SESSION_ID=$(ls -tS ~/.claude/projects/-home-hndrewaall/*.jsonl 2>/dev/null | grep -v session-events | head -1 | xargs -r basename | sed 's/.jsonl//')
-        if [ -n "$SESSION_ID" ]; then
-            CLAUDE_CMD="claude --resume $SESSION_ID $APPEND"
-        else
-            CLAUDE_CMD="claude --continue $APPEND"
-        fi
+        CLAUDE_CMD="claude --continue $APPEND"
     else
         CLAUDE_CMD="claude $APPEND"
     fi
@@ -219,12 +213,7 @@ echo "$CLAUDE" > /var/run/claude/pane-id
 # Launch Claude Code
 if [ "$CONTINUE" = 1 ]; then
     APPEND='--append-system-prompt "You were just restarted via dashboard (continued session). Immediately run your full session start checklist from MEMORY.md without waiting for user input."'
-    RESUME_ID=$(ls -tS ~/.claude/projects/-home-hndrewaall/*.jsonl 2>/dev/null | grep -v session-events | head -1 | xargs -r basename | sed 's/.jsonl//')
-    if [ -n "$RESUME_ID" ]; then
-        CLAUDE_CMD="claude --resume $RESUME_ID $APPEND"
-    else
-        CLAUDE_CMD="claude --continue $APPEND"
-    fi
+    CLAUDE_CMD="claude --continue $APPEND"
 else
     APPEND='--append-system-prompt "You were just restarted via dashboard (fresh session). Immediately run your full session start checklist from MEMORY.md without waiting for user input."'
     CLAUDE_CMD="claude $APPEND"
