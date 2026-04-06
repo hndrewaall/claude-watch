@@ -38,6 +38,7 @@ pub struct WatcherEntry {
     pub pattern: String,
     pub min_count: u32,
     pub enabled: bool,
+    pub start_cmd: Option<String>,
 }
 
 /// Pure function: parse status bar fields from pane capture text.
@@ -306,11 +307,16 @@ pub(crate) fn parse_watchers_config_str(content: &str) -> Vec<WatcherEntry> {
                 .get(3)
                 .map(|s| *s == "true")
                 .unwrap_or(true);
+            let start_cmd = parts
+                .get(4)
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
             Some(WatcherEntry {
                 name,
                 pattern,
                 min_count,
                 enabled,
+                start_cmd,
             })
         })
         .collect()
@@ -446,7 +452,15 @@ mod tests {
         assert_eq!(entries[0].pattern, "signal-wait$");
         assert_eq!(entries[0].min_count, 1);
         assert!(entries[0].enabled);
+        assert_eq!(
+            entries[0].start_cmd.as_deref(),
+            Some("watcher-ctl run signal-wait")
+        );
         assert_eq!(entries[1].name, "torrent-wait");
+        assert_eq!(
+            entries[1].start_cmd.as_deref(),
+            Some("watcher-ctl run torrent-wait")
+        );
     }
 
     #[test]
@@ -455,6 +469,7 @@ mod tests {
         let entries = parse_watchers_config_str(config);
         assert_eq!(entries.len(), 1);
         assert!(!entries[0].enabled);
+        assert_eq!(entries[0].start_cmd.as_deref(), Some("cmd-a"));
     }
 
     #[test]
@@ -477,6 +492,7 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].min_count, 1); // default
         assert!(entries[0].enabled); // default
+        assert_eq!(entries[0].start_cmd, None); // no start_cmd
     }
 
     #[test]

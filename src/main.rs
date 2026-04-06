@@ -31,6 +31,7 @@ mod state;
 mod status;
 mod task_watch;
 mod tmux;
+mod watcher;
 
 use clap::{Parser, Subcommand};
 use std::path::Path;
@@ -88,6 +89,11 @@ enum Commands {
     Task {
         #[command(subcommand)]
         action: TaskAction,
+    },
+    /// Manage watchers (supervision, enable/disable, restart)
+    Watcher {
+        #[command(subcommand)]
+        action: WatcherAction,
     },
 }
 
@@ -171,6 +177,40 @@ enum AgentAction {
         #[arg(short, long)]
         dry_run: bool,
     },
+}
+
+#[derive(Subcommand)]
+enum WatcherAction {
+    /// Run a watcher by name (exec start_cmd, wait for exit)
+    Run {
+        /// Watcher name
+        name: String,
+    },
+    /// List configured watchers
+    #[command(alias = "ls")]
+    List {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show running status of all watchers
+    Status {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Enable a watcher (toggle + start)
+    Enable {
+        /// Watcher name
+        name: String,
+    },
+    /// Disable a watcher (toggle + kill)
+    Disable {
+        /// Watcher name
+        name: String,
+    },
+    /// Kill all enabled watcher processes and clean PID files
+    Restart,
 }
 
 async fn run_status(json: bool, tokens_only: bool, bashes_only: bool) {
@@ -551,6 +591,30 @@ async fn run_task(action: TaskAction) {
     }
 }
 
+async fn run_watcher(action: WatcherAction) {
+    let cfg = watcher::config_path();
+    let exit_code = match action {
+        WatcherAction::Run { name } => watcher::cmd_run(&cfg, &name).await,
+        WatcherAction::List { json } => {
+            watcher::cmd_list(&cfg, json);
+            0
+        }
+        WatcherAction::Status { json } => {
+            watcher::cmd_status(&cfg, json).await;
+            0
+        }
+        WatcherAction::Enable { name } => watcher::cmd_toggle(&cfg, &name, true).await,
+        WatcherAction::Disable { name } => watcher::cmd_toggle(&cfg, &name, false).await,
+        WatcherAction::Restart => {
+            watcher::cmd_restart(&cfg).await;
+            0
+        }
+    };
+    if exit_code != 0 {
+        std::process::exit(exit_code);
+    }
+}
+
 fn run_agent(action: AgentAction) {
     let exit_code = match action {
         AgentAction::List { all } => agent::cmd_list(all),
@@ -584,6 +648,24 @@ fn multicall_rewrite_args() -> Vec<String> {
         "task-watch-ctl" => {
             // task-watch-ctl <args...> → claude-watch task <args...>
             let mut new_args = vec!["claude-watch".to_string(), "task".to_string()];
+            new_args.extend_from_slice(&args[1..]);
+            new_args
+        }
+        "watcher-ctl" => {
+            // watcher-ctl <args...> → claude-watch watcher <args...>
+            let mut new_args = vec!["claude-watch".to_string(), "watcher".to_string()];
+            new_args.extend_from_slice(&args[1..]);
+            new_args
+        }
+        "watcher-status" => {
+            // watcher-status → claude-watch watcher status
+            let mut new_args = vec!["claude-watch".to_string(), "watcher".to_string(), "status".to_string()];
+            new_args.extend_from_slice(&args[1..]);
+            new_args
+        }
+        "watcher-restart" => {
+            // watcher-restart → claude-watch watcher restart
+            let mut new_args = vec!["claude-watch".to_string(), "watcher".to_string(), "restart".to_string()];
             new_args.extend_from_slice(&args[1..]);
             new_args
         }
@@ -628,6 +710,9 @@ async fn main() {
         }
         Some(Commands::Task { action }) => {
             run_task(action).await;
+        }
+        Some(Commands::Watcher { action }) => {
+            run_watcher(action).await;
         }
         None => {
             run_daemon().await;
