@@ -25,9 +25,8 @@
 #   claude_percent = 45        # claude pane height percentage
 #
 #   [windows]
-#   monitor_top = gl           # window 1 top pane
-#   monitor_bottom = sudo htop # window 1 bottom pane
-#   logs = journalctl -u claude-watch -f --no-hostname  # window 2
+#   monitor = gl /// sudo htop           # window with 2 panes (split by ///)
+#   logs = journalctl -u claude-watch -f # single-pane window
 
 SESSION="dashboard"
 CONF="${XDG_CONFIG_HOME:-$HOME/.config}/dashboard/layout.conf"
@@ -35,17 +34,21 @@ REFIT="$(dirname "$(readlink -f "$0")")/dashboard-refit"
 
 # Parse config file (INI-style, simple key = value)
 conf_get() {
-    local key="$1" default="$2"
+    local key="$1" default="$2" section="${3:-main}"
     if [ -f "$CONF" ]; then
-        val=$(awk -F= -v k="$key" '
-            /^\[/ { next }
+        val=$(awk -v k="$key" -v sect="$section" '
+            /^\[/ { gsub(/[\[\]]/, ""); current = $0; gsub(/^[[:space:]]+|[[:space:]]+$/, "", current); next }
             /^#/ { next }
             /^$/ { next }
-            { gsub(/^[[:space:]]+|[[:space:]]+$/, "", $1)
-              if ($1 == k) {
-                  sub(/^[[:space:]]*/, "", $2)
-                  sub(/[[:space:]]*$/, "", $2)
-                  print $2
+            current == sect {
+              idx = index($0, "=")
+              if (idx == 0) next
+              key_part = substr($0, 1, idx - 1)
+              gsub(/^[[:space:]]+|[[:space:]]+$/, "", key_part)
+              if (key_part == k) {
+                  val = substr($0, idx + 1)
+                  gsub(/^[[:space:]]+|[[:space:]]+$/, "", val)
+                  print val
                   exit
               }
             }' "$CONF")
@@ -55,14 +58,31 @@ conf_get() {
     fi
 }
 
+# Parse [windows] section: returns "name<TAB>command" lines
+# Commands can contain /// to split into multiple panes
+conf_windows() {
+    [ -f "$CONF" ] || return
+    awk '
+        /^\[/ { gsub(/[\[\]]/, ""); section = $0; gsub(/^[[:space:]]+|[[:space:]]+$/, "", section); next }
+        /^#/ { next }
+        /^$/ { next }
+        section == "windows" {
+            idx = index($0, "=")
+            if (idx == 0) next
+            key = substr($0, 1, idx - 1)
+            val = substr($0, idx + 1)
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", key)
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", val)
+            if (key != "" && val != "") print key "\t" val
+        }
+    ' "$CONF"
+}
+
 # Read layout config (defaults: claude only, no extra panes)
-TOP_LEFT=$(conf_get top_left "")
-TOP_RIGHT=$(conf_get top_right "")
-SIDEBAR_W=$(conf_get sidebar_width 25)
-CLAUDE_PCT=$(conf_get claude_percent 45)
-MON_TOP=$(conf_get monitor_top "")
-MON_BOT=$(conf_get monitor_bottom "")
-LOGS_CMD=$(conf_get logs "")
+TOP_LEFT=$(conf_get top_left "" main)
+TOP_RIGHT=$(conf_get top_right "" main)
+SIDEBAR_W=$(conf_get sidebar_width 25 main)
+CLAUDE_PCT=$(conf_get claude_percent 45 main)
 
 # How many panes in window 0?
 has_split() { [ -n "$TOP_LEFT" ] || [ -n "$TOP_RIGHT" ]; }
@@ -222,20 +242,31 @@ tmux send-keys -t "$CLAUDE" "cd ~ &&$CLAUDE_CMD" Enter
 # Inject "resume" after Claude initializes (polls for idle, up to 90s).
 nohup claude-inject-resume "$CLAUDE" >/dev/null 2>&1 &
 
-# === Extra windows (only if configured) ===
-if [ -n "$MON_TOP" ] || [ -n "$MON_BOT" ]; then
-    tmux new-window -t "$SESSION" -n monitor
-    [ -n "$MON_TOP" ] && tmux send-keys -t "$SESSION:1.0" "$MON_TOP" Enter
-    if [ -n "$MON_BOT" ]; then
-        tmux split-window -t "$SESSION:1.0" -v
-        tmux send-keys -t "$SESSION:1.1" "$MON_BOT" Enter
-    fi
-fi
-
-if [ -n "$LOGS_CMD" ]; then
-    tmux new-window -t "$SESSION" -n logs
-    tmux send-keys -t "$SESSION:2.0" "$LOGS_CMD" Enter
-fi
+# === Extra windows from [windows] section ===
+# Each key = window name, value = command(s) separated by /// for multiple panes
+conf_windows | while IFS=$'\t' read -r win_name win_cmds; do
+    win_idx=$(tmux new-window -t "$SESSION" -n "$win_name" -P -F '#{window_index}')
+    pane_num=0
+    remaining="$win_cmds"
+    while true; do
+        # Extract command before next ///
+        case "$remaining" in
+            *///*) cmd="${remaining%%///*}"; remaining="${remaining#*///}" ;;
+            *)     cmd="$remaining"; remaining="" ;;
+        esac
+        # Trim whitespace
+        cmd="$(echo "$cmd" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+        [ -z "$cmd" ] && { [ -z "$remaining" ] && break; continue; }
+        if [ "$pane_num" -eq 0 ]; then
+            tmux send-keys -t "$SESSION:${win_idx}.0" "$cmd" Enter
+        else
+            tmux split-window -t "$SESSION:${win_idx}" -v
+            tmux send-keys -t "$SESSION:${win_idx}.${pane_num}" "$cmd" Enter
+        fi
+        pane_num=$((pane_num + 1))
+        [ -z "$remaining" ] && break
+    done
+done
 
 # Global hooks: refit sidebar on client attach/resize (only if sidebar exists)
 if [ -n "$TOP_RIGHT" ] && [ -f "$REFIT" ]; then
