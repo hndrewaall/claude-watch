@@ -105,4 +105,4 @@ Claude Code stores task output in `/tmp/claude-<UID>/<HOME>/UUID/tasks/`. claude
 
 ## License
 
-Private repository. Not open source.
+MIT
