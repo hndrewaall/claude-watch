@@ -53,6 +53,15 @@ Full test suite (including e2e): `cargo nextest run` (~49s, 292 tests in paralle
 - `src/actions.rs` — recovery actions (inject resume, etc.)
 - `tests/fixtures/` — saved tmux captures for fixture tests
 
+## Dashboard Scripts
+
+The repo also includes shell scripts that manage the tmux session claude-watch operates in:
+
+- **`dashboard`** — Creates and manages the `dashboard` tmux session where Claude Code runs. Reads layout from `~/.config/dashboard/layout.conf` to configure panes (sidebar, extra windows for monitoring). Supports `--recreate`, `--attach`, `--read-only`, and `--detach` (systemd boot) modes.
+- **`dashboard-refit`** — Snaps the sidebar pane to its configured width. Called by tmux hooks on resize/attach events.
+
+These scripts live here (rather than in server-config) because the dashboard layout is tightly coupled to claude-watch's pane detection and monitoring. claude-watch's `[tmux]` config section (`dashboard_pane`, `dashboard_session`) must match the layout these scripts create. The layout config file (`~/.config/dashboard/layout.conf`) controls both the dashboard structure and how claude-watch finds the Claude Code pane.
+
 ## Service Management
 
 ```bash
