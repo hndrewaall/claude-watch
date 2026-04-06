@@ -69,9 +69,8 @@ sidebar_width = 25           # right pane width in columns
 claude_percent = 45          # claude pane height % (when using top/bottom split)
 
 [windows]
-monitor_top = glances        # window 1 top pane (optional)
-monitor_bottom = sudo htop   # window 1 bottom pane (optional)
-logs = journalctl -f         # window 2 (optional)
+monitor = glances /// sudo htop   # window with 2 panes (split by ///)
+logs = journalctl -f              # single-pane window
 ```
 
 **Layout modes** (determined by which `[main]` keys are present):
