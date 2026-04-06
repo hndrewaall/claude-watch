@@ -1,0 +1,228 @@
+#!/bin/bash
+# Launch the gomorrah dashboard tmux session
+# Recreates the monitoring layout in one shot
+#
+# Usage:
+#   dashboard            — create layout (or refit+attach if exists)
+#   dashboard --detach   — start claude in a bare tmux session (for systemd)
+#   dashboard --recreate — kill and recreate the session
+#   dashboard --attach     — RW multi-client attach (SSH / phone)
+#   dashboard --attach --cc — RW attach (iTerm2 -CC mode / laptop)
+#   dashboard --read-only — RO attach (safe monitoring)
+#
+# Default layout (window 0 "main"): claude only (full pane)
+#
+# With ~/.config/dashboard/layout.conf you can add panes:
+#   [main]
+#   top_left = bt              # command for top-left pane
+#   top_right = sidebar        # command for top-right pane (fixed width)
+#   sidebar_width = 25         # width of top-right pane
+#   claude_percent = 45        # claude pane height percentage
+#
+#   [windows]
+#   monitor_top = gl           # window 1 top pane
+#   monitor_bottom = sudo htop # window 1 bottom pane
+#   logs = journalctl -u claude-watch -f --no-hostname  # window 2
+
+SESSION="dashboard"
+CONF="${XDG_CONFIG_HOME:-$HOME/.config}/dashboard/layout.conf"
+REFIT=/home/hndrewaall/bin/dashboard-refit
+
+# Parse config file (INI-style, simple key = value)
+conf_get() {
+    local key="$1" default="$2"
+    if [ -f "$CONF" ]; then
+        val=$(awk -F= -v k="$key" '
+            /^\[/ { next }
+            /^#/ { next }
+            /^$/ { next }
+            { gsub(/^[[:space:]]+|[[:space:]]+$/, "", $1)
+              if ($1 == k) {
+                  sub(/^[[:space:]]*/, "", $2)
+                  sub(/[[:space:]]*$/, "", $2)
+                  print $2
+                  exit
+              }
+            }' "$CONF")
+        [ -n "$val" ] && echo "$val" || echo "$default"
+    else
+        echo "$default"
+    fi
+}
+
+# Read layout config (defaults: claude only, no extra panes)
+TOP_LEFT=$(conf_get top_left "")
+TOP_RIGHT=$(conf_get top_right "")
+SIDEBAR_W=$(conf_get sidebar_width 25)
+CLAUDE_PCT=$(conf_get claude_percent 45)
+MON_TOP=$(conf_get monitor_top "")
+MON_BOT=$(conf_get monitor_bottom "")
+LOGS_CMD=$(conf_get logs "")
+
+# How many panes in window 0?
+has_split() { [ -n "$TOP_LEFT" ] || [ -n "$TOP_RIGHT" ]; }
+expected_panes() {
+    local n=1  # claude always
+    [ -n "$TOP_LEFT" ] && n=$((n+1))
+    [ -n "$TOP_RIGHT" ] && n=$((n+1))
+    echo "$n"
+}
+
+# --detach (systemd boot): start claude in a bare session, no layout.
+# The full layout gets built on first interactive `dashboard` call.
+if [ "$1" = "--detach" ]; then
+    tmux kill-session -t "$SESSION" 2>/dev/null
+    tmux new-session -d -s "$SESSION" -n main
+    # Save pane ID for claude-start to find after pkill
+    BOOT_PANE=$(tmux display-message -t "$SESSION:0.0" -p '#{pane_id}')
+    mkdir -p /var/run/claude
+    echo "$BOOT_PANE" > /var/run/claude/pane-id
+    # Find the most recent large session to --resume (--continue creates empty sessions after /exit)
+    SESSION_ID=$(ls -tS ~/.claude/projects/-home-hndrewaall/*.jsonl 2>/dev/null | grep -v session-events | head -1 | xargs -r basename | sed 's/.jsonl//')
+    if [ -n "$SESSION_ID" ]; then
+        CLAUDE_CMD="claude --resume $SESSION_ID --append-system-prompt \"You were just restarted via systemd boot. Immediately run your full session start checklist from MEMORY.md without waiting for user input.\""
+    else
+        CLAUDE_CMD='claude --continue --append-system-prompt "You were just restarted via systemd boot. Immediately run your full session start checklist from MEMORY.md without waiting for user input."'
+    fi
+    tmux send-keys -t "$SESSION:0.0" "cd /home/hndrewaall && $CLAUDE_CMD" Enter
+    # Inject "resume" after Claude initializes (polls for idle, up to 90s).
+    nohup claude-inject-resume "$SESSION:0.0" >/dev/null 2>&1 &
+    exit 0
+fi
+
+# --attach: RW multi-client attach (grouped session for independent window selection)
+# --read-only: RO attach (safe for monitoring)
+if [ "$1" = "--attach" ] || [ "$1" = "--read-only" ]; then
+    if ! tmux has-session -t "$SESSION" 2>/dev/null; then
+        echo "No dashboard session running." >&2
+        exit 1
+    fi
+    RO_FLAG=""
+    if [ "$1" = "--read-only" ]; then
+        RO_FLAG="-r"
+    fi
+    # Reset window-size to prevent iTerm2 -CC from locking to manual mode
+    tmux set-option -t "$SESSION" window-size latest 2>/dev/null
+    # Kill orphaned grouped sessions from previous attaches to prevent leaks
+    for s in $(tmux list-sessions -F '#{session_name}' 2>/dev/null | grep "^${SESSION}-"); do
+        tmux kill-session -t "$s" 2>/dev/null
+    done
+    if [ "$2" = "--cc" ]; then
+        # iTerm2 -CC: grouped session (independent window selection)
+        exec tmux -CC new-session -t "$SESSION" $RO_FLAG
+    else
+        # SSH/terminal: grouped session for independent window switching
+        exec tmux new-session -t "$SESSION" $RO_FLAG
+    fi
+fi
+
+# If session exists with expected pane count, refit and attach
+PANE_COUNT=$(tmux list-panes -t "$SESSION:0" 2>/dev/null | wc -l)
+EXPECTED=$(expected_panes)
+if [ "$PANE_COUNT" -ge "$EXPECTED" ] 2>/dev/null && [ "$1" != "--recreate" ]; then
+    # Update pane-id in case it was lost (tmpfiles cleanup, missing --detach write, etc.)
+    REFIT_CLAUDE=$(tmux list-panes -t "$SESSION:0" -F '#{pane_id} #{pane_current_command}' 2>/dev/null | awk '/claude/{print $1; exit}')
+    if [ -z "$REFIT_CLAUDE" ]; then
+        # No running claude — try pane title
+        REFIT_CLAUDE=$(tmux list-panes -t "$SESSION:0" -F '#{pane_id} #{pane_title}' 2>/dev/null | awk '/Claude/{print $1; exit}')
+    fi
+    if [ -z "$REFIT_CLAUDE" ]; then
+        # Fallback: first pane (claude is typically pane 0)
+        REFIT_CLAUDE=$(tmux list-panes -t "$SESSION:0" -F '#{pane_id} #{pane_index}' 2>/dev/null | sort -k2 -n | head -1 | awk '{print $1}')
+    fi
+    if [ -n "$REFIT_CLAUDE" ]; then
+        mkdir -p /var/run/claude
+        echo "$REFIT_CLAUDE" > /var/run/claude/pane-id
+    fi
+    [ -f "$REFIT" ] && "$REFIT"
+    if [ -n "$TMUX" ]; then
+        tmux switch-client -t "$SESSION"
+    else
+        tmux attach -t "$SESSION"
+    fi
+    exit 0
+fi
+
+# Kill existing session and orphaned grouped sessions
+tmux kill-session -t "$SESSION" 2>/dev/null
+for s in $(tmux list-sessions -F '#{session_name}' 2>/dev/null | grep "^${SESSION}-"); do
+    tmux kill-session -t "$s" 2>/dev/null
+done
+
+# Detect real terminal size
+COLS=$(tput cols 2>/dev/null || echo 120)
+ROWS=$(tput lines 2>/dev/null || echo 40)
+
+# Create session at the real terminal size
+tmux new-session -d -s "$SESSION" -n main -x "$COLS" -y "$ROWS"
+
+if [ -n "$TOP_RIGHT" ] && [ -z "$TOP_LEFT" ]; then
+    # Sidebar-only layout: claude (left) + sidebar (right), full height
+    CLAUDE=$(tmux display-message -t "$SESSION:0.0" -p '#{pane_id}')
+    SIDEBAR=$(tmux split-window -t "$CLAUDE" -h -l "$SIDEBAR_W" -P -F '#{pane_id}')
+    tmux send-keys -t "$SIDEBAR" "$TOP_RIGHT" Enter
+elif has_split; then
+    # Multi-pane layout: top pane(s) + claude bottom
+    # Pane 0 starts as top-left (or sole top pane)
+    TOP_PANE=$(tmux display-message -t "$SESSION:0.0" -p '#{pane_id}')
+    [ -n "$TOP_LEFT" ] && tmux send-keys -t "$TOP_PANE" "$TOP_LEFT" Enter
+
+    # Split bottom for claude
+    CLAUDE=$(tmux split-window -t "$TOP_PANE" -v -p "$CLAUDE_PCT" -P -F '#{pane_id}')
+
+    # Split top pane for right sidebar (if configured)
+    if [ -n "$TOP_RIGHT" ]; then
+        SIDEBAR=$(tmux split-window -t "$TOP_PANE" -h -l "$SIDEBAR_W" -P -F '#{pane_id}')
+        tmux send-keys -t "$SIDEBAR" "$TOP_RIGHT" Enter
+    fi
+else
+    # Claude-only layout: single full pane
+    CLAUDE=$(tmux display-message -t "$SESSION:0.0" -p '#{pane_id}')
+fi
+
+# Save pane ID for claude-watch to find
+mkdir -p /var/run/claude
+echo "$CLAUDE" > /var/run/claude/pane-id
+
+# Launch Claude Code
+RESUME_ID=$(ls -tS ~/.claude/projects/-home-hndrewaall/*.jsonl 2>/dev/null | grep -v session-events | head -1 | xargs -r basename | sed 's/.jsonl//')
+if [ -n "$RESUME_ID" ]; then
+    CLAUDE_CMD="claude --resume $RESUME_ID --append-system-prompt \"You were just restarted via dashboard. Immediately run your full session start checklist from MEMORY.md without waiting for user input.\""
+else
+    CLAUDE_CMD='claude --continue --append-system-prompt "You were just restarted via dashboard. Immediately run your full session start checklist from MEMORY.md without waiting for user input."'
+fi
+tmux send-keys -t "$CLAUDE" "cd /home/hndrewaall && $CLAUDE_CMD" Enter
+# Inject "resume" after Claude initializes (polls for idle, up to 90s).
+nohup claude-inject-resume "$CLAUDE" >/dev/null 2>&1 &
+
+# === Extra windows (only if configured) ===
+if [ -n "$MON_TOP" ] || [ -n "$MON_BOT" ]; then
+    tmux new-window -t "$SESSION" -n monitor
+    [ -n "$MON_TOP" ] && tmux send-keys -t "$SESSION:1.0" "$MON_TOP" Enter
+    if [ -n "$MON_BOT" ]; then
+        tmux split-window -t "$SESSION:1.0" -v
+        tmux send-keys -t "$SESSION:1.1" "$MON_BOT" Enter
+    fi
+fi
+
+if [ -n "$LOGS_CMD" ]; then
+    tmux new-window -t "$SESSION" -n logs
+    tmux send-keys -t "$SESSION:2.0" "$LOGS_CMD" Enter
+fi
+
+# Global hooks: refit sidebar on client attach/resize (only if sidebar exists)
+if [ -n "$TOP_RIGHT" ] && [ -f "$REFIT" ]; then
+    tmux set-hook -g client-resized "run-shell '$REFIT'"
+    tmux set-hook -g client-attached "run-shell '$REFIT'"
+fi
+
+# Select main window, focus on claude pane
+tmux select-window -t "$SESSION:0"
+tmux select-pane -t "$CLAUDE"
+
+# Attach
+if [ -n "$TMUX" ]; then
+    tmux switch-client -t "$SESSION"
+else
+    tmux attach -t "$SESSION"
+fi
