@@ -822,6 +822,12 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
             &config.general.legacy_log_file,
             "claude-status returned None -- not running",
         );
+        // Claude Code not running at all — if a new session starts later,
+        // it should be eligible for fresh inject regardless of old state.
+        if state.fresh_session_injected {
+            debug!("resetting fresh_session_injected — no Claude Code running");
+            state.fresh_session_injected = false;
+        }
         state.last_check = Some(now);
         state.consecutive_failures = 0;
         crate::state::save_state(&config.general.state_file, state);
@@ -880,6 +886,22 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
     } else {
         pane.clone()
     };
+
+    // Detect pane change (new Claude Code session, e.g. dashboard --recreate).
+    // Reset fresh_session_injected so the new session can get its resume inject,
+    // and reset dead_checks so the countdown restarts for the new session.
+    if !effective_pane.is_empty()
+        && !state.last_known_pane.is_empty()
+        && effective_pane != state.last_known_pane
+    {
+        info!(
+            old_pane = %state.last_known_pane,
+            new_pane = %effective_pane,
+            "pane change detected — resetting fresh_session_injected"
+        );
+        state.fresh_session_injected = false;
+        state.consecutive_dead_checks = 0;
+    }
 
     // Store last known values for foreground polling between full check cycles.
     // Only update tokens/bashes when we got a valid parse (non-zero) to avoid
