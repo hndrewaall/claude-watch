@@ -74,6 +74,10 @@ pub struct State {
     pub last_reauth_alert: Option<String>,
     #[serde(default)]
     pub login_injected: bool,
+    /// Tracks whether we've already injected "resume" for a fresh external session
+    /// (tokens=0 with Claude idle prompt visible). Reset when tokens become non-zero.
+    #[serde(default)]
+    pub fresh_session_injected: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

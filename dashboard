@@ -6,9 +6,14 @@
 #   dashboard            — create layout (or refit+attach if exists)
 #   dashboard --detach   — start claude in a bare tmux session (for systemd)
 #   dashboard --recreate — kill and recreate the session
+#   dashboard --fresh    — start Claude without resuming old context
 #   dashboard --attach     — RW multi-client attach (SSH / phone)
 #   dashboard --attach --cc — RW attach (iTerm2 -CC mode / laptop)
 #   dashboard --read-only — RO attach (safe monitoring)
+#
+# Claude Code context:
+#   By default, dashboard resumes the most recent conversation context.
+#   Use --fresh to start a clean session (no --resume/--continue).
 #
 # Default layout (window 0 "main"): claude only (full pane)
 #
@@ -71,18 +76,29 @@ expected_panes() {
 # --detach (systemd boot): start claude in a bare session, no layout.
 # The full layout gets built on first interactive `dashboard` call.
 if [ "$1" = "--detach" ]; then
+    shift
+    CONTINUE=1
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --fresh) CONTINUE=0; shift ;;
+            *) shift ;;
+        esac
+    done
     tmux kill-session -t "$SESSION" 2>/dev/null
     tmux new-session -d -s "$SESSION" -n main
     # Save pane ID for claude-start to find after pkill
     BOOT_PANE=$(tmux display-message -t "$SESSION:0.0" -p '#{pane_id}')
     mkdir -p /var/run/claude
     echo "$BOOT_PANE" > /var/run/claude/pane-id
-    # Find the most recent large session to --resume (--continue creates empty sessions after /exit)
-    SESSION_ID=$(ls -tS ~/.claude/projects/-home-hndrewaall/*.jsonl 2>/dev/null | grep -v session-events | head -1 | xargs -r basename | sed 's/.jsonl//')
-    if [ -n "$SESSION_ID" ]; then
-        CLAUDE_CMD="claude --resume $SESSION_ID --append-system-prompt \"You were just restarted via systemd boot. Immediately run your full session start checklist from MEMORY.md without waiting for user input.\""
+    if [ "$CONTINUE" = 1 ]; then
+        APPEND='--append-system-prompt "You were just restarted via systemd boot (continued session). Immediately run your full session start checklist from MEMORY.md without waiting for user input."'
     else
-        CLAUDE_CMD='claude --continue --append-system-prompt "You were just restarted via systemd boot. Immediately run your full session start checklist from MEMORY.md without waiting for user input."'
+        APPEND='--append-system-prompt "You were just restarted via systemd boot (fresh session). Immediately run your full session start checklist from MEMORY.md without waiting for user input."'
+    fi
+    if [ "$CONTINUE" = 1 ]; then
+        CLAUDE_CMD="claude --continue $APPEND"
+    else
+        CLAUDE_CMD="claude $APPEND"
     fi
     tmux send-keys -t "$SESSION:0.0" "cd ~ &&$CLAUDE_CMD" Enter
     # Inject "resume" after Claude initializes (polls for idle, up to 90s).
@@ -116,10 +132,20 @@ if [ "$1" = "--attach" ] || [ "$1" = "--read-only" ]; then
     fi
 fi
 
+# Parse --fresh/--recreate flags for the main (non-detach) path
+CONTINUE=1
+RECREATE=0
+for arg in "$@"; do
+    case "$arg" in
+        --fresh) CONTINUE=0 ;;
+        --recreate) RECREATE=1 ;;
+    esac
+done
+
 # If session exists with expected pane count, refit and attach
 PANE_COUNT=$(tmux list-panes -t "$SESSION:0" 2>/dev/null | wc -l)
 EXPECTED=$(expected_panes)
-if [ "$PANE_COUNT" -ge "$EXPECTED" ] 2>/dev/null && [ "$1" != "--recreate" ]; then
+if [ "$PANE_COUNT" -ge "$EXPECTED" ] 2>/dev/null && [ "$RECREATE" != 1 ]; then
     # Update pane-id in case it was lost (tmpfiles cleanup, missing --detach write, etc.)
     REFIT_CLAUDE=$(tmux list-panes -t "$SESSION:0" -F '#{pane_id} #{pane_current_command}' 2>/dev/null | awk '/claude/{print $1; exit}')
     if [ -z "$REFIT_CLAUDE" ]; then
@@ -185,11 +211,12 @@ mkdir -p /var/run/claude
 echo "$CLAUDE" > /var/run/claude/pane-id
 
 # Launch Claude Code
-RESUME_ID=$(ls -tS ~/.claude/projects/-home-hndrewaall/*.jsonl 2>/dev/null | grep -v session-events | head -1 | xargs -r basename | sed 's/.jsonl//')
-if [ -n "$RESUME_ID" ]; then
-    CLAUDE_CMD="claude --resume $RESUME_ID --append-system-prompt \"You were just restarted via dashboard. Immediately run your full session start checklist from MEMORY.md without waiting for user input.\""
+if [ "$CONTINUE" = 1 ]; then
+    APPEND='--append-system-prompt "You were just restarted via dashboard (continued session). Immediately run your full session start checklist from MEMORY.md without waiting for user input."'
+    CLAUDE_CMD="claude --continue $APPEND"
 else
-    CLAUDE_CMD='claude --continue --append-system-prompt "You were just restarted via dashboard. Immediately run your full session start checklist from MEMORY.md without waiting for user input."'
+    APPEND='--append-system-prompt "You were just restarted via dashboard (fresh session). Immediately run your full session start checklist from MEMORY.md without waiting for user input."'
+    CLAUDE_CMD="claude $APPEND"
 fi
 tmux send-keys -t "$CLAUDE" "cd ~ &&$CLAUDE_CMD" Enter
 # Inject "resume" after Claude initializes (polls for idle, up to 90s).
