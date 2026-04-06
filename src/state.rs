@@ -78,6 +78,15 @@ pub struct State {
     /// (tokens=0 with Claude idle prompt visible). Reset when tokens become non-zero.
     #[serde(default)]
     pub fresh_session_injected: bool,
+    /// Tracks whether Claude was ever alive (tokens > 0) since the last fresh inject.
+    /// Prevents the inject loop: inject → startup (tokens=0) → "dead" reset → re-inject.
+    /// Only set to true when tokens > 0 while fresh_session_injected is true.
+    #[serde(default)]
+    pub was_alive_since_inject: bool,
+    /// Timestamp of the last fresh session inject. Used as a fallback timeout: if Claude
+    /// never becomes active within N minutes after inject, allow resetting the flag.
+    #[serde(default)]
+    pub last_fresh_inject: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
