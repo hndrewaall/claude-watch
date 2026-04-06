@@ -10,3 +10,4 @@ pub mod session_event;
 pub mod status;
 pub mod task_watch;
 pub mod tmux;
+pub mod watcher;

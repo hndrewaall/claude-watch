@@ -5,6 +5,7 @@ use serde::Deserialize;
 #[derive(Debug, Deserialize, Clone)]
 pub struct Config {
     pub general: GeneralConfig,
+    #[serde(default)]
     pub tmux: TmuxConfig,
     pub claude: ClaudeConfig,
     pub dead_process: DeadProcessConfig,
@@ -33,8 +34,23 @@ pub struct GeneralConfig {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct TmuxConfig {
+    /// Known dashboard pane for Claude Code (e.g. "dashboard:0.2").
+    /// Empty string = auto-detect via find_claude_pane().
+    #[serde(default)]
     pub dashboard_pane: String,
+    /// Tmux session name where Claude Code runs (e.g. "dashboard").
+    /// Empty string = auto-detect via find_claude_pane().
+    #[serde(default)]
     pub dashboard_session: String,
+}
+
+impl Default for TmuxConfig {
+    fn default() -> Self {
+        Self {
+            dashboard_pane: String::new(),
+            dashboard_session: String::new(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -396,6 +412,197 @@ agent_done_delay = 120
 max_panes = 20
 show_all = false
 "#;
+
+    #[test]
+    fn test_tmux_config_defaults_when_omitted() {
+        // Config without [tmux] section should parse with empty defaults
+        let config_no_tmux = r#"
+[general]
+check_interval = 10
+state_file = "/tmp/test-state.json"
+log_file = "/tmp/test.jsonl"
+legacy_log_file = "/tmp/test.log"
+
+[claude]
+max_context_tokens = 200000
+heartbeat_file = "/tmp/heartbeat"
+relaunch_script = "/tmp/relaunch.sh"
+
+[dead_process]
+checks_required = 3
+restart_cooldown = 300
+
+[fresh_clear]
+min_tokens = 1000
+max_tokens = 50000
+detections_required = 2
+cooldown = 120
+
+[heartbeat]
+stale_minutes = 15
+
+[token_stall]
+checks_required = 5
+max_range = 100
+min_usage_fraction = 0.5
+
+[alerts]
+initial_cooldown = 60
+escalation_tiers = [60, 120, 300, 600, 3600]
+max_pingme_alerts = 3
+resume_prompt = "Resume your work."
+
+[foreground_monitor]
+enabled = true
+threshold_seconds = 120
+check_interval = 10
+
+[watcher_monitor]
+enabled = true
+watchers_config = "/tmp/watchers.conf"
+expected_watchmen = 3
+
+[context_monitor]
+enabled = true
+threshold_percent = 75
+compact_trigger_percent = 5
+grace_period = 120
+cooldown = 300
+"#;
+        let config = parse_config(config_no_tmux)
+            .expect("should parse without [tmux] section");
+        assert_eq!(config.tmux.dashboard_pane, "");
+        assert_eq!(config.tmux.dashboard_session, "");
+    }
+
+    #[test]
+    fn test_tmux_config_partial_override() {
+        // Config with only dashboard_session set (dashboard_pane defaults to empty)
+        let config_partial_tmux = r#"
+[general]
+check_interval = 10
+state_file = "/tmp/test-state.json"
+log_file = "/tmp/test.jsonl"
+legacy_log_file = "/tmp/test.log"
+
+[tmux]
+dashboard_session = "my-session"
+
+[claude]
+max_context_tokens = 200000
+heartbeat_file = "/tmp/heartbeat"
+relaunch_script = "/tmp/relaunch.sh"
+
+[dead_process]
+checks_required = 3
+restart_cooldown = 300
+
+[fresh_clear]
+min_tokens = 1000
+max_tokens = 50000
+detections_required = 2
+cooldown = 120
+
+[heartbeat]
+stale_minutes = 15
+
+[token_stall]
+checks_required = 5
+max_range = 100
+min_usage_fraction = 0.5
+
+[alerts]
+initial_cooldown = 60
+escalation_tiers = [60, 120, 300, 600, 3600]
+max_pingme_alerts = 3
+resume_prompt = "Resume your work."
+
+[foreground_monitor]
+enabled = true
+threshold_seconds = 120
+check_interval = 10
+
+[watcher_monitor]
+enabled = true
+watchers_config = "/tmp/watchers.conf"
+expected_watchmen = 3
+
+[context_monitor]
+enabled = true
+threshold_percent = 75
+compact_trigger_percent = 5
+grace_period = 120
+cooldown = 300
+"#;
+        let config = parse_config(config_partial_tmux)
+            .expect("should parse with partial [tmux] section");
+        assert_eq!(config.tmux.dashboard_pane, "");
+        assert_eq!(config.tmux.dashboard_session, "my-session");
+    }
+
+    #[test]
+    fn test_tmux_config_empty_section() {
+        // Config with empty [tmux] section should use defaults
+        let config_empty_tmux = r#"
+[general]
+check_interval = 10
+state_file = "/tmp/test-state.json"
+log_file = "/tmp/test.jsonl"
+legacy_log_file = "/tmp/test.log"
+
+[tmux]
+
+[claude]
+max_context_tokens = 200000
+heartbeat_file = "/tmp/heartbeat"
+relaunch_script = "/tmp/relaunch.sh"
+
+[dead_process]
+checks_required = 3
+restart_cooldown = 300
+
+[fresh_clear]
+min_tokens = 1000
+max_tokens = 50000
+detections_required = 2
+cooldown = 120
+
+[heartbeat]
+stale_minutes = 15
+
+[token_stall]
+checks_required = 5
+max_range = 100
+min_usage_fraction = 0.5
+
+[alerts]
+initial_cooldown = 60
+escalation_tiers = [60, 120, 300, 600, 3600]
+max_pingme_alerts = 3
+resume_prompt = "Resume your work."
+
+[foreground_monitor]
+enabled = true
+threshold_seconds = 120
+check_interval = 10
+
+[watcher_monitor]
+enabled = true
+watchers_config = "/tmp/watchers.conf"
+expected_watchmen = 3
+
+[context_monitor]
+enabled = true
+threshold_percent = 75
+compact_trigger_percent = 5
+grace_period = 120
+cooldown = 300
+"#;
+        let config = parse_config(config_empty_tmux)
+            .expect("should parse with empty [tmux] section");
+        assert_eq!(config.tmux.dashboard_pane, "");
+        assert_eq!(config.tmux.dashboard_session, "");
+    }
 
     #[test]
     fn test_parse_valid_config() {
