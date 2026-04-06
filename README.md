@@ -60,14 +60,14 @@ logs = journalctl -f         # single-pane window
 
 claude-watch monitors the session and recovers from failures, but it has no memory of what Claude was working on. It can detect "Claude is idle" or "Claude is stuck," but it can't tell Claude *what to resume*.
 
-**You need a separate memory/session continuity system** to make recovery useful. In our setup, this is a set of session tools (`session-resume`, `session-task`, `session-event`, `session-log`) that:
+**You need a separate memory/session continuity system** to make recovery useful. Such a system would:
 
-- Save resume actions before context clears (`session-task set "what to do next"`)
-- Gather full session state on startup (`session-resume boot`)
-- Track completed work across clears (`session-task complete`)
-- Log session events for debugging (`session-event`)
+- Save what Claude should resume before context clears
+- Gather full session state on startup (watchers, pending work, message history)
+- Track completed work across clears to prevent re-doing finished tasks
+- Log session events for debugging
 
-Without something like this, claude-watch can inject "resume" into a fresh session, but Claude won't know what it was doing. The memory system is the bridge between "session is alive" (claude-watch's job) and "session knows what to do" (the memory system's job).
+Without something like this, claude-watch can inject "resume" into a fresh session, but Claude won't know what it was doing. The memory system is the bridge between "session is alive" (claude-watch's job) and "session knows what to do" (the memory system's job). This is beyond the scope of claude-watch itself.
 
 ## Build & run
 
