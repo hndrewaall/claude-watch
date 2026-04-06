@@ -1,0 +1,24 @@
+#!/bin/bash
+# Snap the dashboard sidebar back to fixed width.
+# Called by tmux hooks on client-resized and client-attached.
+# No-op if no sidebar pane exists (claude-only layout).
+
+CONF="${XDG_CONFIG_HOME:-$HOME/.config}/dashboard/layout.conf"
+
+# Read sidebar width from config (default 25)
+SIDEBAR_W=25
+if [ -f "$CONF" ]; then
+    val=$(awk -F= '/^[[:space:]]*sidebar_width/ { gsub(/[[:space:]]/, "", $2); print $2 }' "$CONF")
+    [ -n "$val" ] && SIDEBAR_W="$val"
+fi
+
+tmux has-session -t dashboard 2>/dev/null || exit 0
+
+# Only refit if there are 2+ panes (layout with sidebar)
+PANE_COUNT=$(tmux list-panes -t dashboard:0 2>/dev/null | wc -l)
+[ "$PANE_COUNT" -lt 2 ] && exit 0
+
+# Find the non-claude pane (sidebar) by excluding the claude process
+SIDEBAR=$(tmux list-panes -t dashboard:0 -F '#{pane_id} #{pane_current_command}' \
+    | grep -v claude | head -1 | awk '{print $1}')
+[ -n "$SIDEBAR" ] && tmux resize-pane -t "$SIDEBAR" -x "$SIDEBAR_W" 2>/dev/null
