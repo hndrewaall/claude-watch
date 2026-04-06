@@ -26,7 +26,7 @@
 
 SESSION="dashboard"
 CONF="${XDG_CONFIG_HOME:-$HOME/.config}/dashboard/layout.conf"
-REFIT=/home/hndrewaall/bin/dashboard-refit
+REFIT="$(dirname "$(readlink -f "$0")")/dashboard-refit"
 
 # Parse config file (INI-style, simple key = value)
 conf_get() {
@@ -84,7 +84,7 @@ if [ "$1" = "--detach" ]; then
     else
         CLAUDE_CMD='claude --continue --append-system-prompt "You were just restarted via systemd boot. Immediately run your full session start checklist from MEMORY.md without waiting for user input."'
     fi
-    tmux send-keys -t "$SESSION:0.0" "cd /home/hndrewaall && $CLAUDE_CMD" Enter
+    tmux send-keys -t "$SESSION:0.0" "cd ~ &&$CLAUDE_CMD" Enter
     # Inject "resume" after Claude initializes (polls for idle, up to 90s).
     nohup claude-inject-resume "$SESSION:0.0" >/dev/null 2>&1 &
     exit 0
@@ -191,7 +191,7 @@ if [ -n "$RESUME_ID" ]; then
 else
     CLAUDE_CMD='claude --continue --append-system-prompt "You were just restarted via dashboard. Immediately run your full session start checklist from MEMORY.md without waiting for user input."'
 fi
-tmux send-keys -t "$CLAUDE" "cd /home/hndrewaall && $CLAUDE_CMD" Enter
+tmux send-keys -t "$CLAUDE" "cd ~ &&$CLAUDE_CMD" Enter
 # Inject "resume" after Claude initializes (polls for idle, up to 90s).
 nohup claude-inject-resume "$CLAUDE" >/dev/null 2>&1 &
 
