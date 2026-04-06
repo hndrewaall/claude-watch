@@ -61,15 +61,20 @@ pub(crate) fn parse_status_bar(pane_text: &str) -> ParsedStatusBar {
     let bash_re = Regex::new(r"(\d+)\s+(?:bashes|background\s+tasks)").unwrap();
     let compact_re = Regex::new(r"Context left until auto-compact:\s*(\d+)%").unwrap();
 
-    for line in &lines[start..] {
-        // Only parse tokens from status bar lines (contain mode indicators)
-        let is_status_bar = line.contains("bypass permissions")
+    // Check if ANY line in the bottom section is a status bar line.
+    // When the tmux pane is narrow, the status bar wraps across multiple lines —
+    // e.g. "bypass permissions" on one line and "175630 tokens" on the next.
+    // If we see a status bar indicator anywhere, enable token parsing for all lines.
+    let has_status_bar = lines[start..].iter().any(|line| {
+        line.contains("bypass permissions")
             || line.contains("-- INSERT --")
             || line.contains("background tasks")
             || line.contains("bashes")
-            || line.contains("auto-compact");
+            || line.contains("auto-compact")
+    });
 
-        if is_status_bar {
+    for line in &lines[start..] {
+        if has_status_bar {
             if let Some(caps) = token_re.captures(line) {
                 if let Some(m) = caps.get(1) {
                     let cleaned = m.as_str().replace(',', "");
@@ -413,6 +418,30 @@ mod tests {
         assert_eq!(parsed.tokens, Some(123456));
         assert_eq!(parsed.bashes, Some(5));
         assert_eq!(parsed.compact_remaining, Some(42));
+    }
+
+    #[test]
+    fn test_parse_status_bar_wrapped_narrow_pane() {
+        // When tmux pane is narrow, the status bar wraps across lines.
+        // "bypass permissions" is on one line, "175630 tokens" on the next.
+        let input = "some output\n\
+                     more output\n\
+                     \u{23f5}\u{23f5} bypass permissions on \u{00b7} 5 shells \u{00b7} esc to interrupt \u{00b7} \u{2193}\u{2026}\n\
+                     175630 tokens";
+        let parsed = parse_status_bar(input);
+        assert_eq!(parsed.tokens, Some(175630));
+    }
+
+    #[test]
+    fn test_parse_status_bar_wrapped_with_compact() {
+        // Wrapped status bar with compact info on a separate line
+        let input = "output\n\
+                     \u{23f5}\u{23f5} bypass permissions on \u{00b7} 3 bashes \u{00b7} esc to interrupt\n\
+                     42,000 tokens  Context left until auto-compact: 30%";
+        let parsed = parse_status_bar(input);
+        assert_eq!(parsed.tokens, Some(42000));
+        assert_eq!(parsed.bashes, Some(3));
+        assert_eq!(parsed.compact_remaining, Some(30));
     }
 
     // --- extract_version_from_path tests ---
