@@ -4,6 +4,7 @@ use crate::cmd::{run_cmd, run_cmd_any};
 use std::fmt;
 use std::time::Duration;
 use tokio::time::sleep;
+use tracing::debug;
 
 /// Current activity state of Claude Code as observed from tmux pane output.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -415,7 +416,18 @@ pub async fn get_activity(pane: &str) -> ClaudeActivity {
 }
 
 /// Find the dashboard pane for Claude Code.
+///
+/// When `dashboard_session` and `dashboard_pane` are configured (non-empty),
+/// checks those specific locations first. When unconfigured (empty/default),
+/// falls back to `find_claude_pane()` which auto-discovers across all tmux
+/// sessions. This makes the [tmux] config section optional for fresh installs.
 pub async fn find_dashboard_pane(config: &crate::config::TmuxConfig) -> Option<String> {
+    // If no session configured, skip session-specific checks and auto-detect
+    if config.dashboard_session.is_empty() {
+        debug!("no dashboard_session configured, falling back to find_claude_pane()");
+        return crate::status::find_claude_pane().await;
+    }
+
     // Check if dashboard session exists
     let (_, ok) = run_cmd_any(
         &["tmux", "has-session", "-t", &config.dashboard_session],
@@ -426,24 +438,26 @@ pub async fn find_dashboard_pane(config: &crate::config::TmuxConfig) -> Option<S
         return None;
     }
 
-    // Check known pane
-    let (out, ok) = run_cmd_any(
-        &[
-            "tmux",
-            "display-message",
-            "-t",
-            &config.dashboard_pane,
-            "-p",
-            "#{pane_id}",
-        ],
-        5,
-    )
-    .await;
-    if ok && !out.is_empty() {
-        return Some(config.dashboard_pane.clone());
+    // Check known pane (only if explicitly configured)
+    if !config.dashboard_pane.is_empty() {
+        let (out, ok) = run_cmd_any(
+            &[
+                "tmux",
+                "display-message",
+                "-t",
+                &config.dashboard_pane,
+                "-p",
+                "#{pane_id}",
+            ],
+            5,
+        )
+        .await;
+        if ok && !out.is_empty() {
+            return Some(config.dashboard_pane.clone());
+        }
     }
 
-    // Fallback: search for shell panes in dashboard
+    // Fallback: search for shell panes in dashboard session
     let (out, ok) = run_cmd_any(
         &[
             "tmux",
