@@ -3,7 +3,7 @@
 use crate::cmd::{run_cmd, run_cmd_any};
 use regex_lite::Regex;
 use serde::Serialize;
-use tracing::debug;
+use tracing::{debug, warn};
 
 /// Parsed Claude Code status from tmux pane capture + /proc.
 #[derive(Debug, Serialize, Clone)]
@@ -107,6 +107,45 @@ pub(crate) fn parse_status_bar(pane_text: &str) -> ParsedStatusBar {
     }
 
     result
+}
+
+/// Pure function: determine whether a parse-bar result + pane capture
+/// represents a suspicious "parse miss" — i.e. the pane had non-whitespace
+/// content but we extracted neither tokens nor bashes. This is the case we
+/// want to log loudly so we can diagnose stale-latch bugs where the daemon
+/// repeatedly reads 0 from a pane that clearly has a status bar.
+///
+/// A capture that is empty or all-whitespace is *not* a parse miss — that's
+/// "process is actually gone" and shouldn't spam logs.
+pub(crate) fn is_parse_miss(pane_text: &str, parsed: &ParsedStatusBar) -> bool {
+    if parsed.tokens.is_some() || parsed.bashes.is_some() {
+        return false;
+    }
+    pane_text.chars().any(|c| !c.is_whitespace())
+}
+
+/// Pure function: extract a short diagnostic tail from a pane capture for
+/// logging. Returns the last `max_lines` non-empty lines, each truncated to
+/// `max_line_len` characters. Keeps log volume bounded even if the pane has
+/// huge lines.
+pub(crate) fn parse_miss_tail(pane_text: &str, max_lines: usize, max_line_len: usize) -> String {
+    let lines: Vec<&str> = pane_text
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .collect();
+    let start = lines.len().saturating_sub(max_lines);
+    lines[start..]
+        .iter()
+        .map(|line| {
+            if line.chars().count() > max_line_len {
+                let truncated: String = line.chars().take(max_line_len).collect();
+                format!("{}…", truncated)
+            } else {
+                (*line).to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" | ")
 }
 
 /// Extract a version string from a path containing `/versions/X.Y.Z/`.
@@ -242,6 +281,18 @@ pub async fn get_claude_status() -> Option<ClaudeStatus> {
         // Use joined capture (-J) for status bar parsing to avoid truncation
         if let Some(capture) = crate::tmux::capture_pane_joined(&pane).await {
             let parsed = parse_status_bar(&capture);
+
+            // Diagnostic: if we got nothing out of the parser but the pane
+            // clearly has content, log the tail so we can debug stale-latch
+            // bugs where the daemon reads tokens=0 forever while the CLI
+            // parses the same pane correctly.
+            if is_parse_miss(&capture, &parsed) {
+                warn!(
+                    pane = %pane,
+                    tail = %parse_miss_tail(&capture, 10, 200),
+                    "status parse miss: pane non-empty but no tokens/bashes extracted"
+                );
+            }
 
             let version_info = tokio::task::spawn_blocking(get_version_info)
                 .await
@@ -475,6 +526,79 @@ mod tests {
         assert_eq!(parsed.tokens, Some(42000));
         assert_eq!(parsed.bashes, Some(3));
         assert_eq!(parsed.compact_remaining, Some(30));
+    }
+
+    // --- is_parse_miss tests ---
+
+    #[test]
+    fn test_is_parse_miss_empty_capture() {
+        // Empty pane capture is "process gone", not a parse miss.
+        let parsed = ParsedStatusBar::default();
+        assert!(!is_parse_miss("", &parsed));
+        assert!(!is_parse_miss("   \n\t\n  ", &parsed));
+    }
+
+    #[test]
+    fn test_is_parse_miss_has_content_but_nothing_parsed() {
+        // Non-empty pane with no tokens/bashes is the suspicious case.
+        let parsed = ParsedStatusBar::default();
+        assert!(is_parse_miss("hello world\nno status bar here", &parsed));
+    }
+
+    #[test]
+    fn test_is_parse_miss_tokens_found() {
+        // Any successful parse = not a miss.
+        let parsed = ParsedStatusBar {
+            tokens: Some(100),
+            bashes: None,
+            compact_remaining: None,
+        };
+        assert!(!is_parse_miss("some content", &parsed));
+    }
+
+    #[test]
+    fn test_is_parse_miss_bashes_found() {
+        let parsed = ParsedStatusBar {
+            tokens: None,
+            bashes: Some(3),
+            compact_remaining: None,
+        };
+        assert!(!is_parse_miss("some content", &parsed));
+    }
+
+    // --- parse_miss_tail tests ---
+
+    #[test]
+    fn test_parse_miss_tail_basic() {
+        let input = "line1\nline2\nline3\nline4";
+        let tail = parse_miss_tail(input, 2, 100);
+        assert_eq!(tail, "line3 | line4");
+    }
+
+    #[test]
+    fn test_parse_miss_tail_truncates_long_lines() {
+        let long = "x".repeat(500);
+        let input = format!("short\n{}", long);
+        let tail = parse_miss_tail(&input, 5, 50);
+        assert!(tail.contains("short"));
+        assert!(tail.contains("…"));
+        let segments: Vec<&str> = tail.split(" | ").collect();
+        assert_eq!(segments.len(), 2);
+        // Truncated segment = 50 chars + ellipsis
+        assert!(segments[1].chars().count() <= 51);
+    }
+
+    #[test]
+    fn test_parse_miss_tail_skips_blank_lines() {
+        let input = "keep1\n\n   \nkeep2\n\nkeep3";
+        let tail = parse_miss_tail(input, 10, 100);
+        assert_eq!(tail, "keep1 | keep2 | keep3");
+    }
+
+    #[test]
+    fn test_parse_miss_tail_fewer_lines_than_max() {
+        let tail = parse_miss_tail("one\ntwo", 10, 100);
+        assert_eq!(tail, "one | two");
     }
 
     // --- extract_version_from_path tests ---
