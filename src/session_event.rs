@@ -26,7 +26,7 @@ pub fn events_file_path() -> PathBuf {
     PathBuf::from(home)
         .join(".claude")
         .join("projects")
-        .join("-home-user")  // NOTE: Adjust project slug to match your Claude Code project path
+        .join("-home-user") // NOTE: Adjust project slug to match your Claude Code project path
         .join("session-events.jsonl")
 }
 
@@ -61,7 +61,9 @@ pub struct CompletedTask {
 pub fn parse_duration_secs(s: &str) -> Result<u64, String> {
     let re = Regex::new(r"^(\d+)([smhd])$").unwrap();
     if let Some(caps) = re.captures(s) {
-        let n: u64 = caps[1].parse().map_err(|_| format!("Invalid number: {}", &caps[1]))?;
+        let n: u64 = caps[1]
+            .parse()
+            .map_err(|_| format!("Invalid number: {}", &caps[1]))?;
         let secs = match &caps[2] {
             "s" => n,
             "m" => n * 60,
@@ -143,10 +145,7 @@ pub async fn log_event(
 }
 
 /// Read events from the JSONL file, optionally filtered by a time cutoff.
-pub fn read_events(
-    events_file: &std::path::Path,
-    since_secs: Option<u64>,
-) -> Vec<SessionEvent> {
+pub fn read_events(events_file: &std::path::Path, since_secs: Option<u64>) -> Vec<SessionEvent> {
     let content = match std::fs::read_to_string(events_file) {
         Ok(c) => c,
         Err(_) => return Vec::new(),
@@ -245,7 +244,11 @@ pub fn format_stats(events: &[SessionEvent]) -> String {
     out.push('\n');
 
     // Show recent events (last 20)
-    let start = if events.len() > 20 { events.len() - 20 } else { 0 };
+    let start = if events.len() > 20 {
+        events.len() - 20
+    } else {
+        0
+    };
     let recent = &events[start..];
     out.push_str(&format!("Last {} events:\n", recent.len()));
     for e in recent {
@@ -373,7 +376,10 @@ pub fn format_compaction_stats(events: &[SessionEvent]) -> String {
 
     // Session duration stats
     if !sessions.is_empty() {
-        let durations: Vec<i64> = sessions.iter().map(|(s, e)| (*e - *s).num_seconds()).collect();
+        let durations: Vec<i64> = sessions
+            .iter()
+            .map(|(s, e)| (*e - *s).num_seconds())
+            .collect();
         let avg = durations.iter().sum::<i64>() / durations.len() as i64;
         let min_d = *durations.iter().min().unwrap();
         let max_d = *durations.iter().max().unwrap();
@@ -422,9 +428,7 @@ pub fn format_compaction_stats(events: &[SessionEvent]) -> String {
     for comp in &compactions {
         let last_before = parsed.iter().filter(|e| e.ts < comp.ts).last();
         let next_checklist = parsed.iter().find(|e| {
-            e.ts > comp.ts
-                && e.event.event == "checklist"
-                && (e.ts - comp.ts).num_seconds() < 600
+            e.ts > comp.ts && e.event.event == "checklist" && (e.ts - comp.ts).num_seconds() < 600
         });
         if let (Some(before), Some(after)) = (last_before, next_checklist) {
             let dt = (after.ts - before.ts).num_seconds();
@@ -460,7 +464,12 @@ pub fn format_compaction_stats(events: &[SessionEvent]) -> String {
         let dur_str = sessions
             .iter()
             .find(|(_, end)| *end == comp.ts)
-            .map(|(start, end)| format!("  [session: {}]", fmt_duration((*end - *start).num_seconds())))
+            .map(|(start, end)| {
+                format!(
+                    "  [session: {}]",
+                    fmt_duration((*end - *start).num_seconds())
+                )
+            })
             .unwrap_or_default();
 
         let oh_str = parsed
@@ -470,7 +479,12 @@ pub fn format_compaction_stats(events: &[SessionEvent]) -> String {
                     && e.event.event == "checklist"
                     && (e.ts - comp.ts).num_seconds() < 600
             })
-            .map(|e| format!("  [resume: {}]", fmt_duration((e.ts - comp.ts).num_seconds())))
+            .map(|e| {
+                format!(
+                    "  [resume: {}]",
+                    fmt_duration((e.ts - comp.ts).num_seconds())
+                )
+            })
             .unwrap_or_default();
 
         let clean_str = if clean_flags[i] {
@@ -506,16 +520,14 @@ pub fn format_compaction_stats(events: &[SessionEvent]) -> String {
     }
 
     // Token stats
-    let token_events: Vec<&ParsedEvent> = parsed.iter().filter(|e| e.event.tokens.is_some()).collect();
+    let token_events: Vec<&ParsedEvent> =
+        parsed.iter().filter(|e| e.event.tokens.is_some()).collect();
     if !token_events.is_empty() {
         let mut tok_by_type: std::collections::HashMap<&str, Vec<u64>> =
             std::collections::HashMap::new();
         for e in &token_events {
             if let Some(t) = e.event.tokens {
-                tok_by_type
-                    .entry(&e.event.event)
-                    .or_default()
-                    .push(t);
+                tok_by_type.entry(&e.event.event).or_default().push(t);
             }
         }
 
@@ -607,15 +619,24 @@ pub fn check_compaction_stats_due() -> CompactionStatsDue {
     let path = compaction_stats_timestamp_path();
     let content = match std::fs::read_to_string(&path) {
         Ok(c) => c.trim().to_string(),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return CompactionStatsDue::NeverPosted,
-        Err(e) => return CompactionStatsDue::Error(format!("Failed to read {}: {}", path.display(), e)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return CompactionStatsDue::NeverPosted
+        }
+        Err(e) => {
+            return CompactionStatsDue::Error(format!("Failed to read {}: {}", path.display(), e))
+        }
     };
 
     let last_ts: DateTime<Utc> = match content.parse::<DateTime<chrono::FixedOffset>>() {
         Ok(dt) => dt.with_timezone(&Utc),
         Err(_) => match content.parse::<DateTime<Utc>>() {
             Ok(dt) => dt,
-            Err(e) => return CompactionStatsDue::Error(format!("Failed to parse timestamp '{}': {}", content, e)),
+            Err(e) => {
+                return CompactionStatsDue::Error(format!(
+                    "Failed to parse timestamp '{}': {}",
+                    content, e
+                ))
+            }
         },
     };
 
@@ -687,7 +708,8 @@ mod tests {
 
     #[test]
     fn test_read_events_from_str_skips_corrupt() {
-        let content = "not json\n{\"timestamp\":\"2026-03-16T12:00:00+00:00\",\"event\":\"boot\"}\n{broken\n";
+        let content =
+            "not json\n{\"timestamp\":\"2026-03-16T12:00:00+00:00\",\"event\":\"boot\"}\n{broken\n";
         let events = read_events_from_str(content, None);
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event, "boot");

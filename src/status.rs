@@ -51,7 +51,11 @@ pub(crate) fn parse_status_bar(pane_text: &str) -> ParsedStatusBar {
     let mut result = ParsedStatusBar::default();
 
     let lines: Vec<&str> = pane_text.lines().collect();
-    let start = if lines.len() > 10 { lines.len() - 10 } else { 0 };
+    let start = if lines.len() > 10 {
+        lines.len() - 10
+    } else {
+        0
+    };
 
     // Match "N tokens" or truncated "N tok…" / "N toke" — but ONLY on status
     // bar lines (contain permission mode, INSERT, or background tasks
@@ -129,10 +133,7 @@ pub(crate) fn is_parse_miss(pane_text: &str, parsed: &ParsedStatusBar) -> bool {
 /// `max_line_len` characters. Keeps log volume bounded even if the pane has
 /// huge lines.
 pub(crate) fn parse_miss_tail(pane_text: &str, max_lines: usize, max_line_len: usize) -> String {
-    let lines: Vec<&str> = pane_text
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .collect();
+    let lines: Vec<&str> = pane_text.lines().filter(|l| !l.trim().is_empty()).collect();
     let start = lines.len().saturating_sub(max_lines);
     lines[start..]
         .iter()
@@ -151,7 +152,8 @@ pub(crate) fn parse_miss_tail(pane_text: &str, max_lines: usize, max_line_len: u
 /// Extract a version string from a path containing `/versions/X.Y.Z/`.
 pub(crate) fn extract_version_from_path(path: &str) -> Option<String> {
     let re = Regex::new(r"/versions/([\d.]+)").unwrap();
-    re.captures(path).and_then(|caps| caps.get(1).map(|m| m.as_str().to_string()))
+    re.captures(path)
+        .and_then(|caps| caps.get(1).map(|m| m.as_str().to_string()))
 }
 
 /// Get installed and running Claude Code versions via symlink and /proc.
@@ -204,11 +206,15 @@ pub fn get_version_info() -> VersionInfo {
 pub async fn find_claude_pane() -> Option<String> {
     let out = run_cmd(
         &[
-            "tmux", "list-panes", "-a", "-F",
+            "tmux",
+            "list-panes",
+            "-a",
+            "-F",
             "#{session_name}:#{window_index}.#{pane_index} #{pane_current_command}",
         ],
         5,
-    ).await?;
+    )
+    .await?;
 
     let mut candidates = Vec::new();
 
@@ -379,10 +385,7 @@ pub(crate) fn parse_watchers_config_str(content: &str) -> Vec<WatcherEntry> {
             let name = parts[0].to_string();
             let pattern = parts[1].to_string();
             let min_count = parts.get(2).and_then(|s| s.parse().ok()).unwrap_or(1);
-            let enabled = parts
-                .get(3)
-                .map(|s| *s == "true")
-                .unwrap_or(true);
+            let enabled = parts.get(3).map(|s| *s == "true").unwrap_or(true);
             let start_cmd = parts
                 .get(4)
                 .map(|s| s.trim().to_string())

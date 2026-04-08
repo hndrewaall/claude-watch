@@ -155,7 +155,8 @@ impl Default for TestEnvOptions {
             heartbeat_stale_minutes: 1,
             foreground_threshold: 3,
             foreground_interrupt_enabled: false,
-            foreground_interrupt_message: "[TEST-INTERRUPT] Foreground command was backgrounded.".to_string(),
+            foreground_interrupt_message: "[TEST-INTERRUPT] Foreground command was backgrounded."
+                .to_string(),
             foreground_check_interval: 1,
             show_shell_prompt: false,
             show_idle_prompt: false,

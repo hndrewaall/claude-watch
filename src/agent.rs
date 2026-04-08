@@ -479,7 +479,9 @@ pub fn format_list(
         sorted_agents.sort_by_key(|(id, _)| (*id).clone());
 
         for (agent_id, info) in sorted_agents {
-            let pids = matches.get(agent_id.as_str()).or_else(|| matches.get(agent_id));
+            let pids = matches
+                .get(agent_id.as_str())
+                .or_else(|| matches.get(agent_id));
             let age = if info.jsonl_mtime > 0.0 {
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -627,8 +629,7 @@ pub fn cmd_kill(target: &str, dry_run: bool) -> i32 {
     // Check if target is a PID
     if let Ok(target_pid) = target.parse::<u32>() {
         let children = get_children(claude_pid);
-        let child_pids: std::collections::HashSet<u32> =
-            children.iter().map(|c| c.pid).collect();
+        let child_pids: std::collections::HashSet<u32> = children.iter().map(|c| c.pid).collect();
         if !child_pids.contains(&target_pid) {
             println!(
                 "PID {} is not a child of Claude Code (PID {}).",
@@ -681,10 +682,7 @@ pub fn cmd_kill(target: &str, dry_run: bool) -> i32 {
     }
 
     if matching.len() > 1 {
-        println!(
-            "Ambiguous target '{}' matches: {:?}",
-            target, matching
-        );
+        println!("Ambiguous target '{}' matches: {:?}", target, matching);
         return 1;
     }
 
@@ -773,10 +771,7 @@ pub fn cmd_kill_all(dry_run: bool) -> i32 {
     }
 
     if !agent_children.is_empty() {
-        println!(
-            "Found {} agent child process(es):",
-            agent_children.len()
-        );
+        println!("Found {} agent child process(es):", agent_children.len());
         for child in &agent_children {
             let eval_cmd = extract_eval_command(&child.cmd);
             let preview: String = eval_cmd.chars().take(100).collect();
@@ -785,10 +780,7 @@ pub fn cmd_kill_all(dry_run: bool) -> i32 {
     }
 
     if !orphans.is_empty() {
-        println!(
-            "\nFound {} orphaned agent process(es):",
-            orphans.len()
-        );
+        println!("\nFound {} orphaned agent process(es):", orphans.len());
         for orphan in &orphans {
             let preview: String = orphan.cmd.chars().take(100).collect();
             println!("  PID {}: {}", orphan.pid, preview);
@@ -938,8 +930,7 @@ mod tests {
 
     #[test]
     fn test_extract_last_bash_cmd_from_str_no_bash() {
-        let content =
-            r#"{"message":{"content":[{"name":"Read","input":{"file_path":"/tmp/x"}}]}}"#;
+        let content = r#"{"message":{"content":[{"name":"Read","input":{"file_path":"/tmp/x"}}]}}"#;
         assert_eq!(extract_last_bash_cmd_from_str(content), None);
     }
 

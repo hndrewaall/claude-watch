@@ -55,11 +55,7 @@ pub async fn capture_pane_joined(pane: &str) -> Option<String> {
 
 pub async fn capture_pane_history(pane: &str, lines: i32) -> Option<String> {
     let start = format!("-{}", lines);
-    run_cmd(
-        &["tmux", "capture-pane", "-t", pane, "-p", "-S", &start],
-        5,
-    )
-    .await
+    run_cmd(&["tmux", "capture-pane", "-t", pane, "-p", "-S", &start], 5).await
 }
 
 /// Check if the Claude Code prompt (>) is visible in the last 15 lines.
@@ -73,7 +69,11 @@ pub async fn is_idle(pane: &str) -> bool {
 /// Pure function: check if any of the last 15 lines contain the Claude prompt character.
 pub(crate) fn check_lines_for_idle_prompt(pane_output: &str) -> bool {
     let lines: Vec<&str> = pane_output.lines().collect();
-    let start = if lines.len() > 15 { lines.len() - 15 } else { 0 };
+    let start = if lines.len() > 15 {
+        lines.len() - 15
+    } else {
+        0
+    };
     for line in &lines[start..] {
         if line.contains('\u{276f}') {
             return true;
@@ -98,7 +98,11 @@ pub(crate) fn check_lines_for_exit_teardown(pane_output: &str) -> bool {
     let lines: Vec<&str> = pane_output.lines().collect();
     // Check more lines (30) since "Goodbye!" may scroll up as
     // "Background command was stopped" messages accumulate
-    let start = if lines.len() > 30 { lines.len() - 30 } else { 0 };
+    let start = if lines.len() > 30 {
+        lines.len() - 30
+    } else {
+        0
+    };
     for line in &lines[start..] {
         let trimmed = line.trim();
         if trimmed == "Goodbye!" || trimmed.contains("Background command was stopped") {
@@ -259,7 +263,11 @@ pub async fn is_foreground_busy(pane: &str) -> bool {
 /// No prompt visible + spinner characters = foreground busy.
 pub(crate) fn check_lines_for_foreground_busy(pane_output: &str) -> bool {
     let lines: Vec<&str> = pane_output.lines().collect();
-    let start = if lines.len() > 10 { lines.len() - 10 } else { 0 };
+    let start = if lines.len() > 10 {
+        lines.len() - 10
+    } else {
+        0
+    };
     let tail = &lines[start..];
 
     // If prompt is visible, not in foreground
@@ -285,9 +293,8 @@ pub(crate) fn check_lines_for_foreground_busy(pane_output: &str) -> bool {
 ///   strings <binary> | grep -oP '\\u280[0-9a-fA-F]|\\u281[0-9a-fA-F]|...'
 /// These are braille pattern characters used in the dots spinner animation.
 const SPINNER_CHARS: &[char] = &[
-    '\u{2802}', '\u{2807}', '\u{280b}', '\u{280f}', '\u{2810}',
-    '\u{2819}', '\u{2826}', '\u{2827}', '\u{2834}', '\u{2838}',
-    '\u{2839}', '\u{283c}',
+    '\u{2802}', '\u{2807}', '\u{280b}', '\u{280f}', '\u{2810}', '\u{2819}', '\u{2826}', '\u{2827}',
+    '\u{2834}', '\u{2838}', '\u{2839}', '\u{283c}',
 ];
 
 /// Check if a line is a separator (composed entirely of U+2500 box-drawing chars).
@@ -311,7 +318,11 @@ fn is_separator_line(line: &str) -> bool {
 /// Priority order: Thinking > ToolRunning > Writing > Idle > Unknown.
 pub fn detect_activity(pane_output: &str) -> ClaudeActivity {
     let lines: Vec<&str> = pane_output.lines().collect();
-    let start = if lines.len() > 15 { lines.len() - 15 } else { 0 };
+    let start = if lines.len() > 15 {
+        lines.len() - 15
+    } else {
+        0
+    };
     let tail = &lines[start..];
 
     // Find the first separator line to split content area from prompt/status area
@@ -353,7 +364,9 @@ pub fn detect_activity(pane_output: &str) -> ClaudeActivity {
     if has_prompt {
         let has_completion = content_lines.iter().any(|line| {
             let trimmed = line.trim();
-            has_indicator_char(trimmed) && trimmed.contains(" for ") && !trimmed.contains('\u{2026}')
+            has_indicator_char(trimmed)
+                && trimmed.contains(" for ")
+                && !trimmed.contains('\u{2026}')
         });
         if has_completion {
             return ClaudeActivity::Idle;
@@ -429,11 +442,7 @@ pub async fn find_dashboard_pane(config: &crate::config::TmuxConfig) -> Option<S
     }
 
     // Check if dashboard session exists
-    let (_, ok) = run_cmd_any(
-        &["tmux", "has-session", "-t", &config.dashboard_session],
-        5,
-    )
-    .await;
+    let (_, ok) = run_cmd_any(&["tmux", "has-session", "-t", &config.dashboard_session], 5).await;
     if !ok {
         return None;
     }
@@ -520,7 +529,11 @@ pub(crate) fn check_claude_running(pane_output: &str) -> bool {
     // Only if no shell prompt found, check for Claude Code indicators.
     // Match "tok" (not "tokens") to tolerate the `502064 tok…` ellipsis
     // truncation Claude Code applies in narrow panes.
-    let tail_start = if lines.len() > 10 { lines.len() - 10 } else { 0 };
+    let tail_start = if lines.len() > 10 {
+        lines.len() - 10
+    } else {
+        0
+    };
     let tail: String = lines[tail_start..].join("\n");
     if tail.contains("tok")
         && (tail.contains("auto-compact")
@@ -579,11 +592,9 @@ async fn has_claude_binary(pane: &str) -> bool {
     // Spawn blocking since we're walking /proc
     let pid_str_owned = pid_str.clone();
     let versions_dir_owned = versions_dir;
-    tokio::task::spawn_blocking(move || {
-        check_proc_tree(&pid_str_owned, &versions_dir_owned, 0)
-    })
-    .await
-    .unwrap_or(false)
+    tokio::task::spawn_blocking(move || check_proc_tree(&pid_str_owned, &versions_dir_owned, 0))
+        .await
+        .unwrap_or(false)
 }
 
 /// Recursively check process tree for claude binary.
@@ -921,7 +932,8 @@ mod tests {
 
     #[test]
     fn test_activity_thinking_standard() {
-        let output = "previous output\n  \u{273d} Thinking\u{2026} (12s \u{00b7} \u{2193} 384 tokens)";
+        let output =
+            "previous output\n  \u{273d} Thinking\u{2026} (12s \u{00b7} \u{2193} 384 tokens)";
         assert_eq!(detect_activity(output), ClaudeActivity::Thinking);
     }
 
@@ -1171,7 +1183,10 @@ mod tests {
     fn test_extract_login_url_basic() {
         let output = "Login\n\nhttps://claude.ai/oauth/authorize?code=true&client_id=abc123\n\nPaste code here";
         let url = extract_login_url(output);
-        assert_eq!(url, Some("https://claude.ai/oauth/authorize?code=true&client_id=abc123".to_string()));
+        assert_eq!(
+            url,
+            Some("https://claude.ai/oauth/authorize?code=true&client_id=abc123".to_string())
+        );
     }
 
     #[test]

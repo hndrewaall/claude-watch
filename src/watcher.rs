@@ -168,11 +168,7 @@ pub async fn watcher_run(config_path: &str, name: &str) -> Result<i32, String> {
 /// Enable or disable a watcher by rewriting the config file.
 /// On disable, kills matching processes.
 /// On enable, kills existing instances and starts via nohup.
-pub async fn watcher_toggle(
-    config_path: &str,
-    name: &str,
-    enable: bool,
-) -> Result<String, String> {
+pub async fn watcher_toggle(config_path: &str, name: &str, enable: bool) -> Result<String, String> {
     let content = std::fs::read_to_string(config_path)
         .map_err(|e| format!("failed to read config: {}", e))?;
 
@@ -212,8 +208,8 @@ pub async fn watcher_toggle(
 
     // Write updated config
     let new_content = output_lines.join("\n") + "\n";
-    let mut file = std::fs::File::create(config_path)
-        .map_err(|e| format!("failed to write config: {}", e))?;
+    let mut file =
+        std::fs::File::create(config_path).map_err(|e| format!("failed to write config: {}", e))?;
     file.write_all(new_content.as_bytes())
         .map_err(|e| format!("failed to write config: {}", e))?;
 
@@ -241,10 +237,7 @@ pub async fn watcher_toggle(
                         return Ok(format!("{}: enabled (started, pid {})", name, pid));
                     }
                     Err(e) => {
-                        return Ok(format!(
-                            "{}: enabled (failed to start: {})",
-                            name, e
-                        ));
+                        return Ok(format!("{}: enabled (failed to start: {})", name, e));
                     }
                 }
             }
@@ -261,10 +254,7 @@ pub async fn watcher_toggle(
             for pid in &pids {
                 let _ = run_cmd_any(&["kill", &pid.to_string()], 5).await;
             }
-            Ok(format!(
-                "{}: disabled (killed {} process(es))",
-                name, count
-            ))
+            Ok(format!("{}: disabled (killed {} process(es))", name, count))
         } else {
             Ok(format!("{}: disabled (no processes running)", name))
         }
@@ -295,11 +285,7 @@ pub async fn watcher_restart(config_path: &str) -> String {
     // Clean PID files
     if let Ok(dir) = std::fs::read_dir(PID_DIR) {
         for entry in dir.flatten() {
-            if entry
-                .path()
-                .extension()
-                .map_or(false, |ext| ext == "pid")
-            {
+            if entry.path().extension().map_or(false, |ext| ext == "pid") {
                 let _ = std::fs::remove_file(entry.path());
             }
         }
@@ -566,7 +552,8 @@ mod tests {
 
     #[test]
     fn test_rewrite_config_enable() {
-        let config = "# comment\nsig|sig$|1|false|signal-wait\ntorrent|torrent$|1|true|torrent-wait\n";
+        let config =
+            "# comment\nsig|sig$|1|false|signal-wait\ntorrent|torrent$|1|true|torrent-wait\n";
         let result = rewrite_config_toggle(config, "sig", true).unwrap();
         assert!(result.contains("sig|sig$|1|true|signal-wait"));
         assert!(result.contains("torrent|torrent$|1|true|torrent-wait"));
