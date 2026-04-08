@@ -53,11 +53,17 @@ pub(crate) fn parse_status_bar(pane_text: &str) -> ParsedStatusBar {
     let lines: Vec<&str> = pane_text.lines().collect();
     let start = if lines.len() > 10 { lines.len() - 10 } else { 0 };
 
-    // Match "N tokens" or truncated "N toke" — but ONLY on status bar lines
-    // (contain permission mode, INSERT, or background tasks indicator).
-    // This prevents matching thinking indicator text ("↓ 400 tokens") or
-    // Claude's output text that mentions tokens.
-    let token_re = Regex::new(r"(\d[\d,]*)\s+toke").unwrap();
+    // Match "N tokens" or truncated "N tok…" / "N toke" — but ONLY on status
+    // bar lines (contain permission mode, INSERT, or background tasks
+    // indicator). This prevents matching thinking indicator text ("↓ 400
+    // tokens") or Claude's output text that mentions tokens.
+    //
+    // Claude Code truncates the status bar with an ellipsis when the pane is
+    // narrow, producing `502064 tok…` (only three letters of "tokens"). We
+    // match `tok` followed by anything that is NOT a letter — that excludes
+    // false positives like "took" / "token" in prose while still catching
+    // both the truncated and full forms.
+    let token_re = Regex::new(r"(\d[\d,]*)\s+tok").unwrap();
     let bash_re = Regex::new(r"(\d+)\s+(?:bashes|background\s+tasks)").unwrap();
     let compact_re = Regex::new(r"Context left until auto-compact:\s*(\d+)%").unwrap();
 
@@ -180,20 +186,34 @@ pub async fn find_claude_pane() -> Option<String> {
     }
 
     // Fallback: capture candidate panes and check for Claude Code status bar.
+    //
+    // Use joined capture (-J) so wrapped status bar lines reassemble into one
+    // line — narrow panes wrap and truncate, but -J gives us the full logical
+    // line before terminal truncation.
+    //
+    // Match on "tok" (not "tokens") because Claude Code truncates the status
+    // bar with an ellipsis when the pane is narrow, producing things like
+    // `502064 tok…`. Similarly, "bypass permissi" covers truncated
+    // "bypass permissions". Also accept "background tasks" / "bashes" as
+    // status-bar indicators (already used by parse_status_bar).
+    //
     // The status bar format varies — sometimes shows "auto-compact", "latest",
-    // "current:", or just "N tokens". Use multiple heuristics:
-    //   1. "tokens" + version-related strings (original check)
-    //   2. "tokens" + Claude Code prompt (❯) or vim mode (-- INSERT --)
-    //   3. "tokens" + "bypass permissions" (Claude Code permission mode indicator)
+    // "current:", or just "N tok…". Use multiple heuristics.
     for pane in candidates {
-        if let Some(content) = crate::tmux::capture_pane(&pane).await {
-            if content.contains("tokens")
+        let content = match crate::tmux::capture_pane_joined(&pane).await {
+            Some(c) => Some(c),
+            None => crate::tmux::capture_pane(&pane).await,
+        };
+        if let Some(content) = content {
+            if content.contains("tok")
                 && (content.contains("auto-compact")
                     || content.contains("latest")
                     || content.contains("current:")
                     || content.contains("❯")
                     || content.contains("-- INSERT --")
-                    || content.contains("bypass permissions"))
+                    || content.contains("bypass permissi")
+                    || content.contains("background tasks")
+                    || content.contains("bashes"))
             {
                 return Some(pane);
             }
@@ -430,6 +450,19 @@ mod tests {
                      175630 tokens";
         let parsed = parse_status_bar(input);
         assert_eq!(parsed.tokens, Some(175630));
+    }
+
+    #[test]
+    fn test_parse_status_bar_truncated_ellipsis() {
+        // Real capture from a pane where Claude Code truncated the status bar
+        // with an ellipsis: "bypass permissi" (not "permissions") and
+        // "502064 tok…" (not "tokens"). Previously parsed as tokens=None
+        // which caused spurious ClaudeProcessDead Prometheus alerts.
+        let input = "output line\n\
+                     \u{23f5}\u{23f5} bypass permissi \u{00b7}  on   6 background tasks \u{00b7} ctrl+x ctrl+k to stop agen502064 tok\u{2026}";
+        let parsed = parse_status_bar(input);
+        assert_eq!(parsed.tokens, Some(502064));
+        assert_eq!(parsed.bashes, Some(6));
     }
 
     #[test]
