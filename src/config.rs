@@ -32,7 +32,7 @@ pub struct GeneralConfig {
     pub legacy_log_file: String,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, Default)]
 pub struct TmuxConfig {
     /// Known dashboard pane for Claude Code (e.g. "dashboard:0.2").
     /// Empty string = auto-detect via find_claude_pane().
@@ -42,15 +42,6 @@ pub struct TmuxConfig {
     /// Empty string = auto-detect via find_claude_pane().
     #[serde(default)]
     pub dashboard_session: String,
-}
-
-impl Default for TmuxConfig {
-    fn default() -> Self {
-        Self {
-            dashboard_pane: String::new(),
-            dashboard_session: String::new(),
-        }
-    }
 }
 
 #[derive(Debug, Deserialize, Clone)]

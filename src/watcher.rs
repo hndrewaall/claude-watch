@@ -285,7 +285,7 @@ pub async fn watcher_restart(config_path: &str) -> String {
     // Clean PID files
     if let Ok(dir) = std::fs::read_dir(PID_DIR) {
         for entry in dir.flatten() {
-            if entry.path().extension().map_or(false, |ext| ext == "pid") {
+            if entry.path().extension().is_some_and(|ext| ext == "pid") {
                 let _ = std::fs::remove_file(entry.path());
             }
         }
@@ -325,8 +325,8 @@ pub fn cmd_list(config_path: &str, json: bool) {
             .collect();
         println!("{}", serde_json::to_string_pretty(&items).unwrap());
     } else {
-        println!("{:<20} {:<8} {}", "NAME", "ENABLED", "PATTERN");
-        println!("{:<20} {:<8} {}", "----", "-------", "-------");
+        println!("{:<20} {:<8} PATTERN", "NAME", "ENABLED");
+        println!("{:<20} {:<8} -------", "----", "-------");
         for e in &entries {
             println!("{:<20} {:<8} {}", e.name, e.enabled, e.pattern);
         }
@@ -396,6 +396,7 @@ pub async fn cmd_restart(config_path: &str) {
 // --- Pure function tests ---
 
 /// Pure function: format watcher list output (for testing without I/O).
+#[allow(dead_code)]
 pub fn format_list(entries: &[WatcherEntry]) -> String {
     let mut out = String::new();
     out.push_str(&format!("{:<20} {:<8} {}\n", "NAME", "ENABLED", "PATTERN"));
@@ -407,6 +408,7 @@ pub fn format_list(entries: &[WatcherEntry]) -> String {
 }
 
 /// Pure function: format watcher status output (for testing without I/O).
+#[allow(dead_code)]
 pub fn format_status(statuses: &[WatcherStatus]) -> String {
     let mut out = String::new();
     let mut all_ok = true;
@@ -433,6 +435,7 @@ pub fn format_status(statuses: &[WatcherStatus]) -> String {
 
 /// Pure function: rewrite config content toggling the enabled field for a watcher.
 /// Returns the new config content, or None if the watcher was not found.
+#[allow(dead_code)]
 pub fn rewrite_config_toggle(content: &str, name: &str, enable: bool) -> Option<String> {
     let new_val = if enable { "true" } else { "false" };
     let mut found = false;
