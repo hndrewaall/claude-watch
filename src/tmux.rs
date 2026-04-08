@@ -517,10 +517,17 @@ pub(crate) fn check_claude_running(pane_output: &str) -> bool {
         }
     }
 
-    // Only if no shell prompt found, check for Claude Code indicators
+    // Only if no shell prompt found, check for Claude Code indicators.
+    // Match "tok" (not "tokens") to tolerate the `502064 tok…` ellipsis
+    // truncation Claude Code applies in narrow panes.
     let tail_start = if lines.len() > 10 { lines.len() - 10 } else { 0 };
     let tail: String = lines[tail_start..].join("\n");
-    if tail.contains("tokens") && (tail.contains("auto-compact") || tail.contains("latest:")) {
+    if tail.contains("tok")
+        && (tail.contains("auto-compact")
+            || tail.contains("latest:")
+            || tail.contains("background tasks")
+            || tail.contains("bypass permissi"))
+    {
         return true;
     }
 
