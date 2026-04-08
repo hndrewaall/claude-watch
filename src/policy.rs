@@ -1271,6 +1271,20 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                 health.last_seen_running = Some(now.clone());
                 health.consecutive_missing = 0;
             } else {
+                // Grace period: if the watcher was seen running within the
+                // last 90 seconds, don't count this as a miss. Short-lived
+                // watchers (e.g. signal-wait exits when a message arrives)
+                // have a natural gap between exit and the main loop's
+                // restart. Without this grace period we fire spurious
+                // "watcher missing" alerts every time a message is received.
+                let in_grace = health
+                    .last_seen_running
+                    .as_deref()
+                    .and_then(|ts| elapsed_since(&ts.to_string()))
+                    .map_or(false, |e| e < 90.0);
+                if in_grace {
+                    continue;
+                }
                 health.consecutive_missing += 1;
                 // Log after 3 consecutive misses (~30s at 10s interval)
                 if health.consecutive_missing == 3 {
