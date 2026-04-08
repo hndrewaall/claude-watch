@@ -197,9 +197,9 @@ fn foreground_uses_own_check_interval() {
     let env = TestEnv::new(
         "fg-interval",
         TestEnvOptions {
-            check_interval: 10,               // general check: slow (10s)
-            foreground_check_interval: 1,      // foreground check: fast (1s)
-            foreground_threshold: 3,           // detect after 3s
+            check_interval: 10,           // general check: slow (10s)
+            foreground_check_interval: 1, // foreground check: fast (1s)
+            foreground_threshold: 3,      // detect after 3s
             ..Default::default()
         },
     );
@@ -227,7 +227,9 @@ fn foreground_uses_own_check_interval() {
     // a single 10s general check cycle
     std::thread::sleep(std::time::Duration::from_secs(7));
 
-    unsafe { libc::kill(child.id() as i32, libc::SIGTERM); }
+    unsafe {
+        libc::kill(child.id() as i32, libc::SIGTERM);
+    }
     let output = child.wait_with_output().expect("wait on daemon");
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
 

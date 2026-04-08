@@ -79,10 +79,7 @@ fn state_persisted_after_checks() {
 
     // State file should exist and contain valid JSON
     let state = env.read_state();
-    assert!(
-        !state.is_null(),
-        "state file should contain valid JSON"
-    );
+    assert!(!state.is_null(), "state file should contain valid JSON");
     assert!(
         state["last_check"].is_string(),
         "state should have last_check timestamp. State: {:?}",

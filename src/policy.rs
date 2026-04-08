@@ -2,11 +2,11 @@
 //! heartbeat stale, token-stall, foreground monitor, and watcher health.
 
 use chrono::{DateTime, Local, Timelike, Utc};
+use nix::sys::signal::{kill, Signal};
+use nix::unistd::Pid;
 use std::os::unix::process::CommandExt;
 use std::time::SystemTime;
 use tracing::{debug, info, warn};
-use nix::sys::signal::{kill, Signal};
-use nix::unistd::Pid;
 
 use crate::alert;
 use crate::config::Config;
@@ -25,7 +25,11 @@ pub(crate) fn elapsed_since(dt_str: &str) -> Option<f64> {
 /// Pure function: compute the next thinking interrupt threshold with exponential backoff.
 /// Formula: min(base_threshold * 2^interrupt_count, max_backoff)
 /// E.g. with base=60, max=960: 60, 120, 240, 480, 960, 960, ...
-pub(crate) fn thinking_backoff_threshold(base_threshold: u64, max_backoff: u64, interrupt_count: u32) -> u64 {
+pub(crate) fn thinking_backoff_threshold(
+    base_threshold: u64,
+    max_backoff: u64,
+    interrupt_count: u32,
+) -> u64 {
     let multiplier = 1u64.checked_shl(interrupt_count).unwrap_or(u64::MAX);
     let threshold = base_threshold.saturating_mul(multiplier);
     threshold.min(max_backoff)
@@ -55,13 +59,16 @@ pub(crate) fn detect_token_stall(
     let token_range = token_max - token_min;
 
     let bashes_declining = recent_bashes[0] > recent_bashes[n - 1];
-    let high_tokens =
-        current_tokens as f64 > max_context_tokens as f64 * min_usage_fraction;
+    let high_tokens = current_tokens as f64 > max_context_tokens as f64 * min_usage_fraction;
 
     if token_range <= max_range && bashes_declining && high_tokens {
         Some(format!(
             "token stall ({}min, tokens={}, range={}, bashes {}->{})",
-            n, current_tokens, token_range, recent_bashes[0], recent_bashes[n - 1]
+            n,
+            current_tokens,
+            token_range,
+            recent_bashes[0],
+            recent_bashes[n - 1]
         ))
     } else {
         None
@@ -258,11 +265,8 @@ pub async fn check_foreground(
                         if config.foreground_monitor.interrupt_enabled {
                             info!("foreground interrupt: sending Ctrl-B x2 + inject message");
                             tmux::interrupt_and_wait(pane, 30).await;
-                            tmux::inject_text(
-                                pane,
-                                &config.foreground_monitor.interrupt_message,
-                            )
-                            .await;
+                            tmux::inject_text(pane, &config.foreground_monitor.interrupt_message)
+                                .await;
                             write_jsonl_log(
                                 &config.general.log_file,
                                 "foreground_interrupted",
@@ -336,11 +340,12 @@ fn spawn_deferred_clear(config: &Config, state: &mut State) {
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .pre_exec(|| {
-                nix::unistd::setsid().map(|_| ()).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+                nix::unistd::setsid()
+                    .map(|_| ())
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
             })
             .spawn()
-    }
-    {
+    } {
         Ok(child) => {
             state.context_clear_child_pid = Some(child.id());
             info!(pid = child.id(), grace, "spawned deferred self-clear child");
@@ -454,11 +459,7 @@ async fn check_reauth(config: &Config, state: &mut State, pane: &str) {
                 let now = Local::now().to_rfc3339();
                 warn!("sending high-priority reauth alert with URL");
                 let alert_msg = format!("Claude Code login needed. URL: {}", login_url);
-                alert::send_pingme_with_priority(
-                    &alert_msg,
-                    "high",
-                )
-                .await;
+                alert::send_pingme_with_priority(&alert_msg, "high").await;
                 write_jsonl_log(
                     &config.general.log_file,
                     "reauth_alert",
@@ -484,10 +485,7 @@ async fn check_reauth(config: &Config, state: &mut State, pane: &str) {
             "reauth_resolved",
             serde_json::json!({}),
         );
-        write_legacy_log(
-            &config.general.legacy_log_file,
-            "Reauth resolved",
-        );
+        write_legacy_log(&config.general.legacy_log_file, "Reauth resolved");
         state.reauth_detected = false;
         state.last_reauth_alert = None;
         state.login_injected = false;
@@ -589,11 +587,17 @@ pub async fn check_auto_update(config: &Config, state: &mut State, pane: &str) {
         if let Some(ref last_attempt) = state.last_update_attempt {
             if let Some(elapsed) = elapsed_since(last_attempt) {
                 if elapsed > 3600.0 {
-                    warn!("auto-update: update_in_progress stuck for {:.0}s, clearing", elapsed);
+                    warn!(
+                        "auto-update: update_in_progress stuck for {:.0}s, clearing",
+                        elapsed
+                    );
                     state.update_in_progress = false;
                     crate::state::save_state(&config.general.state_file, state);
                 } else {
-                    debug!("auto-update already in progress ({:.0}s ago), skipping", elapsed);
+                    debug!(
+                        "auto-update already in progress ({:.0}s ago), skipping",
+                        elapsed
+                    );
                     return;
                 }
             } else {
@@ -841,7 +845,9 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
         if state.fresh_session_injected {
             // Only reset if Claude was alive at some point since the inject,
             // or if the inject is expired (>5min without activity).
-            let inject_expired = state.last_fresh_inject.as_ref()
+            let inject_expired = state
+                .last_fresh_inject
+                .as_ref()
                 .and_then(|ts| elapsed_since(ts))
                 .map_or(false, |elapsed| elapsed >= 300.0);
 
@@ -1025,7 +1031,9 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
             // reset anyway — the session likely died during startup and a new one may
             // need injection.
             if state.fresh_session_injected {
-                let inject_expired = state.last_fresh_inject.as_ref()
+                let inject_expired = state
+                    .last_fresh_inject
+                    .as_ref()
                     .and_then(|ts| elapsed_since(ts))
                     .map_or(false, |elapsed| elapsed >= 300.0);
 
@@ -1059,7 +1067,10 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
             }
 
             if tmux::is_shell_prompt(&effective_pane).await {
-                info!(dead_checks, "shell prompt confirmed -- restarting Claude Code");
+                info!(
+                    dead_checks,
+                    "shell prompt confirmed -- restarting Claude Code"
+                );
                 restart_claude(&effective_pane, state, &config.claude).await;
                 state.consecutive_dead_checks = 0;
                 state.consecutive_failures = 0;
@@ -1071,7 +1082,10 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                 // Claude Code is running (idle prompt visible) but tokens=0 — this is
                 // a fresh session launched externally (e.g. dashboard --fresh), not by
                 // claude-watch. Inject "resume" to kick-start the checklist.
-                info!(dead_checks, "fresh external session detected — injecting resume");
+                info!(
+                    dead_checks,
+                    "fresh external session detected — injecting resume"
+                );
                 tmux::inject_text(&effective_pane, "resume").await;
                 state.fresh_session_injected = true;
                 state.was_alive_since_inject = false;
@@ -1383,9 +1397,8 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
         // Inject restart commands if watchers are down and cooldown has passed
         if any_critical_missing && !effective_pane.is_empty() {
             let should_inject = match &state.last_watcher_inject {
-                Some(ref last) => {
-                    elapsed_since(last).map_or(true, |e| e >= config.watcher_monitor.inject_cooldown as f64)
-                }
+                Some(ref last) => elapsed_since(last)
+                    .map_or(true, |e| e >= config.watcher_monitor.inject_cooldown as f64),
                 None => true,
             };
             if should_inject {
@@ -1408,7 +1421,8 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 
                 // Build specific restart commands
-                let restart_cmds: Vec<String> = missing_names.iter()
+                let restart_cmds: Vec<String> = missing_names
+                    .iter()
                     .map(|n| format!("watcher-ctl run {}", n))
                     .collect();
                 let prompt = format!(
@@ -1556,7 +1570,11 @@ mod tests {
         let dt_str = dt.to_rfc3339();
         let elapsed = elapsed_since(&dt_str).expect("should parse");
         // Should be approximately 60 seconds (allow some tolerance)
-        assert!(elapsed >= 59.0 && elapsed <= 62.0, "elapsed was {}", elapsed);
+        assert!(
+            elapsed >= 59.0 && elapsed <= 62.0,
+            "elapsed was {}",
+            elapsed
+        );
     }
 
     #[test]
@@ -1607,9 +1625,9 @@ mod tests {
         let result = detect_token_stall(
             &token_history,
             &bash_history,
-            5,    // checks_required
-            100,  // max_range
-            0.5,  // min_usage_fraction
+            5,      // checks_required
+            100,    // max_range
+            0.5,    // min_usage_fraction
             200000, // max_context_tokens
             180040, // current_tokens
         );
@@ -1622,9 +1640,7 @@ mod tests {
     fn test_detect_token_stall_not_enough_history() {
         let token_history = vec![180000, 180010];
         let bash_history = vec![50, 48];
-        let result = detect_token_stall(
-            &token_history, &bash_history, 5, 100, 0.5, 200000, 180010,
-        );
+        let result = detect_token_stall(&token_history, &bash_history, 5, 100, 0.5, 200000, 180010);
         assert!(result.is_none(), "not enough history");
     }
 
@@ -1633,9 +1649,7 @@ mod tests {
         // Tokens changing significantly = not stalled
         let token_history = vec![100000, 120000, 140000, 160000, 180000];
         let bash_history = vec![50, 48, 46, 44, 42];
-        let result = detect_token_stall(
-            &token_history, &bash_history, 5, 100, 0.5, 200000, 180000,
-        );
+        let result = detect_token_stall(&token_history, &bash_history, 5, 100, 0.5, 200000, 180000);
         assert!(result.is_none(), "tokens are changing");
     }
 
@@ -1644,9 +1658,7 @@ mod tests {
         // Bashes increasing = not stalled
         let token_history = vec![180000, 180010, 180020, 180030, 180040];
         let bash_history = vec![42, 44, 46, 48, 50];
-        let result = detect_token_stall(
-            &token_history, &bash_history, 5, 100, 0.5, 200000, 180040,
-        );
+        let result = detect_token_stall(&token_history, &bash_history, 5, 100, 0.5, 200000, 180040);
         assert!(result.is_none(), "bashes not declining");
     }
 
@@ -1693,7 +1705,10 @@ mod tests {
         let result = check_context_threshold_with_margin(160000, 200000, None, 75, 5, None);
         assert!(result.is_some());
         let (pct, by_compact) = result.unwrap();
-        assert!(!by_compact, "should trigger via token fallback, not compact");
+        assert!(
+            !by_compact,
+            "should trigger via token fallback, not compact"
+        );
         assert!((pct - 80.0).abs() < 0.1);
     }
 
@@ -1709,7 +1724,10 @@ mod tests {
         // compact_remaining is present and safe (50%), even though tokens are at 80%
         // Primary trigger (compact) takes precedence — not triggered
         let result = check_context_threshold_with_margin(160000, 200000, Some(50), 75, 5, None);
-        assert!(result.is_none(), "compact_remaining safe should prevent trigger even with high tokens");
+        assert!(
+            result.is_none(),
+            "compact_remaining safe should prevent trigger even with high tokens"
+        );
     }
 
     #[test]
@@ -1723,7 +1741,10 @@ mod tests {
     fn test_context_threshold_margin_safe() {
         // 1M max, 30K margin: 960K < 970K threshold
         let result = check_context_threshold_with_margin(960000, 1000000, None, 75, 5, Some(30000));
-        assert!(result.is_none(), "should not trigger at 960K with 30K margin");
+        assert!(
+            result.is_none(),
+            "should not trigger at 960K with 30K margin"
+        );
     }
 
     #[test]
@@ -1738,9 +1759,7 @@ mod tests {
         // Low token usage = not stalled (hasn't been running long)
         let token_history = vec![10000, 10010, 10020, 10030, 10040];
         let bash_history = vec![50, 48, 46, 44, 42];
-        let result = detect_token_stall(
-            &token_history, &bash_history, 5, 100, 0.5, 200000, 10040,
-        );
+        let result = detect_token_stall(&token_history, &bash_history, 5, 100, 0.5, 200000, 10040);
         assert!(result.is_none(), "tokens too low");
     }
 
@@ -1810,7 +1829,9 @@ mod tests {
         // Inject was recent (30s ago), Claude never became active.
         // Should NOT reset fresh_session_injected — prevents the inject loop.
         let state = make_state_with_inject(false, Some(30));
-        let inject_expired = state.last_fresh_inject.as_ref()
+        let inject_expired = state
+            .last_fresh_inject
+            .as_ref()
             .and_then(|ts| elapsed_since(ts))
             .map_or(false, |elapsed| elapsed >= 300.0);
 
@@ -1834,7 +1855,9 @@ mod tests {
         // Inject was 6 minutes ago, Claude never became active.
         // Should reset fresh_session_injected — the session is stuck/dead, allow retry.
         let state = make_state_with_inject(false, Some(360));
-        let inject_expired = state.last_fresh_inject.as_ref()
+        let inject_expired = state
+            .last_fresh_inject
+            .as_ref()
             .and_then(|ts| elapsed_since(ts))
             .map_or(false, |elapsed| elapsed >= 300.0);
 
@@ -1848,7 +1871,9 @@ mod tests {
         // fresh_session_injected is true but no timestamp (legacy state).
         // Should NOT reset (conservative — treat as recent).
         let state = make_state_with_inject(false, None);
-        let inject_expired = state.last_fresh_inject.as_ref()
+        let inject_expired = state
+            .last_fresh_inject
+            .as_ref()
             .and_then(|ts| elapsed_since(ts))
             .map_or(false, |elapsed| elapsed >= 300.0);
 

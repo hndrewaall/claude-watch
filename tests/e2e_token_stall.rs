@@ -59,10 +59,7 @@ fn token_stall_detected_with_declining_bashes() {
     // Look for stall indicators in check entries
     let stuck_checks: Vec<_> = log_entries
         .iter()
-        .filter(|e| {
-            e["event"].as_str() == Some("check")
-                && e["stuck"].as_bool() == Some(true)
-        })
+        .filter(|e| e["event"].as_str() == Some("check") && e["stuck"].as_bool() == Some(true))
         .collect();
 
     let has_stall_in_legacy = legacy_log.contains("token stall");
