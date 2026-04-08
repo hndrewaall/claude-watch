@@ -14,7 +14,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use notify::{Config as NotifyConfig, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use notify::{
+    Config as NotifyConfig, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher,
+};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
@@ -456,7 +458,11 @@ fn extract_task_id_from_pane_cmd(cmd: &str) -> Option<String> {
         if close > open + 1 {
             let tid = &cmd[open + 1..close];
             // Validate: task IDs are alphanumeric hex-ish strings
-            if !tid.is_empty() && tid.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_') {
+            if !tid.is_empty()
+                && tid
+                    .chars()
+                    .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+            {
                 return Some(tid.to_string());
             }
         }
@@ -472,11 +478,7 @@ async fn session_exists(session: &str) -> bool {
 }
 
 /// Add a tail -f pane for a task. Returns the new pane ID.
-async fn add_pane(
-    state: &mut TaskWatchState,
-    task_id: &str,
-    label: &str,
-) -> Option<String> {
+async fn add_pane(state: &mut TaskWatchState, task_id: &str, label: &str) -> Option<String> {
     // Already tracked and alive?
     if let Some(tracked) = state.tracked.get(task_id) {
         let alive = get_alive_panes(&state.session).await;
@@ -568,11 +570,7 @@ async fn remove_pane(state: &mut TaskWatchState, task_id: &str) {
     if let Some(tracked) = state.tracked.remove(task_id) {
         let alive = get_alive_panes(&state.session).await;
         if alive.contains(&tracked.pane_id) {
-            let _ = run_cmd(
-                &["tmux", "kill-pane", "-t", &tracked.pane_id],
-                5,
-            )
-            .await;
+            let _ = run_cmd(&["tmux", "kill-pane", "-t", &tracked.pane_id], 5).await;
         }
         // Rebalance
         let _ = run_cmd(
@@ -630,10 +628,7 @@ pub async fn run_task_watch_loop(config: TaskWatchConfig, shutdown: Arc<AtomicBo
     };
     info!(
         poll_interval,
-        done_delay,
-        agent_done_delay,
-        mode,
-        "task-watch loop started"
+        done_delay, agent_done_delay, mode, "task-watch loop started"
     );
 
     // Find initial tasks directory (use override if provided, e.g. for testing)
@@ -684,13 +679,12 @@ pub async fn run_task_watch_loop(config: TaskWatchConfig, shutdown: Arc<AtomicBo
 
     // Initial scan: find active writers
     info!("scanning for active tasks...");
-    let active_tids =
-        tokio::task::spawn_blocking({
-            let td = state.tasks_dir.clone();
-            move || scan_active_writers(&td, show_all)
-        })
-        .await
-        .unwrap_or_default();
+    let active_tids = tokio::task::spawn_blocking({
+        let td = state.tasks_dir.clone();
+        move || scan_active_writers(&td, show_all)
+    })
+    .await
+    .unwrap_or_default();
 
     // Also discover active agents via mtime
     let mut all_active = active_tids;
@@ -735,11 +729,8 @@ pub async fn run_task_watch_loop(config: TaskWatchConfig, shutdown: Arc<AtomicBo
     // that aren't tracked (leftover from a previous daemon instance).
     // Pane 0 is the daemon/status pane — never kill it.
     let existing_panes = list_existing_panes(&session).await;
-    let tracked_pane_ids: std::collections::HashSet<String> = state
-        .tracked
-        .values()
-        .map(|t| t.pane_id.clone())
-        .collect();
+    let tracked_pane_ids: std::collections::HashSet<String> =
+        state.tracked.values().map(|t| t.pane_id.clone()).collect();
     let mut orphan_count = 0;
     for pane in &existing_panes {
         // Skip pane 0 (daemon pane)
@@ -758,24 +749,14 @@ pub async fn run_task_watch_loop(config: TaskWatchConfig, shutdown: Arc<AtomicBo
             task_id = ?pane.task_id,
             "killing orphan pane from previous daemon"
         );
-        let _ = run_cmd(
-            &["tmux", "kill-pane", "-t", &pane.pane_id],
-            5,
-        )
-        .await;
+        let _ = run_cmd(&["tmux", "kill-pane", "-t", &pane.pane_id], 5).await;
         orphan_count += 1;
     }
     if orphan_count > 0 {
         info!(orphan_count, "orphan pane cleanup complete");
         // Rebalance after killing orphans
         let _ = run_cmd(
-            &[
-                "tmux",
-                "select-layout",
-                "-t",
-                &session,
-                "even-vertical",
-            ],
+            &["tmux", "select-layout", "-t", &session, "even-vertical"],
             5,
         )
         .await;
@@ -798,7 +779,11 @@ pub async fn run_task_watch_loop(config: TaskWatchConfig, shutdown: Arc<AtomicBo
             break;
         }
 
-        debug!(tracked = state.tracked.len(), pending = state.pending_removal.len(), "task-watch poll cycle");
+        debug!(
+            tracked = state.tracked.len(),
+            pending = state.pending_removal.len(),
+            "task-watch poll cycle"
+        );
 
         // Detect UUID directory change (new Claude Code session)
         if let Some(new_dir) = find_tasks_dir() {
@@ -900,11 +885,10 @@ pub async fn run_task_watch_loop(config: TaskWatchConfig, shutdown: Arc<AtomicBo
                 if is_agent {
                     let td = state.tasks_dir.clone();
                     let tid_c = tid.clone();
-                    let still_active = tokio::task::spawn_blocking(move || {
-                        agent_is_active(&td, &tid_c)
-                    })
-                    .await
-                    .unwrap_or(false);
+                    let still_active =
+                        tokio::task::spawn_blocking(move || agent_is_active(&td, &tid_c))
+                            .await
+                            .unwrap_or(false);
                     if still_active {
                         continue;
                     }
@@ -927,9 +911,10 @@ pub async fn run_task_watch_loop(config: TaskWatchConfig, shutdown: Arc<AtomicBo
                     delay = effective_delay,
                     "writer gone, scheduling removal"
                 );
-                state
-                    .pending_removal
-                    .insert(tid.clone(), Instant::now() + std::time::Duration::from_secs(effective_delay));
+                state.pending_removal.insert(
+                    tid.clone(),
+                    Instant::now() + std::time::Duration::from_secs(effective_delay),
+                );
             }
         }
 
@@ -992,11 +977,10 @@ pub async fn run_task_watch_loop(config: TaskWatchConfig, shutdown: Arc<AtomicBo
             if is_agent_output(&state.tasks_dir, &tid) {
                 let td = state.tasks_dir.clone();
                 let tid_c = tid.clone();
-                let still_active = tokio::task::spawn_blocking(move || {
-                    agent_is_active(&td, &tid_c)
-                })
-                .await
-                .unwrap_or(false);
+                let still_active =
+                    tokio::task::spawn_blocking(move || agent_is_active(&td, &tid_c))
+                        .await
+                        .unwrap_or(false);
                 if still_active {
                     state.pending_removal.remove(&tid);
                     info!(task_id = %tid, "agent resumed, cancelling removal");
@@ -1025,9 +1009,10 @@ pub async fn run_task_watch_loop(config: TaskWatchConfig, shutdown: Arc<AtomicBo
                     info!("tasks session is back, resuming");
                     // Re-scan for active tasks (both /proc writers and agents)
                     let td = state.tasks_dir.clone();
-                    let mut active: HashMap<String, bool> = tokio::task::spawn_blocking(move || scan_active_writers(&td, show_all))
-                        .await
-                        .unwrap_or_default();
+                    let mut active: HashMap<String, bool> =
+                        tokio::task::spawn_blocking(move || scan_active_writers(&td, show_all))
+                            .await
+                            .unwrap_or_default();
 
                     // Also discover active agents via mtime
                     {
@@ -1038,8 +1023,12 @@ pub async fn run_task_watch_loop(config: TaskWatchConfig, shutdown: Arc<AtomicBo
                                 for entry in entries.flatten() {
                                     let fname = entry.file_name().to_string_lossy().to_string();
                                     if fname.ends_with(".output") {
-                                        let tid = fname.strip_suffix(".output").unwrap_or(&fname).to_string();
-                                        if is_agent_output(&td, &tid) && agent_is_active(&td, &tid) {
+                                        let tid = fname
+                                            .strip_suffix(".output")
+                                            .unwrap_or(&fname)
+                                            .to_string();
+                                        if is_agent_output(&td, &tid) && agent_is_active(&td, &tid)
+                                        {
                                             agents.push(tid);
                                         }
                                     }
@@ -1109,9 +1098,7 @@ fn check_is_service_for_task(tasks_dir: &Path, task_id: &str) -> bool {
                 Err(_) => continue,
             };
 
-            if target == real_path
-                && proc_util::fd_is_writable(&pid_str, &fd_str)
-            {
+            if target == real_path && proc_util::fd_is_writable(&pid_str, &fd_str) {
                 return proc_util::is_service_process(&pid_str)
                     || proc_util::is_service_output(tasks_dir, task_id);
             }
@@ -1226,14 +1213,7 @@ pub async fn cmd_task_init(session: &str, show_all: bool) {
 
         // Reset window-size
         let _ = run_cmd(
-            &[
-                "tmux",
-                "set-option",
-                "-t",
-                session,
-                "window-size",
-                "latest",
-            ],
+            &["tmux", "set-option", "-t", session, "window-size", "latest"],
             5,
         )
         .await;
@@ -1246,28 +1226,27 @@ pub async fn cmd_task_init(session: &str, show_all: bool) {
         // Create new session with daemon pane
         let daemon_cmd = format!("task-watch daemon{}", all_flag);
         let _ = run_cmd(
-            &["tmux", "new-session", "-d", "-s", session, "-n", "watch", &daemon_cmd],
-            5,
-        )
-        .await;
-
-        let _ = run_cmd(
             &[
                 "tmux",
-                "set-option",
-                "-t",
+                "new-session",
+                "-d",
+                "-s",
                 session,
-                "window-size",
-                "latest",
+                "-n",
+                "watch",
+                &daemon_cmd,
             ],
             5,
         )
         .await;
 
-        println!(
-            "Session '{}' created, daemon running in pane 0",
-            session
-        );
+        let _ = run_cmd(
+            &["tmux", "set-option", "-t", session, "window-size", "latest"],
+            5,
+        )
+        .await;
+
+        println!("Session '{}' created, daemon running in pane 0", session);
     }
 }
 
@@ -1309,7 +1288,10 @@ pub async fn cmd_task_list(_session: &str, json: bool) {
     }
 
     if json {
-        println!("{}", serde_json::to_string_pretty(&entries).unwrap_or_else(|_| "[]".to_string()));
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&entries).unwrap_or_else(|_| "[]".to_string())
+        );
     } else if entries.is_empty() {
         println!("No tracked tasks");
     } else {
@@ -1354,19 +1336,13 @@ mod tests {
     #[test]
     fn test_infer_label_from_content_agent_slug() {
         let json = r#"{"slug":"my-agent","agentId":"abc123"}"#;
-        assert_eq!(
-            infer_label_from_content("tid", json),
-            "agent:my-agent"
-        );
+        assert_eq!(infer_label_from_content("tid", json), "agent:my-agent");
     }
 
     #[test]
     fn test_infer_label_from_content_agent_id_only() {
         let json = r#"{"agentId":"abcdef123456789"}"#;
-        assert_eq!(
-            infer_label_from_content("tid", json),
-            "agent:abcdef123456"
-        );
+        assert_eq!(infer_label_from_content("tid", json), "agent:abcdef123456");
     }
 
     #[test]
@@ -1422,13 +1398,19 @@ mod tests {
     #[test]
     fn test_extract_task_id_from_pane_cmd_standard() {
         let cmd = "echo '=== Some Label [abc123def] ==='; tail -f /tmp/tasks/abc123def.output";
-        assert_eq!(extract_task_id_from_pane_cmd(cmd), Some("abc123def".to_string()));
+        assert_eq!(
+            extract_task_id_from_pane_cmd(cmd),
+            Some("abc123def".to_string())
+        );
     }
 
     #[test]
     fn test_extract_task_id_from_pane_cmd_agent() {
         let cmd = "echo '=== agent:tracker-search [a644bc543a7a9e8a6] ==='; tail -f /tmp/tasks/a644bc543a7a9e8a6.output | task-watch format-jsonl | task-watch timestamp-lines";
-        assert_eq!(extract_task_id_from_pane_cmd(cmd), Some("a644bc543a7a9e8a6".to_string()));
+        assert_eq!(
+            extract_task_id_from_pane_cmd(cmd),
+            Some("a644bc543a7a9e8a6".to_string())
+        );
     }
 
     #[test]
@@ -1446,6 +1428,9 @@ mod tests {
     #[test]
     fn test_extract_task_id_from_pane_cmd_with_hyphens() {
         let cmd = "echo '=== Build Task [my-task-123] ==='; tail -f /tmp/out";
-        assert_eq!(extract_task_id_from_pane_cmd(cmd), Some("my-task-123".to_string()));
+        assert_eq!(
+            extract_task_id_from_pane_cmd(cmd),
+            Some("my-task-123".to_string())
+        );
     }
 }

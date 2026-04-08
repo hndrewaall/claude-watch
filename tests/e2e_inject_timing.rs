@@ -87,8 +87,14 @@ fn inject_text_waits_for_idle_before_typing() {
     // Create tmux session running bash
     let status = Command::new("tmux")
         .args([
-            "new-session", "-d", "-s", &session_name,
-            "-x", "120", "-y", "40",
+            "new-session",
+            "-d",
+            "-s",
+            &session_name,
+            "-x",
+            "120",
+            "-y",
+            "40",
         ])
         .status()
         .expect("create tmux session");
@@ -131,9 +137,7 @@ printf '  -- INSERT -- 50000 tokens\n'
     // Write the script to a temp file and run it in the pane
     let script_path = format!("/tmp/cw-inject-test-{}.sh", std::process::id());
     std::fs::write(&script_path, thinking_script).expect("write script");
-    let _ = Command::new("chmod")
-        .args(["+x", &script_path])
-        .output();
+    let _ = Command::new("chmod").args(["+x", &script_path]).output();
 
     send_literal(&session_name, &format!("bash {}", script_path));
     send_keys(&session_name, &["Enter"]);
@@ -195,8 +199,14 @@ fn get_activity_thinking_with_prompt_visible() {
 
     let status = Command::new("tmux")
         .args([
-            "new-session", "-d", "-s", &session_name,
-            "-x", "120", "-y", "40",
+            "new-session",
+            "-d",
+            "-s",
+            &session_name,
+            "-x",
+            "120",
+            "-y",
+            "40",
         ])
         .status()
         .expect("create tmux session");
@@ -221,9 +231,7 @@ sleep 30
 
     let script_path = format!("/tmp/cw-activity-test-{}.sh", std::process::id());
     std::fs::write(&script_path, script).expect("write script");
-    let _ = Command::new("chmod")
-        .args(["+x", &script_path])
-        .output();
+    let _ = Command::new("chmod").args(["+x", &script_path]).output();
 
     send_literal(&session_name, &format!("bash {}", script_path));
     send_keys(&session_name, &["Enter"]);
@@ -232,9 +240,7 @@ sleep 30
     // Use get_activity (the async version that captures from tmux)
     let pane = format!("{}:0.0", session_name);
     let rt = tokio::runtime::Runtime::new().unwrap();
-    let activity = rt.block_on(async {
-        get_activity(&pane).await
-    });
+    let activity = rt.block_on(async { get_activity(&pane).await });
 
     let content = capture_pane(&session_name).unwrap_or_default();
     eprintln!("Pane content:\n{}", content);
@@ -262,8 +268,14 @@ fn get_activity_idle_after_thinking_clears() {
 
     let status = Command::new("tmux")
         .args([
-            "new-session", "-d", "-s", &session_name,
-            "-x", "120", "-y", "40",
+            "new-session",
+            "-d",
+            "-s",
+            &session_name,
+            "-x",
+            "120",
+            "-y",
+            "40",
         ])
         .status()
         .expect("create tmux session");
@@ -286,9 +298,7 @@ sleep 30
 
     let script_path = format!("/tmp/cw-idle-test-{}.sh", std::process::id());
     std::fs::write(&script_path, script).expect("write script");
-    let _ = Command::new("chmod")
-        .args(["+x", &script_path])
-        .output();
+    let _ = Command::new("chmod").args(["+x", &script_path]).output();
 
     send_literal(&session_name, &format!("bash {}", script_path));
     send_keys(&session_name, &["Enter"]);
@@ -296,9 +306,7 @@ sleep 30
 
     let pane = format!("{}:0.0", session_name);
     let rt = tokio::runtime::Runtime::new().unwrap();
-    let activity = rt.block_on(async {
-        get_activity(&pane).await
-    });
+    let activity = rt.block_on(async { get_activity(&pane).await });
 
     let content = capture_pane(&session_name).unwrap_or_default();
     eprintln!("Pane content:\n{}", content);

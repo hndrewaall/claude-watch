@@ -48,7 +48,7 @@ fn dead_process_detected_and_restart_triggered() {
     let state = env.read_state();
     assert!(
         state["restart_count"].as_u64().unwrap_or(0) >= 1
-        || legacy_log.contains("restarting Claude Code"),
+            || legacy_log.contains("restarting Claude Code"),
         "should have attempted restart. State: {:?}, Stderr: {}",
         state,
         run.stderr

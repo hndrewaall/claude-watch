@@ -246,7 +246,10 @@ fn character_inventory() {
     let thinking_line = "\u{2722} Fermenting\u{2026} (38s \u{00b7} \u{2193} 909 tokens)";
     let idle_line = "\u{273b} Brewed for 38s \u{00b7} 11 background tasks still running";
 
-    assert!(thinking_line.contains('\u{2026}'), "thinking line has ellipsis");
+    assert!(
+        thinking_line.contains('\u{2026}'),
+        "thinking line has ellipsis"
+    );
     assert!(!idle_line.contains('\u{2026}'), "idle line has no ellipsis");
 }
 
@@ -473,7 +476,8 @@ fn idle_after_response_with_completion_is_still_idle() {
 /// below the separator. Before the fix, is_idle() returned true (prompt found),
 /// and inject_text proceeded immediately. After the fix, get_activity() returns
 /// Thinking, and inject_text waits for it to settle.
-const INJECT_TIMING_BUG_CAPTURE: &str = include_str!("fixtures/thinking_with_prompt_stale_content.txt");
+const INJECT_TIMING_BUG_CAPTURE: &str =
+    include_str!("fixtures/thinking_with_prompt_stale_content.txt");
 
 /// The exact inject timing bug scenario: thinking indicator + prompt visible
 /// + stale output from previous tool calls. Must be detected as Thinking.
@@ -500,7 +504,11 @@ fn inject_timing_bug_thinking_with_stale_content_is_thinking() {
 fn inject_timing_bug_old_is_idle_would_return_true() {
     // Replicate the old is_idle() logic: check last 15 lines for prompt char (❯)
     let lines: Vec<&str> = INJECT_TIMING_BUG_CAPTURE.lines().collect();
-    let start = if lines.len() > 15 { lines.len() - 15 } else { 0 };
+    let start = if lines.len() > 15 {
+        lines.len() - 15
+    } else {
+        0
+    };
     let has_prompt = lines[start..].iter().any(|line| line.contains('\u{276f}'));
     assert!(
         has_prompt,
@@ -560,5 +568,8 @@ fn proposed_fix_documentation() {
             !trimmed.is_empty() && trimmed.chars().all(|c| c == '\u{2500}')
         })
         .count();
-    assert_eq!(sep_count, 2, "Should have exactly 2 separator lines (above and below prompt)");
+    assert_eq!(
+        sep_count, 2,
+        "Should have exactly 2 separator lines (above and below prompt)"
+    );
 }

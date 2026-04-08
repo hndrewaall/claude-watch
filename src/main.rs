@@ -24,6 +24,7 @@ mod alert;
 mod cmd;
 mod config;
 mod logging;
+mod metrics;
 mod policy;
 mod proc_util;
 mod session_event;
@@ -32,6 +33,7 @@ mod status;
 mod task_watch;
 mod tmux;
 mod watcher;
+mod workload;
 
 use clap::{Parser, Subcommand};
 use std::path::Path;
@@ -94,6 +96,52 @@ enum Commands {
     Watcher {
         #[command(subcommand)]
         action: WatcherAction,
+    },
+    /// Launch long-running workloads in the tasks tmux session
+    Workload {
+        #[command(subcommand)]
+        action: WorkloadAction,
+    },
+    /// Write Prometheus textfile metrics from claude-watch state
+    Metrics,
+}
+
+#[derive(Subcommand)]
+enum WorkloadAction {
+    /// Start a workload in tmux
+    Run {
+        /// Short label for the workload
+        label: String,
+        /// Command to run (after --)
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
+        cmd: Vec<String>,
+    },
+    /// Show running workloads
+    #[command(alias = "ls")]
+    List,
+    /// Block until workload completes, print final output
+    Wait {
+        /// Workload label
+        label: String,
+        /// Number of output lines to show (default: 20)
+        #[arg(short = 'n', long, default_value_t = 20)]
+        lines: usize,
+    },
+    /// Show/tail workload output
+    Log {
+        /// Workload label
+        label: String,
+        /// Follow output (tail -f)
+        #[arg(short, long)]
+        follow: bool,
+        /// Number of lines (default: 20)
+        #[arg(short = 'n', long, default_value_t = 20)]
+        lines: usize,
+    },
+    /// Kill a running workload
+    Kill {
+        /// Workload label
+        label: String,
     },
 }
 
@@ -246,16 +294,28 @@ async fn run_status(json: bool, tokens_only: bool, bashes_only: bool) {
     if json {
         let mut map = serde_json::Map::new();
         if !cs.pane.is_empty() {
-            map.insert("pane".to_string(), serde_json::Value::String(cs.pane.clone()));
+            map.insert(
+                "pane".to_string(),
+                serde_json::Value::String(cs.pane.clone()),
+            );
         }
         if cs.tokens > 0 || !cs.pane.is_empty() {
-            map.insert("tokens".to_string(), serde_json::Value::Number(cs.tokens.into()));
+            map.insert(
+                "tokens".to_string(),
+                serde_json::Value::Number(cs.tokens.into()),
+            );
         }
         if cs.bashes > 0 || !cs.pane.is_empty() {
-            map.insert("bashes".to_string(), serde_json::Value::Number(cs.bashes.into()));
+            map.insert(
+                "bashes".to_string(),
+                serde_json::Value::Number(cs.bashes.into()),
+            );
         }
         if let Some(cr) = cs.compact_remaining {
-            map.insert("compact_remaining".to_string(), serde_json::Value::Number(cr.into()));
+            map.insert(
+                "compact_remaining".to_string(),
+                serde_json::Value::Number(cr.into()),
+            );
         }
         if let Some(ref v) = cs.version {
             map.insert("version".to_string(), serde_json::Value::String(v.clone()));
@@ -289,7 +349,12 @@ async fn run_status(json: bool, tokens_only: bool, bashes_only: bool) {
     // Human-readable output
     if cs.tokens > 0 || !cs.pane.is_empty() {
         let pct = cs.tokens as f64 / max_tokens as f64 * 100.0;
-        println!("Tokens:   {:>7} / {} ({:.0}%)", format_number(cs.tokens), format_number(max_tokens), pct);
+        println!(
+            "Tokens:   {:>7} / {} ({:.0}%)",
+            format_number(cs.tokens),
+            format_number(max_tokens),
+            pct
+        );
     }
     if let Some(cr) = cs.compact_remaining {
         println!("Compact:  {}% remaining", cr);
@@ -438,7 +503,12 @@ async fn run_daemon() {
         general_interval
     };
     let loop_interval = fg_interval.min(general_interval);
-    info!(loop_interval_ms = loop_interval.as_millis() as u64, general_interval_ms = general_interval.as_millis() as u64, fg_interval_ms = fg_interval.as_millis() as u64, "main loop intervals");
+    info!(
+        loop_interval_ms = loop_interval.as_millis() as u64,
+        general_interval_ms = general_interval.as_millis() as u64,
+        fg_interval_ms = fg_interval.as_millis() as u64,
+        "main loop intervals"
+    );
     let mut last_full_check = std::time::Instant::now() - general_interval; // run immediately
 
     loop {
@@ -495,13 +565,7 @@ async fn run_event(action: EventAction) {
             tokens,
         } => {
             let events_file = session_event::events_file_path();
-            match session_event::log_event(
-                &event_type,
-                note.as_deref(),
-                tokens,
-                &events_file,
-            )
-            .await
+            match session_event::log_event(&event_type, note.as_deref(), tokens, &events_file).await
             {
                 Ok(entry) => {
                     let token_str = entry
@@ -546,7 +610,11 @@ async fn run_event(action: EventAction) {
                         std::process::exit(0);
                     }
                     session_event::CompactionStatsDue::NotDue(hours) => {
-                        println!("Not due ({}h since last post, next in ~{}h)", hours, 24 - hours);
+                        println!(
+                            "Not due ({}h since last post, next in ~{}h)",
+                            hours,
+                            24 - hours
+                        );
                         std::process::exit(1);
                     }
                     session_event::CompactionStatsDue::NeverPosted => {
@@ -615,6 +683,26 @@ async fn run_watcher(action: WatcherAction) {
     }
 }
 
+fn run_workload(action: WorkloadAction) -> i32 {
+    match action {
+        WorkloadAction::Run { label, mut cmd } => {
+            // Strip leading '--' from command remainder (shell passes it through)
+            if cmd.first().map(|s| s.as_str()) == Some("--") {
+                cmd.remove(0);
+            }
+            workload::cmd_run(&label, &cmd)
+        }
+        WorkloadAction::List => workload::cmd_list(),
+        WorkloadAction::Wait { label, lines } => workload::cmd_wait(&label, lines),
+        WorkloadAction::Log {
+            label,
+            follow,
+            lines,
+        } => workload::cmd_log(&label, lines, follow),
+        WorkloadAction::Kill { label } => workload::cmd_kill(&label),
+    }
+}
+
 fn run_agent(action: AgentAction) {
     let exit_code = match action {
         AgentAction::List { all } => agent::cmd_list(all),
@@ -659,13 +747,33 @@ fn multicall_rewrite_args() -> Vec<String> {
         }
         "watcher-status" => {
             // watcher-status → claude-watch watcher status
-            let mut new_args = vec!["claude-watch".to_string(), "watcher".to_string(), "status".to_string()];
+            let mut new_args = vec![
+                "claude-watch".to_string(),
+                "watcher".to_string(),
+                "status".to_string(),
+            ];
+            new_args.extend_from_slice(&args[1..]);
+            new_args
+        }
+        "workload" => {
+            // workload <args...> → claude-watch workload <args...>
+            let mut new_args = vec!["claude-watch".to_string(), "workload".to_string()];
+            new_args.extend_from_slice(&args[1..]);
+            new_args
+        }
+        "claude-watch-metrics" => {
+            // claude-watch-metrics → claude-watch metrics
+            let mut new_args = vec!["claude-watch".to_string(), "metrics".to_string()];
             new_args.extend_from_slice(&args[1..]);
             new_args
         }
         "watcher-restart" => {
             // watcher-restart → claude-watch watcher restart
-            let mut new_args = vec!["claude-watch".to_string(), "watcher".to_string(), "restart".to_string()];
+            let mut new_args = vec![
+                "claude-watch".to_string(),
+                "watcher".to_string(),
+                "restart".to_string(),
+            ];
             new_args.extend_from_slice(&args[1..]);
             new_args
         }
@@ -692,11 +800,23 @@ fn multicall_rewrite_args() -> Vec<String> {
 
 #[tokio::main]
 async fn main() {
+    // Restore default SIGPIPE handling so piping to `head` etc. exits
+    // cleanly instead of panicking on println! with a broken pipe.
+    // Safe: we only call this once at startup before any async work.
+    // See https://github.com/rust-lang/rust/issues/46016
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+
     let args = multicall_rewrite_args();
     let cli = Cli::parse_from(args);
 
     match cli.command {
-        Some(Commands::Status { json, tokens, bashes }) => {
+        Some(Commands::Status {
+            json,
+            tokens,
+            bashes,
+        }) => {
             run_status(json, tokens, bashes).await;
         }
         Some(Commands::Update { force }) => {
@@ -713,6 +833,18 @@ async fn main() {
         }
         Some(Commands::Watcher { action }) => {
             run_watcher(action).await;
+        }
+        Some(Commands::Workload { action }) => {
+            let code = run_workload(action);
+            if code != 0 {
+                std::process::exit(code);
+            }
+        }
+        Some(Commands::Metrics) => {
+            let code = metrics::cmd_metrics();
+            if code != 0 {
+                std::process::exit(code);
+            }
         }
         None => {
             run_daemon().await;

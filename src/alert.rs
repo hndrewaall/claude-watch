@@ -8,11 +8,7 @@ pub async fn send_pingme(message: &str) {
 }
 
 pub async fn send_pingme_with_priority(message: &str, priority: &str) {
-    let _ = run_cmd(
-        &["pingme", "-p", priority, message, "claude-watch"],
-        15,
-    )
-    .await;
+    let _ = run_cmd(&["pingme", "-p", priority, message, "claude-watch"], 15).await;
 }
 
 pub async fn alert(message: &str, pane: &str, resume_prompt: &str, use_pingme: bool) {

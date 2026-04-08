@@ -69,7 +69,10 @@ fn test_has_output_empty_file() {
     let (_base, tasks_dir) = create_mock_tasks_dir();
     let output_file = tasks_dir.join("empty-task.output");
     fs::write(&output_file, "").unwrap();
-    assert!(!claude_watch::task_watch::has_output(&tasks_dir, "empty-task"));
+    assert!(!claude_watch::task_watch::has_output(
+        &tasks_dir,
+        "empty-task"
+    ));
 }
 
 #[test]
@@ -77,7 +80,10 @@ fn test_has_output_with_content() {
     let (_base, tasks_dir) = create_mock_tasks_dir();
     let output_file = tasks_dir.join("full-task.output");
     fs::write(&output_file, "hello world\n").unwrap();
-    assert!(claude_watch::task_watch::has_output(&tasks_dir, "full-task"));
+    assert!(claude_watch::task_watch::has_output(
+        &tasks_dir,
+        "full-task"
+    ));
 }
 
 #[test]
@@ -107,7 +113,9 @@ fn test_is_agent_output_regular_file() {
     let (_base, tasks_dir) = create_mock_tasks_dir();
     let output_file = tasks_dir.join("regular.output");
     fs::write(&output_file, "output").unwrap();
-    assert!(!claude_watch::task_watch::is_agent_output(&tasks_dir, "regular"));
+    assert!(!claude_watch::task_watch::is_agent_output(
+        &tasks_dir, "regular"
+    ));
 }
 
 #[cfg(unix)]
@@ -123,7 +131,10 @@ fn test_is_agent_output_symlink_to_jsonl() {
     let output_file = tasks_dir.join("agent-task.output");
     std::os::unix::fs::symlink(&jsonl_file, &output_file).unwrap();
 
-    assert!(claude_watch::task_watch::is_agent_output(&tasks_dir, "agent-task"));
+    assert!(claude_watch::task_watch::is_agent_output(
+        &tasks_dir,
+        "agent-task"
+    ));
 }
 
 #[test]
@@ -282,7 +293,10 @@ fn session_reconnect_after_disappearance() {
 
     // infer_label should return the first line of output
     let label = claude_watch::task_watch::infer_label(&tasks_dir, "reconnect-task");
-    assert_eq!(label, "tick", "label should be 'tick' from the writer output");
+    assert_eq!(
+        label, "tick",
+        "label should be 'tick' from the writer output"
+    );
 
     // --- Phase 5: Verify add_pane equivalent (split-window into the session) ---
     let tail_cmd = format!("tail -f {}", output_file.display());
@@ -313,13 +327,7 @@ fn session_reconnect_after_disappearance() {
 
     // Verify the pane is alive
     let list = Command::new("tmux")
-        .args([
-            "list-panes",
-            "-t",
-            &session,
-            "-F",
-            "#{pane_id}",
-        ])
+        .args(["list-panes", "-t", &session, "-F", "#{pane_id}"])
         .output()
         .expect("failed to list panes");
     let panes = String::from_utf8_lossy(&list.stdout);
@@ -399,7 +407,8 @@ async fn test_run_task_watch_loop_survives_session_disappearance() {
     let output_file = tasks_dir.join("reconnect-loop-task.output");
 
     // Write an incomplete agent conversation (last role = "user" means not complete)
-    let jsonl_content = r#"{"message": {"role": "user", "content": [{"type": "text", "text": "test task"}]}}"#;
+    let jsonl_content =
+        r#"{"message": {"role": "user", "content": [{"type": "text", "text": "test task"}]}}"#;
     fs::write(&jsonl_file, format!("{}\n", jsonl_content)).unwrap();
 
     // Create symlink: .output -> .jsonl (marks it as an agent output)
@@ -422,7 +431,11 @@ async fn test_run_task_watch_loop_survives_session_disappearance() {
     }
     // Update the tmux session's PATH so split-window subshells find the mock.
     // Also set remain-on-exit so panes survive even if the command exits.
-    let new_path = format!("{}:{}", mock_bin_dir.display(), std::env::var("PATH").unwrap_or_default());
+    let new_path = format!(
+        "{}:{}",
+        mock_bin_dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
     let set_env = Command::new("tmux")
         .args(["set-environment", "-t", &session, "PATH", &new_path])
         .output()
@@ -504,7 +517,10 @@ async fn test_run_task_watch_loop_survives_session_disappearance() {
     {
         use std::io::Write;
         if let Ok(mut f) = fs::OpenOptions::new().append(true).open(&jsonl_file) {
-            let _ = writeln!(f, r#"{{"message": {{"role": "user", "content": [{{"type": "text", "text": "still active"}}]}}}}"#);
+            let _ = writeln!(
+                f,
+                r#"{{"message": {{"role": "user", "content": [{{"type": "text", "text": "still active"}}]}}}}"#
+            );
         }
     }
     eprintln!("[test] touched JSONL to refresh mtime");

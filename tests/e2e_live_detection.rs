@@ -233,7 +233,11 @@ fn live_thinking_should_be_detected() {
          got 0. The ❯ prompt is masking the thinking state. \
          All {} captures: Idle={}, Thinking={}, ToolRunning={}, Writing={}, Unknown={}. Check {}",
         captures.len(),
-        idle_count, thinking_count, tool_count, writing_count, unknown_count,
+        idle_count,
+        thinking_count,
+        tool_count,
+        writing_count,
+        unknown_count,
         capture_dir
     );
 }
@@ -294,10 +298,10 @@ fn live_idle_after_response_should_be_idle() {
             let has_thinking = content.contains('\u{2026}')
                 && (content.contains('\u{273d}')
                     || content.contains('\u{2722}')
-                    || content.lines().any(|l| l.trim().starts_with("* ") && l.contains('\u{2026}')));
-            let has_spinner = SPINNER_CHARS_FOR_TEST
-                .iter()
-                .any(|&c| content.contains(c));
+                    || content
+                        .lines()
+                        .any(|l| l.trim().starts_with("* ") && l.contains('\u{2026}')));
+            let has_spinner = SPINNER_CHARS_FOR_TEST.iter().any(|&c| content.contains(c));
 
             if has_prompt && !has_thinking && !has_spinner {
                 match stable_since {
@@ -328,12 +332,11 @@ fn live_idle_after_response_should_be_idle() {
     eprintln!("Detected activity: {:?}", activity);
     eprintln!(
         "Content has ● bullets: {}",
-        content.lines().any(|l| l.trim_start().starts_with('\u{25cf}'))
+        content
+            .lines()
+            .any(|l| l.trim_start().starts_with('\u{25cf}'))
     );
-    eprintln!(
-        "Content has prompt: {}",
-        content.contains('\u{276f}')
-    );
+    eprintln!("Content has prompt: {}", content.contains('\u{276f}'));
 
     assert_eq!(
         activity,
@@ -354,8 +357,8 @@ fn live_idle_after_response_should_be_idle() {
 
 /// Spinner characters for the e2e test polling (mirrors SPINNER_CHARS from tmux.rs).
 const SPINNER_CHARS_FOR_TEST: &[char] = &[
-    '\u{280b}', '\u{2819}', '\u{2839}', '\u{2838}', '\u{283c}',
-    '\u{2834}', '\u{2826}', '\u{2827}', '\u{2807}', '\u{280f}',
+    '\u{280b}', '\u{2819}', '\u{2839}', '\u{2838}', '\u{283c}', '\u{2834}', '\u{2826}', '\u{2827}',
+    '\u{2807}', '\u{280f}',
 ];
 
 /// Verify that the initial idle state IS correctly detected before sending any prompt.
@@ -404,10 +407,7 @@ fn live_initial_idle_is_correct() {
     let activity = detect_activity(&content);
     eprintln!("Initial idle capture saved to {}", capture_dir);
     eprintln!("Detected activity: {:?}", activity);
-    eprintln!(
-        "Pane contains ❯: {}",
-        content.contains('\u{276f}')
-    );
+    eprintln!("Pane contains ❯: {}", content.contains('\u{276f}'));
 
     assert_eq!(
         activity,

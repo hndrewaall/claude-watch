@@ -308,7 +308,7 @@ pub fn load_config() -> Config {
             "{}/.config/claude-watch/config.toml",
             std::env::var("HOME").unwrap_or_else(|_| "/home/user".to_string())
         ),
-        "config.toml".to_string(),  // fallback: look in current directory
+        "config.toml".to_string(), // fallback: look in current directory
     ];
 
     for path in &config_paths {
@@ -479,8 +479,7 @@ compact_trigger_percent = 5
 grace_period = 120
 cooldown = 300
 "#;
-        let config = parse_config(config_no_tmux)
-            .expect("should parse without [tmux] section");
+        let config = parse_config(config_no_tmux).expect("should parse without [tmux] section");
         assert_eq!(config.tmux.dashboard_pane, "");
         assert_eq!(config.tmux.dashboard_session, "");
     }
@@ -544,8 +543,8 @@ compact_trigger_percent = 5
 grace_period = 120
 cooldown = 300
 "#;
-        let config = parse_config(config_partial_tmux)
-            .expect("should parse with partial [tmux] section");
+        let config =
+            parse_config(config_partial_tmux).expect("should parse with partial [tmux] section");
         assert_eq!(config.tmux.dashboard_pane, "");
         assert_eq!(config.tmux.dashboard_session, "my-session");
     }
@@ -608,8 +607,8 @@ compact_trigger_percent = 5
 grace_period = 120
 cooldown = 300
 "#;
-        let config = parse_config(config_empty_tmux)
-            .expect("should parse with empty [tmux] section");
+        let config =
+            parse_config(config_empty_tmux).expect("should parse with empty [tmux] section");
         assert_eq!(config.tmux.dashboard_pane, "");
         assert_eq!(config.tmux.dashboard_session, "");
     }
