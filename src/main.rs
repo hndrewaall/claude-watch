@@ -800,6 +800,14 @@ fn multicall_rewrite_args() -> Vec<String> {
 
 #[tokio::main]
 async fn main() {
+    // Restore default SIGPIPE handling so piping to `head` etc. exits
+    // cleanly instead of panicking on println! with a broken pipe.
+    // Safe: we only call this once at startup before any async work.
+    // See https://github.com/rust-lang/rust/issues/46016
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+
     let args = multicall_rewrite_args();
     let cli = Cli::parse_from(args);
 
