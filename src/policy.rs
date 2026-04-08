@@ -809,6 +809,20 @@ async fn run_auto_update(pane: &str, old_version: &str, new_version: &str, confi
     info!("auto-update: complete ({} → {})", old_version, new_version);
 }
 
+/// Pure function: decide whether a self-heal retry should reset the dead-check
+/// counter. Returns true if `dead_checks` has reached the configured threshold
+/// AND the retry observed a non-zero status (tokens or bashes).
+///
+/// Split out so the decision logic can be unit-tested without mocking tmux.
+pub(crate) fn should_self_heal(
+    dead_checks: u32,
+    checks_required: u32,
+    retry_tokens: u64,
+    retry_bashes: u64,
+) -> bool {
+    dead_checks >= checks_required && (retry_tokens > 0 || retry_bashes > 0)
+}
+
 /// Run a single check cycle.
 pub async fn check_cycle(config: &Config, state: &mut State) {
     let now = Local::now().to_rfc3339();
@@ -932,6 +946,61 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
         state.consecutive_dead_checks += 1;
         let dead_checks = state.consecutive_dead_checks;
         info!(dead_checks, "dead process detected: tokens=0, bashes=0");
+
+        // --- Self-heal: once we reach the alert threshold, retry status
+        // discovery from scratch before committing to any dead-check actions.
+        // Addresses a stale-latch bug where the daemon read tokens=0 for 45+
+        // minutes across 250+ loops while the same binary's CLI
+        // (`claude-watch status --json`) parsed the same pane correctly.
+        // A fresh get_claude_status() call re-runs pane discovery and
+        // capture, which recovers from the stuck state.
+        if dead_checks >= config.dead_process.checks_required {
+            if let Some(retry) = status::get_claude_status().await {
+                if should_self_heal(
+                    dead_checks,
+                    config.dead_process.checks_required,
+                    retry.tokens,
+                    retry.bashes,
+                ) {
+                    warn!(
+                        recovered_tokens = retry.tokens,
+                        recovered_bashes = retry.bashes,
+                        pane = %retry.pane,
+                        prior_dead_checks = dead_checks,
+                        "self-heal triggered: retry returned non-zero status, \
+                         resetting consecutive_dead_checks"
+                    );
+                    write_jsonl_log(
+                        &config.general.log_file,
+                        "self_heal_retry",
+                        serde_json::json!({
+                            "recovered_tokens": retry.tokens,
+                            "recovered_bashes": retry.bashes,
+                            "pane": &retry.pane,
+                            "prior_dead_checks": dead_checks,
+                        }),
+                    );
+                    state.consecutive_dead_checks = 0;
+                    state.last_known_pane = retry.pane.clone();
+                    if retry.tokens > 0 {
+                        state.last_known_tokens = retry.tokens;
+                    }
+                    if retry.bashes > 0 || retry.tokens > 0 {
+                        state.last_known_bashes = retry.bashes;
+                    }
+                    // Mirror the active-session bookkeeping from the
+                    // non-dead branch below so inject state stays coherent.
+                    if state.fresh_session_injected {
+                        state.was_alive_since_inject = true;
+                        state.fresh_session_injected = false;
+                    }
+                    state.last_check = Some(now);
+                    crate::state::save_state(&config.general.state_file, state);
+                    return;
+                }
+            }
+        }
+
         write_legacy_log(
             &config.general.legacy_log_file,
             &format!(
@@ -1494,6 +1563,40 @@ mod tests {
     fn test_elapsed_since_invalid() {
         assert!(elapsed_since("not a date").is_none());
         assert!(elapsed_since("").is_none());
+    }
+
+    // --- should_self_heal tests ---
+
+    #[test]
+    fn test_self_heal_triggers_at_threshold_with_tokens() {
+        assert!(should_self_heal(5, 5, 12345, 0));
+    }
+
+    #[test]
+    fn test_self_heal_triggers_at_threshold_with_bashes() {
+        assert!(should_self_heal(5, 5, 0, 3));
+    }
+
+    #[test]
+    fn test_self_heal_triggers_above_threshold() {
+        assert!(should_self_heal(250, 5, 100, 0));
+    }
+
+    #[test]
+    fn test_self_heal_no_trigger_below_threshold() {
+        // Not at threshold yet — even if retry has tokens, don't self-heal.
+        assert!(!should_self_heal(4, 5, 12345, 0));
+    }
+
+    #[test]
+    fn test_self_heal_no_trigger_when_retry_still_zero() {
+        // At threshold but retry also returned zero — no recovery possible.
+        assert!(!should_self_heal(5, 5, 0, 0));
+    }
+
+    #[test]
+    fn test_self_heal_no_trigger_at_zero() {
+        assert!(!should_self_heal(0, 5, 1000, 2));
     }
 
     #[test]
