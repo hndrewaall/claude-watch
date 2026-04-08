@@ -30,6 +30,7 @@ mod proc_util;
 mod session_event;
 mod state;
 mod status;
+mod task_filters;
 mod task_watch;
 mod tmux;
 mod watcher;
@@ -192,6 +193,15 @@ enum TaskAction {
         /// Show all tasks including persistent watchers
         #[arg(long, short)]
         all: bool,
+        /// Detach after creating (for systemd)
+        #[arg(long)]
+        detach: bool,
+        /// Destroy and recreate session (kills workload panes)
+        #[arg(long)]
+        recreate: bool,
+        /// Allow --recreate even with running workloads
+        #[arg(long)]
+        force: bool,
     },
     /// List tracked tasks
     #[command(alias = "ls")]
@@ -199,6 +209,55 @@ enum TaskAction {
         /// Output as JSON
         #[arg(long)]
         json: bool,
+    },
+    /// Add a tail -f pane for a task
+    Add {
+        /// Task ID
+        id: String,
+        /// Display label for the pane
+        #[arg(long, short)]
+        label: Option<String>,
+    },
+    /// Kill a task pane
+    Remove {
+        /// Task ID
+        id: String,
+        /// Show what would be removed
+        #[arg(long, short = 'n')]
+        dry_run: bool,
+    },
+    /// Garbage-collect dead/orphaned panes
+    Gc,
+    /// Read-only attach to the tasks session (fatfinger-proof)
+    Monitor {
+        /// Use tmux -CC (iTerm2 control mode)
+        #[arg(long)]
+        cc: bool,
+    },
+    /// Read-write multi-client attach
+    Attach {
+        /// Use tmux -CC (iTerm2 control mode)
+        #[arg(long)]
+        cc: bool,
+    },
+    /// Prefix each stdin line with [HH:MM:SS]
+    #[command(name = "timestamp-lines")]
+    TimestampLines,
+    /// Pretty-print agent JSONL from stdin
+    #[command(name = "format-jsonl")]
+    FormatJsonl,
+    /// Compat shim: the daemon loop runs in-process in claude-watch now.
+    /// Accepts and ignores --all / --poll-interval / --done-delay / --min-display.
+    #[command(hide = true)]
+    Daemon {
+        #[arg(long, short)]
+        all: bool,
+        #[arg(long)]
+        poll_interval: Option<u64>,
+        #[arg(long)]
+        done_delay: Option<u64>,
+        #[arg(long)]
+        min_display: Option<u64>,
     },
 }
 
@@ -647,14 +706,44 @@ async fn run_event(action: EventAction) {
     }
 }
 
-async fn run_task(action: TaskAction) {
+async fn run_task(action: TaskAction) -> i32 {
     let config = load_config();
+    let session = &config.task_watch.session;
     match action {
-        TaskAction::Init { all } => {
-            task_watch::cmd_task_init(&config.task_watch.session, all).await;
+        TaskAction::Init {
+            all,
+            detach,
+            recreate,
+            force,
+        } => {
+            task_watch::cmd_task_init(session, all, detach, recreate, force).await;
+            0
         }
         TaskAction::List { json } => {
-            task_watch::cmd_task_list(&config.task_watch.session, json).await;
+            task_watch::cmd_task_list(session, json).await;
+            0
+        }
+        TaskAction::Add { id, label } => {
+            task_watch::cmd_task_add(session, &id, label.as_deref()).await
+        }
+        TaskAction::Remove { id, dry_run } => {
+            task_watch::cmd_task_remove(session, &id, dry_run).await
+        }
+        TaskAction::Gc => task_watch::cmd_task_gc(session).await,
+        TaskAction::Monitor { cc } => task_watch::cmd_task_monitor(session, true, cc).await,
+        TaskAction::Attach { cc } => task_watch::cmd_task_monitor(session, false, cc).await,
+        TaskAction::TimestampLines => task_filters::cmd_timestamp_lines(),
+        TaskAction::FormatJsonl => task_filters::cmd_format_jsonl(),
+        TaskAction::Daemon { .. } => {
+            // Compat shim for old callers (e.g. the init pane 0 command).
+            // The real daemon loop runs inside claude-watch as a tokio task
+            // when `[task_watch] enabled = true` in the config.
+            println!("task-watch daemon handled by claude-watch");
+            // Sleep indefinitely so this behaves like the Python daemon
+            // would from a process-lifetime perspective.
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+            }
         }
     }
 }
@@ -733,8 +822,8 @@ fn multicall_rewrite_args() -> Vec<String> {
             new_args.extend_from_slice(&args[1..]);
             new_args
         }
-        "task-watch-ctl" => {
-            // task-watch-ctl <args...> → claude-watch task <args...>
+        "task-watch-ctl" | "task-watch" => {
+            // task-watch <args...> → claude-watch task <args...>
             let mut new_args = vec!["claude-watch".to_string(), "task".to_string()];
             new_args.extend_from_slice(&args[1..]);
             new_args
@@ -829,7 +918,10 @@ async fn main() {
             run_agent(action);
         }
         Some(Commands::Task { action }) => {
-            run_task(action).await;
+            let code = run_task(action).await;
+            if code != 0 {
+                std::process::exit(code);
+            }
         }
         Some(Commands::Watcher { action }) => {
             run_watcher(action).await;

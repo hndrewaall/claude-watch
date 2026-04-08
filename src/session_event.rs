@@ -331,7 +331,7 @@ pub fn format_compaction_stats(events: &[SessionEvent]) -> String {
         let best_start = parsed
             .iter()
             .filter(|e| e.ts < comp.ts && session_starts.contains(&e.event.event.as_str()))
-            .last();
+            .next_back();
         if let Some(start) = best_start {
             sessions.push((start.ts, comp.ts));
         }
@@ -426,7 +426,7 @@ pub fn format_compaction_stats(events: &[SessionEvent]) -> String {
     // Downtime: last event before compaction → checklist after compaction
     let mut downtimes: Vec<i64> = Vec::new();
     for comp in &compactions {
-        let last_before = parsed.iter().filter(|e| e.ts < comp.ts).last();
+        let last_before = parsed.iter().filter(|e| e.ts < comp.ts).next_back();
         let next_checklist = parsed.iter().find(|e| {
             e.ts > comp.ts && e.event.event == "checklist" && (e.ts - comp.ts).num_seconds() < 600
         });
