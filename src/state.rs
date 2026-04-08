@@ -110,10 +110,20 @@ pub struct WatcherState {
 }
 
 pub fn load_state(path: &str) -> State {
-    match std::fs::read_to_string(path) {
+    let mut state: State = match std::fs::read_to_string(path) {
         Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
         Err(_) => State::default(),
-    }
+    };
+    // Transient timers are meaningless across daemon restarts — daemon
+    // downtime makes the elapsed measurement unreliable and can trigger
+    // spurious "prolonged thinking" interrupts within seconds of startup.
+    // Clear them on load so tracking starts fresh.
+    state.thinking_start = None;
+    state.thinking_alerted = false;
+    state.thinking_interrupt_count = 0;
+    state.foreground_start = None;
+    state.foreground_alerted = false;
+    state
 }
 
 pub fn save_state(path: &str, state: &State) {
