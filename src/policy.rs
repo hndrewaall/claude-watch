@@ -156,51 +156,50 @@ pub async fn check_foreground(
             // Don't reset thinking_interrupt_count here — it persists across
             // brief non-thinking blips within the same stall episode. It only
             // resets when we see a genuinely active state (below).
-        } else {
-            if let Some(ref start) = state.thinking_start {
-                if let Some(elapsed) = elapsed_since(start) {
-                    let next_threshold = thinking_backoff_threshold(
-                        config.foreground_monitor.threshold_seconds,
-                        config.foreground_monitor.max_thinking_backoff,
-                        state.thinking_interrupt_count,
+        } else if let Some(ref start) = state.thinking_start {
+            if let Some(elapsed) = elapsed_since(start) {
+                let next_threshold = thinking_backoff_threshold(
+                    config.foreground_monitor.threshold_seconds,
+                    config.foreground_monitor.max_thinking_backoff,
+                    state.thinking_interrupt_count,
+                );
+                if elapsed >= next_threshold as f64 {
+                    warn!(
+                        elapsed_secs = elapsed,
+                        threshold = next_threshold,
+                        interrupt_count = state.thinking_interrupt_count,
+                        "prolonged thinking detected — interrupting (backoff)"
                     );
-                    if elapsed >= next_threshold as f64 {
-                        warn!(
-                            elapsed_secs = elapsed,
-                            threshold = next_threshold,
-                            interrupt_count = state.thinking_interrupt_count,
-                            "prolonged thinking detected — interrupting (backoff)"
-                        );
-                        write_jsonl_log(
-                            &config.general.log_file,
-                            "prolonged_thinking",
-                            serde_json::json!({
-                                "elapsed_secs": elapsed,
-                                "tokens": tokens,
-                                "bashes": bashes,
-                                "interrupt_count": state.thinking_interrupt_count,
-                                "next_threshold_secs": next_threshold,
-                                "action": if config.foreground_monitor.interrupt_enabled { "interrupt" } else { "log-only" },
-                            }),
-                        );
-                        state.thinking_alerted = true;
-                        state.thinking_interrupt_count += 1;
-                        // Reset thinking_start so the next backoff interval
-                        // counts from NOW, not from the original start
-                        state.thinking_start = Some(now.clone());
+                    write_jsonl_log(
+                        &config.general.log_file,
+                        "prolonged_thinking",
+                        serde_json::json!({
+                            "elapsed_secs": elapsed,
+                            "tokens": tokens,
+                            "bashes": bashes,
+                            "interrupt_count": state.thinking_interrupt_count,
+                            "next_threshold_secs": next_threshold,
+                            "action": if config.foreground_monitor.interrupt_enabled { "interrupt" } else { "log-only" },
+                        }),
+                    );
+                    state.thinking_alerted = true;
+                    state.thinking_interrupt_count += 1;
+                    // Reset thinking_start so the next backoff interval
+                    // counts from NOW, not from the original start
+                    state.thinking_start = Some(now.clone());
 
-                        if config.foreground_monitor.interrupt_enabled {
-                            info!(
-                                interrupt_count = state.thinking_interrupt_count,
-                                next_backoff_secs = thinking_backoff_threshold(
-                                    config.foreground_monitor.threshold_seconds,
-                                    config.foreground_monitor.max_thinking_backoff,
-                                    state.thinking_interrupt_count,
-                                ),
-                                "thinking interrupt: Escape + inject prompt"
-                            );
-                            tmux::interrupt_and_wait(pane, 30).await;
-                            let msg = format!(
+                    if config.foreground_monitor.interrupt_enabled {
+                        info!(
+                            interrupt_count = state.thinking_interrupt_count,
+                            next_backoff_secs = thinking_backoff_threshold(
+                                config.foreground_monitor.threshold_seconds,
+                                config.foreground_monitor.max_thinking_backoff,
+                                state.thinking_interrupt_count,
+                            ),
+                            "thinking interrupt: Escape + inject prompt"
+                        );
+                        tmux::interrupt_and_wait(pane, 30).await;
+                        let msg = format!(
                                 "[CLAUDE-WATCH] Prolonged thinking detected (>{}s in thinking state, interrupt #{}). \
                                 You appear to be stuck in a long generation. If you have complex work to do, \
                                 delegate it to a background Agent instead of doing it inline. \
@@ -209,24 +208,23 @@ pub async fn check_foreground(
                                 next_threshold,
                                 state.thinking_interrupt_count,
                             );
-                            tmux::inject_text(pane, &msg).await;
-                            write_jsonl_log(
-                                &config.general.log_file,
-                                "thinking_interrupted",
-                                serde_json::json!({
-                                    "elapsed_secs": elapsed,
-                                    "tokens": tokens,
-                                    "bashes": bashes,
-                                    "interrupt_count": state.thinking_interrupt_count,
-                                }),
-                            );
-                        } else {
-                            info!(
-                                elapsed_secs = elapsed,
-                                interrupt_count = state.thinking_interrupt_count,
-                                "thinking would interrupt (log-only mode)"
-                            );
-                        }
+                        tmux::inject_text(pane, &msg).await;
+                        write_jsonl_log(
+                            &config.general.log_file,
+                            "thinking_interrupted",
+                            serde_json::json!({
+                                "elapsed_secs": elapsed,
+                                "tokens": tokens,
+                                "bashes": bashes,
+                                "interrupt_count": state.thinking_interrupt_count,
+                            }),
+                        );
+                    } else {
+                        info!(
+                            elapsed_secs = elapsed,
+                            interrupt_count = state.thinking_interrupt_count,
+                            "thinking would interrupt (log-only mode)"
+                        );
                     }
                 }
             }
@@ -849,7 +847,7 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                 .last_fresh_inject
                 .as_ref()
                 .and_then(|ts| elapsed_since(ts))
-                .map_or(false, |elapsed| elapsed >= 300.0);
+                .is_some_and(|elapsed| elapsed >= 300.0);
 
             if state.was_alive_since_inject || inject_expired {
                 debug!("resetting fresh_session_injected — no Claude Code running (was_alive={}, expired={})",
@@ -1035,7 +1033,7 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                     .last_fresh_inject
                     .as_ref()
                     .and_then(|ts| elapsed_since(ts))
-                    .map_or(false, |elapsed| elapsed >= 300.0);
+                    .is_some_and(|elapsed| elapsed >= 300.0);
 
                 if state.was_alive_since_inject {
                     info!("dead state reached after active session — resetting fresh_session_injected");
@@ -1363,8 +1361,8 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                 let in_grace = health
                     .last_seen_running
                     .as_deref()
-                    .and_then(|ts| elapsed_since(&ts.to_string()))
-                    .map_or(false, |e| e < 90.0);
+                    .and_then(elapsed_since)
+                    .is_some_and(|e| e < 90.0);
                 if in_grace {
                     continue;
                 }
@@ -1398,7 +1396,7 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
         if any_critical_missing && !effective_pane.is_empty() {
             let should_inject = match &state.last_watcher_inject {
                 Some(ref last) => elapsed_since(last)
-                    .map_or(true, |e| e >= config.watcher_monitor.inject_cooldown as f64),
+                    .is_none_or(|e| e >= config.watcher_monitor.inject_cooldown as f64),
                 None => true,
             };
             if should_inject {

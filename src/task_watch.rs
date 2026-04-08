@@ -881,7 +881,7 @@ pub async fn run_task_watch_loop(config: TaskWatchConfig, shutdown: Arc<AtomicBo
                 continue;
             }
             if !active_tids.contains_key(tid) {
-                let is_agent = is_agent_output(&state.tasks_dir, &tid);
+                let is_agent = is_agent_output(&state.tasks_dir, tid);
                 if is_agent {
                     let td = state.tasks_dir.clone();
                     let tid_c = tid.clone();
@@ -1044,7 +1044,7 @@ pub async fn run_task_watch_loop(config: TaskWatchConfig, shutdown: Arc<AtomicBo
                         }
                     }
 
-                    for (tid, _) in &active {
+                    for tid in active.keys() {
                         if has_output(&state.tasks_dir, tid) {
                             let label = infer_label(&state.tasks_dir, tid);
                             if let Some(pane_id) = add_pane(&mut state, tid, &label).await {
@@ -1190,41 +1190,154 @@ fn setup_notify_watcher(
     Some(watcher)
 }
 
+/// Get the list of running workloads by reading workload state and intersecting
+/// with the currently alive panes in the tasks session.
+async fn get_running_workloads(session: &str) -> Vec<String> {
+    let state_file = "/tmp/claude-workloads/state.json";
+    let content = match std::fs::read_to_string(state_file) {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+    let state: serde_json::Value = match serde_json::from_str(&content) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    let obj = match state.as_object() {
+        Some(o) => o,
+        None => return Vec::new(),
+    };
+    let alive = get_alive_panes(session).await;
+    let mut running = Vec::new();
+    for (label, info) in obj {
+        let pane_id = info
+            .get("pane_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if !pane_id.is_empty() && alive.contains(&pane_id) {
+            running.push(label.clone());
+        }
+    }
+    running
+}
+
+/// Check if claude-watch's task_watch loop is handling the daemon.
+fn claude_watch_handles_daemon() -> bool {
+    let config = crate::config::load_config();
+    config.task_watch.enabled
+}
+
 /// CLI handler: create/reinit the tasks tmux session.
-pub async fn cmd_task_init(session: &str, show_all: bool) {
+///
+/// Mirrors the Python `task-watch init` behavior:
+/// - If session exists and `--recreate` is not set, respawn daemon pane
+///   (preserving workload panes).
+/// - If session exists and `--recreate` is set, require `--force` when there
+///   are running workloads.
+/// - When claude-watch handles the daemon loop, pane 0 gets a stub command
+///   (`echo ...; sleep infinity`) instead of `task-watch daemon`.
+pub async fn cmd_task_init(
+    session: &str,
+    show_all: bool,
+    detach: bool,
+    recreate: bool,
+    force: bool,
+) {
     let all_flag = if show_all { " --all" } else { "" };
 
-    // Check if session exists
-    if session_exists(session).await {
-        // Respawn daemon pane without killing workloads
-        let daemon_cmd = format!("task-watch daemon{}", all_flag);
-        let _ = run_cmd(
-            &[
-                "tmux",
-                "respawn-pane",
-                "-k",
-                "-t",
-                &format!("{}:0.0", session),
-                &daemon_cmd,
-            ],
-            5,
-        )
-        .await;
+    // Clean orphaned grouped sessions (tasks-N from previous inits)
+    if let Some(out) = run_cmd(&["tmux", "list-sessions", "-F", "#{session_name}"], 5).await {
+        let prefix = format!("{}-", session);
+        for line in out.lines() {
+            if line.starts_with(&prefix) {
+                let _ = run_cmd(&["tmux", "kill-session", "-t", line], 5).await;
+            }
+        }
+    }
 
-        // Reset window-size
+    let cw_handling = claude_watch_handles_daemon();
+    let stub_cmd = "echo 'task-watch daemon handled by claude-watch'; sleep infinity".to_string();
+    let daemon_cmd = if cw_handling {
+        stub_cmd.clone()
+    } else {
+        format!("task-watch daemon{}", all_flag)
+    };
+
+    if session_exists(session).await {
+        if recreate {
+            // --recreate: destroy and rebuild; --force required if workloads are running
+            let running = get_running_workloads(session).await;
+            if !running.is_empty() && !force {
+                eprintln!(
+                    "ERROR: Session '{}' has {} running workload(s): {}.",
+                    session,
+                    running.len(),
+                    running.join(", ")
+                );
+                eprintln!("Use --recreate --force to destroy and recreate.");
+                std::process::exit(1);
+            }
+            if !running.is_empty() {
+                println!(
+                    "WARNING: Killing {} running workload(s): {}",
+                    running.len(),
+                    running.join(", ")
+                );
+            }
+            let _ = run_cmd(&["tmux", "kill-session", "-t", session], 5).await;
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            let _ = run_cmd(
+                &[
+                    "tmux",
+                    "new-session",
+                    "-d",
+                    "-s",
+                    session,
+                    "-n",
+                    "watch",
+                    &daemon_cmd,
+                ],
+                5,
+            )
+            .await;
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            println!("Session '{}' recreated (all panes destroyed)", session);
+        } else {
+            // Safe: respawn daemon pane (pane 0) without killing workload panes
+            let _ = run_cmd(
+                &[
+                    "tmux",
+                    "respawn-pane",
+                    "-k",
+                    "-t",
+                    &format!("{}:0.0", session),
+                    &daemon_cmd,
+                ],
+                5,
+            )
+            .await;
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            if cw_handling {
+                println!(
+                    "Session '{}' reinited (daemon handled by claude-watch, workload panes preserved)",
+                    session
+                );
+            } else {
+                println!(
+                    "Session '{}' reinited (daemon restarted, workload panes preserved)",
+                    session
+                );
+            }
+        }
+        // Ensure window-size is not stuck on 'manual' (iTerm2 -CC sets this
+        // and it persists after disconnect, locking the session to a fixed width)
         let _ = run_cmd(
             &["tmux", "set-option", "-t", session, "window-size", "latest"],
             5,
         )
         .await;
-
-        println!(
-            "Session '{}' reinited (daemon restarted, workload panes preserved)",
-            session
-        );
     } else {
         // Create new session with daemon pane
-        let daemon_cmd = format!("task-watch daemon{}", all_flag);
         let _ = run_cmd(
             &[
                 "tmux",
@@ -1239,15 +1352,317 @@ pub async fn cmd_task_init(session: &str, show_all: bool) {
             5,
         )
         .await;
-
+        // Prevent iTerm2 -CC from locking session to a fixed width
         let _ = run_cmd(
             &["tmux", "set-option", "-t", session, "window-size", "latest"],
             5,
         )
         .await;
-
-        println!("Session '{}' created, daemon running in pane 0", session);
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        if detach {
+            println!(
+                "Session '{}' created (detached), daemon running in pane 0",
+                session
+            );
+        } else {
+            println!("Session '{}' created, daemon running in pane 0", session);
+            println!("Attach with: tmux attach -t {}", session);
+        }
     }
+}
+
+// ---- Standalone (state-file-backed) CLI subcommands ----
+//
+// These mirror the Python `task-watch` CLI for `add`, `remove`, `gc`,
+// `monitor`, and `attach`. Unlike the in-process daemon loop (which keeps
+// state in a HashMap), these CLI commands operate on a JSON state file at
+// `~/.config/task-watch/state.json` so that multiple short-lived invocations
+// can share pane-tracking state.
+
+fn state_file_path() -> std::path::PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    std::path::PathBuf::from(home).join(".config/task-watch/state.json")
+}
+
+fn load_state_file() -> serde_json::Map<String, serde_json::Value> {
+    let path = state_file_path();
+    let content = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(_) => return serde_json::Map::new(),
+    };
+    match serde_json::from_str::<serde_json::Value>(&content) {
+        Ok(serde_json::Value::Object(m)) => m,
+        _ => serde_json::Map::new(),
+    }
+}
+
+fn save_state_file(state: &serde_json::Map<String, serde_json::Value>) {
+    let path = state_file_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(s) = serde_json::to_string_pretty(state) {
+        let _ = std::fs::write(&path, s);
+    }
+}
+
+/// CLI handler: `task add <id> [--label LABEL]`.
+pub async fn cmd_task_add(session: &str, task_id: &str, label: Option<&str>) -> i32 {
+    if !session_exists(session).await {
+        eprintln!("No '{}' session. Run: claude-watch task init", session);
+        return 1;
+    }
+    let tasks_dir = match find_tasks_dir() {
+        Some(d) => d,
+        None => {
+            eprintln!("No Claude Code tasks directory found");
+            return 1;
+        }
+    };
+    let output_file = tasks_dir.join(format!("{}.output", task_id));
+    if !output_file.exists() {
+        eprintln!(
+            "No output file for task {}: {}",
+            task_id,
+            output_file.display()
+        );
+        return 1;
+    }
+
+    let label_str = label.unwrap_or("").to_string();
+    let mut state = load_state_file();
+
+    // Already tracked and alive?
+    if let Some(existing) = state.get(task_id) {
+        if let Some(pane_id) = existing.get("pane_id").and_then(|v| v.as_str()) {
+            let alive = get_alive_panes(session).await;
+            if alive.contains(pane_id) {
+                println!("Already tracked: {} [{}]", label_str, task_id);
+                return 0;
+            }
+        }
+    }
+
+    // Pane count check
+    let alive = get_alive_panes(session).await;
+    if alive.len() >= 20 {
+        eprintln!("Max panes (20) reached, skipping {}", task_id);
+        return 1;
+    }
+
+    let display_label_raw = if label_str.is_empty() {
+        task_id.chars().take(12).collect::<String>()
+    } else {
+        label_str.clone()
+    };
+    let display_label = display_label_raw.replace('\'', "'\\''");
+    let is_agent = is_agent_output(&tasks_dir, task_id);
+    let output_path = output_file.to_string_lossy().to_string();
+    let tail_cmd = if is_agent {
+        format!(
+            "tail -f {} | task-watch format-jsonl | task-watch timestamp-lines",
+            output_path
+        )
+    } else {
+        format!("tail -f {} | task-watch timestamp-lines", output_path)
+    };
+    let pane_cmd = format!(
+        "echo '=== {} [{}] ==='; {}",
+        display_label, task_id, tail_cmd
+    );
+
+    let pane_id = match run_cmd(
+        &[
+            "tmux",
+            "split-window",
+            "-t",
+            session,
+            "-v",
+            "-P",
+            "-F",
+            "#{pane_id}",
+            &pane_cmd,
+        ],
+        5,
+    )
+    .await
+    {
+        Some(id) if !id.trim().is_empty() => id.trim().to_string(),
+        _ => {
+            eprintln!("Failed to create pane");
+            return 1;
+        }
+    };
+
+    let _ = run_cmd(
+        &["tmux", "select-layout", "-t", session, "even-vertical"],
+        5,
+    )
+    .await;
+
+    let now_ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64();
+    let entry = serde_json::json!({
+        "pane_id": pane_id,
+        "label": label_str,
+        "created_ts": now_ts,
+    });
+    state.insert(task_id.to_string(), entry);
+    save_state_file(&state);
+    println!(
+        "Added pane {} for {} [{}]",
+        pane_id, display_label_raw, task_id
+    );
+    0
+}
+
+/// CLI handler: `task remove <id> [-n]`.
+pub async fn cmd_task_remove(session: &str, task_id: &str, dry_run: bool) -> i32 {
+    let mut state = load_state_file();
+    let entry = match state.get(task_id).cloned() {
+        Some(e) => e,
+        None => {
+            eprintln!("Task {} not tracked", task_id);
+            return 1;
+        }
+    };
+    let pane_id = entry
+        .get("pane_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let label = entry
+        .get("label")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let display = if label.is_empty() {
+        task_id.to_string()
+    } else {
+        format!("{} [{}]", label, task_id)
+    };
+
+    let alive = get_alive_panes(session).await;
+    let is_alive = alive.contains(&pane_id);
+
+    if dry_run {
+        println!(
+            "Would remove: {} (pane {}, {})",
+            display,
+            pane_id,
+            if is_alive { "alive" } else { "dead" }
+        );
+        return 0;
+    }
+
+    if is_alive {
+        let _ = run_cmd(&["tmux", "kill-pane", "-t", &pane_id], 5).await;
+    }
+    state.remove(task_id);
+    save_state_file(&state);
+    let _ = run_cmd(
+        &["tmux", "select-layout", "-t", session, "even-vertical"],
+        5,
+    )
+    .await;
+    println!("Removed: {}", display);
+    0
+}
+
+/// CLI handler: `task gc` — remove tracked entries whose panes are dead.
+pub async fn cmd_task_gc(session: &str) -> i32 {
+    let mut state = load_state_file();
+    if state.is_empty() {
+        println!("No tracked panes");
+        return 0;
+    }
+    let alive = get_alive_panes(session).await;
+    let dead: Vec<String> = state
+        .iter()
+        .filter_map(|(tid, info)| {
+            let pane_id = info.get("pane_id").and_then(|v| v.as_str()).unwrap_or("");
+            if !pane_id.is_empty() && !alive.contains(pane_id) {
+                Some(tid.clone())
+            } else {
+                None
+            }
+        })
+        .collect();
+    let count = dead.len();
+    for tid in &dead {
+        state.remove(tid);
+    }
+    if count > 0 {
+        save_state_file(&state);
+        println!("Cleaned up {} dead pane(s)", count);
+    } else {
+        println!("No dead panes found");
+    }
+    0
+}
+
+/// CLI handler: `task monitor|attach [--cc]`.
+///
+/// monitor → read-only attach (`tmux attach -r`)
+/// attach  → RW multi-client attach (grouped session)
+/// --cc     → use tmux -CC mode (iTerm2 control mode)
+pub async fn cmd_task_monitor(session: &str, read_only: bool, cc: bool) -> i32 {
+    if !session_exists(session).await {
+        eprintln!("No '{}' session. Run: claude-watch task init", session);
+        return 1;
+    }
+
+    // Kill orphaned grouped sessions from previous attaches
+    if let Some(out) = run_cmd(&["tmux", "list-sessions", "-F", "#{session_name}"], 5).await {
+        let prefix = format!("{}-", session);
+        for line in out.lines() {
+            if line.starts_with(&prefix) || line == "tasks-viewer" {
+                let _ = run_cmd(&["tmux", "kill-session", "-t", line], 5).await;
+            }
+        }
+    }
+
+    use std::ffi::CString;
+    let argv_owned: Vec<CString> = if cc {
+        // grouped -CC attach
+        vec![
+            CString::new("tmux").unwrap(),
+            CString::new("-CC").unwrap(),
+            CString::new("new-session").unwrap(),
+            CString::new("-t").unwrap(),
+            CString::new(session).unwrap(),
+        ]
+    } else if read_only {
+        vec![
+            CString::new("tmux").unwrap(),
+            CString::new("attach").unwrap(),
+            CString::new("-t").unwrap(),
+            CString::new(session).unwrap(),
+            CString::new("-r").unwrap(),
+        ]
+    } else {
+        vec![
+            CString::new("tmux").unwrap(),
+            CString::new("new-session").unwrap(),
+            CString::new("-t").unwrap(),
+            CString::new(session).unwrap(),
+        ]
+    };
+    let argv_ptrs: Vec<*const libc::c_char> = argv_owned
+        .iter()
+        .map(|s| s.as_ptr())
+        .chain(std::iter::once(std::ptr::null()))
+        .collect();
+    // Use execvp via libc
+    let program = argv_owned[0].as_c_str();
+    unsafe {
+        libc::execvp(program.as_ptr(), argv_ptrs.as_ptr());
+    }
+    // If execvp returned, it failed.
+    eprintln!("execvp(tmux) failed");
+    1
 }
 
 /// CLI handler: list tracked tasks.
