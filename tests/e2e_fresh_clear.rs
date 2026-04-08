@@ -50,10 +50,7 @@ fn fresh_clear_detected_and_resume_injected() {
     assert!(
         detected,
         "should detect fresh /clear. Legacy log: {}\nPingme: {:?}\nState: {:?}\nStderr: {}",
-        legacy_log,
-        pingme_calls,
-        state,
-        _run.stderr
+        legacy_log, pingme_calls, state, _run.stderr
     );
 }
 

@@ -32,10 +32,7 @@ fn stale_heartbeat_detected() {
     let log_entries = env.read_log_entries();
     let stuck_checks: Vec<_> = log_entries
         .iter()
-        .filter(|e| {
-            e["event"].as_str() == Some("check")
-                && e["stuck"].as_bool() == Some(true)
-        })
+        .filter(|e| e["event"].as_str() == Some("check") && e["stuck"].as_bool() == Some(true))
         .collect();
 
     assert!(
