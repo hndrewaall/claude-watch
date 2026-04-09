@@ -168,7 +168,18 @@ pub async fn watcher_run(config_path: &str, name: &str) -> Result<i32, String> {
 /// Enable or disable a watcher by rewriting the config file.
 /// On disable, kills matching processes.
 /// On enable, kills existing instances and starts via nohup.
+/// Watchers that must never be disabled (guardrails).
+const PROTECTED_WATCHERS: &[&str] = &["memory-remind"];
+
 pub async fn watcher_toggle(config_path: &str, name: &str, enable: bool) -> Result<String, String> {
+    if !enable && PROTECTED_WATCHERS.contains(&name) {
+        return Err(format!(
+            "watcher '{}' is protected and cannot be disabled. \
+             Edit ~/.config/watchmen/watchers.conf manually if you really mean it.",
+            name
+        ));
+    }
+
     let content = std::fs::read_to_string(config_path)
         .map_err(|e| format!("failed to read config: {}", e))?;
 
@@ -583,6 +594,13 @@ mod tests {
         assert!(result.contains("# header comment"));
         assert!(result.contains("# footer"));
         assert!(result.contains("false"));
+    }
+
+    #[test]
+    fn test_protected_watchers_includes_memory_remind() {
+        // memory-remind is a guardrail and must never be removable from
+        // the protected list without a deliberate code change.
+        assert!(super::PROTECTED_WATCHERS.contains(&"memory-remind"));
     }
 
     #[test]
