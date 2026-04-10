@@ -47,6 +47,9 @@ pub struct State {
     pub last_context_clear: Option<String>,
     #[serde(default)]
     pub context_clear_child_pid: Option<u32>,
+    /// Last observed token count (for detecting external clears)
+    #[serde(default)]
+    pub last_seen_tokens: Option<u64>,
     // Watcher health
     pub watcher_health: HashMap<String, WatcherState>,
     #[serde(default)]
