@@ -1325,7 +1325,29 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
             );
             state.context_clear_triggered = false;
             state.context_clear_child_pid = None;
+            state.last_context_clear = Some(now.clone());
         }
+
+        // Detect external clears (self-clear, user /clear) that claude-watch didn't trigger.
+        // If tokens drop below 30K but we didn't trigger the clear, still update the timestamp
+        // so the "Since Last Clear" dashboard metric stays accurate.
+        if !state.context_clear_triggered && tokens < 30000 {
+            // Only log if we previously saw high tokens (avoid re-logging on every check
+            // while tokens are still low during boot)
+            if state.last_seen_tokens.unwrap_or(0) >= 30000 {
+                info!(tokens, prev_tokens = state.last_seen_tokens, "external context clear detected");
+                write_jsonl_log(
+                    &config.general.log_file,
+                    "context_clear_reset",
+                    serde_json::json!({
+                        "tokens": tokens,
+                        "external": true,
+                    }),
+                );
+                state.last_context_clear = Some(now.clone());
+            }
+        }
+        state.last_seen_tokens = Some(tokens);
     }
 
     // --- Individual watcher health monitoring ---
