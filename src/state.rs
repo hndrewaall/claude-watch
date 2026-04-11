@@ -17,8 +17,6 @@ pub struct State {
     pub last_restart: Option<String>,
     pub restart_count: u32,
     pub pending_resume_inject: bool,
-    pub token_history: Vec<u64>,
-    pub bash_history: Vec<u64>,
     pub last_failure: Option<String>,
     pub last_failure_detail: Option<FailureDetail>,
     pub last_status: Option<StatusSnapshot>,
@@ -155,8 +153,6 @@ mod tests {
         assert_eq!(state.alert_count, 0);
         assert_eq!(state.restart_count, 0);
         assert!(!state.pending_resume_inject);
-        assert!(state.token_history.is_empty());
-        assert!(state.bash_history.is_empty());
         assert!(state.last_check.is_none());
         assert!(state.watcher_health.is_empty());
     }
@@ -167,8 +163,6 @@ mod tests {
         state.consecutive_failures = 5;
         state.alert_count = 2;
         state.last_check = Some("2026-03-16T12:00:00-05:00".to_string());
-        state.token_history = vec![100000, 100050, 100100];
-        state.bash_history = vec![50, 48, 45];
         state.pending_resume_inject = true;
         state.last_failure_detail = Some(FailureDetail {
             bashes: 45,
@@ -194,8 +188,6 @@ mod tests {
         assert_eq!(restored.consecutive_failures, 5);
         assert_eq!(restored.alert_count, 2);
         assert_eq!(restored.last_check, state.last_check);
-        assert_eq!(restored.token_history, vec![100000, 100050, 100100]);
-        assert_eq!(restored.bash_history, vec![50, 48, 45]);
         assert!(restored.pending_resume_inject);
         assert!(restored.last_failure_detail.is_some());
         assert!(restored.last_status.is_some());
