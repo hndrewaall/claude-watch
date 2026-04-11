@@ -539,6 +539,7 @@ pub(crate) fn check_claude_running(pane_output: &str) -> bool {
         && (tail.contains("auto-compact")
             || tail.contains("latest:")
             || tail.contains("background tasks")
+            || tail.contains(" shells")
             || tail.contains("bypass permissi"))
     {
         return true;
@@ -668,7 +669,11 @@ pub(crate) fn check_lines_for_reauth(pane_output: &str) -> bool {
 
     // Phase 2: Login screen — TUI elements are NOT visible (replaced by auth flow).
     // Guard: if TUI is still showing, only 401 patterns above should match.
-    if lower.contains("tokens") || lower.contains("bashes") || lower.contains("\u{276f}") {
+    if lower.contains("tokens")
+        || lower.contains("bashes")
+        || lower.contains(" shells")
+        || lower.contains("\u{276f}")
+    {
         return false;
     }
 
