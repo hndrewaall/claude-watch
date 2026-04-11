@@ -127,8 +127,6 @@ pub struct TestEnvOptions {
     pub dead_checks_required: u32,
     /// Fresh clear detections required (default: 2).
     pub fresh_clear_detections: u32,
-    /// Token stall checks required (default: 3 for fast tests).
-    pub token_stall_checks: usize,
     /// Heartbeat stale minutes (default: 1 for fast tests).
     pub heartbeat_stale_minutes: u64,
     /// Foreground threshold seconds (default: 3 for fast tests).
@@ -151,7 +149,6 @@ impl Default for TestEnvOptions {
             check_interval: 1,
             dead_checks_required: 2,
             fresh_clear_detections: 2,
-            token_stall_checks: 3,
             heartbeat_stale_minutes: 1,
             foreground_threshold: 3,
             foreground_interrupt_enabled: false,
@@ -334,11 +331,6 @@ cooldown = 5
 [heartbeat]
 stale_minutes = {heartbeat_stale_minutes}
 
-[token_stall]
-checks_required = {token_stall_checks}
-max_range = 500
-min_usage_fraction = 0.70
-
 [alerts]
 initial_cooldown = 5
 escalation_tiers = [5, 10, 30]
@@ -381,7 +373,6 @@ resume_prompt = "resume"
             dead_checks = opts.dead_checks_required,
             fresh_clear_detections = opts.fresh_clear_detections,
             heartbeat_stale_minutes = opts.heartbeat_stale_minutes,
-            token_stall_checks = opts.token_stall_checks,
             foreground_threshold = opts.foreground_threshold,
             foreground_check_interval = opts.foreground_check_interval,
             foreground_interrupt_enabled = opts.foreground_interrupt_enabled,
