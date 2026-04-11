@@ -46,16 +46,10 @@ detections_required = 2
 cooldown = 120
 
 [heartbeat]
-# Minutes before heartbeat is considered stale
+# Minutes before heartbeat is considered stale.
+# This is the SOLE stuck-state indicator: if memory-remind can't touch the
+# heartbeat file for this many minutes, Claude Code is definitively stuck.
 stale_minutes = 10
-
-[token_stall]
-# Consecutive checks with unchanged tokens before declaring stall
-checks_required = 5
-# Max token variation to consider "unchanged"
-max_range = 500
-# Only trigger above this fraction of max context
-min_usage_fraction = 0.70
 
 [alerts]
 # Initial cooldown between heartbeat-path alerts (seconds)
