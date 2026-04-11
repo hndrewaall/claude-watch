@@ -68,18 +68,27 @@ pub(crate) fn parse_status_bar(pane_text: &str) -> ParsedStatusBar {
     // false positives like "took" / "token" in prose while still catching
     // both the truncated and full forms.
     let token_re = Regex::new(r"(\d[\d,]*)\s+tok").unwrap();
-    let bash_re = Regex::new(r"(\d+)\s+(?:bashes|background\s+tasks)").unwrap();
+    // Claude Code has used multiple names for the concurrent-task counter:
+    // `bashes` (old), `background tasks` (mid), and `shells` (2.1.94+). Match
+    // all of them. The `\b` word boundary prevents e.g. "5 shellscript" from
+    // matching.
+    let bash_re =
+        Regex::new(r"(\d+)\s+(?:bashes|background\s+tasks|shells)\b").unwrap();
     let compact_re = Regex::new(r"Context left until auto-compact:\s*(\d+)%").unwrap();
 
     // Check if ANY line in the bottom section is a status bar line.
     // When the tmux pane is narrow, the status bar wraps across multiple lines —
     // e.g. "bypass permissions" on one line and "175630 tokens" on the next.
+    // Narrow wrapping can ALSO split "bypass permissions" itself across a
+    // separator ("bypass permissi ·  on"), so we match the more reliable prefix
+    // "bypass permissi" instead of the full word.
     // If we see a status bar indicator anywhere, enable token parsing for all lines.
     let has_status_bar = lines[start..].iter().any(|line| {
-        line.contains("bypass permissions")
+        line.contains("bypass permissi")
             || line.contains("-- INSERT --")
             || line.contains("background tasks")
             || line.contains("bashes")
+            || line.contains(" shells")
             || line.contains("auto-compact")
     });
 
@@ -258,7 +267,8 @@ pub async fn find_claude_pane() -> Option<String> {
                     || content.contains("-- INSERT --")
                     || content.contains("bypass permissi")
                     || content.contains("background tasks")
-                    || content.contains("bashes"))
+                    || content.contains("bashes")
+                    || content.contains(" shells"))
             {
                 return Some(pane);
             }
@@ -447,6 +457,25 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_status_bar_shells() {
+        // Claude Code 2.1.94+ renamed "background tasks" / "bashes" to "shells".
+        let input = "7 shells";
+        let parsed = parse_status_bar(input);
+        assert_eq!(parsed.bashes, Some(7));
+    }
+
+    #[test]
+    fn test_parse_status_bar_shells_realistic() {
+        // Full realistic status bar line as emitted by Claude Code 2.1.94+
+        // in the dashboard pane.
+        let input = "output\n\
+                     \u{23f5}\u{23f5} bypass permissions on \u{00b7} 6 shells \u{00b7} esc to interrupt \u{00b7} \u{2193} to manage   849577 tokens";
+        let parsed = parse_status_bar(input);
+        assert_eq!(parsed.tokens, Some(849577));
+        assert_eq!(parsed.bashes, Some(6));
+    }
+
+    #[test]
     fn test_parse_status_bar_missing_fields() {
         let input = "nothing relevant here\njust some text";
         let parsed = parse_status_bar(input);
@@ -504,6 +533,23 @@ mod tests {
                      175630 tokens";
         let parsed = parse_status_bar(input);
         assert_eq!(parsed.tokens, Some(175630));
+        assert_eq!(parsed.bashes, Some(5));
+    }
+
+    #[test]
+    fn test_parse_status_bar_shells_wrapped_permissi() {
+        // Real capture from Claude Code 2.1.94: status bar uses "N shells"
+        // (new terminology) AND the word "permissions" is wrapped, splitting
+        // into "bypass permissi ·  on". Previously neither the has_status_bar
+        // check nor bash_re matched "shells", so tokens + bashes both parsed
+        // as None and the daemon emitted 696 ClaudeProcessDead false alerts
+        // in a few hours.
+        let input = "some output\n\
+                     \u{23f5}\u{23f5} bypass permissi \u{00b7}  on   5 shells \u{00b7} esc to interrupt \u{00b7} \u{2193} to manage   580828 tokens\n\
+                     current: 2.1.94 \u{00b7} latest: 2.1.96";
+        let parsed = parse_status_bar(input);
+        assert_eq!(parsed.tokens, Some(580828));
+        assert_eq!(parsed.bashes, Some(5));
     }
 
     #[test]
