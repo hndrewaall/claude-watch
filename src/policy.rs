@@ -37,6 +37,15 @@ pub(crate) fn thinking_backoff_threshold(
 
 /// Pure function: detect token stall from history arrays.
 /// Returns Some(reason) if stall detected, None otherwise.
+///
+/// The intent is to catch a state where Claude Code has nothing left to do
+/// (no background tasks running) but also isn't producing output (tokens
+/// flat). When there are STILL background tasks running at the end of the
+/// window, we are not stuck — the main loop is legitimately waiting on
+/// background work (bash commands OR subagents, which both surface as
+/// "background tasks" in the status bar). Requiring the final bash count to
+/// be zero avoids firing during the very common "waiting on N background
+/// agents" scenario.
 pub(crate) fn detect_token_stall(
     token_history: &[u64],
     bash_history: &[u64],
@@ -58,7 +67,11 @@ pub(crate) fn detect_token_stall(
     let token_max = *recent_tokens.iter().max().unwrap_or(&0);
     let token_range = token_max - token_min;
 
-    let bashes_declining = recent_bashes[0] > recent_bashes[n - 1];
+    // Only consider it a stall when the last observed bash count is zero —
+    // i.e. all background tasks (bashes AND agents, which appear in the same
+    // "background tasks" status bar count) have finished. If any are still
+    // running we're legitimately idle waiting on them, not stuck.
+    let bashes_declining = recent_bashes[0] > recent_bashes[n - 1] && recent_bashes[n - 1] == 0;
     let high_tokens = current_tokens as f64 > max_context_tokens as f64 * min_usage_fraction;
 
     if token_range <= max_range && bashes_declining && high_tokens {
@@ -1639,9 +1652,9 @@ mod tests {
 
     #[test]
     fn test_detect_token_stall_detected() {
-        // Tokens barely changing, bashes declining, high token usage
+        // Tokens barely changing, bashes drained to zero, high token usage
         let token_history = vec![180000, 180010, 180020, 180030, 180040];
-        let bash_history = vec![50, 48, 46, 44, 42];
+        let bash_history = vec![5, 4, 3, 2, 0];
         let result = detect_token_stall(
             &token_history,
             &bash_history,
@@ -1659,7 +1672,7 @@ mod tests {
     #[test]
     fn test_detect_token_stall_not_enough_history() {
         let token_history = vec![180000, 180010];
-        let bash_history = vec![50, 48];
+        let bash_history = vec![5, 0];
         let result = detect_token_stall(&token_history, &bash_history, 5, 100, 0.5, 200000, 180010);
         assert!(result.is_none(), "not enough history");
     }
@@ -1668,7 +1681,7 @@ mod tests {
     fn test_detect_token_stall_tokens_changing() {
         // Tokens changing significantly = not stalled
         let token_history = vec![100000, 120000, 140000, 160000, 180000];
-        let bash_history = vec![50, 48, 46, 44, 42];
+        let bash_history = vec![5, 4, 3, 2, 0];
         let result = detect_token_stall(&token_history, &bash_history, 5, 100, 0.5, 200000, 180000);
         assert!(result.is_none(), "tokens are changing");
     }
@@ -1680,6 +1693,57 @@ mod tests {
         let bash_history = vec![42, 44, 46, 48, 50];
         let result = detect_token_stall(&token_history, &bash_history, 5, 100, 0.5, 200000, 180040);
         assert!(result.is_none(), "bashes not declining");
+    }
+
+    #[test]
+    fn test_detect_token_stall_agents_still_running() {
+        // Real-world false-positive scenario: main loop is waiting on background
+        // agents, so tokens are flat and high. One agent finishes (9 -> 8) but
+        // eight are still running. This is NOT a stall — delegate-and-wait is
+        // the desired idle state.
+        let token_history = vec![761130, 761130, 761130, 761130, 761130];
+        let bash_history = vec![9, 9, 9, 9, 8];
+        let result = detect_token_stall(
+            &token_history,
+            &bash_history,
+            5,
+            500,
+            0.70,
+            1_000_000,
+            761130,
+        );
+        assert!(
+            result.is_none(),
+            "should not fire while background tasks are still running"
+        );
+    }
+
+    #[test]
+    fn test_detect_token_stall_bashes_partially_drained_not_zero() {
+        // Bashes declined but still > 0 — not a stall, main loop is still
+        // waiting on the remaining tasks.
+        let token_history = vec![180000, 180010, 180020, 180030, 180040];
+        let bash_history = vec![5, 4, 3, 2, 1];
+        let result = detect_token_stall(&token_history, &bash_history, 5, 100, 0.5, 200000, 180040);
+        assert!(
+            result.is_none(),
+            "one remaining background task should suppress stall"
+        );
+    }
+
+    #[test]
+    fn test_detect_token_stall_flat_at_zero() {
+        // Bashes flat at zero the whole window — the current check requires
+        // recent_bashes[0] > recent_bashes[n-1], so an always-zero window
+        // does not trip the "declining" signal. This preserves the historical
+        // behavior where a cold stall (no bashes ever) is not auto-flagged.
+        let token_history = vec![180000, 180010, 180020, 180030, 180040];
+        let bash_history = vec![0, 0, 0, 0, 0];
+        let result = detect_token_stall(&token_history, &bash_history, 5, 100, 0.5, 200000, 180040);
+        assert!(
+            result.is_none(),
+            "flat-at-zero window is not treated as declining"
+        );
     }
 
     // --- check_context_threshold tests ---
