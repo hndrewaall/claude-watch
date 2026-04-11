@@ -28,19 +28,22 @@ fn token_stall_detected_with_declining_bashes() {
     // Strategy: start the daemon, then update status mid-run.
     // Since check_interval=1s and we need 3 checks, schedule updates.
 
-    // Start with high tokens, high bashes
-    env.set_status(&MockStatus::high_context(&env.tmux_pane, 180000, 50));
+    // Start with high tokens and a small pool of bashes that will drain to 0.
+    env.set_status(&MockStatus::high_context(&env.tmux_pane, 180000, 4));
 
     // Spawn a thread to update status after each cycle
     let data_path = env.mock_status_data.clone();
     let pane = env.tmux_pane.clone();
     let updater = thread::spawn(move || {
-        // The daemon checks every 1s. We update status to simulate declining bashes.
+        // The daemon checks every 1s. We update status to simulate declining
+        // bashes that drain to zero — a genuine stall requires the final
+        // bash count to be 0, otherwise the main loop is still legitimately
+        // waiting on background work (agents, bash tasks).
         let statuses = [
-            MockStatus::high_context(&pane, 180010, 48),
-            MockStatus::high_context(&pane, 180020, 46),
-            MockStatus::high_context(&pane, 180030, 44),
-            MockStatus::high_context(&pane, 180040, 42),
+            MockStatus::high_context(&pane, 180010, 3),
+            MockStatus::high_context(&pane, 180020, 2),
+            MockStatus::high_context(&pane, 180030, 1),
+            MockStatus::high_context(&pane, 180040, 0),
         ];
         for status in &statuses {
             thread::sleep(Duration::from_millis(1200));
@@ -179,6 +182,65 @@ fn low_usage_no_stall() {
     assert!(
         stuck_checks.is_empty(),
         "should NOT detect stall at low token usage. Stuck: {:?}",
+        stuck_checks
+    );
+}
+
+/// Regression test: the main loop has delegated work to several background
+/// agents. Tokens plateau (we're waiting) and one agent completes during the
+/// window, so the background-task count drops from 9 to 8. This is the
+/// desired idle-delegate state, NOT a stall. Before this fix, the daemon
+/// fired a "no background tasks running and not thinking" alert because it
+/// only checked that the final count was smaller than the first — it did
+/// not require the final count to be zero.
+#[test]
+fn agents_running_no_stall() {
+    let env = TestEnv::new(
+        "stall-agents-running",
+        TestEnvOptions {
+            check_interval: 1,
+            token_stall_checks: 3,
+            ..Default::default()
+        },
+    );
+
+    env.set_status(&MockStatus::high_context(&env.tmux_pane, 180000, 9));
+
+    let data_path = env.mock_status_data.clone();
+    let pane = env.tmux_pane.clone();
+    let updater = thread::spawn(move || {
+        // Tokens flat, one of nine agents completes — eight still running.
+        let statuses = [
+            MockStatus::high_context(&pane, 180000, 9),
+            MockStatus::high_context(&pane, 180000, 9),
+            MockStatus::high_context(&pane, 180000, 8),
+            MockStatus::high_context(&pane, 180000, 8),
+        ];
+        for status in &statuses {
+            thread::sleep(Duration::from_millis(1200));
+            std::fs::write(&data_path, status.to_json()).ok();
+        }
+    });
+
+    let _run = env.run_daemon_cycles(6, 2000);
+    updater.join().unwrap();
+
+    let log_entries = env.read_log_entries();
+    let stuck_checks: Vec<_> = log_entries
+        .iter()
+        .filter(|e| {
+            e["event"].as_str() == Some("check")
+                && e["stuck"].as_bool() == Some(true)
+                && e["stuck_reason"]
+                    .as_str()
+                    .map(|r| r.contains("token stall"))
+                    .unwrap_or(false)
+        })
+        .collect();
+
+    assert!(
+        stuck_checks.is_empty(),
+        "should NOT detect stall while agents are still running. Stuck: {:?}",
         stuck_checks
     );
 }
