@@ -647,39 +647,38 @@ pub async fn wait_for_idle_prompt(pane: &str, timeout_secs: u64) -> bool {
 
 /// Pure function: check if pane output indicates Claude Code needs API reauth.
 ///
-/// Two phases of auth failure:
-/// 1. **401 error** — TUI is still visible but shows "API Error: 401" with
-///    `authentication_error` JSON. Detected even with TUI elements present.
-/// 2. **Login screen** — TUI is gone, replaced by "Browser didn't open?" / OAuth URL.
-///    Detected by auth-specific patterns AND absence of normal TUI indicators.
+/// Design: if the TUI is visible (tokens counter, status bar, prompt, permission
+/// mode indicator, etc.), we are looking at a live Claude Code session with
+/// conversation content — NOT a reauth state. Even strings like "API Error: 401"
+/// or `"authentication_error"` that appear in conversation text (e.g. the user
+/// discussing the error pattern) must NOT trigger reauth, or we inject `/login`
+/// into their active session and break it.
+///
+/// A real reauth failure replaces the TUI entirely with a login screen
+/// ("Browser didn't open?", OAuth URL, "Paste code here"), so the absence of
+/// TUI indicators is the reliable signal. This is a single-phase check: if the
+/// TUI is gone AND login-screen patterns are present, reauth is needed.
 pub(crate) fn check_lines_for_reauth(pane_output: &str) -> bool {
     let lower = pane_output.to_lowercase();
 
-    // Phase 1: 401/authentication errors — these appear WITH the TUI still visible.
-    // The pane shows: "Please run /login · API Error: 401" and JSON with
-    // "authentication_error" / "Invalid authentication credentials".
-    // These are unambiguous — no false positives from conversation content because
-    // they include the structured error JSON format.
-    if lower.contains("api error: 401")
-        || lower.contains("\"authentication_error\"")
-        || lower.contains("invalid authentication credentials")
-    {
-        return true;
-    }
-
-    // Phase 2: Login screen — TUI elements are NOT visible (replaced by auth flow).
-    // Guard: if TUI is still showing, only 401 patterns above should match.
-    if lower.contains("tokens")
+    // Unified TUI guard: any TUI indicator means we're looking at live conversation,
+    // not a login screen. Conversation content can legitimately contain any
+    // auth-error text without triggering reauth.
+    let tui_visible = lower.contains("tokens")
         || lower.contains("bashes")
         || lower.contains(" shells")
+        || lower.contains(" agents")
+        || lower.contains(" background tasks")
         || lower.contains("\u{276f}")
-    {
+        || lower.contains("bypass permissi");
+
+    if tui_visible {
         return false;
     }
 
-    // Auth-specific patterns for the login screen
-    // Current login screen shows: "Browser didn't open?", "Paste code here",
-    // and a claude.ai/oauth/authorize URL
+    // TUI is gone — check for login-screen patterns.
+    // Current Claude Code login screen shows: "Browser didn't open?",
+    // "Paste code here", and a claude.ai/oauth/authorize URL.
     lower.contains("browser didn't open")
         || lower.contains("paste code here")
         || lower.contains("claude.ai/oauth/authorize")
@@ -1145,11 +1144,19 @@ mod tests {
         assert!(!check_lines_for_reauth(output));
     }
 
-    // --- 401 error detection (phase 1 — TUI still visible) ---
+    // --- TUI guard: auth-error text inside a live session must NOT trigger ---
+    //
+    // The old "phase 1" logic detected "API Error: 401" / "authentication_error"
+    // even when the TUI was visible. That false-positived on conversation content
+    // containing those strings (the user typing about the error pattern) and
+    // injected `/login` into a live session. Now: if the TUI is visible, reauth
+    // is never triggered — a real reauth failure replaces the TUI with the
+    // login screen, which is caught by the phase-2 patterns.
 
     #[test]
-    fn test_reauth_401_error_with_tui() {
-        // Real 401 error from screenshot — TUI is still visible (tokens in status bar)
+    fn test_reauth_not_detected_401_text_with_tui() {
+        // Literal "API Error: 401" in a live session (tokens + prompt visible) —
+        // this is conversation content, not a real error screen.
         let output = concat!(
             "resume\n",
             "Please run /login · API Error: 401\n",
@@ -1160,26 +1167,67 @@ mod tests {
             "❯ \n",
             "-- INSERT --  871864 tokens"
         );
-        assert!(check_lines_for_reauth(output));
+        assert!(!check_lines_for_reauth(output));
     }
 
     #[test]
-    fn test_reauth_401_api_error() {
+    fn test_reauth_not_detected_api_error_401_in_conversation() {
         let output = "API Error: 401\n57,129 tokens  9 bashes\n❯ ";
-        assert!(check_lines_for_reauth(output));
+        assert!(!check_lines_for_reauth(output));
     }
 
     #[test]
-    fn test_reauth_authentication_error_json() {
+    fn test_reauth_not_detected_authentication_error_json_in_conversation() {
         let output = "\"authentication_error\"\n57,129 tokens  9 bashes\n❯ ";
-        assert!(check_lines_for_reauth(output));
+        assert!(!check_lines_for_reauth(output));
     }
 
     #[test]
     fn test_reauth_not_detected_conversation_about_401() {
-        // Conversation ABOUT 401 errors shouldn't trigger — no actual error JSON
+        // Conversation ABOUT 401 errors shouldn't trigger.
         let output = "The server returns a 401 status code when auth is invalid\n57,129 tokens  9 bashes\n❯ ";
         assert!(!check_lines_for_reauth(output));
+    }
+
+    #[test]
+    fn test_reauth_not_detected_invalid_credentials_in_conversation() {
+        // "Invalid authentication credentials" appearing in conversation text.
+        let output = "Claude responded: Invalid authentication credentials\n57,129 tokens  9 bashes\n❯ ";
+        assert!(!check_lines_for_reauth(output));
+    }
+
+    #[test]
+    fn test_reauth_not_detected_shells_counter_with_auth_text() {
+        // Claude Code 2.1.94+ uses "shells" instead of "bashes".
+        let output = "API Error: 401\n57,129 tokens  9 shells\n❯ ";
+        assert!(!check_lines_for_reauth(output));
+    }
+
+    #[test]
+    fn test_reauth_not_detected_agents_counter_with_auth_text() {
+        // Newer Claude Code shows "agents" counter.
+        let output = "\"authentication_error\"\n57,129 tokens  3 agents\n❯ ";
+        assert!(!check_lines_for_reauth(output));
+    }
+
+    #[test]
+    fn test_reauth_not_detected_background_tasks_counter_with_auth_text() {
+        let output = "API Error: 401\n57,129 tokens  2 background tasks\n❯ ";
+        assert!(!check_lines_for_reauth(output));
+    }
+
+    #[test]
+    fn test_reauth_not_detected_bypass_permissions_banner_with_auth_text() {
+        // The "bypass permissions" banner is a reliable TUI indicator.
+        let output = "API Error: 401\nbypass permissions on\n\u{276f} ";
+        assert!(!check_lines_for_reauth(output));
+    }
+
+    #[test]
+    fn test_reauth_still_detected_when_tui_gone() {
+        // Real login screen: TUI is gone, phase-2 patterns present.
+        let output = "Login\n\nBrowser didn't open? Use the url below to sign in\n\nhttps://claude.ai/oauth/authorize?code=true&client_id=abc\n\nPaste code here if prompted >\n";
+        assert!(check_lines_for_reauth(output));
     }
 
     // --- extract_login_url tests ---
