@@ -11,7 +11,6 @@ pub struct Config {
     pub dead_process: DeadProcessConfig,
     pub fresh_clear: FreshClearConfig,
     pub heartbeat: HeartbeatConfig,
-    pub token_stall: TokenStallConfig,
     pub alerts: AlertsConfig,
     pub foreground_monitor: ForegroundMonitorConfig,
     pub watcher_monitor: WatcherMonitorConfig,
@@ -78,13 +77,6 @@ pub struct FreshClearConfig {
 #[derive(Debug, Deserialize, Clone)]
 pub struct HeartbeatConfig {
     pub stale_minutes: u64,
-}
-
-#[derive(Debug, Deserialize, Clone)]
-pub struct TokenStallConfig {
-    pub checks_required: usize,
-    pub max_range: u64,
-    pub min_usage_fraction: f64,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -364,11 +356,6 @@ cooldown = 120
 [heartbeat]
 stale_minutes = 15
 
-[token_stall]
-checks_required = 5
-max_range = 100
-min_usage_fraction = 0.5
-
 [alerts]
 initial_cooldown = 60
 escalation_tiers = [60, 120, 300, 600, 3600]
@@ -442,11 +429,6 @@ cooldown = 120
 [heartbeat]
 stale_minutes = 15
 
-[token_stall]
-checks_required = 5
-max_range = 100
-min_usage_fraction = 0.5
-
 [alerts]
 initial_cooldown = 60
 escalation_tiers = [60, 120, 300, 600, 3600]
@@ -505,11 +487,6 @@ cooldown = 120
 
 [heartbeat]
 stale_minutes = 15
-
-[token_stall]
-checks_required = 5
-max_range = 100
-min_usage_fraction = 0.5
 
 [alerts]
 initial_cooldown = 60
@@ -570,11 +547,6 @@ cooldown = 120
 [heartbeat]
 stale_minutes = 15
 
-[token_stall]
-checks_required = 5
-max_range = 100
-min_usage_fraction = 0.5
-
 [alerts]
 initial_cooldown = 60
 escalation_tiers = [60, 120, 300, 600, 3600]
@@ -613,7 +585,6 @@ cooldown = 300
         assert_eq!(config.dead_process.checks_required, 3);
         assert_eq!(config.fresh_clear.min_tokens, 1000);
         assert_eq!(config.heartbeat.stale_minutes, 15);
-        assert_eq!(config.token_stall.checks_required, 5);
         assert_eq!(config.alerts.escalation_tiers.len(), 5);
         assert!(config.foreground_monitor.enabled);
         assert!(config.watcher_monitor.enabled);
@@ -631,7 +602,6 @@ cooldown = 300
     #[test]
     fn test_parse_minimal_values() {
         let config = parse_config(SAMPLE_CONFIG).unwrap();
-        assert_eq!(config.token_stall.min_usage_fraction, 0.5);
         assert_eq!(config.alerts.max_pingme_alerts, 3);
         assert_eq!(config.alerts.resume_prompt, "Resume your work.");
         assert!(!config.auto_update.enabled);
@@ -673,11 +643,6 @@ cooldown = 120
 
 [heartbeat]
 stale_minutes = 15
-
-[token_stall]
-checks_required = 5
-max_range = 100
-min_usage_fraction = 0.5
 
 [alerts]
 initial_cooldown = 60

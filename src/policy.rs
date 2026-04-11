@@ -1,5 +1,5 @@
 //! Policy: the main check logic including dead process detection, fresh /clear,
-//! heartbeat stale, token-stall, foreground monitor, and watcher health.
+//! heartbeat stale, foreground monitor, and watcher health.
 
 use chrono::{DateTime, Local, Timelike, Utc};
 use nix::sys::signal::{kill, Signal};
@@ -33,46 +33,6 @@ pub(crate) fn thinking_backoff_threshold(
     let multiplier = 1u64.checked_shl(interrupt_count).unwrap_or(u64::MAX);
     let threshold = base_threshold.saturating_mul(multiplier);
     threshold.min(max_backoff)
-}
-
-/// Pure function: detect token stall from history arrays.
-/// Returns Some(reason) if stall detected, None otherwise.
-pub(crate) fn detect_token_stall(
-    token_history: &[u64],
-    bash_history: &[u64],
-    checks_required: usize,
-    max_range: u64,
-    min_usage_fraction: f64,
-    max_context_tokens: u64,
-    current_tokens: u64,
-) -> Option<String> {
-    if token_history.len() < checks_required {
-        return None;
-    }
-
-    let n = checks_required;
-    let recent_tokens = &token_history[token_history.len() - n..];
-    let recent_bashes = &bash_history[bash_history.len() - n..];
-
-    let token_min = *recent_tokens.iter().min().unwrap_or(&0);
-    let token_max = *recent_tokens.iter().max().unwrap_or(&0);
-    let token_range = token_max - token_min;
-
-    let bashes_declining = recent_bashes[0] > recent_bashes[n - 1];
-    let high_tokens = current_tokens as f64 > max_context_tokens as f64 * min_usage_fraction;
-
-    if token_range <= max_range && bashes_declining && high_tokens {
-        Some(format!(
-            "token stall ({}min, tokens={}, range={}, bashes {}->{})",
-            n,
-            current_tokens,
-            token_range,
-            recent_bashes[0],
-            recent_bashes[n - 1]
-        ))
-    } else {
-        None
-    }
 }
 
 /// Restart Claude Code by writing a relaunch script and injecting it.
@@ -1214,34 +1174,6 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
         }
     }
 
-    // --- Token-stall detection ---
-    state.token_history.push(tokens);
-    state.bash_history.push(bashes);
-    let keep = config.token_stall.checks_required + 1;
-    if state.token_history.len() > keep {
-        let drain = state.token_history.len() - keep;
-        state.token_history.drain(..drain);
-    }
-    if state.bash_history.len() > keep {
-        let drain = state.bash_history.len() - keep;
-        state.bash_history.drain(..drain);
-    }
-
-    if !stuck {
-        if let Some(reason) = detect_token_stall(
-            &state.token_history,
-            &state.bash_history,
-            config.token_stall.checks_required,
-            config.token_stall.max_range,
-            config.token_stall.min_usage_fraction,
-            config.claude.max_context_tokens,
-            tokens,
-        ) {
-            stuck = true;
-            stuck_reason = reason;
-        }
-    }
-
     // --- Foreground blocking detection ---
     // Delegated to check_foreground() which runs on its own timer in the main loop.
     // Also run it here during full check cycles to ensure it runs at least as often
@@ -1637,51 +1569,6 @@ mod tests {
         assert!(!should_self_heal(0, 5, 1000, 2));
     }
 
-    #[test]
-    fn test_detect_token_stall_detected() {
-        // Tokens barely changing, bashes declining, high token usage
-        let token_history = vec![180000, 180010, 180020, 180030, 180040];
-        let bash_history = vec![50, 48, 46, 44, 42];
-        let result = detect_token_stall(
-            &token_history,
-            &bash_history,
-            5,      // checks_required
-            100,    // max_range
-            0.5,    // min_usage_fraction
-            200000, // max_context_tokens
-            180040, // current_tokens
-        );
-        assert!(result.is_some(), "should detect stall");
-        let reason = result.unwrap();
-        assert!(reason.contains("token stall"));
-    }
-
-    #[test]
-    fn test_detect_token_stall_not_enough_history() {
-        let token_history = vec![180000, 180010];
-        let bash_history = vec![50, 48];
-        let result = detect_token_stall(&token_history, &bash_history, 5, 100, 0.5, 200000, 180010);
-        assert!(result.is_none(), "not enough history");
-    }
-
-    #[test]
-    fn test_detect_token_stall_tokens_changing() {
-        // Tokens changing significantly = not stalled
-        let token_history = vec![100000, 120000, 140000, 160000, 180000];
-        let bash_history = vec![50, 48, 46, 44, 42];
-        let result = detect_token_stall(&token_history, &bash_history, 5, 100, 0.5, 200000, 180000);
-        assert!(result.is_none(), "tokens are changing");
-    }
-
-    #[test]
-    fn test_detect_token_stall_bashes_not_declining() {
-        // Bashes increasing = not stalled
-        let token_history = vec![180000, 180010, 180020, 180030, 180040];
-        let bash_history = vec![42, 44, 46, 48, 50];
-        let result = detect_token_stall(&token_history, &bash_history, 5, 100, 0.5, 200000, 180040);
-        assert!(result.is_none(), "bashes not declining");
-    }
-
     // --- check_context_threshold tests ---
 
     #[test]
@@ -1772,15 +1659,6 @@ mod tests {
         // 750K would trigger at 75% but margin says 970K — should NOT trigger
         let result = check_context_threshold_with_margin(750000, 1000000, None, 75, 5, Some(30000));
         assert!(result.is_none(), "margin should override percent threshold");
-    }
-
-    #[test]
-    fn test_detect_token_stall_low_tokens() {
-        // Low token usage = not stalled (hasn't been running long)
-        let token_history = vec![10000, 10010, 10020, 10030, 10040];
-        let bash_history = vec![50, 48, 46, 44, 42];
-        let result = detect_token_stall(&token_history, &bash_history, 5, 100, 0.5, 200000, 10040);
-        assert!(result.is_none(), "tokens too low");
     }
 
     // --- Thinking backoff threshold tests ---
