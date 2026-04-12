@@ -267,6 +267,45 @@ fn is_pid_alive(pid: u32) -> bool {
         .unwrap_or(false)
 }
 
+/// Spawn `self-clear` immediately (no grace period). Used for the
+/// wedged-pane recovery path: when the agent is too stuck to run any tool
+/// call (context limit reached, persistent 429), claude-watch must drive
+/// `/clear` itself rather than waiting for the agent to cooperate.
+///
+/// Detached via setsid() so it survives a daemon restart, same as
+/// `spawn_deferred_clear`.
+fn spawn_immediate_clear(state: &mut State) {
+    // Don't double-spawn if a deferred clear child is already running.
+    if let Some(pid) = state.context_clear_child_pid {
+        if is_pid_alive(pid) {
+            debug!(pid, "self-clear child already running, skipping immediate spawn");
+            return;
+        }
+    }
+
+    // SAFETY: setsid() is async-signal-safe and we call it before exec.
+    match unsafe {
+        std::process::Command::new("self-clear")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .pre_exec(|| {
+                nix::unistd::setsid()
+                    .map(|_| ())
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+            })
+            .spawn()
+    } {
+        Ok(child) => {
+            state.context_clear_child_pid = Some(child.id());
+            info!(pid = child.id(), "spawned immediate self-clear (wedged recovery)");
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "failed to spawn immediate self-clear");
+        }
+    }
+}
+
 /// Spawn a deferred self-clear child process.
 /// The child sleeps for the grace period, then checks if tokens are still high.
 /// If so, it runs `self-clear` to force a context clear.
@@ -1282,70 +1321,103 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
         state.last_seen_tokens = Some(tokens);
     }
 
-    // --- Hard context limit detection (safety net) ---
-    // If Claude Code shows "Context limit reached" or "compact or /clear" in the pane,
-    // trigger an immediate self-clear regardless of token count. This catches the case
-    // where the token-margin threshold missed (e.g. output tokens pushed past the margin
-    // before the next check cycle).
-    if config.context_monitor.enabled
-        && !state.context_clear_triggered
-        && !effective_pane.is_empty()
-    {
-        if tmux::has_context_limit(&effective_pane).await {
-            // Check cooldown (same as token-based trigger)
-            let can_trigger = match &state.last_context_clear {
-                Some(last) => elapsed_since(last)
-                    .map(|e| e >= config.context_monitor.cooldown as f64)
-                    .unwrap_or(true),
-                None => true,
-            };
+    // --- Wedged-pane detection (context limit / persistent rate limit) ---
+    //
+    // If the pane shows "Context limit reached. /compact or /clear to continue"
+    // or repeated "API Error: Request rejected (429)", the agent is wedged: it
+    // cannot make any tool call (every attempt errors out before it runs), so
+    // it cannot run the normal compact-prep checklist or `self-clear`. The
+    // token-based context_monitor above does NOT cover this — the agent may
+    // hit the wall *below* its configured threshold (Anthropic API can return
+    // context-limit errors before our token counter says "max"), and 429s are
+    // entirely independent of token count.
+    //
+    // Recovery: claude-watch runs `self-clear` itself, the same way the
+    // deferred-clear child does after the grace period expires — but
+    // immediately, no grace period, no agent dependency.
+    //
+    // To avoid false positives from chat-history references to the strings,
+    // we require N consecutive cycles before firing.
+    if config.context_monitor.wedged_detection_enabled && !effective_pane.is_empty() {
+        let wedged = tmux::detect_wedged(&effective_pane).await;
 
-            if can_trigger {
-                warn!(
-                    tokens,
-                    "hard context limit text detected in pane — triggering immediate clear"
-                );
-                write_jsonl_log(
-                    &config.general.log_file,
-                    "context_limit_reached",
-                    serde_json::json!({
-                        "tokens": tokens,
-                        "trigger": "pane_text",
-                        "grace_period": config.context_monitor.grace_period,
-                    }),
-                );
+        if let Some(reason) = wedged {
+            state.wedged_consecutive += 1;
+            debug!(
+                reason = %reason,
+                consecutive = state.wedged_consecutive,
+                threshold = config.context_monitor.wedged_consecutive,
+                "wedged pane detected"
+            );
 
-                // Run session-event compact-prep
-                let _ = crate::cmd::run_cmd(
-                    &[
-                        "session-event",
-                        "compact-prep",
-                        "--note",
-                        "hard context limit reached",
-                    ],
-                    10,
-                )
-                .await;
+            if state.wedged_consecutive >= config.context_monitor.wedged_consecutive {
+                // Cooldown gate: don't re-fire within wedged_cooldown seconds.
+                let in_cooldown = state
+                    .last_wedged_clear
+                    .as_deref()
+                    .and_then(elapsed_since)
+                    .is_some_and(|e| e < config.context_monitor.wedged_cooldown as f64);
 
-                // Spawn deferred self-clear child (same grace period)
-                spawn_deferred_clear(config, state);
+                if !in_cooldown {
+                    warn!(
+                        reason = %reason,
+                        consecutive = state.wedged_consecutive,
+                        "wedged pane sustained — running self-clear immediately (no agent cooperation possible)"
+                    );
+                    write_jsonl_log(
+                        &config.general.log_file,
+                        "wedged_clear",
+                        serde_json::json!({
+                            "reason": reason.to_string(),
+                            "consecutive": state.wedged_consecutive,
+                            "tokens": tokens,
+                        }),
+                    );
+                    write_legacy_log(
+                        &config.general.legacy_log_file,
+                        &format!(
+                            "wedged pane ({reason}) — running self-clear (consecutive={})",
+                            state.wedged_consecutive,
+                        ),
+                    );
 
-                // Inject warning message
-                let pct = if config.claude.max_context_tokens > 0 {
-                    (tokens as f64 / config.claude.max_context_tokens as f64) * 100.0
+                    // Run session-event compact-prep so the next session has a
+                    // breadcrumb in the session log explaining why context was
+                    // dropped. Best-effort — if it fails, still proceed with
+                    // self-clear.
+                    let note = format!("auto-clear: pane wedged ({reason})");
+                    let _ = crate::cmd::run_cmd(
+                        &["session-event", "compact-prep", "--note", &note],
+                        10,
+                    )
+                    .await;
+
+                    // Notify Andrew so he knows claude-watch had to step in.
+                    let alert_msg = format!(
+                        "claude-watch: agent wedged ({reason}) -- running self-clear",
+                    );
+                    alert::send_pingme(&alert_msg).await;
+
+                    spawn_immediate_clear(state);
+
+                    state.last_wedged_clear = Some(now.clone());
+                    state.wedged_clear_count += 1;
+                    state.wedged_consecutive = 0;
                 } else {
-                    100.0
-                };
-                inject_context_warning(
-                    &effective_pane,
-                    pct,
-                    cs.compact_remaining,
-                    config.context_monitor.grace_period,
-                )
-                .await;
-
-                state.context_clear_triggered = true;
-                state.last_context_clear = Some(now.clone());
+                    debug!(
+                        reason = %reason,
+                        "wedged pane detected but cooldown active"
+                    );
+                }
+            }
+        } else {
+            // Pane is no longer wedged — reset the counter.
+            if state.wedged_consecutive > 0 {
+                debug!(
+                    prev_consecutive = state.wedged_consecutive,
+                    "wedged pane cleared — resetting counter"
+                );
+                state.wedged_consecutive = 0;
             }
         }
     }
