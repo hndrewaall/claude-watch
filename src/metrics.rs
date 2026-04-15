@@ -7,6 +7,7 @@
 //! Run from cron every minute:
 //!     * * * * * /home/hndrewaall/bin/claude-watch metrics
 
+use crate::status::get_version_info;
 use chrono::DateTime;
 use serde_json::Value;
 use std::fs;
@@ -196,29 +197,17 @@ fn write_prom(lines: &[String], path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Fetch version info via `claude-watch status --json` (best-effort).
+/// Get version info directly from /proc and symlinks (no subprocess).
+///
+/// Previous implementation shelled out to `claude-watch status --json`, which
+/// broke when PATH resolved to a stale binary at /usr/local/bin/claude-watch
+/// that couldn't parse the current config. Calling get_version_info() directly
+/// avoids the recursive subprocess and config dependency entirely.
 fn fetch_version_info() -> (String, String) {
-    let out = std::process::Command::new("claude-watch")
-        .args(["status", "--json"])
-        .output();
-    if let Ok(o) = out {
-        if o.status.success() {
-            if let Ok(v) = serde_json::from_slice::<Value>(&o.stdout) {
-                let cur = v
-                    .get("version")
-                    .and_then(|x| x.as_str())
-                    .unwrap_or("unknown")
-                    .to_string();
-                let latest = v
-                    .get("latest")
-                    .and_then(|x| x.as_str())
-                    .unwrap_or("unknown")
-                    .to_string();
-                return (cur, latest);
-            }
-        }
-    }
-    ("unknown".to_string(), "unknown".to_string())
+    let info = get_version_info();
+    let current = info.running.unwrap_or_else(|| "unknown".to_string());
+    let latest = info.installed.unwrap_or_else(|| "unknown".to_string());
+    (current, latest)
 }
 
 /// CLI entry point: `claude-watch metrics`.
