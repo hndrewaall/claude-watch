@@ -48,6 +48,18 @@ pub struct State {
     /// Last observed token count (for detecting external clears)
     #[serde(default)]
     pub last_seen_tokens: Option<u64>,
+    /// Number of consecutive check cycles where the pane has shown a "wedged"
+    /// pattern (context limit reached / persistent rate limit). When this
+    /// reaches `context_monitor.wedged_consecutive`, claude-watch runs
+    /// `self-clear` itself rather than waiting for the agent to do it.
+    #[serde(default)]
+    pub wedged_consecutive: u32,
+    /// Timestamp of the last wedged-triggered self-clear (cooldown gate).
+    #[serde(default)]
+    pub last_wedged_clear: Option<String>,
+    /// Total wedged-triggered self-clears (for metrics).
+    #[serde(default)]
+    pub wedged_clear_count: u32,
     // Watcher health
     pub watcher_health: HashMap<String, WatcherState>,
     #[serde(default)]
@@ -124,6 +136,10 @@ pub fn load_state(path: &str) -> State {
     state.thinking_interrupt_count = 0;
     state.foreground_start = None;
     state.foreground_alerted = false;
+    // wedged_consecutive is transient — daemon downtime breaks the
+    // "consecutive" semantics. Reset on load. (last_wedged_clear and
+    // wedged_clear_count persist for cooldown + metrics.)
+    state.wedged_consecutive = 0;
     state
 }
 

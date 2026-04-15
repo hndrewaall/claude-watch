@@ -277,6 +277,35 @@ pub struct ContextMonitorConfig {
     pub grace_period: u64,
     /// Minimum interval between context clear triggers (seconds)
     pub cooldown: u64,
+    /// Detect "Context limit reached" / "Request rejected (429)" banners in the
+    /// pane and run `self-clear` immediately, without waiting for the agent to
+    /// cooperate. This is the recovery path for when the agent is too wedged
+    /// to run any tool call (and so the normal compact-prep checklist can't
+    /// fire). Defaults to enabled.
+    #[serde(default = "default_wedged_detection_enabled")]
+    pub wedged_detection_enabled: bool,
+    /// Number of consecutive check cycles a wedged pattern must be observed
+    /// before claude-watch runs `self-clear`. Avoids tripping on stale chat
+    /// history references to the strings. At a 10s general interval, the
+    /// default of 3 corresponds to ~30s of sustained wedge.
+    #[serde(default = "default_wedged_consecutive")]
+    pub wedged_consecutive: u32,
+    /// Cooldown in seconds between wedged-triggered self-clears. Prevents
+    /// rapid retriggering if /clear takes a moment to land.
+    #[serde(default = "default_wedged_cooldown")]
+    pub wedged_cooldown: u64,
+}
+
+fn default_wedged_detection_enabled() -> bool {
+    true
+}
+
+fn default_wedged_consecutive() -> u32 {
+    3
+}
+
+fn default_wedged_cooldown() -> u64 {
+    300 // 5 minutes
 }
 
 fn default_threshold_percent() -> u64 {
