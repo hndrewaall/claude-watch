@@ -751,6 +751,29 @@ pub async fn needs_reauth(pane: &str) -> Option<String> {
     None
 }
 
+/// Pure function: check if the pane text contains the hard context limit message.
+/// Claude Code shows "Context limit reached" and/or "compact or /clear" when the
+/// context window is completely exhausted. This is the safety net for when the
+/// token-margin threshold check fails to trigger in time.
+pub(crate) fn check_lines_for_context_limit(pane_output: &str) -> bool {
+    let lines: Vec<&str> = pane_output.lines().collect();
+    let start = if lines.len() > 20 { lines.len() - 20 } else { 0 };
+    for line in &lines[start..] {
+        if line.contains("Context limit reached") || line.contains("compact or /clear") {
+            return true;
+        }
+    }
+    false
+}
+
+/// Check if the pane is showing the hard context limit message.
+pub async fn has_context_limit(pane: &str) -> bool {
+    if let Some(out) = capture_pane(pane).await {
+        return check_lines_for_context_limit(&out);
+    }
+    false
+}
+
 /// Run tmux healthcheck brief.
 pub async fn healthcheck_brief() -> String {
     run_cmd(&["tmux-healthcheck", "--brief"], 5)
@@ -1296,5 +1319,50 @@ mod tests {
         // "Goodbye!" must be the entire trimmed line, not part of a sentence
         let output = "He said Goodbye! to his friend\nTokens: 3000";
         assert!(!check_lines_for_exit_teardown(output));
+    }
+
+    // --- check_lines_for_context_limit tests ---
+
+    #[test]
+    fn test_context_limit_reached_detected() {
+        let output = "some output\nContext limit reached\nmore text";
+        assert!(check_lines_for_context_limit(output));
+    }
+
+    #[test]
+    fn test_compact_or_clear_detected() {
+        let output = "some output\nPlease compact or /clear to continue";
+        assert!(check_lines_for_context_limit(output));
+    }
+
+    #[test]
+    fn test_context_limit_not_present() {
+        let output = "normal output\nsome tokens\njust working";
+        assert!(!check_lines_for_context_limit(output));
+    }
+
+    #[test]
+    fn test_context_limit_only_checks_last_20_lines() {
+        let mut lines = vec!["Context limit reached"];
+        for _ in 0..25 {
+            lines.push("filler line");
+        }
+        let output = lines.join("\n");
+        // The message is beyond the last 20 lines, should not be found
+        assert!(!check_lines_for_context_limit(&output));
+    }
+
+    #[test]
+    fn test_context_limit_within_last_20_lines() {
+        let mut lines: Vec<&str> = Vec::new();
+        for _ in 0..15 {
+            lines.push("filler line");
+        }
+        lines.push("Context limit reached");
+        for _ in 0..3 {
+            lines.push("more filler");
+        }
+        let output = lines.join("\n");
+        assert!(check_lines_for_context_limit(&output));
     }
 }

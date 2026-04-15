@@ -1282,6 +1282,74 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
         state.last_seen_tokens = Some(tokens);
     }
 
+    // --- Hard context limit detection (safety net) ---
+    // If Claude Code shows "Context limit reached" or "compact or /clear" in the pane,
+    // trigger an immediate self-clear regardless of token count. This catches the case
+    // where the token-margin threshold missed (e.g. output tokens pushed past the margin
+    // before the next check cycle).
+    if config.context_monitor.enabled
+        && !state.context_clear_triggered
+        && !effective_pane.is_empty()
+    {
+        if tmux::has_context_limit(&effective_pane).await {
+            // Check cooldown (same as token-based trigger)
+            let can_trigger = match &state.last_context_clear {
+                Some(last) => elapsed_since(last)
+                    .map(|e| e >= config.context_monitor.cooldown as f64)
+                    .unwrap_or(true),
+                None => true,
+            };
+
+            if can_trigger {
+                warn!(
+                    tokens,
+                    "hard context limit text detected in pane — triggering immediate clear"
+                );
+                write_jsonl_log(
+                    &config.general.log_file,
+                    "context_limit_reached",
+                    serde_json::json!({
+                        "tokens": tokens,
+                        "trigger": "pane_text",
+                        "grace_period": config.context_monitor.grace_period,
+                    }),
+                );
+
+                // Run session-event compact-prep
+                let _ = crate::cmd::run_cmd(
+                    &[
+                        "session-event",
+                        "compact-prep",
+                        "--note",
+                        "hard context limit reached",
+                    ],
+                    10,
+                )
+                .await;
+
+                // Spawn deferred self-clear child (same grace period)
+                spawn_deferred_clear(config, state);
+
+                // Inject warning message
+                let pct = if config.claude.max_context_tokens > 0 {
+                    (tokens as f64 / config.claude.max_context_tokens as f64) * 100.0
+                } else {
+                    100.0
+                };
+                inject_context_warning(
+                    &effective_pane,
+                    pct,
+                    cs.compact_remaining,
+                    config.context_monitor.grace_period,
+                )
+                .await;
+
+                state.context_clear_triggered = true;
+                state.last_context_clear = Some(now.clone());
+            }
+        }
+    }
+
     // --- Individual watcher health monitoring ---
     if config.watcher_monitor.enabled {
         let entries = status::parse_watchers_config(&config.watcher_monitor.watchers_config);
