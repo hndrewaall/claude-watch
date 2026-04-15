@@ -751,27 +751,85 @@ pub async fn needs_reauth(pane: &str) -> Option<String> {
     None
 }
 
-/// Pure function: check if the pane text contains the hard context limit message.
-/// Claude Code shows "Context limit reached" and/or "compact or /clear" when the
-/// context window is completely exhausted. This is the safety net for when the
-/// token-margin threshold check fails to trigger in time.
-pub(crate) fn check_lines_for_context_limit(pane_output: &str) -> bool {
-    let lines: Vec<&str> = pane_output.lines().collect();
-    let start = if lines.len() > 20 { lines.len() - 20 } else { 0 };
-    for line in &lines[start..] {
-        if line.contains("Context limit reached") || line.contains("compact or /clear") {
-            return true;
-        }
-    }
-    false
+/// Reason a Claude Code session is considered wedged (unable to recover on its own).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WedgedReason {
+    /// "Context limit reached" / "/compact or /clear to continue" — context overflow.
+    /// The agent cannot make any tool call until the context is cleared.
+    ContextLimit,
+    /// Persistent "API Error: Request rejected (429)" / "Rate limited" — Anthropic
+    /// 429 from the model API. The agent cannot make any tool call until the rate
+    /// limit clears, but the only safe recovery on our side is /clear (which drops
+    /// most of the prior context and lets a fresh request slip through).
+    RateLimited,
 }
 
-/// Check if the pane is showing the hard context limit message.
-pub async fn has_context_limit(pane: &str) -> bool {
-    if let Some(out) = capture_pane(pane).await {
-        return check_lines_for_context_limit(&out);
+impl fmt::Display for WedgedReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            WedgedReason::ContextLimit => write!(f, "context_limit"),
+            WedgedReason::RateLimited => write!(f, "rate_limited"),
+        }
     }
-    false
+}
+
+/// Pure function: detect whether the pane shows that Claude Code is wedged in a
+/// state it cannot recover from on its own.
+///
+/// Looks for two patterns in the last ~40 lines of pane output:
+///   1. "Context limit reached" or "/compact or /clear to continue"
+///      → `WedgedReason::ContextLimit`. Means the agent has hit its context
+///        ceiling and every subsequent tool call returns an error before it can
+///        run. Only an external `/clear` can recover.
+///   2. "Request rejected (429)" or "rate limited" / "rate-limited"
+///      → `WedgedReason::RateLimited`. Anthropic 429 — same external-recovery
+///        story (we /clear to shed context and slip a smaller request through,
+///        and the daemon will keep trying).
+///
+/// Returns `Some(reason)` on the FIRST matching pattern found. The caller is
+/// responsible for requiring multiple consecutive matches before acting, to
+/// avoid false positives from chat-history references to the strings.
+///
+/// We deliberately do NOT match arbitrary "API Error" lines — those happen
+/// occasionally during normal operation and recover on their own.
+pub(crate) fn check_lines_for_wedged(pane_output: &str) -> Option<WedgedReason> {
+    let lines: Vec<&str> = pane_output.lines().collect();
+    let start = if lines.len() > 40 {
+        lines.len() - 40
+    } else {
+        0
+    };
+    let tail = &lines[start..];
+
+    let lower: String = tail.join("\n").to_lowercase();
+
+    // Context-limit patterns (Claude Code prints these as a fixed banner when
+    // the model context overflows).
+    if lower.contains("context limit reached")
+        || lower.contains("context low (")
+        || lower.contains("/compact or /clear to continue")
+        || lower.contains("/clear or /compact to continue")
+    {
+        return Some(WedgedReason::ContextLimit);
+    }
+
+    // Rate-limit patterns. We require BOTH a rejection signal and a 429-ish
+    // marker so that incidental mentions of the strings (e.g. an HTTP status
+    // table in chat history) don't trip the detector.
+    let has_reject = lower.contains("request rejected") || lower.contains("api error");
+    let has_429 = lower.contains("(429)") || lower.contains(" 429 ") || lower.contains("rate limit");
+    if has_reject && has_429 {
+        return Some(WedgedReason::RateLimited);
+    }
+
+    None
+}
+
+/// Capture the pane and check whether Claude Code is wedged (context limit /
+/// persistent rate limit). Returns the reason on detection.
+pub async fn detect_wedged(pane: &str) -> Option<WedgedReason> {
+    let out = capture_pane_history(pane, 80).await?;
+    check_lines_for_wedged(&out)
 }
 
 /// Run tmux healthcheck brief.
@@ -1321,48 +1379,98 @@ mod tests {
         assert!(!check_lines_for_exit_teardown(output));
     }
 
-    // --- check_lines_for_context_limit tests ---
+    // --- check_lines_for_wedged tests ---
 
     #[test]
-    fn test_context_limit_reached_detected() {
-        let output = "some output\nContext limit reached\nmore text";
-        assert!(check_lines_for_context_limit(output));
+    fn test_wedged_context_limit_banner() {
+        // The exact banner Claude Code prints when context overflows.
+        let output = "\
+some prior output\n\
+\u{276f} a tool call\n\
+Context limit reached. /compact or /clear to continue\n\
+Context limit reached. /compact or /clear to continue\n\
+Context limit reached. /compact or /clear to continue\n";
+        assert_eq!(
+            check_lines_for_wedged(output),
+            Some(WedgedReason::ContextLimit)
+        );
     }
 
     #[test]
-    fn test_compact_or_clear_detected() {
-        let output = "some output\nPlease compact or /clear to continue";
-        assert!(check_lines_for_context_limit(output));
+    fn test_wedged_context_limit_alt_phrasing() {
+        // Some Claude Code versions reverse the slash-command order.
+        let output = "Context limit reached. /clear or /compact to continue";
+        assert_eq!(
+            check_lines_for_wedged(output),
+            Some(WedgedReason::ContextLimit)
+        );
     }
 
     #[test]
-    fn test_context_limit_not_present() {
-        let output = "normal output\nsome tokens\njust working";
-        assert!(!check_lines_for_context_limit(output));
+    fn test_wedged_rate_limit_429() {
+        let output = "\
+\u{25cf} Bash(...)\n\
+API Error: Request rejected (429) Rate limited\n\
+\u{276f}\n";
+        assert_eq!(
+            check_lines_for_wedged(output),
+            Some(WedgedReason::RateLimited)
+        );
     }
 
     #[test]
-    fn test_context_limit_only_checks_last_20_lines() {
-        let mut lines = vec!["Context limit reached"];
-        for _ in 0..25 {
-            lines.push("filler line");
+    fn test_wedged_rate_limit_repeated() {
+        // Repeated 429s as the agent retries — typical wedged signature.
+        let output = "\
+API Error: Request rejected (429)\n\
+API Error: Request rejected (429)\n\
+API Error: Request rejected (429)\n";
+        assert_eq!(
+            check_lines_for_wedged(output),
+            Some(WedgedReason::RateLimited)
+        );
+    }
+
+    #[test]
+    fn test_not_wedged_normal_output() {
+        let output = "\u{276f} Hello world\nNormal Claude Code conversation\nTokens: 50000";
+        assert_eq!(check_lines_for_wedged(output), None);
+    }
+
+    #[test]
+    fn test_not_wedged_429_without_reject() {
+        // A bare "429" mention in chat history should not trip the detector.
+        let output = "\u{276f} HTTP 429 means Too Many Requests, btw\nTokens: 50000";
+        assert_eq!(check_lines_for_wedged(output), None);
+    }
+
+    #[test]
+    fn test_not_wedged_api_error_without_429() {
+        // Generic API errors are noisy and recover on their own — don't trip.
+        let output = "API Error: bad request\nTokens: 50000";
+        assert_eq!(check_lines_for_wedged(output), None);
+    }
+
+    #[test]
+    fn test_wedged_only_checks_recent_lines() {
+        // A "Context limit reached" 100 lines ago shouldn't count — only the
+        // last ~40 lines are inspected.
+        let mut lines: Vec<String> = vec!["Context limit reached. /compact or /clear to continue".to_string()];
+        for _ in 0..100 {
+            lines.push("normal chat line".to_string());
         }
         let output = lines.join("\n");
-        // The message is beyond the last 20 lines, should not be found
-        assert!(!check_lines_for_context_limit(&output));
+        assert_eq!(check_lines_for_wedged(&output), None);
     }
 
     #[test]
-    fn test_context_limit_within_last_20_lines() {
-        let mut lines: Vec<&str> = Vec::new();
-        for _ in 0..15 {
-            lines.push("filler line");
-        }
-        lines.push("Context limit reached");
-        for _ in 0..3 {
-            lines.push("more filler");
-        }
-        let output = lines.join("\n");
-        assert!(check_lines_for_context_limit(&output));
+    fn test_wedged_empty_input() {
+        assert_eq!(check_lines_for_wedged(""), None);
+    }
+
+    #[test]
+    fn test_wedged_reason_display() {
+        assert_eq!(format!("{}", WedgedReason::ContextLimit), "context_limit");
+        assert_eq!(format!("{}", WedgedReason::RateLimited), "rate_limited");
     }
 }
