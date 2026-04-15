@@ -90,7 +90,7 @@ inject_cooldown = 120
 # Enable context usage monitoring and deferred self-clear
 enabled = true
 # Fixed token margin from max: trigger when tokens >= max - margin (overrides threshold_percent)
-threshold_margin = 30000
+threshold_margin = 60000
 # Token percentage threshold (legacy fallback, ignored when threshold_margin is set)
 threshold_percent = 75
 # Compact remaining % at which to trigger (primary — "Context left until auto-compact: N%")
