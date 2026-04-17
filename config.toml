@@ -136,3 +136,23 @@ agent_done_delay = 120
 max_panes = 20
 # Show all tasks including persistent watchers (false = workloads only)
 show_all = false
+
+[hybrid]
+# Hybrid hooks + daemon-fallback tuning.
+#
+# When enabled, Claude Code hooks (SessionStart/Stop/PreCompact) fire
+# conversational reminders via `claude-watch hook-fire`. The daemon records
+# a marker for each fire and defers its heavy-handed tmux injections
+# (/clear, claude update) for the configured grace window so Claude has a
+# chance to self-act. If the reminder is stale, the daemon falls back to
+# the old always-inject behaviour and bumps fallback_*_count metrics.
+#
+# See `skills/setup-hooks.md` for the installer.
+enabled = true
+# Grace window after a context_high hook fire before the daemon forces
+# `/clear` via tmux. Default 5 minutes.
+context_fallback_secs = 300
+# Grace window after a version_update hook fire before the daemon runs
+# `claude update`. Default 15 minutes — Claude often needs a few turns to
+# hit a stopping point before restarting.
+version_fallback_secs = 900
