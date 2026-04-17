@@ -5,16 +5,29 @@
 //! `~/.cache/claude-watch/reminders/<type>.json` so the daemon knows to
 //! defer its heavy-handed fallback (tmux inject) for a grace period.
 //!
-//! Hook output protocol: Claude Code hooks consume JSON on stdout with
+//! Hook output protocol: Claude Code hook JSON validation is per-event.
+//! Only `UserPromptSubmit`, `PostToolUse`, and `SessionStart` accept
 //! `hookSpecificOutput.additionalContext` to inject text into the
-//! conversation. For PreCompact we can also set `continue: false` with
-//! `stopReason` to block the compaction and ask Claude to run `/clear`.
+//! conversation. `Stop`, `PreCompact`, `Notification`, and `PreToolUse`
+//! reject that shape — for those events we emit `systemMessage` (a
+//! top-level string field that surfaces the reminder to the user as a
+//! system message) instead. `PreCompact` can additionally set
+//! `continue: false` + `stopReason` to block the compaction.
 //!
 //! Exit code is always 0 so a hook failure never breaks a Claude session.
 
 use crate::config::try_load_config;
 use crate::reminders::{record_fire, ReminderType};
 use crate::status;
+
+/// Hook events that accept `hookSpecificOutput.additionalContext` per the
+/// Claude Code hook JSON schema. Other events must use `systemMessage`.
+fn event_supports_additional_context(event_name: &str) -> bool {
+    matches!(
+        event_name,
+        "UserPromptSubmit" | "PostToolUse" | "SessionStart"
+    )
+}
 
 /// Grace threshold below which the "context high" reminder should fire,
 /// expressed as a percentage of max_context_tokens. 80% matches the
@@ -35,29 +48,58 @@ async fn context_usage_pct() -> Option<(u64, u64, f64)> {
     Some((cs.tokens, max, pct))
 }
 
-/// Build the hook JSON response that injects `text` back into the
-/// conversation via `hookSpecificOutput.additionalContext`.
-fn additional_context_response(hook_event_name: &str, text: &str) -> serde_json::Value {
-    serde_json::json!({
-        "hookSpecificOutput": {
-            "hookEventName": hook_event_name,
-            "additionalContext": text,
-        }
-    })
+/// Build a hook JSON response that surfaces `text` to the conversation in
+/// the schema-correct shape for `hook_event_name`.
+///
+/// Events that accept `hookSpecificOutput.additionalContext`
+/// (`UserPromptSubmit`, `PostToolUse`, `SessionStart`) get the nested
+/// shape. All other events (`Stop`, `PreCompact`, `Notification`,
+/// `PreToolUse`) get a top-level `systemMessage` string, which is the only
+/// conversation-surfacing field those events accept.
+fn reminder_response(hook_event_name: &str, text: &str) -> serde_json::Value {
+    if event_supports_additional_context(hook_event_name) {
+        serde_json::json!({
+            "hookSpecificOutput": {
+                "hookEventName": hook_event_name,
+                "additionalContext": text,
+            }
+        })
+    } else {
+        serde_json::json!({
+            "systemMessage": text,
+        })
+    }
 }
 
 /// Build a `continue: false` response that blocks the hook's event and
-/// shows `stop_reason` + `additional_context` back to the model.
-/// Used by PreCompact to ask Claude to `/clear` instead of auto-compacting.
+/// shows `stop_reason` + a reminder back to the user. Used by PreCompact
+/// to ask Claude to `/clear` instead of auto-compacting.
+///
+/// The reminder text is attached via the schema-correct field for the
+/// event: `hookSpecificOutput.additionalContext` where supported, else
+/// top-level `systemMessage`.
 fn block_with_context(hook_event_name: &str, stop_reason: &str, text: &str) -> serde_json::Value {
-    serde_json::json!({
-        "continue": false,
-        "stopReason": stop_reason,
-        "hookSpecificOutput": {
-            "hookEventName": hook_event_name,
-            "additionalContext": text,
-        }
-    })
+    let mut obj = serde_json::Map::new();
+    obj.insert("continue".into(), serde_json::Value::Bool(false));
+    obj.insert(
+        "stopReason".into(),
+        serde_json::Value::String(stop_reason.to_string()),
+    );
+    if event_supports_additional_context(hook_event_name) {
+        obj.insert(
+            "hookSpecificOutput".into(),
+            serde_json::json!({
+                "hookEventName": hook_event_name,
+                "additionalContext": text,
+            }),
+        );
+    } else {
+        obj.insert(
+            "systemMessage".into(),
+            serde_json::Value::String(text.to_string()),
+        );
+    }
+    serde_json::Value::Object(obj)
 }
 
 /// Empty JSON — hook does nothing. Used when the trigger condition isn't
@@ -117,7 +159,7 @@ async fn handle_context_high(hook_event: Option<&str>) -> serde_json::Value {
         Some(serde_json::json!({"tokens": tokens, "max": max, "pct": pct})),
     );
 
-    additional_context_response(event_name, &text)
+    reminder_response(event_name, &text)
 }
 
 async fn handle_version_update(hook_event: Option<&str>) -> serde_json::Value {
@@ -151,7 +193,7 @@ async fn handle_version_update(hook_event: Option<&str>) -> serde_json::Value {
         Some(serde_json::json!({"running": running, "installed": installed})),
     );
 
-    additional_context_response(event_name, &text)
+    reminder_response(event_name, &text)
 }
 
 async fn handle_pre_compact(hook_event: Option<&str>) -> serde_json::Value {
@@ -176,22 +218,162 @@ async fn handle_pre_compact(hook_event: Option<&str>) -> serde_json::Value {
 mod tests {
     use super::*;
 
-    #[test]
-    fn additional_context_shape() {
-        let v = additional_context_response("Stop", "hello");
-        assert_eq!(v["hookSpecificOutput"]["hookEventName"], "Stop");
-        assert_eq!(
-            v["hookSpecificOutput"]["additionalContext"],
-            serde_json::Value::String("hello".to_string())
-        );
+    /// Events that accept `hookSpecificOutput.additionalContext`.
+    const ADDITIONAL_CONTEXT_EVENTS: &[&str] =
+        &["UserPromptSubmit", "PostToolUse", "SessionStart"];
+
+    /// Events that must use top-level `systemMessage` instead.
+    const SYSTEM_MESSAGE_EVENTS: &[&str] =
+        &["Stop", "PreCompact", "Notification", "PreToolUse"];
+
+    /// Validate that a hook JSON response conforms to the Claude Code hook
+    /// schema: no top-level unknown fields, `hookSpecificOutput` (when
+    /// present) is an object with `hookEventName`, and `additionalContext`
+    /// only appears on supported events.
+    fn assert_schema_compliant(v: &serde_json::Value, event: &str) {
+        let obj = v
+            .as_object()
+            .unwrap_or_else(|| panic!("response for {event} must be a JSON object"));
+
+        // Allowed top-level fields per the schema.
+        let allowed_top_level: &[&str] = &[
+            "continue",
+            "suppressOutput",
+            "stopReason",
+            "decision",
+            "reason",
+            "systemMessage",
+            "permissionDecision",
+            "hookSpecificOutput",
+        ];
+        for key in obj.keys() {
+            assert!(
+                allowed_top_level.contains(&key.as_str()),
+                "unexpected top-level key {key:?} for event {event}"
+            );
+        }
+
+        if let Some(hso) = obj.get("hookSpecificOutput") {
+            let hso_obj = hso
+                .as_object()
+                .unwrap_or_else(|| panic!("hookSpecificOutput for {event} must be an object"));
+            assert_eq!(
+                hso_obj
+                    .get("hookEventName")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default(),
+                event,
+                "hookEventName must match the event for {event}"
+            );
+            if hso_obj.contains_key("additionalContext") {
+                assert!(
+                    ADDITIONAL_CONTEXT_EVENTS.contains(&event),
+                    "event {event} must not use additionalContext"
+                );
+            }
+        }
+
+        if obj.contains_key("systemMessage") {
+            assert!(
+                obj.get("systemMessage")
+                    .and_then(|v| v.as_str())
+                    .is_some(),
+                "systemMessage must be a string for {event}"
+            );
+        }
     }
 
     #[test]
-    fn block_shape() {
-        let v = block_with_context("PreCompact", "nope", "try /clear");
+    fn event_classification() {
+        for e in ADDITIONAL_CONTEXT_EVENTS {
+            assert!(
+                event_supports_additional_context(e),
+                "{e} should support additionalContext"
+            );
+        }
+        for e in SYSTEM_MESSAGE_EVENTS {
+            assert!(
+                !event_supports_additional_context(e),
+                "{e} should NOT support additionalContext"
+            );
+        }
+    }
+
+    #[test]
+    fn reminder_response_additional_context_events() {
+        for e in ADDITIONAL_CONTEXT_EVENTS {
+            let v = reminder_response(e, "hello");
+            assert_schema_compliant(&v, e);
+            assert_eq!(v["hookSpecificOutput"]["hookEventName"], *e);
+            assert_eq!(
+                v["hookSpecificOutput"]["additionalContext"],
+                serde_json::Value::String("hello".to_string())
+            );
+            assert!(
+                v.get("systemMessage").is_none(),
+                "{e} should not use systemMessage"
+            );
+        }
+    }
+
+    #[test]
+    fn reminder_response_system_message_events() {
+        for e in SYSTEM_MESSAGE_EVENTS {
+            let v = reminder_response(e, "hello");
+            assert_schema_compliant(&v, e);
+            assert_eq!(
+                v["systemMessage"],
+                serde_json::Value::String("hello".to_string())
+            );
+            assert!(
+                v.get("hookSpecificOutput").is_none(),
+                "{e} must not emit hookSpecificOutput.additionalContext"
+            );
+        }
+    }
+
+    #[test]
+    fn block_with_context_additional_context_event() {
+        // SessionStart supports additionalContext — the block response
+        // should use the nested shape.
+        let v = block_with_context("SessionStart", "nope", "try /clear");
+        assert_schema_compliant(&v, "SessionStart");
         assert_eq!(v["continue"], serde_json::Value::Bool(false));
         assert_eq!(v["stopReason"], "nope");
-        assert_eq!(v["hookSpecificOutput"]["hookEventName"], "PreCompact");
+        assert_eq!(v["hookSpecificOutput"]["hookEventName"], "SessionStart");
+        assert_eq!(
+            v["hookSpecificOutput"]["additionalContext"],
+            serde_json::Value::String("try /clear".to_string())
+        );
+        assert!(v.get("systemMessage").is_none());
+    }
+
+    #[test]
+    fn block_with_context_system_message_event() {
+        // PreCompact does NOT support additionalContext — the block
+        // response must surface the reminder via systemMessage.
+        let v = block_with_context("PreCompact", "nope", "try /clear");
+        assert_schema_compliant(&v, "PreCompact");
+        assert_eq!(v["continue"], serde_json::Value::Bool(false));
+        assert_eq!(v["stopReason"], "nope");
+        assert_eq!(
+            v["systemMessage"],
+            serde_json::Value::String("try /clear".to_string())
+        );
+        assert!(v.get("hookSpecificOutput").is_none());
+    }
+
+    #[test]
+    fn block_with_context_stop_event_uses_system_message() {
+        // Regression: the original bug was a Stop hook producing
+        // hookSpecificOutput.additionalContext, which Claude Code rejects.
+        let v = block_with_context("Stop", "stopping", "reminder text");
+        assert_schema_compliant(&v, "Stop");
+        assert!(v.get("hookSpecificOutput").is_none());
+        assert_eq!(
+            v["systemMessage"],
+            serde_json::Value::String("reminder text".to_string())
+        );
     }
 
     #[test]
@@ -199,5 +381,25 @@ mod tests {
         let v = noop_response();
         assert!(v.is_object());
         assert_eq!(v.as_object().map(|o| o.is_empty()), Some(true));
+    }
+
+    #[test]
+    fn stop_event_reminder_matches_bug_report_fix() {
+        // Reproduces the failing case from Andrew's 2026-04-17 screenshot:
+        // Stop hook with the context_high reminder text. The output MUST
+        // NOT contain hookSpecificOutput.additionalContext — it must use
+        // top-level systemMessage.
+        let text = "[claude-watch] Context usage is at 86% (856k / 1000k tokens). \
+                    Consider running `/clear` before continuing.";
+        let v = reminder_response("Stop", text);
+        assert_schema_compliant(&v, "Stop");
+        assert!(
+            v.get("hookSpecificOutput").is_none(),
+            "Stop hook must not emit hookSpecificOutput"
+        );
+        assert_eq!(
+            v["systemMessage"],
+            serde_json::Value::String(text.to_string())
+        );
     }
 }
