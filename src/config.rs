@@ -21,6 +21,8 @@ pub struct Config {
     pub reauth: ReauthConfig,
     #[serde(default)]
     pub task_watch: TaskWatchConfig,
+    #[serde(default)]
+    pub hybrid: HybridConfig,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -312,8 +314,67 @@ fn default_threshold_percent() -> u64 {
     75
 }
 
+/// Hybrid hooks + daemon-fallback tuning.
+///
+/// When enabled, the daemon defers its heavy-handed injections (tmux
+/// `/clear`, `claude update`) for a grace window after a Claude Code hook
+/// fires the corresponding reminder. This lets the conversational
+/// reminder (low-friction) succeed most of the time, falling back to the
+/// daemon only when Claude ignores or can't act on the hint.
+#[derive(Debug, Deserialize, Clone)]
+pub struct HybridConfig {
+    /// Master switch. Default: true (the feature is opt-out).
+    #[serde(default = "default_hybrid_enabled")]
+    pub enabled: bool,
+    /// Seconds to wait after a `context_high` hook fire before falling back
+    /// to tmux-injecting `/clear`. Default: 300 (5 min).
+    #[serde(default = "default_context_fallback_secs")]
+    pub context_fallback_secs: u64,
+    /// Seconds to wait after a `version_update` hook fire before falling
+    /// back to running `claude update`. Default: 900 (15 min) — Claude
+    /// often needs a few turns to hit a stopping point before restarting.
+    #[serde(default = "default_version_fallback_secs")]
+    pub version_fallback_secs: u64,
+}
+
+impl Default for HybridConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_hybrid_enabled(),
+            context_fallback_secs: default_context_fallback_secs(),
+            version_fallback_secs: default_version_fallback_secs(),
+        }
+    }
+}
+
+fn default_hybrid_enabled() -> bool {
+    true
+}
+fn default_context_fallback_secs() -> u64 {
+    300
+}
+fn default_version_fallback_secs() -> u64 {
+    900
+}
+
 /// Load config from well-known paths or CLAUDE_WATCH_CONFIG env var.
+/// Exits the process on failure — suitable for the daemon, not for
+/// best-effort subcommands. Use `try_load_config` for those.
 pub fn load_config() -> Config {
+    match try_load_config() {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            eprintln!("FATAL: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Non-exiting config loader. Returns an Err with a human-readable
+/// reason if no valid config file is found. The hybrid `hook-fire`
+/// subcommand uses this to fail gracefully — a Claude Code session
+/// must not break just because the host hasn't set up a config file.
+pub fn try_load_config() -> Result<Config, String> {
     let config_paths = [
         std::env::var("CLAUDE_WATCH_CONFIG").unwrap_or_default(),
         format!(
@@ -334,16 +395,18 @@ pub fn load_config() -> Config {
             match toml::from_str::<Config>(&content) {
                 Ok(config) => {
                     tracing::info!(path, "loaded config");
-                    return config;
+                    return Ok(config);
                 }
                 Err(e) => {
-                    eprintln!("Failed to parse config {}: {}", path, e);
+                    return Err(format!("Failed to parse config {}: {}", path, e));
                 }
             }
         }
     }
-    eprintln!("FATAL: no config file found. Tried: {:?}", config_paths);
-    std::process::exit(1);
+    Err(format!(
+        "no config file found. Tried: {:?}",
+        config_paths
+    ))
 }
 
 /// Parse config from a TOML string. Useful for testing.
@@ -639,6 +702,71 @@ cooldown = 300
         assert_eq!(config.auto_update.resume_prompt, "resume");
         assert!(config.reauth.enabled);
         assert_eq!(config.reauth.alert_interval_seconds, 10800);
+        // Hybrid defaults (no [hybrid] in SAMPLE_CONFIG -> defaults applied)
+        assert!(config.hybrid.enabled);
+        assert_eq!(config.hybrid.context_fallback_secs, 300);
+        assert_eq!(config.hybrid.version_fallback_secs, 900);
+    }
+
+    #[test]
+    fn test_hybrid_config_override() {
+        let cfg_str = r#"
+[general]
+check_interval = 10
+state_file = "/tmp/s.json"
+log_file = "/tmp/s.jsonl"
+legacy_log_file = "/tmp/s.log"
+
+[claude]
+max_context_tokens = 200000
+heartbeat_file = "/tmp/hb"
+relaunch_script = "/tmp/rel.sh"
+
+[dead_process]
+checks_required = 3
+restart_cooldown = 60
+
+[fresh_clear]
+min_tokens = 2000
+max_tokens = 5000
+detections_required = 2
+cooldown = 60
+
+[heartbeat]
+stale_minutes = 10
+
+[alerts]
+initial_cooldown = 60
+escalation_tiers = [60]
+max_pingme_alerts = 3
+resume_prompt = "r"
+
+[foreground_monitor]
+enabled = false
+threshold_seconds = 180
+check_interval = 3
+
+[watcher_monitor]
+enabled = false
+watchers_config = "/tmp/w.conf"
+expected_watchmen = 0
+
+[context_monitor]
+enabled = true
+threshold_percent = 75
+compact_trigger_percent = 5
+grace_period = 120
+cooldown = 300
+
+[hybrid]
+enabled = false
+context_fallback_secs = 60
+version_fallback_secs = 120
+"#;
+        let cfg = parse_config(cfg_str).unwrap();
+        assert!(!cfg.hybrid.enabled);
+        assert_eq!(cfg.hybrid.context_fallback_secs, 60);
+        assert_eq!(cfg.hybrid.version_fallback_secs, 120);
     }
 
     #[test]
