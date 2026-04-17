@@ -23,10 +23,12 @@ mod agent;
 mod alert;
 mod cmd;
 mod config;
+mod hook_fire;
 mod logging;
 mod metrics;
 mod policy;
 mod proc_util;
+mod reminders;
 mod session_event;
 mod state;
 mod status;
@@ -105,6 +107,21 @@ enum Commands {
     },
     /// Write Prometheus textfile metrics from claude-watch state
     Metrics,
+    /// Fire a hybrid-model hook reminder (invoked by Claude Code hooks).
+    ///
+    /// Writes a marker to `~/.cache/claude-watch/reminders/<type>.json` so
+    /// the daemon knows to defer its fallback injection, and emits a hook
+    /// JSON response on stdout that injects reminder text into the
+    /// conversation.
+    #[command(name = "hook-fire")]
+    HookFire {
+        /// Reminder type: context_high | version_update | pre_compact
+        kind: String,
+        /// Override the hookEventName echoed in the JSON response. Defaults
+        /// to a sensible per-type value (Stop / SessionStart / PreCompact).
+        #[arg(long)]
+        hook_event: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -934,6 +951,12 @@ async fn main() {
         }
         Some(Commands::Metrics) => {
             let code = metrics::cmd_metrics();
+            if code != 0 {
+                std::process::exit(code);
+            }
+        }
+        Some(Commands::HookFire { kind, hook_event }) => {
+            let code = hook_fire::cmd_hook_fire(&kind, hook_event.as_deref()).await;
             if code != 0 {
                 std::process::exit(code);
             }

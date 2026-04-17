@@ -56,6 +56,65 @@ monitor = glances /// htop   # extra window, panes split by ///
 logs = journalctl -f         # single-pane window
 ```
 
+## Hybrid hooks + daemon fallback
+
+claude-watch ships a **hybrid model** that pairs conversational reminders
+(Claude Code hooks) with the daemon's tmux-injecting fallback:
+
+- **Primary path — hooks.** Three Claude Code hooks call
+  `claude-watch hook-fire <type>` on the relevant trigger and inject a
+  reminder directly into the conversation:
+
+  | Hook | When | Reminder |
+  |---|---|---|
+  | `SessionStart` (`startup\|resume`) | new Claude Code version installed | "Version X → Y available, run /restart" |
+  | `Stop` | context usage > 80% | "Context at N%, consider /clear" |
+  | `PreCompact` (`auto`) | auto-compaction is about to run | blocks, suggests /clear |
+
+- **Fallback path — daemon.** For each reminder, the daemon records a
+  timestamped marker in `~/.cache/claude-watch/reminders/<type>.json`.
+  Before the daemon falls back to injecting `/clear` or `claude update`
+  via tmux, it checks whether a matching reminder fired within the
+  configured grace window (default 5 min for `/clear`, 15 min for
+  `claude update`). If it did, the daemon defers; if the reminder is
+  stale, the daemon proceeds with the tmux fallback and bumps the
+  `fallback_*_count` metric.
+
+### Installing the hooks
+
+See [`skills/setup-hooks.md`](skills/setup-hooks.md). Summary:
+
+```
+/setup-claude-watch-hooks install                # global ~/.claude/settings.json
+/setup-claude-watch-hooks --scope project install  # .claude/settings.json
+/setup-claude-watch-hooks uninstall
+```
+
+### Tuning
+
+```toml
+# ~/.config/claude-watch/config.toml
+[hybrid]
+enabled = true                   # master switch (default: true)
+context_fallback_secs = 300      # wait 5 min after context_high hook before /clear fallback
+version_fallback_secs = 900      # wait 15 min after version_update hook before claude update fallback
+```
+
+### Observability
+
+`claude-watch metrics` exports:
+
+- `claude_watch_reminder_fires_total{type=...}` — how often hooks fired
+  (counter, labels: `context_high`, `version_update`, `pre_compact`)
+- `claude_watch_fallback_injections_total{type=...}` — how often the
+  daemon fell back to tmux injection (labels: `clear`, `update`)
+- `claude_watch_reminder_to_action_latency_seconds_{sum,count}{type=...}`
+  — histogram-style counters for the delay between reminder and the
+  self-action (context drop / version match) landing.
+
+Ratio `fallback_injections_total / reminder_fires_total` = how often
+Claude ignored the conversational hint.
+
 ## What it doesn't do
 
 claude-watch monitors the session and recovers from failures, but it has no memory of what Claude was working on. It can detect "Claude is idle" or "Claude is stuck," but it can't tell Claude *what to resume*.

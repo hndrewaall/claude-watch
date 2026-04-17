@@ -11,6 +11,7 @@ use tracing::{debug, info, warn};
 use crate::alert;
 use crate::config::Config;
 use crate::logging::{write_jsonl_log, write_legacy_log};
+use crate::reminders::{seconds_since_fire, should_defer_to_hook, ReminderType};
 use crate::state::{FailureDetail, State, StatusSnapshot, WatcherState};
 use crate::status;
 use crate::tmux;
@@ -33,6 +34,38 @@ pub(crate) fn thinking_backoff_threshold(
     let multiplier = 1u64.checked_shl(interrupt_count).unwrap_or(u64::MAX);
     let threshold = base_threshold.saturating_mul(multiplier);
     threshold.min(max_backoff)
+}
+
+/// If the given reminder fired within the last `max_age_secs` (we default
+/// to 1 hour — beyond that we assume the self-action is unrelated),
+/// record the reminder -> action latency sample into the state-based
+/// counters that `claude-watch metrics` exports. No-op otherwise.
+///
+/// `short` selects the shorter "context clear" latency window (1h); the
+/// longer version-update path uses `short = false` (6h cap) because
+/// updates can legitimately take many turns to propagate.
+fn record_reminder_latency_if_recent(kind: ReminderType, state: &mut State, short: bool) {
+    let max_age = if short { 3600.0 } else { 21600.0 };
+    let elapsed = match seconds_since_fire(kind) {
+        Some(e) if e >= 0.0 && e < max_age => e,
+        _ => return,
+    };
+    match kind {
+        ReminderType::ContextHigh => {
+            state.reminder_to_clear_latency_secs_sum += elapsed;
+            state.reminder_to_clear_latency_count =
+                state.reminder_to_clear_latency_count.saturating_add(1);
+        }
+        ReminderType::VersionUpdate => {
+            state.reminder_to_update_latency_secs_sum += elapsed;
+            state.reminder_to_update_latency_count =
+                state.reminder_to_update_latency_count.saturating_add(1);
+        }
+        ReminderType::PreCompact => {
+            // PreCompact is a blocking hook — there's no "latency to
+            // action" concept the same way as the other two. Skip.
+        }
+    }
 }
 
 /// Restart Claude Code by writing a relaunch script and injecting it.
@@ -644,13 +677,44 @@ pub async fn check_auto_update(config: &Config, state: &mut State, pane: &str) {
     if running == installed {
         state.last_update_check = Some(now.to_rfc3339());
         debug!(running = %running, installed = %installed, "versions match, no update needed");
+        // Claude Code picked up the new binary (either via /restart after the
+        // hook reminder or via the previous fallback). Record the latency.
+        record_reminder_latency_if_recent(ReminderType::VersionUpdate, state, false);
+        return;
+    }
+
+    // Hybrid gate: if the version_update hook fired recently, give Claude
+    // a grace window to `/restart` on its own before falling back to the
+    // heavy-handed `claude update` injection.
+    if config.hybrid.enabled
+        && should_defer_to_hook(
+            ReminderType::VersionUpdate,
+            config.hybrid.version_fallback_secs as f64,
+        )
+    {
+        debug!(
+            running = %running,
+            installed = %installed,
+            grace = config.hybrid.version_fallback_secs,
+            "version mismatch detected but deferring to recent hook reminder"
+        );
+        write_jsonl_log(
+            &config.general.log_file,
+            "auto_update_hook_deferred",
+            serde_json::json!({
+                "running": running,
+                "installed": installed,
+                "grace_secs": config.hybrid.version_fallback_secs,
+            }),
+        );
+        state.last_update_check = Some(now.to_rfc3339());
         return;
     }
 
     info!(
         running = %running,
         installed = %installed,
-        "version mismatch detected — starting auto-update"
+        "version mismatch detected — starting auto-update (hybrid fallback)"
     );
 
     write_jsonl_log(
@@ -659,6 +723,7 @@ pub async fn check_auto_update(config: &Config, state: &mut State, pane: &str) {
         serde_json::json!({
             "running": running,
             "installed": installed,
+            "hybrid_fallback": true,
         }),
     );
 
@@ -666,6 +731,7 @@ pub async fn check_auto_update(config: &Config, state: &mut State, pane: &str) {
     state.last_update_check = Some(now.to_rfc3339());
     state.update_in_progress = true;
     state.auto_update_count += 1;
+    state.fallback_update_count = state.fallback_update_count.saturating_add(1);
     crate::state::save_state(&config.general.state_file, state);
 
     // Spawn the long-running update sequence as a background task
@@ -1239,47 +1305,77 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                 };
 
                 if can_trigger {
-                    warn!(
-                        tokens,
-                        pct,
-                        compact_remaining = ?cs.compact_remaining,
-                        "context threshold exceeded — triggering deferred clear"
-                    );
-                    write_jsonl_log(
-                        &config.general.log_file,
-                        "context_threshold",
-                        serde_json::json!({
-                            "tokens": tokens,
-                            "pct": pct,
-                            "compact_remaining": cs.compact_remaining,
-                            "grace_period": config.context_monitor.grace_period,
-                        }),
-                    );
+                    // Hybrid gate: if a recent context_high hook fired the
+                    // reminder, give Claude a grace window to self-act
+                    // before we tmux-inject a warning + schedule the
+                    // deferred clear.
+                    let hook_deferred = config.hybrid.enabled
+                        && should_defer_to_hook(
+                            ReminderType::ContextHigh,
+                            config.hybrid.context_fallback_secs as f64,
+                        );
 
-                    // Run session-event compact-prep
-                    let note = format!("auto-clear at {:.0}% tokens", pct);
-                    let _ = crate::cmd::run_cmd(
-                        &["session-event", "compact-prep", "--note", &note],
-                        10,
-                    )
-                    .await;
-
-                    // Spawn deferred self-clear child
-                    spawn_deferred_clear(config, state);
-
-                    // Inject warning message into Claude Code pane
-                    if !effective_pane.is_empty() {
-                        inject_context_warning(
-                            &effective_pane,
+                    if hook_deferred {
+                        debug!(
+                            tokens,
                             pct,
-                            cs.compact_remaining,
-                            config.context_monitor.grace_period,
+                            grace = config.hybrid.context_fallback_secs,
+                            "context threshold exceeded but deferring to recent hook reminder"
+                        );
+                        write_jsonl_log(
+                            &config.general.log_file,
+                            "context_threshold_hook_deferred",
+                            serde_json::json!({
+                                "tokens": tokens,
+                                "pct": pct,
+                                "grace_secs": config.hybrid.context_fallback_secs,
+                            }),
+                        );
+                    } else {
+                        warn!(
+                            tokens,
+                            pct,
+                            compact_remaining = ?cs.compact_remaining,
+                            "context threshold exceeded — triggering deferred clear (hybrid fallback)"
+                        );
+                        write_jsonl_log(
+                            &config.general.log_file,
+                            "context_threshold",
+                            serde_json::json!({
+                                "tokens": tokens,
+                                "pct": pct,
+                                "compact_remaining": cs.compact_remaining,
+                                "grace_period": config.context_monitor.grace_period,
+                                "hybrid_fallback": true,
+                            }),
+                        );
+
+                        // Run session-event compact-prep
+                        let note = format!("auto-clear at {:.0}% tokens", pct);
+                        let _ = crate::cmd::run_cmd(
+                            &["session-event", "compact-prep", "--note", &note],
+                            10,
                         )
                         .await;
-                    }
 
-                    state.context_clear_triggered = true;
-                    state.last_context_clear = Some(now.clone());
+                        // Spawn deferred self-clear child
+                        spawn_deferred_clear(config, state);
+
+                        // Inject warning message into Claude Code pane
+                        if !effective_pane.is_empty() {
+                            inject_context_warning(
+                                &effective_pane,
+                                pct,
+                                cs.compact_remaining,
+                                config.context_monitor.grace_period,
+                            )
+                            .await;
+                        }
+
+                        state.context_clear_triggered = true;
+                        state.last_context_clear = Some(now.clone());
+                        state.fallback_clear_count = state.fallback_clear_count.saturating_add(1);
+                    }
                 }
             }
         }
@@ -1294,6 +1390,7 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                     "tokens": tokens,
                 }),
             );
+            record_reminder_latency_if_recent(ReminderType::ContextHigh, state, true);
             state.context_clear_triggered = false;
             state.context_clear_child_pid = None;
             state.last_context_clear = Some(now.clone());
@@ -1315,6 +1412,7 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                         "external": true,
                     }),
                 );
+                record_reminder_latency_if_recent(ReminderType::ContextHigh, state, true);
                 state.last_context_clear = Some(now.clone());
             }
         }

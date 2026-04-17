@@ -73,6 +73,28 @@ pub struct State {
     /// Count of heartbeat stale alert events (for metrics)
     #[serde(default)]
     pub heartbeat_stale_count: u32,
+    /// Count of context-clear fallback injections (daemon injected `/clear`
+    /// because the context_high hook fire was stale or absent).
+    #[serde(default)]
+    pub fallback_clear_count: u32,
+    /// Count of version-update fallback injections (daemon ran `claude update`
+    /// because the version_update hook fire was stale or absent).
+    #[serde(default)]
+    pub fallback_update_count: u32,
+    /// Sum of reminder-to-action latency samples (seconds) for the context_high
+    /// reminder. Used to emit a histogram-style rate via Prometheus counters.
+    #[serde(default)]
+    pub reminder_to_clear_latency_secs_sum: f64,
+    /// Number of reminder-to-action latency samples collected for context_high.
+    #[serde(default)]
+    pub reminder_to_clear_latency_count: u64,
+    /// Sum of reminder-to-action latency samples (seconds) for the version_update
+    /// reminder.
+    #[serde(default)]
+    pub reminder_to_update_latency_secs_sum: f64,
+    /// Number of reminder-to-action latency samples collected for version_update.
+    #[serde(default)]
+    pub reminder_to_update_latency_count: u64,
     // Auto-update tracking
     #[serde(default)]
     pub last_update_check: Option<String>,
@@ -237,6 +259,28 @@ mod tests {
         let loaded = load_state(path);
         assert_eq!(loaded.alert_count, 7);
         assert_eq!(loaded.restart_count, 2);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_hybrid_fallback_counters_roundtrip() {
+        let path = "/tmp/claude-watch-test-hybrid-roundtrip.json";
+        let mut state = State::default();
+        state.fallback_clear_count = 11;
+        state.fallback_update_count = 3;
+        state.reminder_to_clear_latency_secs_sum = 123.45;
+        state.reminder_to_clear_latency_count = 5;
+        state.reminder_to_update_latency_secs_sum = 600.0;
+        state.reminder_to_update_latency_count = 2;
+        save_state(path, &state);
+
+        let loaded = load_state(path);
+        assert_eq!(loaded.fallback_clear_count, 11);
+        assert_eq!(loaded.fallback_update_count, 3);
+        assert!((loaded.reminder_to_clear_latency_secs_sum - 123.45).abs() < 1e-6);
+        assert_eq!(loaded.reminder_to_clear_latency_count, 5);
+        assert!((loaded.reminder_to_update_latency_secs_sum - 600.0).abs() < 1e-6);
+        assert_eq!(loaded.reminder_to_update_latency_count, 2);
         let _ = std::fs::remove_file(path);
     }
 }
