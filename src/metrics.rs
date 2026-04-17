@@ -7,6 +7,7 @@
 //! Run from cron every minute:
 //!     * * * * * /home/hndrewaall/bin/claude-watch metrics
 
+use crate::reminders::all_fire_counts;
 use crate::status::get_version_info;
 use chrono::DateTime;
 use serde_json::Value;
@@ -95,6 +96,18 @@ fn build_metrics(state: &Value, current_version: &str, latest_version: &str) -> 
     let thinking_interrupt = num(state, "thinking_interrupt_count");
     let auto_update = num(state, "auto_update_count");
     let heartbeat_stale = num(state, "heartbeat_stale_count");
+    let fallback_clear = num(state, "fallback_clear_count");
+    let fallback_update = num(state, "fallback_update_count");
+    let reminder_to_clear_count = num(state, "reminder_to_clear_latency_count");
+    let reminder_to_update_count = num(state, "reminder_to_update_latency_count");
+    let reminder_to_clear_sum = state
+        .get("reminder_to_clear_latency_secs_sum")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+    let reminder_to_update_sum = state
+        .get("reminder_to_update_latency_secs_sum")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
 
     vec![
         "# HELP claude_watch_up Whether claude-watch state file is readable".to_string(),
@@ -169,7 +182,60 @@ fn build_metrics(state: &Value, current_version: &str, latest_version: &str) -> 
         "# HELP claude_heartbeat_stale_total Total heartbeat stale events".to_string(),
         "# TYPE claude_heartbeat_stale_total counter".to_string(),
         format!("claude_heartbeat_stale_total {}", heartbeat_stale),
+        "".to_string(),
+        "# HELP claude_watch_reminder_fires_total Total hybrid-hook reminder fires by type"
+            .to_string(),
+        "# TYPE claude_watch_reminder_fires_total counter".to_string(),
+        reminder_fire_lines(),
+        "".to_string(),
+        "# HELP claude_watch_fallback_injections_total Total daemon fallback injections when hook reminder went unheeded".to_string(),
+        "# TYPE claude_watch_fallback_injections_total counter".to_string(),
+        format!(
+            "claude_watch_fallback_injections_total{{type=\"clear\"}} {}",
+            fallback_clear
+        ),
+        format!(
+            "claude_watch_fallback_injections_total{{type=\"update\"}} {}",
+            fallback_update
+        ),
+        "".to_string(),
+        "# HELP claude_watch_reminder_to_action_latency_seconds_sum Sum of seconds between hook reminder and Claude self-action".to_string(),
+        "# TYPE claude_watch_reminder_to_action_latency_seconds_sum counter".to_string(),
+        format!(
+            "claude_watch_reminder_to_action_latency_seconds_sum{{type=\"clear\"}} {:.3}",
+            reminder_to_clear_sum
+        ),
+        format!(
+            "claude_watch_reminder_to_action_latency_seconds_sum{{type=\"update\"}} {:.3}",
+            reminder_to_update_sum
+        ),
+        "# HELP claude_watch_reminder_to_action_latency_seconds_count Number of reminder-to-action latency samples".to_string(),
+        "# TYPE claude_watch_reminder_to_action_latency_seconds_count counter".to_string(),
+        format!(
+            "claude_watch_reminder_to_action_latency_seconds_count{{type=\"clear\"}} {}",
+            reminder_to_clear_count
+        ),
+        format!(
+            "claude_watch_reminder_to_action_latency_seconds_count{{type=\"update\"}} {}",
+            reminder_to_update_count
+        ),
     ]
+}
+
+/// Build the multi-line `claude_watch_reminder_fires_total{type=...}`
+/// block. Reads fire counts from the reminder marker files.
+fn reminder_fire_lines() -> String {
+    let counts = all_fire_counts();
+    counts
+        .iter()
+        .map(|(label, count)| {
+            format!(
+                "claude_watch_reminder_fires_total{{type=\"{}\"}} {}",
+                label, count
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn down_metrics() -> Vec<String> {
@@ -311,5 +377,50 @@ mod tests {
         write_prom(&lines, &path).unwrap();
         let read = std::fs::read_to_string(&path).unwrap();
         assert_eq!(read, "a\nb\n\nc\n");
+    }
+
+    #[test]
+    fn build_metrics_includes_fallback_counters() {
+        let state = json!({
+            "fallback_clear_count": 4,
+            "fallback_update_count": 2,
+            "reminder_to_clear_latency_secs_sum": 123.5,
+            "reminder_to_clear_latency_count": 3,
+        });
+        let lines = build_metrics(&state, "x", "y");
+        let joined = lines.join("\n");
+        assert!(joined.contains(
+            "claude_watch_fallback_injections_total{type=\"clear\"} 4"
+        ));
+        assert!(joined.contains(
+            "claude_watch_fallback_injections_total{type=\"update\"} 2"
+        ));
+        assert!(joined.contains(
+            "claude_watch_reminder_to_action_latency_seconds_sum{type=\"clear\"} 123.500"
+        ));
+        assert!(joined.contains(
+            "claude_watch_reminder_to_action_latency_seconds_count{type=\"clear\"} 3"
+        ));
+    }
+
+    #[test]
+    fn build_metrics_includes_reminder_fire_labels() {
+        // We don't control the marker files here (reminder_fire_lines()
+        // reads from the shared dir), but we can at least verify all
+        // three label types are present in the output.
+        let state = json!({});
+        let lines = build_metrics(&state, "x", "y");
+        let joined = lines.join("\n");
+        for label in ["context_high", "version_update", "pre_compact"] {
+            assert!(
+                joined.contains(&format!(
+                    "claude_watch_reminder_fires_total{{type=\"{}\"}}",
+                    label
+                )),
+                "missing reminder fire line for {}: {}",
+                label,
+                joined
+            );
+        }
     }
 }
