@@ -315,14 +315,21 @@ fn is_separator_line(line: &str) -> bool {
 ///        "* Warping… (26s · ↓ 438 tokens)"
 ///
 ///   Newer (2.1.112+):
-///     ● <Verb>… (<time> · ↓ <N> tokens · thinking)
-///   e.g. "● Whirlpooling… (7s · ↓ 31 tokens · thinking)"
+///     ● <Verb>… (<time> [· ↓ <N> tokens] [· thinking])
+///   e.g. "● Cooking… (28s)"
+///        "● Flibbertigibbeting… (2m 35s · ↓ 869 tokens)"
+///        "● Whirlpooling… (7s · ↓ 31 tokens · thinking)"
 ///        "● Flibbertigibbeting… (1m 19s · ↓ 540 tokens · thinking)"
 ///
-/// Indicator characters (from Claude Code binary analysis — see the comment
-/// in `detect_activity` below for the extraction procedure):
+/// Classic indicator characters (from Claude Code binary analysis — see
+/// the comment in `detect_activity` below for the extraction procedure):
 ///   · (U+00B7), * (U+002A), ✢ (U+2722), ✳ (U+2733), ✶ (U+2736),
 ///   ✻ (U+273B), ✽ (U+273D)
+///
+/// Newer Claude Code uses `●` (U+25CF) as the thinking indicator prefix
+/// (same glyph it uses for writing bullets — the distinguisher is the
+/// widget structure: gerund verb ending in `…`, followed by a time-tag
+/// paren).
 ///
 /// The OLD detection was simply "line contains any of those indicator chars
 /// AND contains U+2026 (…)". That fired false positives because `·` and
@@ -334,57 +341,48 @@ fn is_separator_line(line: &str) -> bool {
 /// stable in the pane during a genuinely-idle session would trigger the
 /// interrupt — the exact bug report Andrew filed 2026-04-17.
 ///
-/// The new predicate requires the full `<indicator> <Verb>… (` structure at
-/// the start of the line, OR the distinctive `· thinking)` suffix used by
-/// the newer `●`-prefix format. Both are specific to the LIVE thinking
-/// widget and are not emitted by any other Claude Code TUI element we've
-/// seen. In particular:
-///   - Completion lines use `for ` instead of `…` after the verb — won't match.
-///   - Markdown/tool-output bullets lack the `(<time>` tail — won't match.
-///   - Status-bar wraps lack the leading indicator+Verb+… prefix — won't match.
+/// The new predicate requires the full `<indicator> <Verb>… (` widget
+/// structure at the start of the line — the same anchor for BOTH formats.
+/// Classic indicators and the newer `●` prefix both match the same regex
+/// once we include `●` in the indicator char set. The critical anchor is
+/// the opening paren of the time-tag, which is ALWAYS present on a live
+/// thinking widget and is NOT present on:
+///   - Completion lines (use `for ` instead of `…` after the verb).
+///   - Markdown/tool-output bullets (lack `(<time>` tail).
+///   - Status-bar wraps (lack leading indicator+Verb+… prefix).
+///   - Writing bullets like `● How is Claude doing this session? (optional)`
+///     which have `(optional)` in parens but lack the `…` before the paren.
 pub(crate) fn is_active_thinking_line(trimmed: &str) -> bool {
-    // Pattern A: classic "<indicator> <Verb>… ("
-    //
     // The indicator must be at the very start. Then: one or more whitespace,
     // an uppercase ASCII letter starting the verb, zero or more ASCII letters
-    // continuing the verb, the ellipsis U+2026, optional whitespace, and
-    // the opening paren of the time-tag. We anchor on the `(` so that
-    // shorter false-positive prefixes (e.g. `· ctrl+o…`) cannot match —
-    // Claude Code always emits the time-tag parens for live thinking.
+    // continuing the verb, the ellipsis U+2026, optional whitespace, the
+    // opening paren of the time-tag, and a digit inside the parens.
+    //
+    // We anchor on the `(<digit>` so that shorter false-positive prefixes
+    // (e.g. `· ctrl+o…` or `● No new messages. Idling.`) and writing
+    // bullets with non-time parens (e.g. `● How is Claude doing this
+    // session? (optional)` — but that one lacks the ellipsis anyway, and
+    // `● Some progress… (every now and then)`) cannot match. Claude Code
+    // always emits a digit-leading time tag for live thinking (`28s`,
+    // `1m 19s`, etc.).
     //
     // We accept a tolerant "ASCII verb" (a-zA-Z) because the 168 known
     // thinking verbs in Claude Code's binary are all plain English words
     // (Accomplishing, Baking, Cogitating, …, Zigzagging). Non-ASCII letters
     // would point to unrelated content like `✻ Sautéed for` (completion).
     //
+    // Indicator char set (union of classic + newer):
+    //   · (U+00B7), * (U+002A), ● (U+25CF), ✢ (U+2722), ✳ (U+2733),
+    //   ✶ (U+2736), ✻ (U+273B), ✽ (U+273D)
+    //
     // regex_lite supports Unicode in character classes but doesn't include
     // Unicode-property syntax (\p{Lu}), so we enumerate indicator chars
     // explicitly and restrict verb letters to ASCII.
-    let pat_a = regex_lite::Regex::new(
-        r"^[\u{00B7}\u{002A}\u{2722}\u{2733}\u{2736}\u{273B}\u{273D}]\s+[A-Z][a-zA-Z]+\u{2026}\s*\(",
+    let pat = regex_lite::Regex::new(
+        r"^[\u{00B7}\u{002A}\u{25CF}\u{2722}\u{2733}\u{2736}\u{273B}\u{273D}]\s+[A-Z][a-zA-Z]*\u{2026}\s*\(\s*\d",
     )
     .unwrap();
-    if pat_a.is_match(trimmed) {
-        return true;
-    }
-
-    // Pattern B: the newer "● Verb… (time · ↓ N tokens · thinking)" format.
-    // Match the distinctive `· thinking)` suffix which only appears in the
-    // live thinking widget. The closing paren ensures we don't match chat
-    // content that happens to mention "· thinking".
-    //
-    // We still require the line to look roughly like the thinking widget
-    // (starts with `●` U+25CF and contains the ellipsis) so we don't
-    // accidentally match conversational prose that happens to include
-    // "· thinking)".
-    if trimmed.starts_with('\u{25CF}') && trimmed.contains('\u{2026}') {
-        let pat_b = regex_lite::Regex::new(r"\u{00B7}\s*thinking\)").unwrap();
-        if pat_b.is_match(trimmed) {
-            return true;
-        }
-    }
-
-    false
+    pat.is_match(trimmed)
 }
 
 /// Pure function: detect Claude Code's current activity from pane output.
@@ -1280,6 +1278,12 @@ mod tests {
         ));
         // Short form (no time-tag contents inside parens)
         assert!(is_active_thinking_line("\u{273d} Thinking\u{2026} (3s)"));
+        // Newer `●`-prefix format — short form, no `· thinking)` suffix
+        assert!(is_active_thinking_line("\u{25cf} Cooking\u{2026} (28s)"));
+        // Newer `●`-prefix format with token count but no `· thinking)`
+        assert!(is_active_thinking_line(
+            "\u{25cf} Flibbertigibbeting\u{2026} (2m 35s \u{00b7} \u{2193} 869 tokens)"
+        ));
         // Newer `●`-prefix format with `· thinking)` suffix
         assert!(is_active_thinking_line(
             "\u{25cf} Whirlpooling\u{2026} (7s \u{00b7} \u{2193} 31 tokens \u{00b7} thinking)"
@@ -1330,10 +1334,26 @@ mod tests {
         assert!(!is_active_thinking_line(
             "bypass permissions on \u{00b7} ctrl+x ctrl+k to stop agents \u{00b7} \u{2193} to manage\u{2026}"
         ));
-        // `●`-prefix line WITHOUT the `· thinking)` suffix is Writing,
-        // not Thinking — even if the line happens to contain `·` and `…`.
+        // `●`-prefix prose lines are Writing, not Thinking — they lack
+        // the `…(<digit>` widget anchor.
         assert!(!is_active_thinking_line(
             "\u{25cf} DM'd. claude-watch debug \u{00b7} more stuff\u{2026}"
+        ));
+        assert!(!is_active_thinking_line(
+            "\u{25cf} Interrupt ack \u{2014} same false positive flagged earlier."
+        ));
+        assert!(!is_active_thinking_line("\u{25cf} No new messages. Idling."));
+        // `●`-prefix with paren but NO ellipsis — the feedback prompt widget.
+        assert!(!is_active_thinking_line(
+            "\u{25cf} How is Claude doing this session? (optional)"
+        ));
+        // `●`-prefix with ellipsis + paren, but paren content is prose
+        // (no leading digit) — the `\d` anchor saves us.
+        assert!(!is_active_thinking_line(
+            "\u{25cf} Some progress\u{2026} (every now and then)"
+        ));
+        assert!(!is_active_thinking_line(
+            "\u{25cf} Starting\u{2026} (every 5 min)"
         ));
         // Bare "Waiting…" (non-breaking space inside) from a running bash
         // task is not thinking.

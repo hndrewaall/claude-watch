@@ -619,6 +619,72 @@ fn new_format_thinking_still_detected() {
     );
 }
 
+/// The SHORT form of the newer thinking widget omits the `· thinking)`
+/// suffix: `● Cooking… (28s)`. An earlier iteration of the 2026-04-17 fix
+/// missed this because it required the `· thinking)` anchor specifically.
+/// Ensure the general `<indicator> <Verb>… (<digit>` pattern catches it.
+const REAL_CAPTURE_NEW_FORMAT_SHORT_THINKING: &str = "\
+previous output\n\
+\n\
+\u{25cf} Bash(some long running thing)\n\
+  \u{23bf}  Running in the background\n\
+\n\
+\u{25cf} Cooking\u{2026} (28s)\n\
+\n\
+\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n\
+\u{276f} \n\
+\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n\
+  \u{23f5}\u{23f5} bypass permissions on \u{00b7} 11 background tasks \u{00b7} esc to interrupt \u{00b7} \u{2193} to manage    319909 tokens\n\
+";
+
+#[test]
+fn new_format_short_thinking_still_detected() {
+    let result = detect_activity(REAL_CAPTURE_NEW_FORMAT_SHORT_THINKING);
+    assert_eq!(
+        result,
+        ClaudeActivity::Thinking,
+        "Newer Claude Code short thinking format (● Cooking… (28s)) must be \
+         detected as Thinking. An earlier fix iteration only matched the \
+         long form with `· thinking)` suffix and missed the short form, \
+         causing the daemon to re-fire a false-positive interrupt even \
+         after deploy. Got {:?}",
+        result
+    );
+}
+
+/// Writing bullets with paren-suffix content (e.g. feedback prompt widget,
+/// `(optional)`) must NOT be misclassified as Thinking. The widget-anchor
+/// regex requires a digit inside the parens.
+const REAL_CAPTURE_WRITING_WITH_PARENS: &str = "\
+previous output\n\
+\n\
+\u{25cf} No new messages. Idling.\n\
+\n\
+\u{25cf} How is Claude doing this session? (optional)\n\
+  1: Bad    2: Fine   3: Good   0: Dismiss\n\
+\n\
+\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n\
+\u{276f} \n\
+\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n\
+  \u{23f5}\u{23f5} bypass permissions on \u{00b7} 11 background tasks    319909 tokens\n\
+";
+
+#[test]
+fn writing_bullets_with_parens_are_not_thinking() {
+    // Feedback prompt + idling bullet + parens for prose content must
+    // not be misclassified as Thinking. (Writing or Idle are both OK —
+    // the critical thing is NOT Thinking, which would trigger the daemon's
+    // prolonged-thinking interrupt.)
+    let result = detect_activity(REAL_CAPTURE_WRITING_WITH_PARENS);
+    assert_ne!(
+        result,
+        ClaudeActivity::Thinking,
+        "Writing bullets with paren content (no digit inside parens) must \
+         NOT be Thinking. Got {:?}",
+        result
+    );
+}
+
 /// Verify that the old is_idle() logic (prompt-only) would have returned true
 /// for this fixture — confirming the bug existed. The fix was to use
 /// get_activity() instead of is_idle().
