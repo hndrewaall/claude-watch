@@ -46,8 +46,7 @@ fn hook_fire_unknown_type_emits_empty_json() {
 
     assert!(out.status.success(), "hook-fire should exit 0");
     let stdout = String::from_utf8_lossy(&out.stdout);
-    let v: serde_json::Value =
-        serde_json::from_str(stdout.trim()).expect("stdout should be JSON");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("stdout should be JSON");
     assert!(
         v.as_object().map(|o| o.is_empty()).unwrap_or(false),
         "unknown type should emit empty JSON object, got: {}",
@@ -105,7 +104,19 @@ fn hook_fire_pre_compact_always_writes_marker() {
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("JSON");
     // PreCompact always blocks with continue=false
     assert_eq!(v["continue"], serde_json::Value::Bool(false));
-    assert_eq!(v["hookSpecificOutput"]["hookEventName"], "PreCompact");
+    // PreCompact does NOT accept hookSpecificOutput.additionalContext per the
+    // Claude Code hook schema — the reminder text must surface via top-level
+    // systemMessage, and hookSpecificOutput must be absent.
+    assert!(
+        v.get("hookSpecificOutput").is_none(),
+        "PreCompact must not emit hookSpecificOutput, got: {}",
+        stdout
+    );
+    assert!(
+        v["systemMessage"].is_string(),
+        "PreCompact must surface reminder via systemMessage, got: {}",
+        stdout
+    );
 
     // Marker must be persisted
     let marker_path = dir.join("pre_compact.json");
@@ -175,8 +186,51 @@ fn hook_fire_accepts_canonical_and_dashed_forms() {
 
 #[test]
 fn hook_fire_hook_event_override_is_echoed() {
+    // The `--hook-event` flag routes the JSON response shape through the
+    // event's schema rules. Overriding to an event that accepts
+    // hookSpecificOutput.additionalContext (SessionStart) must produce the
+    // nested shape with the overridden hookEventName echoed back.
     let bin = binary();
     let dir = scoped_dir("hook_event_override");
+    let cfg = config_path(&dir);
+
+    let out = Command::new(&bin)
+        .args(["hook-fire", "pre_compact", "--hook-event", "SessionStart"])
+        .env("CLAUDE_WATCH_REMINDER_DIR", &dir)
+        .env("CLAUDE_WATCH_CONFIG", &cfg)
+        .env("HOME", &dir)
+        .output()
+        .expect("run hook-fire");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("JSON");
+    assert_eq!(
+        v["hookSpecificOutput"]["hookEventName"], "SessionStart",
+        "override must be echoed in hookSpecificOutput.hookEventName, got: {}",
+        stdout
+    );
+    assert!(
+        v["hookSpecificOutput"]["additionalContext"].is_string(),
+        "SessionStart override must attach reminder via additionalContext, got: {}",
+        stdout
+    );
+    assert!(
+        v.get("systemMessage").is_none(),
+        "SessionStart override must not also emit systemMessage, got: {}",
+        stdout
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn hook_fire_hook_event_override_unsupported_event_uses_system_message() {
+    // Overriding to an event that does NOT accept additionalContext
+    // (e.g. Stop, Notification, or a made-up "CustomEvent") must route the
+    // reminder through top-level systemMessage. hookSpecificOutput must be
+    // absent since there's no hookEventName to echo into.
+    let bin = binary();
+    let dir = scoped_dir("hook_event_override_unsupported");
     let cfg = config_path(&dir);
 
     let out = Command::new(&bin)
@@ -189,7 +243,16 @@ fn hook_fire_hook_event_override_is_echoed() {
 
     let stdout = String::from_utf8_lossy(&out.stdout);
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("JSON");
-    assert_eq!(v["hookSpecificOutput"]["hookEventName"], "CustomEvent");
+    assert!(
+        v.get("hookSpecificOutput").is_none(),
+        "unsupported event must not emit hookSpecificOutput, got: {}",
+        stdout
+    );
+    assert!(
+        v["systemMessage"].is_string(),
+        "unsupported event must surface reminder via systemMessage, got: {}",
+        stdout
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
