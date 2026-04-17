@@ -303,6 +303,90 @@ fn is_separator_line(line: &str) -> bool {
     !trimmed.is_empty() && trimmed.chars().all(|c| c == '\u{2500}')
 }
 
+/// Pure function: does this (already-trimmed) line look like an ACTIVE thinking
+/// indicator from Claude Code's TUI?
+///
+/// Claude Code's live thinking indicator has two observed formats:
+///
+///   Classic (2.1.77-era and earlier):
+///     <indicator-char> <Verb>… (<time> [· ↓ <N> tokens])
+///   e.g. "✽ Thinking… (12s · ↓ 384 tokens)"
+///        "✢ Fermenting… (38s · ↓ 909 tokens)"
+///        "* Warping… (26s · ↓ 438 tokens)"
+///
+///   Newer (2.1.112+):
+///     ● <Verb>… (<time> · ↓ <N> tokens · thinking)
+///   e.g. "● Whirlpooling… (7s · ↓ 31 tokens · thinking)"
+///        "● Flibbertigibbeting… (1m 19s · ↓ 540 tokens · thinking)"
+///
+/// Indicator characters (from Claude Code binary analysis — see the comment
+/// in `detect_activity` below for the extraction procedure):
+///   · (U+00B7), * (U+002A), ✢ (U+2722), ✳ (U+2733), ✶ (U+2736),
+///   ✻ (U+273B), ✽ (U+273D)
+///
+/// The OLD detection was simply "line contains any of those indicator chars
+/// AND contains U+2026 (…)". That fired false positives because `·` and
+/// `* ` appear in TONS of non-thinking content: completion-line separators
+/// (`✻ Brewed for 38s · 6 tasks`), markdown bullets (`* Check the status…`),
+/// Claude Code's status-bar wrap (`current: 2.1.77 · latest: 2.1.…`), and
+/// any tool output that happens to use `…` near a `·`. With the daemon's
+/// prolonged-thinking interrupt at 180s, a handful of such lines sitting
+/// stable in the pane during a genuinely-idle session would trigger the
+/// interrupt — the exact bug report Andrew filed 2026-04-17.
+///
+/// The new predicate requires the full `<indicator> <Verb>… (` structure at
+/// the start of the line, OR the distinctive `· thinking)` suffix used by
+/// the newer `●`-prefix format. Both are specific to the LIVE thinking
+/// widget and are not emitted by any other Claude Code TUI element we've
+/// seen. In particular:
+///   - Completion lines use `for ` instead of `…` after the verb — won't match.
+///   - Markdown/tool-output bullets lack the `(<time>` tail — won't match.
+///   - Status-bar wraps lack the leading indicator+Verb+… prefix — won't match.
+pub(crate) fn is_active_thinking_line(trimmed: &str) -> bool {
+    // Pattern A: classic "<indicator> <Verb>… ("
+    //
+    // The indicator must be at the very start. Then: one or more whitespace,
+    // an uppercase ASCII letter starting the verb, zero or more ASCII letters
+    // continuing the verb, the ellipsis U+2026, optional whitespace, and
+    // the opening paren of the time-tag. We anchor on the `(` so that
+    // shorter false-positive prefixes (e.g. `· ctrl+o…`) cannot match —
+    // Claude Code always emits the time-tag parens for live thinking.
+    //
+    // We accept a tolerant "ASCII verb" (a-zA-Z) because the 168 known
+    // thinking verbs in Claude Code's binary are all plain English words
+    // (Accomplishing, Baking, Cogitating, …, Zigzagging). Non-ASCII letters
+    // would point to unrelated content like `✻ Sautéed for` (completion).
+    //
+    // regex_lite supports Unicode in character classes but doesn't include
+    // Unicode-property syntax (\p{Lu}), so we enumerate indicator chars
+    // explicitly and restrict verb letters to ASCII.
+    let pat_a = regex_lite::Regex::new(
+        r"^[\u{00B7}\u{002A}\u{2722}\u{2733}\u{2736}\u{273B}\u{273D}]\s+[A-Z][a-zA-Z]+\u{2026}\s*\(",
+    )
+    .unwrap();
+    if pat_a.is_match(trimmed) {
+        return true;
+    }
+
+    // Pattern B: the newer "● Verb… (time · ↓ N tokens · thinking)" format.
+    // Match the distinctive `· thinking)` suffix which only appears in the
+    // live thinking widget. The closing paren ensures we don't match chat
+    // content that happens to mention "· thinking".
+    //
+    // We still require the line to look roughly like the thinking widget
+    // (starts with `●` U+25CF and contains the ellipsis) so we don't
+    // accidentally match conversational prose that happens to include
+    // "· thinking)".
+    if trimmed.starts_with('\u{25CF}') && trimmed.contains('\u{2026}') {
+        let pat_b = regex_lite::Regex::new(r"\u{00B7}\s*thinking\)").unwrap();
+        if pat_b.is_match(trimmed) {
+            return true;
+        }
+    }
+
+    false
+}
+
 /// Pure function: detect Claude Code's current activity from pane output.
 ///
 /// Claude Code's TUI has a fixed layout:
@@ -345,37 +429,38 @@ pub fn detect_activity(pane_output: &str) -> ClaudeActivity {
         (tail, false)
     };
 
-    // Helper: check if a line has a thinking indicator character
-    let has_indicator_char = |trimmed: &str| -> bool {
-        trimmed.contains('\u{273d}')  // ✽
-            || trimmed.contains('\u{273b}')  // ✻
-            || trimmed.contains('\u{2722}')  // ✢
-            || trimmed.contains('\u{2733}')  // ✳
-            || trimmed.contains('\u{2736}')  // ✶
-            || trimmed.contains('\u{00b7}')  // · (middle dot)
-            || trimmed.starts_with("* ")
-    };
-
     // 1. Completion check FIRST (when prompt is visible).
-    // Completion lines ("✻ Brewed for 38s") mean Claude finished responding.
-    // A stale thinking indicator ("✽ Thinking… (5s)") may still be visible
-    // in the scroll history above. Completion + prompt = Idle, always.
-    // Must be checked before thinking to avoid false "prolonged thinking".
+    // Completion lines ("✻ Brewed for 38s", "✻ Cogitated for 2m 11s") mean
+    // Claude finished responding. A stale thinking indicator
+    // ("✽ Thinking… (5s)") may still be visible in the scroll history above.
+    // Completion + prompt = Idle, always. Must be checked before thinking to
+    // avoid false "prolonged thinking".
+    //
+    // We anchor on a tighter pattern — leading ✻ (U+273B), whitespace,
+    // capitalized verb (past tense, e.g. "Brewed"/"Cogitated"/"Sautéed"),
+    // whitespace, `for `, and a digit — rather than the old loose heuristic
+    // (any indicator char + " for ") which could match unrelated content.
+    // `Sautéed` uses non-ASCII `é`, so we allow `\S` after the leading
+    // ASCII letter rather than restricting to `a-z`.
     if has_prompt {
+        let completion_re = regex_lite::Regex::new(r"^\u{273B}\s+[A-Z]\S*\s+for\s+\d").unwrap();
         let has_completion = content_lines.iter().any(|line| {
             let trimmed = line.trim();
-            has_indicator_char(trimmed)
-                && trimmed.contains(" for ")
-                && !trimmed.contains('\u{2026}')
+            completion_re.is_match(trimmed) && !trimmed.contains('\u{2026}')
         });
         if has_completion {
             return ClaudeActivity::Idle;
         }
     }
 
-    // 2. Thinking — indicator char + verb ending in … (U+2026)
+    // 2. Thinking — indicator char + verb ending in … (U+2026) with the
+    // time-tag parens. See `is_active_thinking_line` for the rationale —
+    // the old "indicator char + … anywhere" heuristic false-positived on
+    // completion-line separators, markdown bullets, status-bar wraps, and
+    // tool output containing `·` + `…`, producing spurious prolonged-
+    // thinking interrupts during idle sessions.
     //
-    // Extracted from Claude Code v2.1.77 binary. To update, run:
+    // Extraction procedure for indicator chars (Claude Code v2.1.77 binary):
     //   strings <binary> | grep -oP '\\u273[0-9a-fA-F]|\\u272[0-9a-fA-F]' | sort -u
     // Then find the CdH() function context:
     //   strings <binary> | grep -oP '.{0,100}\\u273[0-9a-fA-F].{0,100}' | grep CdH
@@ -386,12 +471,9 @@ pub fn detect_activity(pane_output: &str) -> ClaudeActivity {
     //
     // Thinking verbs (168 total, from "Accomplishing" to "Zigzagging"):
     //   strings <binary> | grep -oP '"Accomplishing".{0,10000}?"Zigzagging"\]' | tr ',' '\n'
-    //
-    // U+273B also appears in completion lines ("Brewed for") but those lack …
-    // Require trailing … (U+2026) to distinguish active thinking from completion.
     for line in content_lines {
         let trimmed = line.trim();
-        if has_indicator_char(trimmed) && trimmed.contains('\u{2026}') {
+        if is_active_thinking_line(trimmed) {
             return ClaudeActivity::Thinking;
         }
     }
@@ -1158,6 +1240,163 @@ mod tests {
         }
         let output = lines.join("\n");
         assert_eq!(detect_activity(&output), ClaudeActivity::Thinking);
+    }
+
+    // --- 2026-04-17 prolonged-thinking-false-positive regression tests ---
+    //
+    // Andrew filed a bug: claude-watch fired "Prolonged thinking detected
+    // (>180s)" on a GENUINELY-IDLE session. The main loop's last response
+    // had been "Interrupt noted — no active work. Idling." for 3 minutes
+    // straight; the pane showed the completion widget and the prompt, no
+    // active generation. The old detector returned Thinking because it
+    // treated any line containing `·` (U+00B7 middle dot) OR a markdown
+    // `* ` bullet PLUS `…` (U+2026) anywhere as an "active thinking
+    // indicator". Many real-world idle-pane lines match that loose pattern:
+    //
+    //   - status-bar wraps:   "current: 2.1.77 · latest: 2.1.…"
+    //   - tool-output hints:  "… to manage · ctrl+o to expand"
+    //   - markdown bullets:   "* Check the status… later"
+    //   - completion tails:   "✻ Cogitated for 2m 11s · 6 tasks still…"
+    //
+    // The fix tightens detection to require the full `<indicator> <Verb>…
+    // (<time>` structure at the start of the line, or the distinctive
+    // `· thinking)` suffix used by the newer `●`-prefix thinking widget.
+    // These negative tests pin the behaviour so it cannot regress.
+
+    #[test]
+    fn test_is_active_thinking_positive_cases() {
+        // Classic: thinking-char + Verb + ellipsis + paren
+        assert!(is_active_thinking_line(
+            "\u{273d} Thinking\u{2026} (12s \u{00b7} \u{2193} 384 tokens)"
+        ));
+        assert!(is_active_thinking_line(
+            "\u{2722} Fermenting\u{2026} (38s \u{00b7} \u{2193} 909 tokens)"
+        ));
+        assert!(is_active_thinking_line(
+            "\u{273b} Flowing\u{2026} (45s \u{00b7} \u{2193} 377 tokens)"
+        ));
+        assert!(is_active_thinking_line(
+            "* Warping\u{2026} (26s \u{00b7} \u{2191} 438 tokens)"
+        ));
+        // Short form (no time-tag contents inside parens)
+        assert!(is_active_thinking_line("\u{273d} Thinking\u{2026} (3s)"));
+        // Newer `●`-prefix format with `· thinking)` suffix
+        assert!(is_active_thinking_line(
+            "\u{25cf} Whirlpooling\u{2026} (7s \u{00b7} \u{2193} 31 tokens \u{00b7} thinking)"
+        ));
+        assert!(is_active_thinking_line(
+            "\u{25cf} Flibbertigibbeting\u{2026} (1m 19s \u{00b7} \u{2193} 540 tokens \u{00b7} thinking)"
+        ));
+        // Middle-dot as the leading indicator char (per binary analysis,
+        // Claude Code can render `·` as the indicator glyph)
+        assert!(is_active_thinking_line("\u{00b7} Thinking\u{2026} (5s)"));
+    }
+
+    #[test]
+    fn test_is_active_thinking_negative_completion_lines() {
+        // Completion widget — past-tense verb, "for", no ellipsis.
+        assert!(!is_active_thinking_line(
+            "\u{273b} Brewed for 38s \u{00b7} 11 background tasks still running"
+        ));
+        assert!(!is_active_thinking_line(
+            "\u{273b} Cogitated for 2m 11s \u{00b7} 6 background tasks still running"
+        ));
+        assert!(!is_active_thinking_line(
+            "\u{273b} Sauteed for 31s \u{00b7} 6 background tasks still running"
+        ));
+    }
+
+    #[test]
+    fn test_is_active_thinking_negative_status_bar_wrap() {
+        // Wrapped status bar: `· latest: 2.1.…` — middle dot + ellipsis
+        // but NO Verb+paren structure. The OLD detector returned true here.
+        assert!(!is_active_thinking_line(
+            "current: 2.1.77 \u{00b7} latest: 2.1.\u{2026}"
+        ));
+        assert!(!is_active_thinking_line(
+            "\u{23f5}\u{23f5} bypass permissi \u{00b7}  on   5 shells \u{00b7} esc to interrupt \u{00b7} \u{2193}\u{2026}"
+        ));
+    }
+
+    #[test]
+    fn test_is_active_thinking_negative_tool_output_and_markdown() {
+        // Tool-output hint: `· ctrl+o to expand` — nothing thinking-like.
+        assert!(!is_active_thinking_line(
+            "Backgrounded agent (\u{2193} to manage \u{00b7} ctrl+o to expand)"
+        ));
+        // Markdown bullet with an ellipsis mid-prose — NOT thinking.
+        assert!(!is_active_thinking_line("* Check the status\u{2026} later"));
+        // Generic `·` + `…` content that happens to appear in idle panes.
+        assert!(!is_active_thinking_line(
+            "bypass permissions on \u{00b7} ctrl+x ctrl+k to stop agents \u{00b7} \u{2193} to manage\u{2026}"
+        ));
+        // `●`-prefix line WITHOUT the `· thinking)` suffix is Writing,
+        // not Thinking — even if the line happens to contain `·` and `…`.
+        assert!(!is_active_thinking_line(
+            "\u{25cf} DM'd. claude-watch debug \u{00b7} more stuff\u{2026}"
+        ));
+        // Bare "Waiting…" (non-breaking space inside) from a running bash
+        // task is not thinking.
+        assert!(!is_active_thinking_line("\u{23bf}\u{a0}Waiting\u{2026}"));
+    }
+
+    #[test]
+    fn test_activity_idle_when_content_has_middle_dot_and_ellipsis() {
+        // Regression: Andrew's 2026-04-17 false positive. After a short
+        // "Idling." response, the pane shows a completion line plus
+        // incidental `·` + `…` content (tool-output tails, status-bar
+        // wraps, etc.). The OLD detector returned Thinking because any
+        // such line matched `has_indicator_char + contains('…')`. The
+        // fixed detector must return Idle.
+        let output = "\u{25cf} DM'd. claude-watch debug \u{00b7} crop-to-figure both reported. Idling.\n\
+                      \n\
+                      Backgrounded agent (\u{2193} to manage \u{00b7} ctrl+o to expand)\n\
+                      \n\
+                      \u{273b} Cogitated for 2m 11s \u{00b7} 6 background tasks still running\n\
+                      \n\
+                      \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n\
+                      \u{276f} \n\
+                      \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n\
+                      \u{23f5}\u{23f5} bypass permissions on \u{00b7} 6 background tasks \u{00b7} ctrl+x ctrl+k to stop agents \u{00b7} \u{2193} to manage    278149 tokens";
+        assert_eq!(
+            detect_activity(output),
+            ClaudeActivity::Idle,
+            "Idle pane with completion line + incidental `·`+`…` content \
+             must NOT be classified as Thinking (2026-04-17 regression)"
+        );
+    }
+
+    #[test]
+    fn test_activity_idle_when_only_completion_no_thinking_content() {
+        // Bare idle state: just the completion line + prompt. No active
+        // thinking, no stale thinking-like lines.
+        let output = "\u{25cf} Short response.\n\
+                      \n\
+                      \u{273b} Brewed for 5s\n\
+                      \n\
+                      \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n\
+                      \u{276f} \n\
+                      \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n\
+                      -- INSERT -- 50000 tokens";
+        assert_eq!(detect_activity(output), ClaudeActivity::Idle);
+    }
+
+    #[test]
+    fn test_activity_thinking_new_format_with_bullet_prefix() {
+        // Newer Claude Code (2.1.112+) renders active thinking with a ●
+        // prefix and a `· thinking)` suffix:
+        //   "● Whirlpooling… (7s · ↓ 31 tokens · thinking)"
+        // Ensure this is correctly classified as Thinking (not Writing,
+        // which is what a plain `●` line would be).
+        let output = "previous context\n\
+                      \n\
+                      \u{25cf} Whirlpooling\u{2026} (7s \u{00b7} \u{2193} 31 tokens \u{00b7} thinking)\n\
+                      \n\
+                      \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n\
+                      \u{276f} \n\
+                      \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n\
+                      -- INSERT -- 50000 tokens";
+        assert_eq!(detect_activity(output), ClaudeActivity::Thinking);
     }
 
     // --- check_lines_for_reauth tests ---

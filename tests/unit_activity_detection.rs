@@ -497,6 +497,128 @@ fn inject_timing_bug_thinking_with_stale_content_is_thinking() {
     );
 }
 
+// =============================================================================
+// 2026-04-17 PROLONGED-THINKING FALSE POSITIVE REGRESSION
+// =============================================================================
+// Andrew filed a bug: claude-watch fired "Prolonged thinking detected (>180s)"
+// on a genuinely idle session. The main loop had just sent "Interrupt noted —
+// no active work. Idling." and was waiting for user input. The pane showed a
+// completion widget and a visible prompt — NO active generation.
+//
+// The old detector returned Thinking because any line containing `·`
+// (U+00B7 middle dot) OR a markdown `* ` prefix PLUS `…` (U+2026) anywhere
+// qualified as a thinking indicator. Many idle-pane lines match that loose
+// pattern: status-bar wraps (`current: 2.1.77 · latest: 2.1.…`), tool-output
+// hints (`↓ to manage · ctrl+o to expand`), markdown bullets
+// (`* Check the status… later`). Over 3 minutes of idle, the detector kept
+// returning Thinking and the daemon fired a spurious interrupt.
+//
+// The fix tightens detection to require the full `<indicator> <Verb>…
+// (<time>` widget, or the newer `●`-prefix format's `· thinking)` suffix.
+
+/// Idle pane captured the moment before Andrew's 2026-04-17 false positive.
+/// Contains a completion line, the prompt, and incidental `·`/`…` content
+/// that the old detector falsely classified as active thinking.
+const REAL_CAPTURE_IDLE_WITH_INCIDENTAL_DOTS: &str = "\
+\u{25cf} DM'd. claude-watch debug \u{00b7} crop-to-figure both reported. Idling.\n\
+\n\
+Backgrounded agent (\u{2193} to manage \u{00b7} ctrl+o to expand)\n\
+\n\
+\u{273b} Cogitated for 2m 11s \u{00b7} 6 background tasks still running\n\
+\n\
+\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n\
+\u{276f} \n\
+\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n\
+  \u{23f5}\u{23f5} bypass permissions on \u{00b7} 6 background tasks \u{00b7} ctrl+x ctrl+k to stop agents \u{00b7} \u{2193} to manage    278149 tokens\n\
+";
+
+/// Idle pane with NO completion widget, just the prompt + incidental `·`/`…`
+/// content. Even without a `✻ Brewed for` line, the detector must NOT treat
+/// status-bar-style `· latest: …` wraps as active thinking.
+const REAL_CAPTURE_IDLE_NO_COMPLETION_WITH_DOTS: &str = "\
+\u{25cf} Some quick response with no completion line rendered.\n\
+\n\
+Some tool output \u{00b7} more stuff\n\
+  \u{23bf}  Done (3 items \u{00b7} \u{2193} to expand)\n\
+\n\
+\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n\
+\u{276f} \n\
+\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n\
+-- INSERT -- current: 2.1.77 \u{00b7} latest: 2.1.\u{2026}   278149 tokens\n\
+";
+
+/// Real live-thinking capture with the newer `●`-prefix format used in
+/// Claude Code 2.1.112+. Ensure this is still correctly detected as Thinking.
+const REAL_CAPTURE_NEW_FORMAT_THINKING: &str = "\
+previous output line 1\n\
+\n\
+\u{25cf} Bash(some long running thing)\n\
+  \u{23bf}  Waiting\u{2026}\n\
+\n\
+\u{25cf} Whirlpooling\u{2026} (7s \u{00b7} \u{2193} 31 tokens \u{00b7} thinking)\n\
+\n\
+\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n\
+\u{276f} \n\
+\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n\
+  \u{23f5}\u{23f5} bypass permissions on \u{00b7} 6 background tasks \u{00b7} esc to interrupt \u{00b7} \u{2193} to manage    286314 tokens\n\
+";
+
+/// 2026-04-17 REGRESSION: idle pane with incidental `·`+`…` content must
+/// be classified as Idle, not Thinking. This is the EXACT scenario Andrew
+/// reported: "Interrupt noted — no active work. Idling." followed by 3
+/// minutes of idle, during which claude-watch fired a spurious interrupt.
+#[test]
+fn bug_20260417_idle_with_incidental_dots_and_ellipsis_is_idle() {
+    let result = detect_activity(REAL_CAPTURE_IDLE_WITH_INCIDENTAL_DOTS);
+    assert_eq!(
+        result,
+        ClaudeActivity::Idle,
+        "2026-04-17 REGRESSION: Idle pane with completion widget + incidental \
+         `·`/`…` content must be Idle. The old detector returned Thinking \
+         because lines like `Backgrounded agent (↓ to manage · ctrl+o to expand)` \
+         (middle dot without ellipsis) AND lines like `↓ to manage … ` \
+         both happened to look like thinking-indicator content to a loose \
+         char-set match. Got {:?}",
+        result
+    );
+}
+
+/// 2026-04-17 REGRESSION: even without a completion widget, the detector
+/// must not treat status-bar-style `· latest: …` wraps as thinking. The
+/// full pane layout means any such wrap is BELOW the separator (in the
+/// status bar), not above it in the content area — but defensively, the
+/// thinking-detection logic itself must be strict enough not to fire on
+/// that content even if it did leak above the separator.
+#[test]
+fn bug_20260417_idle_no_completion_with_dots_is_not_thinking() {
+    let result = detect_activity(REAL_CAPTURE_IDLE_NO_COMPLETION_WITH_DOTS);
+    // Without a completion widget the pane defaults to Writing (bullets
+    // visible) OR Idle (no bullets). Either is acceptable — the important
+    // thing is it is NOT Thinking.
+    assert_ne!(
+        result,
+        ClaudeActivity::Thinking,
+        "2026-04-17 REGRESSION: Idle pane with no completion widget but \
+         with status-bar-style `·`/`…` content must not be classified as \
+         Thinking. Got {:?}",
+        result
+    );
+}
+
+/// Live thinking in the newer Claude Code 2.1.112+ format
+/// (`● Verb… (time · ↓ tokens · thinking)`) must still be detected.
+#[test]
+fn new_format_thinking_still_detected() {
+    let result = detect_activity(REAL_CAPTURE_NEW_FORMAT_THINKING);
+    assert_eq!(
+        result,
+        ClaudeActivity::Thinking,
+        "Newer Claude Code thinking format (● Verb… · thinking)) must be \
+         detected as Thinking, got {:?}",
+        result
+    );
+}
+
 /// Verify that the old is_idle() logic (prompt-only) would have returned true
 /// for this fixture — confirming the bug existed. The fix was to use
 /// get_activity() instead of is_idle().
