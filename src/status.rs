@@ -82,9 +82,20 @@ pub(crate) fn parse_status_bar(pane_text: &str) -> ParsedStatusBar {
     // Narrow wrapping can ALSO split "bypass permissions" itself across a
     // separator ("bypass permissi ·  on"), so we match the more reliable prefix
     // "bypass permissi" instead of the full word.
-    // If we see a status bar indicator anywhere, enable token parsing for all lines.
+    //
+    // EXTREME wraps (2026-04-18 incident) split the bar across many logical
+    // lines so even "bypass permissi" doesn't appear on any one line — just
+    // `bypass` alone on its line, then `INSERT` alone, then `606746 tokens`
+    // alone. The `⏵⏵` permission-mode icon is the most reliable anchor:
+    // Claude Code emits it at the left edge of the status bar whenever
+    // bypass or accept-edits permissions are active, and it never appears in
+    // Claude's chat output or model responses. Match it first.
+    //
+    // If we see a status bar indicator anywhere, enable token parsing for all
+    // lines in the tail.
     let has_status_bar = lines[start..].iter().any(|line| {
-        line.contains("bypass permissi")
+        line.contains('\u{23f5}') // ⏵ — permission mode icon (bypass / accept edits)
+            || line.contains("bypass permissi")
             || line.contains("-- INSERT --")
             || line.contains("background tasks")
             || line.contains("bashes")
@@ -575,6 +586,76 @@ mod tests {
         assert_eq!(parsed.tokens, Some(42000));
         assert_eq!(parsed.bashes, Some(3));
         assert_eq!(parsed.compact_remaining, Some(30));
+    }
+
+    #[test]
+    fn test_parse_status_bar_extreme_wrap_incident_2026_04_18() {
+        // 2026-04-18 21:23 ET — extremely narrow tmux pane ate the usual
+        // "bypass permissi" and "-- INSERT --" indicators by splitting them
+        // across multiple LOGICAL lines (not just visual wraps that -J would
+        // rejoin). The pane tail captured by parse_miss_tail reads:
+        //     partial response | received | ───── | ❯ | ───── |
+        //     --   ⏵⏵ bypass | INSERT | -- | 606746 tokens | ◉ xhigh · /effort
+        //
+        // Previously parse_status_bar returned tokens=None because
+        // has_status_bar couldn't match any line: "bypass" stood alone
+        // (no "permissi"), "INSERT" stood alone (no dashes), no "shells" /
+        // "background tasks" / "auto-compact" keyword anywhere. The daemon
+        // then spuriously flagged dead_checks=4 even though the pane
+        // clearly showed "606746 tokens". Andrew pkilled tmux at 21:24 ET
+        // because the main loop was unresponsive and no alert had fired.
+        //
+        // The fix: recognize `⏵⏵` (the permission-mode icon, unique to the
+        // status bar) as a status-bar indicator. It is always present when
+        // the bar is rendered with `bypass` or `accept edits` permissions,
+        // regardless of how narrowly the terminal wraps the adjacent text.
+        let input = "\
+                     partial response\n\
+                     received\n\
+                     \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n\
+                     \u{276f}\n\
+                     \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n\
+                     --      \u{23f5}\u{23f5} bypass\n\
+                     INSERT\n\
+                     --\n\
+                     606746 tokens\n\
+                     \u{25c9} xhigh \u{00b7} /effort";
+        let parsed = parse_status_bar(input);
+        assert_eq!(
+            parsed.tokens,
+            Some(606746),
+            "status bar with only ⏵⏵ icon (no \"permissi\" / \"INSERT --\" substrings \
+             on any single line) must still be recognized — this was the 2026-04-18 \
+             incident where Andrew killed tmux"
+        );
+    }
+
+    #[test]
+    fn test_parse_status_bar_accept_edits_icon_alone() {
+        // Similar to the wrap incident but with a narrower wrap that splits
+        // even the emoji from its words. `⏵⏵` + a tokens line on its own
+        // must be enough.
+        let input = "some chat output\n\
+                     \u{23f5}\u{23f5}\n\
+                     128000 tokens";
+        let parsed = parse_status_bar(input);
+        assert_eq!(parsed.tokens, Some(128000));
+    }
+
+    #[test]
+    fn test_parse_status_bar_single_chevron_not_enough() {
+        // A lone `>` or the prompt character `❯` isn't a status-bar marker —
+        // Claude's chat output frequently contains chevrons. We do NOT want
+        // to widen the indicator set so far that we match prose that happens
+        // to mention "500 tokens" somewhere.
+        let input = "Hey, cost about 500 tokens per request.\n\
+                     \u{276f}";
+        let parsed = parse_status_bar(input);
+        assert_eq!(
+            parsed.tokens, None,
+            "must not match token counts in chat prose just because the \
+             prompt char is visible"
+        );
     }
 
     // --- is_parse_miss tests ---
