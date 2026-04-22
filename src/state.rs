@@ -79,6 +79,49 @@ pub struct State {
     /// Count of heartbeat stale alert events (for metrics)
     #[serde(default)]
     pub heartbeat_stale_count: u32,
+    /// Cumulative count of prolonged-thinking interrupts (for metrics).
+    /// Separate from `thinking_interrupt_count` which is a per-episode
+    /// backoff index that resets when Claude exits the thinking state.
+    #[serde(default)]
+    pub prolonged_thinking_interrupts_total: u64,
+    /// Cumulative count of foreground-blocking interrupts (for metrics).
+    #[serde(default)]
+    pub foreground_blocking_interrupts_total: u64,
+    /// Cumulative count of context-warning interrupts (for metrics).
+    /// The `fallback_clear_count` field shares the same fire site; this
+    /// field is the canonical per-interrupt counter name.
+    #[serde(default)]
+    pub context_warning_interrupts_total: u64,
+    /// Cumulative count of watcher-down interrupts (for metrics).
+    /// The `watcher_inject_count` field shares the same fire site; this
+    /// field is the canonical per-interrupt counter name.
+    #[serde(default)]
+    pub watcher_down_interrupts_total: u64,
+    /// Cumulative count of wedged-pane self-clear interrupts (for metrics).
+    #[serde(default)]
+    pub wedged_clear_interrupts_total: u64,
+    /// Cumulative count of auto-update interrupts (for metrics).
+    /// The `auto_update_count` field shares the same fire site; this
+    /// field is the canonical per-interrupt counter name.
+    #[serde(default)]
+    pub auto_update_interrupts_total: u64,
+    /// Cumulative count of reauth `/login` injections (for metrics).
+    #[serde(default)]
+    pub reauth_inject_interrupts_total: u64,
+    /// Cumulative count of post-restart resume injections (for metrics).
+    #[serde(default)]
+    pub post_restart_resume_inject_interrupts_total: u64,
+    /// Cumulative count of fresh-external-session resume injections.
+    #[serde(default)]
+    pub fresh_session_inject_interrupts_total: u64,
+    /// Cumulative count of fresh-/clear resume injections.
+    #[serde(default)]
+    pub fresh_clear_resume_inject_interrupts_total: u64,
+    /// Cumulative count of restart-claude events (for metrics).
+    /// The `restart_count` field shares the same fire site; this is the
+    /// canonical per-interrupt counter name.
+    #[serde(default)]
+    pub restart_claude_interrupts_total: u64,
     /// Count of context-clear fallback injections (daemon injected `/clear`
     /// because the context_high hook fire was stale or absent).
     #[serde(default)]
@@ -270,6 +313,81 @@ mod tests {
         let loaded = load_state(path);
         assert_eq!(loaded.alert_count, 7);
         assert_eq!(loaded.restart_count, 2);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_interrupt_counters_roundtrip() {
+        let path = "/tmp/claude-watch-test-interrupt-counters.json";
+        let mut state = State::default();
+        state.prolonged_thinking_interrupts_total = 7;
+        state.foreground_blocking_interrupts_total = 3;
+        state.context_warning_interrupts_total = 11;
+        state.watcher_down_interrupts_total = 42;
+        state.wedged_clear_interrupts_total = 2;
+        state.auto_update_interrupts_total = 19;
+        state.reauth_inject_interrupts_total = 1;
+        state.post_restart_resume_inject_interrupts_total = 4;
+        state.fresh_session_inject_interrupts_total = 5;
+        state.fresh_clear_resume_inject_interrupts_total = 6;
+        state.restart_claude_interrupts_total = 8;
+        save_state(path, &state);
+
+        let loaded = load_state(path);
+        assert_eq!(loaded.prolonged_thinking_interrupts_total, 7);
+        assert_eq!(loaded.foreground_blocking_interrupts_total, 3);
+        assert_eq!(loaded.context_warning_interrupts_total, 11);
+        assert_eq!(loaded.watcher_down_interrupts_total, 42);
+        assert_eq!(loaded.wedged_clear_interrupts_total, 2);
+        assert_eq!(loaded.auto_update_interrupts_total, 19);
+        assert_eq!(loaded.reauth_inject_interrupts_total, 1);
+        assert_eq!(loaded.post_restart_resume_inject_interrupts_total, 4);
+        assert_eq!(loaded.fresh_session_inject_interrupts_total, 5);
+        assert_eq!(loaded.fresh_clear_resume_inject_interrupts_total, 6);
+        assert_eq!(loaded.restart_claude_interrupts_total, 8);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_interrupt_counters_default_to_zero_on_missing_fields() {
+        // State files written before these fields existed should still
+        // deserialize — counters default to 0 (serde default).
+        let path = "/tmp/claude-watch-test-interrupt-counters-default.json";
+        std::fs::write(path, "{}").unwrap();
+        let loaded = load_state(path);
+        assert_eq!(loaded.prolonged_thinking_interrupts_total, 0);
+        assert_eq!(loaded.foreground_blocking_interrupts_total, 0);
+        assert_eq!(loaded.context_warning_interrupts_total, 0);
+        assert_eq!(loaded.watcher_down_interrupts_total, 0);
+        assert_eq!(loaded.wedged_clear_interrupts_total, 0);
+        assert_eq!(loaded.auto_update_interrupts_total, 0);
+        assert_eq!(loaded.reauth_inject_interrupts_total, 0);
+        assert_eq!(loaded.post_restart_resume_inject_interrupts_total, 0);
+        assert_eq!(loaded.fresh_session_inject_interrupts_total, 0);
+        assert_eq!(loaded.fresh_clear_resume_inject_interrupts_total, 0);
+        assert_eq!(loaded.restart_claude_interrupts_total, 0);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_interrupt_counters_preserved_across_load() {
+        // load_state() explicitly resets some transient fields (thinking_start,
+        // last_interrupt_at, etc.) but must NOT reset cumulative counters.
+        let path = "/tmp/claude-watch-test-interrupt-counters-preserve.json";
+        let mut state = State::default();
+        state.prolonged_thinking_interrupts_total = 100;
+        state.watcher_down_interrupts_total = 200;
+        state.thinking_interrupt_count = 5; // transient (gets cleared on load)
+        state.last_interrupt_at = Some("2026-01-01T00:00:00+00:00".to_string()); // transient
+        save_state(path, &state);
+
+        let loaded = load_state(path);
+        // Cumulative counters preserved
+        assert_eq!(loaded.prolonged_thinking_interrupts_total, 100);
+        assert_eq!(loaded.watcher_down_interrupts_total, 200);
+        // Transient state cleared (guarded by existing behavior in load_state)
+        assert_eq!(loaded.thinking_interrupt_count, 0);
+        assert!(loaded.last_interrupt_at.is_none());
         let _ = std::fs::remove_file(path);
     }
 
