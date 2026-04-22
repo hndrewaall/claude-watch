@@ -31,6 +31,18 @@ pub struct GeneralConfig {
     pub state_file: String,
     pub log_file: String,
     pub legacy_log_file: String,
+    /// Global post-interrupt cooldown (seconds). After ANY interrupt fires
+    /// (prolonged-thinking, watcher-down, context-warning), suppress all
+    /// new interrupts for this many seconds. Prevents cascading interrupts
+    /// where e.g. a watcher-down interrupt fires mid-thought, resets the
+    /// thinking timer, and a prolonged-thinking interrupt fires immediately
+    /// on the newly-started thought. 0 disables the gate.
+    #[serde(default = "default_post_interrupt_cooldown_secs")]
+    pub post_interrupt_cooldown_secs: u64,
+}
+
+fn default_post_interrupt_cooldown_secs() -> u64 {
+    60
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
@@ -103,6 +115,12 @@ pub struct ForegroundMonitorConfig {
     /// Maximum backoff for thinking interrupts in seconds (default: 960 = 16 min)
     #[serde(default = "default_max_thinking_backoff")]
     pub max_thinking_backoff: u64,
+    /// Multiplier applied to the thinking-interrupt threshold on each
+    /// successive interrupt. With base=300 and multiplier=3 the sequence
+    /// is 300, 900, 2700 (capped at max_thinking_backoff). Default 2 preserves
+    /// the original doubling behaviour.
+    #[serde(default = "default_thinking_backoff_multiplier")]
+    pub thinking_backoff_multiplier: u64,
 }
 
 fn default_interrupt_enabled() -> bool {
@@ -115,6 +133,10 @@ fn default_interrupt_message() -> String {
 
 fn default_max_thinking_backoff() -> u64 {
     960 // 16 minutes
+}
+
+fn default_thinking_backoff_multiplier() -> u64 {
+    2
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -672,6 +694,10 @@ cooldown = 300
     fn test_parse_valid_config() {
         let config = parse_config(SAMPLE_CONFIG).expect("should parse valid config");
         assert_eq!(config.general.check_interval, 10);
+        // New field: default should be applied when not present in TOML.
+        assert_eq!(config.general.post_interrupt_cooldown_secs, 60);
+        // New field: thinking_backoff_multiplier default is 2 (legacy doubling).
+        assert_eq!(config.foreground_monitor.thinking_backoff_multiplier, 2);
         assert_eq!(config.tmux.dashboard_pane, "dashboard:0.0");
         assert_eq!(config.claude.max_context_tokens, 200000);
         assert_eq!(config.dead_process.checks_required, 3);

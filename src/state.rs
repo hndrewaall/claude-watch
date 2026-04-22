@@ -31,6 +31,12 @@ pub struct State {
     /// Count of consecutive thinking interrupts (for exponential backoff)
     #[serde(default)]
     pub thinking_interrupt_count: u32,
+    /// Timestamp of the last interrupt fired (across all fire paths:
+    /// prolonged-thinking, watcher-down, context-warning). Used as the
+    /// global post-interrupt cooldown gate so any one interrupt suppresses
+    /// re-fires from the other paths for a short window.
+    #[serde(default)]
+    pub last_interrupt_at: Option<String>,
     // Last known pane/status for foreground polling (not persisted meaningfully)
     #[serde(default)]
     pub last_known_pane: String,
@@ -156,6 +162,11 @@ pub fn load_state(path: &str) -> State {
     state.thinking_start = None;
     state.thinking_alerted = false;
     state.thinking_interrupt_count = 0;
+    // last_interrupt_at is a short-lived global cooldown gate — daemon
+    // downtime makes any persisted value meaningless (either stale or
+    // indefinitely-suppressive). Clear on load so the next interrupt is
+    // allowed to fire immediately.
+    state.last_interrupt_at = None;
     state.foreground_start = None;
     state.foreground_alerted = false;
     // wedged_consecutive is transient — daemon downtime breaks the
