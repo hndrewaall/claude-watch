@@ -154,6 +154,8 @@ async fn restart_claude(pane: &str, state: &mut State, config: &crate::config::C
 
     state.last_restart = Some(now);
     state.restart_count += 1;
+    state.restart_claude_interrupts_total =
+        state.restart_claude_interrupts_total.saturating_add(1);
     state.pending_resume_inject = true;
 
     alert::send_pingme("claude-watch: Claude Code crashed -- auto-restarting").await;
@@ -255,6 +257,9 @@ pub async fn check_foreground(
                         // paths (watcher-down, context-warning) see this
                         // interrupt and back off.
                         state.last_interrupt_at = Some(now.clone());
+                        state.prolonged_thinking_interrupts_total = state
+                            .prolonged_thinking_interrupts_total
+                            .saturating_add(1);
                         tmux::interrupt_and_wait(pane, 30).await;
                         let msg = format!(
                                 "[CLAUDE-WATCH] Prolonged thinking detected (>{}s in thinking state, interrupt #{}). \
@@ -319,6 +324,9 @@ pub async fn check_foreground(
 
                         if config.foreground_monitor.interrupt_enabled {
                             info!("foreground interrupt: sending Ctrl-B x2 + inject message");
+                            state.foreground_blocking_interrupts_total = state
+                                .foreground_blocking_interrupts_total
+                                .saturating_add(1);
                             tmux::interrupt_and_wait(pane, 30).await;
                             tmux::inject_text(pane, &config.foreground_monitor.interrupt_message)
                                 .await;
@@ -520,6 +528,9 @@ async fn check_reauth(config: &Config, state: &mut State, pane: &str) {
             info!("injecting /login command into pane");
             tmux::inject_text(pane, "/login").await;
             state.login_injected = true;
+            state.reauth_inject_interrupts_total = state
+                .reauth_inject_interrupts_total
+                .saturating_add(1);
             write_jsonl_log(
                 &config.general.log_file,
                 "login_injected",
@@ -658,6 +669,8 @@ pub async fn check_update_trigger(config: &Config, state: &mut State, pane: &str
     state.last_update_attempt = Some(chrono::Local::now().to_rfc3339());
     state.update_in_progress = true;
     state.auto_update_count += 1;
+    state.auto_update_interrupts_total =
+        state.auto_update_interrupts_total.saturating_add(1);
     crate::state::save_state(&config.general.state_file, state);
 
     let pane = pane.to_string();
@@ -796,6 +809,8 @@ pub async fn check_auto_update(config: &Config, state: &mut State, pane: &str) {
     state.update_in_progress = true;
     state.auto_update_count += 1;
     state.fallback_update_count = state.fallback_update_count.saturating_add(1);
+    state.auto_update_interrupts_total =
+        state.auto_update_interrupts_total.saturating_add(1);
     crate::state::save_state(&config.general.state_file, state);
 
     // Spawn the long-running update sequence as a background task
@@ -1024,6 +1039,9 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
             )
             .await;
             state.pending_resume_inject = false;
+            state.post_restart_resume_inject_interrupts_total = state
+                .post_restart_resume_inject_interrupts_total
+                .saturating_add(1);
             state.last_check = Some(now);
             crate::state::save_state(&config.general.state_file, state);
             return;
@@ -1218,6 +1236,9 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                 state.was_alive_since_inject = false;
                 state.last_fresh_inject = Some(Local::now().to_rfc3339());
                 state.consecutive_dead_checks = 0;
+                state.fresh_session_inject_interrupts_total = state
+                    .fresh_session_inject_interrupts_total
+                    .saturating_add(1);
                 write_jsonl_log(
                     &config.general.log_file,
                     "fresh_session_inject",
@@ -1306,6 +1327,9 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
             state.last_alert = Some(now.clone());
             state.consecutive_failures = 0;
             state.consecutive_fast_detections = 0;
+            state.fresh_clear_resume_inject_interrupts_total = state
+                .fresh_clear_resume_inject_interrupts_total
+                .saturating_add(1);
             state.last_check = Some(now);
             crate::state::save_state(&config.general.state_file, state);
             return;
@@ -1467,6 +1491,9 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                         state.last_context_clear = Some(now.clone());
                         state.last_interrupt_at = Some(now.clone());
                         state.fallback_clear_count = state.fallback_clear_count.saturating_add(1);
+                        state.context_warning_interrupts_total = state
+                            .context_warning_interrupts_total
+                            .saturating_add(1);
                     }
                 }
             }
@@ -1592,6 +1619,8 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
 
                     state.last_wedged_clear = Some(now.clone());
                     state.wedged_clear_count += 1;
+                    state.wedged_clear_interrupts_total =
+                        state.wedged_clear_interrupts_total.saturating_add(1);
                     state.wedged_consecutive = 0;
                 } else {
                     debug!(
@@ -1728,6 +1757,8 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                 state.last_watcher_inject = Some(now.clone());
                 state.last_interrupt_at = Some(now.clone());
                 state.watcher_inject_count += 1;
+                state.watcher_down_interrupts_total =
+                    state.watcher_down_interrupts_total.saturating_add(1);
                 crate::state::save_state(&config.general.state_file, state);
             }
         }
@@ -2226,5 +2257,76 @@ mod tests {
 
         assert!(!state.fresh_session_injected);
         assert!(!state.was_alive_since_inject);
+    }
+
+    // --- Interrupt counter tests (2026-04-22) ---
+    //
+    // These sanity-check that each per-interrupt counter uses saturating
+    // addition and accumulates across multiple fires. The full tmux-driven
+    // fire paths are exercised in the e2e tests; these tests pin down the
+    // arithmetic primitive that every fire site uses.
+
+    #[test]
+    fn test_interrupt_counter_saturating_increment_accumulates() {
+        let mut state = State::default();
+        for _ in 0..5 {
+            state.prolonged_thinking_interrupts_total = state
+                .prolonged_thinking_interrupts_total
+                .saturating_add(1);
+        }
+        assert_eq!(state.prolonged_thinking_interrupts_total, 5);
+    }
+
+    #[test]
+    fn test_interrupt_counter_saturating_increment_does_not_panic_at_u64_max() {
+        let mut state = State::default();
+        state.prolonged_thinking_interrupts_total = u64::MAX;
+        // saturating_add(1) must not panic at u64::MAX; it saturates.
+        state.prolonged_thinking_interrupts_total = state
+            .prolonged_thinking_interrupts_total
+            .saturating_add(1);
+        assert_eq!(state.prolonged_thinking_interrupts_total, u64::MAX);
+    }
+
+    #[test]
+    fn test_interrupt_counter_independent_of_backoff_index() {
+        // The cumulative counter must not be reset by the per-episode
+        // thinking_interrupt_count reset (which happens when Claude exits
+        // the thinking state — see `check_foreground` else branch).
+        let mut state = State::default();
+        state.prolonged_thinking_interrupts_total = 42;
+        state.thinking_interrupt_count = 3;
+
+        // Mirror the reset branch at the non-thinking else arm:
+        state.thinking_start = None;
+        state.thinking_alerted = false;
+        state.thinking_interrupt_count = 0;
+
+        // Cumulative counter must NOT be reset.
+        assert_eq!(state.prolonged_thinking_interrupts_total, 42);
+        assert_eq!(state.thinking_interrupt_count, 0);
+    }
+
+    #[test]
+    fn test_interrupt_counters_independent_per_kind() {
+        // Incrementing one kind must not affect the others.
+        let mut state = State::default();
+        state.watcher_down_interrupts_total = state
+            .watcher_down_interrupts_total
+            .saturating_add(1);
+        state.context_warning_interrupts_total = state
+            .context_warning_interrupts_total
+            .saturating_add(1);
+        state.context_warning_interrupts_total = state
+            .context_warning_interrupts_total
+            .saturating_add(1);
+
+        assert_eq!(state.watcher_down_interrupts_total, 1);
+        assert_eq!(state.context_warning_interrupts_total, 2);
+        // Untouched kinds stay at 0
+        assert_eq!(state.prolonged_thinking_interrupts_total, 0);
+        assert_eq!(state.wedged_clear_interrupts_total, 0);
+        assert_eq!(state.auto_update_interrupts_total, 0);
+        assert_eq!(state.restart_claude_interrupts_total, 0);
     }
 }

@@ -98,6 +98,24 @@ fn build_metrics(state: &Value, current_version: &str, latest_version: &str) -> 
     let heartbeat_stale = num(state, "heartbeat_stale_count");
     let fallback_clear = num(state, "fallback_clear_count");
     let fallback_update = num(state, "fallback_update_count");
+
+    // Per-interrupt-type counters (cumulative — persisted across daemon restarts
+    // through the state file). Each one increments exactly once per fire at the
+    // corresponding site in src/policy.rs. Rendered as a single labeled
+    // counter so Grafana can aggregate or break down by kind.
+    let prolonged_thinking_interrupts = num(state, "prolonged_thinking_interrupts_total");
+    let foreground_blocking_interrupts = num(state, "foreground_blocking_interrupts_total");
+    let context_warning_interrupts = num(state, "context_warning_interrupts_total");
+    let watcher_down_interrupts = num(state, "watcher_down_interrupts_total");
+    let wedged_clear_interrupts = num(state, "wedged_clear_interrupts_total");
+    let auto_update_interrupts = num(state, "auto_update_interrupts_total");
+    let reauth_inject_interrupts = num(state, "reauth_inject_interrupts_total");
+    let post_restart_resume_inject_interrupts =
+        num(state, "post_restart_resume_inject_interrupts_total");
+    let fresh_session_inject_interrupts = num(state, "fresh_session_inject_interrupts_total");
+    let fresh_clear_resume_inject_interrupts =
+        num(state, "fresh_clear_resume_inject_interrupts_total");
+    let restart_claude_interrupts = num(state, "restart_claude_interrupts_total");
     let reminder_to_clear_count = num(state, "reminder_to_clear_latency_count");
     let reminder_to_update_count = num(state, "reminder_to_update_latency_count");
     let reminder_to_clear_sum = state
@@ -197,6 +215,53 @@ fn build_metrics(state: &Value, current_version: &str, latest_version: &str) -> 
         format!(
             "claude_watch_fallback_injections_total{{type=\"update\"}} {}",
             fallback_update
+        ),
+        "".to_string(),
+        "# HELP claude_interrupts_total Total interrupt events by kind (claude-watch interrupting the managed Claude Code session)".to_string(),
+        "# TYPE claude_interrupts_total counter".to_string(),
+        format!(
+            "claude_interrupts_total{{kind=\"prolonged_thinking\"}} {}",
+            prolonged_thinking_interrupts
+        ),
+        format!(
+            "claude_interrupts_total{{kind=\"foreground_blocking\"}} {}",
+            foreground_blocking_interrupts
+        ),
+        format!(
+            "claude_interrupts_total{{kind=\"context_warning\"}} {}",
+            context_warning_interrupts
+        ),
+        format!(
+            "claude_interrupts_total{{kind=\"watcher_down\"}} {}",
+            watcher_down_interrupts
+        ),
+        format!(
+            "claude_interrupts_total{{kind=\"wedged_clear\"}} {}",
+            wedged_clear_interrupts
+        ),
+        format!(
+            "claude_interrupts_total{{kind=\"auto_update\"}} {}",
+            auto_update_interrupts
+        ),
+        format!(
+            "claude_interrupts_total{{kind=\"reauth_inject\"}} {}",
+            reauth_inject_interrupts
+        ),
+        format!(
+            "claude_interrupts_total{{kind=\"post_restart_resume_inject\"}} {}",
+            post_restart_resume_inject_interrupts
+        ),
+        format!(
+            "claude_interrupts_total{{kind=\"fresh_session_inject\"}} {}",
+            fresh_session_inject_interrupts
+        ),
+        format!(
+            "claude_interrupts_total{{kind=\"fresh_clear_resume_inject\"}} {}",
+            fresh_clear_resume_inject_interrupts
+        ),
+        format!(
+            "claude_interrupts_total{{kind=\"restart_claude\"}} {}",
+            restart_claude_interrupts
         ),
         "".to_string(),
         "# HELP claude_watch_reminder_to_action_latency_seconds_sum Sum of seconds between hook reminder and Claude self-action".to_string(),
@@ -401,6 +466,77 @@ mod tests {
         assert!(joined.contains(
             "claude_watch_reminder_to_action_latency_seconds_count{type=\"clear\"} 3"
         ));
+    }
+
+    #[test]
+    fn build_metrics_includes_per_interrupt_kind_counters() {
+        // Each kind should render as claude_interrupts_total{kind="..."} <value>
+        let state = json!({
+            "prolonged_thinking_interrupts_total": 7,
+            "foreground_blocking_interrupts_total": 3,
+            "context_warning_interrupts_total": 11,
+            "watcher_down_interrupts_total": 42,
+            "wedged_clear_interrupts_total": 2,
+            "auto_update_interrupts_total": 19,
+            "reauth_inject_interrupts_total": 1,
+            "post_restart_resume_inject_interrupts_total": 4,
+            "fresh_session_inject_interrupts_total": 5,
+            "fresh_clear_resume_inject_interrupts_total": 6,
+            "restart_claude_interrupts_total": 8,
+        });
+        let lines = build_metrics(&state, "x", "y");
+        let joined = lines.join("\n");
+
+        // # TYPE claude_interrupts_total counter (NOT gauge)
+        assert!(
+            joined.contains("# TYPE claude_interrupts_total counter"),
+            "missing counter type declaration: {}",
+            joined
+        );
+
+        // Each kind present with expected value
+        for (kind, value) in [
+            ("prolonged_thinking", 7),
+            ("foreground_blocking", 3),
+            ("context_warning", 11),
+            ("watcher_down", 42),
+            ("wedged_clear", 2),
+            ("auto_update", 19),
+            ("reauth_inject", 1),
+            ("post_restart_resume_inject", 4),
+            ("fresh_session_inject", 5),
+            ("fresh_clear_resume_inject", 6),
+            ("restart_claude", 8),
+        ] {
+            let needle = format!(
+                "claude_interrupts_total{{kind=\"{}\"}} {}",
+                kind, value
+            );
+            assert!(
+                joined.contains(&needle),
+                "missing interrupt line {:?} in:\n{}",
+                needle,
+                joined
+            );
+        }
+    }
+
+    #[test]
+    fn build_metrics_per_interrupt_defaults_to_zero() {
+        // Missing fields default to 0 (new counters, state file predates them).
+        let state = json!({});
+        let lines = build_metrics(&state, "x", "y");
+        let joined = lines.join("\n");
+        assert!(
+            joined.contains("claude_interrupts_total{kind=\"prolonged_thinking\"} 0"),
+            "missing zero-default for prolonged_thinking: {}",
+            joined
+        );
+        assert!(
+            joined.contains("claude_interrupts_total{kind=\"watcher_down\"} 0"),
+            "missing zero-default for watcher_down: {}",
+            joined
+        );
     }
 
     #[test]
