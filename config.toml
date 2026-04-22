@@ -10,6 +10,13 @@ state_file = "~/.config/claude-watch/state.json"
 log_file = "/var/log/claude/claude-watch.jsonl"
 # Also log to the legacy plain-text log for backwards compat
 legacy_log_file = "/var/log/claude/claude-watch.log"
+# Global post-interrupt cooldown (seconds). After ANY interrupt fires
+# (prolonged-thinking, watcher-down, context-warning), suppress all new
+# interrupts for this many seconds. Prevents cascading interrupts where a
+# watcher-down interrupt fires mid-thought, resets the thinking timer, and
+# then prolonged-thinking immediately re-fires on the newly-started thought.
+# 0 disables the gate.
+post_interrupt_cooldown_secs = 60
 
 [tmux]
 # Override: pin Claude Code to a specific tmux pane (e.g. "dashboard:0.2").
@@ -65,14 +72,21 @@ resume_prompt = "[CLAUDE-WATCH] Daemon detected stuck state: no background tasks
 [foreground_monitor]
 # Enable foreground blocking pattern detection
 enabled = true
-# Seconds of continuous foreground activity before warning
-threshold_seconds = 180
+# Seconds of continuous foreground activity before warning.
+# Raised 180 -> 300 on 2026-04-21: the shorter value was firing on legitimate
+# long agent-return reads. 300s still catches real stuck states.
+threshold_seconds = 300
 # Check interval for foreground state (seconds) — independent of general.check_interval
 check_interval = 3
 # Interrupt when blocking/prolonged thinking detected (false = log-only mode)
 interrupt_enabled = true
 # Message injected after interrupting
 interrupt_message = "The foreground command was backgrounded by claude-watch because it exceeded the timeout. Use run_in_background for long commands."
+# Multiplier applied to threshold_seconds on each successive interrupt.
+# With threshold_seconds=300 and multiplier=3 the sequence is 300, 900,
+# 2700 (capped at max_thinking_backoff). Raised 2 -> 3 on 2026-04-21:
+# if interrupt #1 didn't break the wedge, firing #2 quickly won't either.
+thinking_backoff_multiplier = 3
 
 [watcher_monitor]
 # Enable individual watcher health tracking
@@ -83,8 +97,11 @@ watchers_config = "~/.config/watchmen/watchers.conf"
 expected_watchmen = 0
 # Consecutive missing checks before injecting restart (6 = ~60s at 10s interval)
 inject_threshold = 6
-# Cooldown between watcher-missing injections (seconds)
-inject_cooldown = 120
+# Cooldown between watcher-missing injections (seconds).
+# Raised 120 -> 300 on 2026-04-21: when watchers are down, one interrupt
+# every 5 min is plenty to nudge the main loop; rapid re-fires just
+# generate alert fatigue and Pushover noise without fixing anything.
+inject_cooldown = 300
 
 [context_monitor]
 # Enable context usage monitoring and deferred self-clear
