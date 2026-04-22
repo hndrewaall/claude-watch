@@ -24,16 +24,56 @@ pub(crate) fn elapsed_since(dt_str: &str) -> Option<f64> {
 }
 
 /// Pure function: compute the next thinking interrupt threshold with exponential backoff.
-/// Formula: min(base_threshold * 2^interrupt_count, max_backoff)
-/// E.g. with base=60, max=960: 60, 120, 240, 480, 960, 960, ...
+/// Formula: min(base_threshold * backoff_multiplier^interrupt_count, max_backoff)
+/// E.g. with base=60, mult=2, max=960: 60, 120, 240, 480, 960, 960, ...
+/// With base=300, mult=3, max=1800: 300, 900, 1800, 1800, ...
+///
+/// This 2-multiplier wrapper is retained for backward-compatibility and is
+/// used by the legacy-compat test. The daemon's check_foreground path now
+/// calls `thinking_backoff_threshold_with_multiplier` directly, reading the
+/// multiplier from config.
+#[allow(dead_code)]
 pub(crate) fn thinking_backoff_threshold(
     base_threshold: u64,
     max_backoff: u64,
     interrupt_count: u32,
 ) -> u64 {
-    let multiplier = 1u64.checked_shl(interrupt_count).unwrap_or(u64::MAX);
-    let threshold = base_threshold.saturating_mul(multiplier);
+    thinking_backoff_threshold_with_multiplier(base_threshold, max_backoff, interrupt_count, 2)
+}
+
+/// Generalised version of `thinking_backoff_threshold` with a configurable
+/// multiplier per step. Uses saturating arithmetic so huge `interrupt_count`
+/// values never panic — they just cap at `max_backoff`.
+pub(crate) fn thinking_backoff_threshold_with_multiplier(
+    base_threshold: u64,
+    max_backoff: u64,
+    interrupt_count: u32,
+    multiplier: u64,
+) -> u64 {
+    let mut threshold = base_threshold;
+    for _ in 0..interrupt_count {
+        threshold = threshold.saturating_mul(multiplier);
+        if threshold >= max_backoff {
+            return max_backoff;
+        }
+    }
     threshold.min(max_backoff)
+}
+
+/// Returns true if a previous interrupt fired within the last
+/// `cooldown_secs` seconds. Used to suppress cascading interrupts across
+/// all fire paths (prolonged-thinking, watcher-down, context-warning).
+///
+/// A `cooldown_secs` of 0 disables the gate entirely.
+pub(crate) fn interrupt_in_global_cooldown(state: &State, cooldown_secs: u64) -> bool {
+    if cooldown_secs == 0 {
+        return false;
+    }
+    state
+        .last_interrupt_at
+        .as_deref()
+        .and_then(elapsed_since)
+        .is_some_and(|e| e < cooldown_secs as f64)
 }
 
 /// If the given reminder fired within the last `max_age_secs` (we default
@@ -151,12 +191,31 @@ pub async fn check_foreground(
             // resets when we see a genuinely active state (below).
         } else if let Some(ref start) = state.thinking_start {
             if let Some(elapsed) = elapsed_since(start) {
-                let next_threshold = thinking_backoff_threshold(
+                let next_threshold = thinking_backoff_threshold_with_multiplier(
                     config.foreground_monitor.threshold_seconds,
                     config.foreground_monitor.max_thinking_backoff,
                     state.thinking_interrupt_count,
+                    config.foreground_monitor.thinking_backoff_multiplier,
                 );
                 if elapsed >= next_threshold as f64 {
+                    // Global post-interrupt cooldown: if ANY interrupt fired
+                    // recently (watcher-down, context-warning, or a prior
+                    // thinking one), suppress this fire. Prevents the
+                    // cascade where e.g. a watcher-down interrupt resets the
+                    // thinking timer and the new thought trips prolonged
+                    // thinking immediately afterward.
+                    if interrupt_in_global_cooldown(
+                        state,
+                        config.general.post_interrupt_cooldown_secs,
+                    ) {
+                        debug!(
+                            elapsed_secs = elapsed,
+                            threshold = next_threshold,
+                            cooldown = config.general.post_interrupt_cooldown_secs,
+                            "prolonged thinking would fire but global post-interrupt cooldown active"
+                        );
+                        return;
+                    }
                     warn!(
                         elapsed_secs = elapsed,
                         threshold = next_threshold,
@@ -184,13 +243,18 @@ pub async fn check_foreground(
                     if config.foreground_monitor.interrupt_enabled {
                         info!(
                             interrupt_count = state.thinking_interrupt_count,
-                            next_backoff_secs = thinking_backoff_threshold(
+                            next_backoff_secs = thinking_backoff_threshold_with_multiplier(
                                 config.foreground_monitor.threshold_seconds,
                                 config.foreground_monitor.max_thinking_backoff,
                                 state.thinking_interrupt_count,
+                                config.foreground_monitor.thinking_backoff_multiplier,
                             ),
                             "thinking interrupt: Escape + inject prompt"
                         );
+                        // Stamp the global interrupt cooldown so other fire
+                        // paths (watcher-down, context-warning) see this
+                        // interrupt and back off.
+                        state.last_interrupt_at = Some(now.clone());
                         tmux::interrupt_and_wait(pane, 30).await;
                         let msg = format!(
                                 "[CLAUDE-WATCH] Prolonged thinking detected (>{}s in thinking state, interrupt #{}). \
@@ -1315,6 +1379,17 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                             config.hybrid.context_fallback_secs as f64,
                         );
 
+                    // Global post-interrupt cooldown: if a recent interrupt
+                    // (thinking, watcher-down, or a prior context-warning)
+                    // fired, defer this context warning too. The deferred
+                    // self-clear child still runs if the token level stays
+                    // high; the cooldown only gates the tmux interrupt +
+                    // warning message.
+                    let global_cooldown_blocks = interrupt_in_global_cooldown(
+                        state,
+                        config.general.post_interrupt_cooldown_secs,
+                    );
+
                     if hook_deferred {
                         debug!(
                             tokens,
@@ -1329,6 +1404,22 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                                 "tokens": tokens,
                                 "pct": pct,
                                 "grace_secs": config.hybrid.context_fallback_secs,
+                            }),
+                        );
+                    } else if global_cooldown_blocks {
+                        debug!(
+                            tokens,
+                            pct,
+                            cooldown = config.general.post_interrupt_cooldown_secs,
+                            "context threshold exceeded but global post-interrupt cooldown active"
+                        );
+                        write_jsonl_log(
+                            &config.general.log_file,
+                            "context_threshold_global_cooldown_deferred",
+                            serde_json::json!({
+                                "tokens": tokens,
+                                "pct": pct,
+                                "cooldown_secs": config.general.post_interrupt_cooldown_secs,
                             }),
                         );
                     } else {
@@ -1374,6 +1465,7 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
 
                         state.context_clear_triggered = true;
                         state.last_context_clear = Some(now.clone());
+                        state.last_interrupt_at = Some(now.clone());
                         state.fallback_clear_count = state.fallback_clear_count.saturating_add(1);
                     }
                 }
@@ -1591,7 +1683,18 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                     .is_none_or(|e| e >= config.watcher_monitor.inject_cooldown as f64),
                 None => true,
             };
-            if should_inject {
+            // Global post-interrupt cooldown: if any interrupt (thinking,
+            // context-warning, or a prior watcher-down) fired recently,
+            // defer this one to avoid cascading interrupts.
+            let global_cooldown_blocks =
+                interrupt_in_global_cooldown(state, config.general.post_interrupt_cooldown_secs);
+            if should_inject && global_cooldown_blocks {
+                debug!(
+                    cooldown = config.general.post_interrupt_cooldown_secs,
+                    "watcher-down inject would fire but global post-interrupt cooldown active"
+                );
+            }
+            if should_inject && !global_cooldown_blocks {
                 let missing_list = missing_names.join(", ");
                 warn!(missing = %missing_list, "watchers down — interrupting and injecting restart");
                 write_jsonl_log(
@@ -1623,6 +1726,7 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                 );
                 tmux::inject_text(&effective_pane, &prompt).await;
                 state.last_watcher_inject = Some(now.clone());
+                state.last_interrupt_at = Some(now.clone());
                 state.watcher_inject_count += 1;
                 crate::state::save_state(&config.general.state_file, state);
             }
@@ -1943,6 +2047,80 @@ mod tests {
         assert_eq!(result, 960); // Capped at max
         let result = thinking_backoff_threshold(60, 960, u32::MAX);
         assert_eq!(result, 960); // Capped at max, no panic
+    }
+
+    // --- Configurable-multiplier backoff tests (2026-04-21) ---
+
+    #[test]
+    fn test_thinking_backoff_multiplier_3() {
+        // With base=300, mult=3, max=960: 300, 900, 960 (cap), 960, ...
+        assert_eq!(thinking_backoff_threshold_with_multiplier(300, 960, 0, 3), 300);
+        assert_eq!(thinking_backoff_threshold_with_multiplier(300, 960, 1, 3), 900);
+        assert_eq!(thinking_backoff_threshold_with_multiplier(300, 960, 2, 3), 960);
+        assert_eq!(thinking_backoff_threshold_with_multiplier(300, 960, 10, 3), 960);
+    }
+
+    #[test]
+    fn test_thinking_backoff_multiplier_2_matches_legacy() {
+        // multiplier=2 should produce the same output as the legacy doubling.
+        for count in 0..6 {
+            assert_eq!(
+                thinking_backoff_threshold_with_multiplier(60, 960, count, 2),
+                thinking_backoff_threshold(60, 960, count),
+                "legacy-compat check failed at count={}", count
+            );
+        }
+    }
+
+    #[test]
+    fn test_thinking_backoff_multiplier_overflow_safety() {
+        // Huge counts with multiplier>1 must not panic.
+        let result = thinking_backoff_threshold_with_multiplier(300, 960, u32::MAX, 3);
+        assert_eq!(result, 960);
+    }
+
+    // --- Global post-interrupt cooldown tests (2026-04-21) ---
+
+    #[test]
+    fn test_global_cooldown_disabled_when_zero() {
+        // cooldown=0 always returns false, regardless of last_interrupt_at.
+        let mut state = State::default();
+        state.last_interrupt_at = Some(Utc::now().to_rfc3339());
+        assert!(!interrupt_in_global_cooldown(&state, 0));
+    }
+
+    #[test]
+    fn test_global_cooldown_inactive_when_no_prior_interrupt() {
+        // No last_interrupt_at -> never in cooldown.
+        let state = State::default();
+        assert!(!interrupt_in_global_cooldown(&state, 60));
+    }
+
+    #[test]
+    fn test_global_cooldown_active_within_window() {
+        // Last interrupt was 10s ago, window is 60s -> in cooldown.
+        let mut state = State::default();
+        let ts = Utc::now() - chrono::Duration::seconds(10);
+        state.last_interrupt_at = Some(ts.to_rfc3339());
+        assert!(interrupt_in_global_cooldown(&state, 60));
+    }
+
+    #[test]
+    fn test_global_cooldown_expired_after_window() {
+        // Last interrupt was 120s ago, window is 60s -> cooldown expired.
+        let mut state = State::default();
+        let ts = Utc::now() - chrono::Duration::seconds(120);
+        state.last_interrupt_at = Some(ts.to_rfc3339());
+        assert!(!interrupt_in_global_cooldown(&state, 60));
+    }
+
+    #[test]
+    fn test_global_cooldown_ignores_malformed_timestamp() {
+        // Garbage timestamp should not count as "in cooldown" (fail-open so
+        // the gate never wedges).
+        let mut state = State::default();
+        state.last_interrupt_at = Some("not a date".to_string());
+        assert!(!interrupt_in_global_cooldown(&state, 60));
     }
 
     // --- Fresh session inject loop prevention tests ---
