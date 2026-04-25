@@ -208,17 +208,26 @@ pub async fn dismiss_feedback_prompt(pane: &str) {
 }
 
 /// Actively interrupt Claude Code: rapid-fire Escape, periodically Ctrl-B x2.
-/// Returns true if idle state confirmed within timeout.
+/// Returns true if idle state confirmed within `timeout_secs`. Returns false
+/// at the deadline; callers should still proceed with their inject (the
+/// pane may not match `detect_activity()`'s idle predicate but Claude Code
+/// has typically responded long before the timeout fires).
 ///
 /// Uses `get_activity()` (content-area aware) instead of `is_idle()` (prompt-only)
 /// to ensure the thinking indicator has fully cleared before returning.
+///
+/// Timing: blasts Escape every 250ms. A 1s wall-clock budget gives ~4
+/// Escape sends, which is enough to interrupt anything Claude is doing
+/// short of a foreground bash command (those need Ctrl-C, not Escape).
+/// Idle confirmation requires two consecutive Idle reads 150ms apart to
+/// guard against transient state during the pane redraw.
 pub async fn interrupt_and_wait(pane: &str, timeout_secs: u64) -> bool {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
     let mut escape_count: u32 = 0;
 
     while tokio::time::Instant::now() < deadline {
         if get_activity(pane).await == ClaudeActivity::Idle {
-            sleep(Duration::from_millis(300)).await;
+            sleep(Duration::from_millis(150)).await;
             if get_activity(pane).await == ClaudeActivity::Idle {
                 return true;
             }
@@ -226,22 +235,40 @@ pub async fn interrupt_and_wait(pane: &str, timeout_secs: u64) -> bool {
 
         if escape_count > 0 && escape_count % 5 == 0 {
             send_keys(pane, &["C-b"]).await;
-            sleep(Duration::from_millis(300)).await;
+            sleep(Duration::from_millis(150)).await;
             send_keys(pane, &["C-b"]).await;
-            sleep(Duration::from_millis(500)).await;
+            sleep(Duration::from_millis(250)).await;
         } else {
             send_keys(pane, &["Escape"]).await;
-            sleep(Duration::from_millis(500)).await;
+            sleep(Duration::from_millis(250)).await;
         }
         escape_count += 1;
     }
+    debug!(
+        pane = %pane,
+        timeout_secs,
+        escape_count,
+        "interrupt_and_wait: idle never observed within timeout, proceeding"
+    );
     false
 }
 
 /// Inject text into Claude Code via vim-mode keystrokes.
 /// Escape(s) -> wait for Idle -> dd -> i -> type -> Escape -> Enter
+///
+/// Designed to be FAST. Most callers reach inject_text right after
+/// `interrupt_and_wait` has already brought the pane to idle, so the
+/// per-step waits below should be the worst case, not the typical case.
+/// The Step 1b idle-wait uses a short fast-path bail
+/// (`INJECT_IDLE_FAST_PATH_MS`) rather than blocking for the full pre-fix
+/// 10s window — if Claude Code's pane hasn't shown Idle within ~1.5s
+/// after our Escape loop, it's overwhelmingly likely the predicate just
+/// isn't matching what the pane actually shows (stale thinking line in
+/// scrollback, custom theme, etc.) and waiting longer doesn't help.
+/// We send anyway.
 pub async fn inject_text(pane: &str, text: &str) {
-    // Step 1: Escape to NORMAL mode (up to 3 attempts)
+    // Step 1: Escape to NORMAL mode (up to 3 attempts). The is_insert_mode()
+    // check confirms tmux processed each Escape before we send the next.
     for _ in 0..3 {
         send_keys(pane, &["Escape"]).await;
         sleep(Duration::from_secs(1)).await;
@@ -256,16 +283,32 @@ pub async fn inject_text(pane: &str, text: &str) {
     // the wait is opt-in rather than always-paid.
     settle_after_escape().await;
 
-    // Step 1b: Wait for activity to settle to Idle (thinking indicator cleared).
-    // The prompt may be visible while thinking text is still rendering in the
-    // content area above. Wait up to 10s for get_activity() == Idle before
-    // proceeding with dd/i/type to avoid typing over stale thinking text.
-    let idle_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    // Step 1b: Wait briefly for the activity indicator to settle to Idle
+    // (thinking indicator cleared). `interrupt_and_wait` is normally
+    // called first and has already done the heavy lifting — this is a
+    // last-line check in case the predicate flickers across the Escape
+    // boundary. Fast-path bails after `INJECT_IDLE_FAST_PATH_MS` and
+    // sends anyway: if the pane's idle predicate hasn't matched by then,
+    // it almost certainly never will (stale scrollback thinking text,
+    // custom prompt, etc.), and blocking longer just makes recovery feel
+    // sluggish without changing the outcome.
+    const INJECT_IDLE_FAST_PATH_MS: u64 = 1500;
+    let idle_deadline =
+        tokio::time::Instant::now() + Duration::from_millis(INJECT_IDLE_FAST_PATH_MS);
+    let mut idle_observed = false;
     while tokio::time::Instant::now() < idle_deadline {
         if get_activity(pane).await == ClaudeActivity::Idle {
+            idle_observed = true;
             break;
         }
-        sleep(Duration::from_millis(500)).await;
+        sleep(Duration::from_millis(200)).await;
+    }
+    if !idle_observed {
+        debug!(
+            pane = %pane,
+            fast_path_ms = INJECT_IDLE_FAST_PATH_MS,
+            "inject_text: idle not observed within fast-path window, sending anyway"
+        );
     }
 
     // Step 2: dd -- delete entire line

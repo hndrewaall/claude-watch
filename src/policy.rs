@@ -260,7 +260,11 @@ pub async fn check_foreground(
                         state.prolonged_thinking_interrupts_total = state
                             .prolonged_thinking_interrupts_total
                             .saturating_add(1);
-                        tmux::interrupt_and_wait(pane, 30).await;
+                        // 5s budget: Escape blasts every 250ms. If Claude
+                        // hasn't honored the interrupt by ~5s, it almost
+                        // certainly won't — proceed with the inject anyway.
+                        // Pre-fix: 30s, dominated perceived recovery latency.
+                        tmux::interrupt_and_wait(pane, 5).await;
                         let msg = format!(
                                 "[CLAUDE-WATCH] Prolonged thinking detected (>{}s in thinking state, interrupt #{}). \
                                 You appear to be stuck in a long generation. If you have complex work to do, \
@@ -327,7 +331,9 @@ pub async fn check_foreground(
                             state.foreground_blocking_interrupts_total = state
                                 .foreground_blocking_interrupts_total
                                 .saturating_add(1);
-                            tmux::interrupt_and_wait(pane, 30).await;
+                            // 5s budget — see comment at the prolonged-thinking
+                            // interrupt site above.
+                            tmux::interrupt_and_wait(pane, 5).await;
                             tmux::inject_text(pane, &config.foreground_monitor.interrupt_message)
                                 .await;
                             write_jsonl_log(
@@ -473,7 +479,8 @@ async fn inject_context_warning(pane: &str, pct: f64, compact_remaining: Option<
         Forced clear in {}s if you don't act.",
         context_info, grace
     );
-    tmux::interrupt_and_wait(pane, 30).await;
+    // 5s budget — same rationale as the other inline interrupt sites.
+    tmux::interrupt_and_wait(pane, 5).await;
     tmux::inject_text(pane, &msg).await;
 }
 
@@ -835,11 +842,14 @@ async fn run_auto_update(pane: &str, old_version: &str, new_version: &str, confi
         serde_json::json!({}),
     );
 
-    // Step 1: Interrupt and wait for idle
-    if tmux::interrupt_and_wait(pane, 30).await {
+    // Step 1: Interrupt and wait for idle. 10s budget — auto-update is
+    // a rare path so we're a bit more patient than the inline interrupt
+    // sites (5s), but still bounded so a stuck pane doesn't pin the
+    // updater for half a minute.
+    if tmux::interrupt_and_wait(pane, 10).await {
         info!("auto-update: Claude Code is idle");
     } else {
-        warn!("auto-update: could not confirm idle after 30s, proceeding anyway");
+        warn!("auto-update: could not confirm idle after 10s, proceeding anyway");
     }
 
     // Settle time after interruption
