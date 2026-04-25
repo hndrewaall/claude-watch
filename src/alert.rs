@@ -16,7 +16,10 @@ pub async fn alert(message: &str, pane: &str, resume_prompt: &str, use_pingme: b
         send_pingme(message).await;
     }
 
-    // Actively interrupt, then inject resume prompt
-    tmux::interrupt_and_wait(pane, 30).await;
+    // Actively interrupt, then inject resume prompt. 5s budget keeps the
+    // perceived recovery latency low; if the pane never goes idle we
+    // proceed with the inject anyway (Claude has typically responded long
+    // before the timeout fires).
+    tmux::interrupt_and_wait(pane, 5).await;
     tmux::inject_text(pane, resume_prompt).await;
 }
