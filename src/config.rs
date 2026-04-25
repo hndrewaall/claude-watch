@@ -55,6 +55,16 @@ pub struct TmuxConfig {
     /// Empty string = auto-detect via find_claude_pane().
     #[serde(default)]
     pub dashboard_session: String,
+    /// Settle delay (milliseconds) inserted between the ESC -> NORMAL-mode
+    /// transition and the dd/i/text sequence inside `inject_text`. Default:
+    /// 0 (disabled — fast path). Tune up only if a particular environment
+    /// shows follow-up keystrokes being garbled or eaten because Claude
+    /// Code's pane hasn't finished processing the Escape before the next
+    /// keys arrive. Most setups don't need this — the ESC loop's
+    /// per-iteration `is_insert_mode()` check already confirms each
+    /// Escape was processed before the next is sent.
+    #[serde(default)]
+    pub post_escape_settle_ms: u64,
 }
 
 #[derive(Debug, Deserialize, Clone)]

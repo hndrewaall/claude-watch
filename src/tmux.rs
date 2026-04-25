@@ -2,9 +2,48 @@
 
 use crate::cmd::{run_cmd, run_cmd_any};
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::time::sleep;
 use tracing::debug;
+
+/// Settle delay (milliseconds) inserted between the ESC -> NORMAL-mode
+/// transition and the dd/i/text sequence in `inject_text`. See
+/// `TmuxConfig::post_escape_settle_ms` for the rationale. Initialized at
+/// daemon startup from config; defaults to 0 (disabled) so the fast path
+/// is the default. Set via `set_post_escape_settle_ms()`.
+static POST_ESCAPE_SETTLE_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Update the global post-escape settle delay. Called from main.rs at daemon
+/// startup and on every config reload. Safe to call concurrently — uses a
+/// relaxed atomic store.
+pub fn set_post_escape_settle_ms(ms: u64) {
+    POST_ESCAPE_SETTLE_MS.store(ms, Ordering::Relaxed);
+}
+
+/// Read the current post-escape settle delay. Used internally by injection
+/// helpers; exposed for tests.
+pub fn post_escape_settle_ms() -> u64 {
+    POST_ESCAPE_SETTLE_MS.load(Ordering::Relaxed)
+}
+
+/// Sleep for the configured post-escape settle delay. No-op when the knob
+/// is set to 0 (the default). Call this AFTER Escape keystroke(s) and
+/// BEFORE any further keystrokes (typed text, vim-mode dd/i, /clear,
+/// Enter, etc.) when extra settle time is needed to keep follow-up keys
+/// from being garbled or eaten.
+///
+/// Currently invoked only at the ESC -> NORMAL-mode boundary inside
+/// `inject_text` (replacing what used to be a hardcoded 500ms sleep).
+/// Default is 0 so the fast path is the default; set
+/// `[tmux].post_escape_settle_ms` in config.toml if a particular
+/// environment needs the extra cushion.
+async fn settle_after_escape() {
+    let ms = post_escape_settle_ms();
+    if ms > 0 {
+        sleep(Duration::from_millis(ms)).await;
+    }
+}
 
 /// Current activity state of Claude Code as observed from tmux pane output.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -210,7 +249,12 @@ pub async fn inject_text(pane: &str, text: &str) {
             break;
         }
     }
-    sleep(Duration::from_millis(500)).await;
+    // Step 1a: Optional configurable settle after the Escape loop, before
+    // typing dd/i/text. Default 0 (no extra wait — fast path). Tunable
+    // via [tmux].post_escape_settle_ms when a slow environment needs the
+    // extra cushion. Replaced what used to be a hardcoded 500ms sleep so
+    // the wait is opt-in rather than always-paid.
+    settle_after_escape().await;
 
     // Step 1b: Wait for activity to settle to Idle (thinking indicator cleared).
     // The prompt may be visible while thinking text is still rendering in the
@@ -1731,5 +1775,24 @@ API Error: Request rejected (429)\n";
     fn test_wedged_reason_display() {
         assert_eq!(format!("{}", WedgedReason::ContextLimit), "context_limit");
         assert_eq!(format!("{}", WedgedReason::RateLimited), "rate_limited");
+    }
+
+    /// Verify the post-escape settle delay is wired through the global
+    /// atomic. We don't test the full settle_after_escape() async helper
+    /// here (it's exercised by the e2e inject tests); we just verify the
+    /// getter reflects the setter so the daemon's startup wiring is sound.
+    ///
+    /// NOTE: this mutates a process-global. Other tests in the same
+    /// process must not depend on a specific value for the setting. We
+    /// restore the default at the end so subsequent tests aren't surprised.
+    #[test]
+    fn test_post_escape_settle_ms_get_set_roundtrip() {
+        let original = post_escape_settle_ms();
+        set_post_escape_settle_ms(1234);
+        assert_eq!(post_escape_settle_ms(), 1234);
+        set_post_escape_settle_ms(0);
+        assert_eq!(post_escape_settle_ms(), 0);
+        // Restore for downstream tests.
+        set_post_escape_settle_ms(original);
     }
 }
