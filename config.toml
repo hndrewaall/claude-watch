@@ -25,6 +25,17 @@ dashboard_pane = "dashboard:0.2"
 # Override: tmux session name where Claude Code runs (e.g. "dashboard").
 # Leave empty or omit to auto-detect across all sessions.
 dashboard_session = "dashboard"
+# Settle delay (milliseconds) inserted after Escape keystrokes and before
+# subsequent keystrokes. Without this, follow-up keys (typed prompt text,
+# vim-mode dd/i, /clear, resume, etc.) can land in the pane before Claude
+# Code has finished processing the Escape interrupt and get garbled or
+# eaten. Applied at the end of interrupt_and_wait (after rapid-fire ESCs),
+# at the start of inject_text (before its own ESC loop), and after the
+# ESC -> NORMAL-mode transition inside inject_text. Default: 500ms. Set
+# to 0 to disable (legacy behavior). Tune up if interrupts still garble
+# the follow-up prompt; tune down only after confirming the pane settles
+# faster.
+post_escape_settle_ms = 500
 
 [claude]
 # Max context window tokens

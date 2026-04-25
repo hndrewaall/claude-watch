@@ -2,9 +2,41 @@
 
 use crate::cmd::{run_cmd, run_cmd_any};
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::time::sleep;
 use tracing::debug;
+
+/// Settle delay (milliseconds) inserted after Escape keystrokes and before
+/// subsequent keystrokes. See `TmuxConfig::post_escape_settle_ms` for the
+/// rationale. Initialized at daemon startup from config; defaults to 500ms
+/// if never set (so unit tests / tools that don't load config get sane
+/// behavior). Set via `set_post_escape_settle_ms()`.
+static POST_ESCAPE_SETTLE_MS: AtomicU64 = AtomicU64::new(500);
+
+/// Update the global post-escape settle delay. Called from main.rs at daemon
+/// startup and on every config reload. Safe to call concurrently — uses a
+/// relaxed atomic store.
+pub fn set_post_escape_settle_ms(ms: u64) {
+    POST_ESCAPE_SETTLE_MS.store(ms, Ordering::Relaxed);
+}
+
+/// Read the current post-escape settle delay. Used internally by injection
+/// helpers; exposed for tests.
+pub fn post_escape_settle_ms() -> u64 {
+    POST_ESCAPE_SETTLE_MS.load(Ordering::Relaxed)
+}
+
+/// Sleep for the configured post-escape settle delay. No-op when the knob
+/// is set to 0. Call this AFTER Escape keystroke(s) and BEFORE any further
+/// keystrokes (typed text, vim-mode dd/i, /clear, Enter, etc.) so Claude
+/// Code has time to finish processing the interrupt.
+async fn settle_after_escape() {
+    let ms = post_escape_settle_ms();
+    if ms > 0 {
+        sleep(Duration::from_millis(ms)).await;
+    }
+}
 
 /// Current activity state of Claude Code as observed from tmux pane output.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -181,6 +213,13 @@ pub async fn interrupt_and_wait(pane: &str, timeout_secs: u64) -> bool {
         if get_activity(pane).await == ClaudeActivity::Idle {
             sleep(Duration::from_millis(300)).await;
             if get_activity(pane).await == ClaudeActivity::Idle {
+                // Idle confirmed. Settle BEFORE returning so any caller
+                // about to send follow-up keystrokes (typed prompt text,
+                // vim-mode dd/i, /clear) doesn't race the just-sent
+                // Escape that brought us idle. Without this, downstream
+                // inject_* keys can land before Claude finishes processing
+                // the interrupt and get garbled or eaten.
+                settle_after_escape().await;
                 return true;
             }
         }
@@ -202,7 +241,18 @@ pub async fn interrupt_and_wait(pane: &str, timeout_secs: u64) -> bool {
 /// Inject text into Claude Code via vim-mode keystrokes.
 /// Escape(s) -> wait for Idle -> dd -> i -> type -> Escape -> Enter
 pub async fn inject_text(pane: &str, text: &str) {
-    // Step 1: Escape to NORMAL mode (up to 3 attempts)
+    // Step 0: Settle. Most callers reach inject_text right after
+    // interrupt_and_wait, which has already fired Escape repeatedly.
+    // If interrupt_and_wait returned false (idle never confirmed) the
+    // pane may still be processing the very last Escape — settling here
+    // gives Claude Code time to finish before our own Escape loop below
+    // piles on. interrupt_and_wait's success path also settles, so this
+    // is a low-cost extra guard, not a duplicate delay.
+    settle_after_escape().await;
+
+    // Step 1: Escape to NORMAL mode (up to 3 attempts). Settle after each
+    // Escape so the is_insert_mode() check sees the post-Escape state
+    // rather than an in-flight one.
     for _ in 0..3 {
         send_keys(pane, &["Escape"]).await;
         sleep(Duration::from_secs(1)).await;
@@ -210,7 +260,12 @@ pub async fn inject_text(pane: &str, text: &str) {
             break;
         }
     }
-    sleep(Duration::from_millis(500)).await;
+    // Step 1a: Final settle after the Escape loop, before we start typing
+    // dd/i/text. This is the critical "post-escape, before more keys"
+    // window Andrew flagged 2026-04-25 — too short and the d/d/i keys
+    // arrive while Claude is still digesting the last Escape, garbling
+    // them. Defaults to 500ms, tunable via [tmux].post_escape_settle_ms.
+    settle_after_escape().await;
 
     // Step 1b: Wait for activity to settle to Idle (thinking indicator cleared).
     // The prompt may be visible while thinking text is still rendering in the
@@ -1731,5 +1786,24 @@ API Error: Request rejected (429)\n";
     fn test_wedged_reason_display() {
         assert_eq!(format!("{}", WedgedReason::ContextLimit), "context_limit");
         assert_eq!(format!("{}", WedgedReason::RateLimited), "rate_limited");
+    }
+
+    /// Verify the post-escape settle delay is wired through the global
+    /// atomic. We don't test the full settle_after_escape() async helper
+    /// here (it's exercised by the e2e inject tests); we just verify the
+    /// getter reflects the setter so the daemon's startup wiring is sound.
+    ///
+    /// NOTE: this mutates a process-global. Other tests in the same
+    /// process must not depend on a specific value for the setting. We
+    /// restore the default at the end so subsequent tests aren't surprised.
+    #[test]
+    fn test_post_escape_settle_ms_get_set_roundtrip() {
+        let original = post_escape_settle_ms();
+        set_post_escape_settle_ms(1234);
+        assert_eq!(post_escape_settle_ms(), 1234);
+        set_post_escape_settle_ms(0);
+        assert_eq!(post_escape_settle_ms(), 0);
+        // Restore for downstream tests.
+        set_post_escape_settle_ms(original);
     }
 }

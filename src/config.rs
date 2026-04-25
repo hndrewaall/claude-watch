@@ -45,7 +45,7 @@ fn default_post_interrupt_cooldown_secs() -> u64 {
     60
 }
 
-#[derive(Debug, Deserialize, Clone, Default)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct TmuxConfig {
     /// Known dashboard pane for Claude Code (e.g. "dashboard:0.2").
     /// Empty string = auto-detect via find_claude_pane().
@@ -55,6 +55,31 @@ pub struct TmuxConfig {
     /// Empty string = auto-detect via find_claude_pane().
     #[serde(default)]
     pub dashboard_session: String,
+    /// Settle delay (milliseconds) inserted after Escape keystrokes and
+    /// before subsequent keystrokes are sent to the same pane. Without this
+    /// delay, follow-up keys (typed prompt text, dd/i in vim mode, /clear,
+    /// resume, etc.) can land in the pane before Claude Code has finished
+    /// processing the Escape interrupt — keystrokes get garbled or eaten.
+    /// Applied at: end of `interrupt_and_wait` (after the rapid-fire ESCs),
+    /// start of `inject_text` (before its own ESC loop), and inside the
+    /// ESC -> NORMAL-mode transition in `inject_text`. Default: 500ms.
+    /// Set to 0 to disable (legacy behavior).
+    #[serde(default = "default_post_escape_settle_ms")]
+    pub post_escape_settle_ms: u64,
+}
+
+impl Default for TmuxConfig {
+    fn default() -> Self {
+        Self {
+            dashboard_pane: String::new(),
+            dashboard_session: String::new(),
+            post_escape_settle_ms: default_post_escape_settle_ms(),
+        }
+    }
+}
+
+fn default_post_escape_settle_ms() -> u64 {
+    500
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -686,6 +711,124 @@ cooldown = 300
 "#;
         let config =
             parse_config(config_empty_tmux).expect("should parse with empty [tmux] section");
+        assert_eq!(config.tmux.dashboard_pane, "");
+        assert_eq!(config.tmux.dashboard_session, "");
+        // New knob (added 2026-04-25): should default to 500ms when omitted.
+        assert_eq!(config.tmux.post_escape_settle_ms, 500);
+    }
+
+    #[test]
+    fn test_post_escape_settle_ms_default_when_tmux_section_missing() {
+        // No [tmux] section at all -> TmuxConfig::default() -> 500ms.
+        let cfg = r#"
+[general]
+check_interval = 10
+state_file = "/tmp/s.json"
+log_file = "/tmp/s.jsonl"
+legacy_log_file = "/tmp/s.log"
+
+[claude]
+max_context_tokens = 200000
+heartbeat_file = "/tmp/hb"
+relaunch_script = "/tmp/rel.sh"
+
+[dead_process]
+checks_required = 3
+restart_cooldown = 60
+
+[fresh_clear]
+min_tokens = 1000
+max_tokens = 5000
+detections_required = 2
+cooldown = 60
+
+[heartbeat]
+stale_minutes = 10
+
+[alerts]
+initial_cooldown = 60
+escalation_tiers = [60]
+max_pingme_alerts = 3
+resume_prompt = "r"
+
+[foreground_monitor]
+enabled = false
+threshold_seconds = 180
+check_interval = 3
+
+[watcher_monitor]
+enabled = false
+watchers_config = "/tmp/w.conf"
+expected_watchmen = 0
+
+[context_monitor]
+enabled = true
+threshold_percent = 75
+compact_trigger_percent = 5
+grace_period = 120
+cooldown = 300
+"#;
+        let config = parse_config(cfg).expect("should parse without [tmux] section");
+        assert_eq!(config.tmux.post_escape_settle_ms, 500);
+    }
+
+    #[test]
+    fn test_post_escape_settle_ms_explicit_override() {
+        // Explicit override in [tmux] should win over the 500ms default.
+        let cfg = r#"
+[general]
+check_interval = 10
+state_file = "/tmp/s.json"
+log_file = "/tmp/s.jsonl"
+legacy_log_file = "/tmp/s.log"
+
+[tmux]
+post_escape_settle_ms = 1500
+
+[claude]
+max_context_tokens = 200000
+heartbeat_file = "/tmp/hb"
+relaunch_script = "/tmp/rel.sh"
+
+[dead_process]
+checks_required = 3
+restart_cooldown = 60
+
+[fresh_clear]
+min_tokens = 1000
+max_tokens = 5000
+detections_required = 2
+cooldown = 60
+
+[heartbeat]
+stale_minutes = 10
+
+[alerts]
+initial_cooldown = 60
+escalation_tiers = [60]
+max_pingme_alerts = 3
+resume_prompt = "r"
+
+[foreground_monitor]
+enabled = false
+threshold_seconds = 180
+check_interval = 3
+
+[watcher_monitor]
+enabled = false
+watchers_config = "/tmp/w.conf"
+expected_watchmen = 0
+
+[context_monitor]
+enabled = true
+threshold_percent = 75
+compact_trigger_percent = 5
+grace_period = 120
+cooldown = 300
+"#;
+        let config = parse_config(cfg).expect("should parse with override");
+        assert_eq!(config.tmux.post_escape_settle_ms, 1500);
+        // Other tmux defaults should still apply (untouched in the override).
         assert_eq!(config.tmux.dashboard_pane, "");
         assert_eq!(config.tmux.dashboard_session, "");
     }

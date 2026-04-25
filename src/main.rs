@@ -501,6 +501,11 @@ async fn run_daemon() {
     let config = load_config();
     let mut state = load_state(&config.general.state_file);
 
+    // Push the post-escape settle delay into the tmux module's global so
+    // every send_keys / inject_text / interrupt_and_wait callsite sees it
+    // without needing the config plumbed through every signature.
+    tmux::set_post_escape_settle_ms(config.tmux.post_escape_settle_ms);
+
     // Ensure log directory exists
     for path in [&config.general.log_file, &config.general.legacy_log_file] {
         if let Some(parent) = Path::new(path).parent() {
@@ -597,6 +602,8 @@ async fn run_daemon() {
             reload.store(false, Ordering::Relaxed);
             info!("reloading config");
             current_config = load_config();
+            // Re-publish the settle delay in case it was tuned in config.
+            tmux::set_post_escape_settle_ms(current_config.tmux.post_escape_settle_ms);
             write_jsonl_log(
                 &current_config.general.log_file,
                 "config_reload",
