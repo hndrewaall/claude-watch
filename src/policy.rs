@@ -98,6 +98,34 @@ pub(crate) fn main_loop_actively_turning(
         .is_some_and(|e| e < window_secs as f64)
 }
 
+/// Pure predicate: should the fresh-/clear inject be suppressed because
+/// the main loop is actively turning? Mirrors the decision we make at
+/// the fire site so unit tests don't have to mock tmux pane reads.
+///
+/// Returns true iff `suppress_enabled && main_loop_actively_turning(...)`.
+pub(crate) fn fresh_clear_inject_suppressed(
+    state: &State,
+    bashes: u64,
+    suppress_enabled: bool,
+    window_secs: u64,
+) -> bool {
+    suppress_enabled && main_loop_actively_turning(state, bashes, window_secs)
+}
+
+/// Pure predicate: should the dead-process restart be suppressed because
+/// the main loop is actively turning? Mirrors the decision we make at
+/// the fire site so unit tests don't have to mock tmux pane reads.
+///
+/// Returns true iff `suppress_enabled && main_loop_actively_turning(...)`.
+pub(crate) fn dead_process_restart_suppressed(
+    state: &State,
+    bashes: u64,
+    suppress_enabled: bool,
+    window_secs: u64,
+) -> bool {
+    suppress_enabled && main_loop_actively_turning(state, bashes, window_secs)
+}
+
 /// If the given reminder fired within the last `max_age_secs` (we default
 /// to 1 hour — beyond that we assume the self-action is unrelated),
 /// record the reminder -> action latency sample into the state-based
@@ -1298,14 +1326,62 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
             }
 
             if tmux::is_shell_prompt(&effective_pane).await {
-                info!(
-                    dead_checks,
-                    "shell prompt confirmed -- restarting Claude Code"
+                // Active-turn suppression (2026-04-27 false-positive fix):
+                // `tokens == 0 && bashes == 0` is point-in-time and can
+                // briefly hold during a tmux pane swap, a status-parser
+                // miss, or the gap between two tool calls. The
+                // shell-prompt confirmation is the strong-side check
+                // here, but the parser can ALSO mis-classify mixed
+                // pane content as a shell prompt (e.g. a backgrounded
+                // bash command output line ending in `$`). If the loop
+                // ran ANY tool call within `active_window_secs`,
+                // suppress the restart — the process is demonstrably
+                // alive and `restart_claude` would kill an active
+                // session and fire a false `claude-crashed` alert.
+                let actively_turning = dead_process_restart_suppressed(
+                    state,
+                    bashes,
+                    config.dead_process.suppress_when_active,
+                    config.dead_process.active_window_secs,
                 );
-                restart_claude(&effective_pane, state, &config.claude).await;
-                state.consecutive_dead_checks = 0;
-                state.consecutive_failures = 0;
-                state.alert_count = 0;
+                if actively_turning {
+                    let last_active_age = state
+                        .last_active_at
+                        .as_deref()
+                        .and_then(elapsed_since)
+                        .map(|e| e as u64);
+                    info!(
+                        dead_checks,
+                        bashes,
+                        last_active_age_secs = ?last_active_age,
+                        "dead-process restart suppressed: main loop actively turning"
+                    );
+                    write_jsonl_log(
+                        &config.general.log_file,
+                        "dead_process_restart_suppressed",
+                        serde_json::json!({
+                            "dead_checks": dead_checks,
+                            "bashes": bashes,
+                            "reason": "main_loop_actively_turning",
+                            "last_active_age_secs": last_active_age,
+                            "active_window_secs": config.dead_process.active_window_secs,
+                        }),
+                    );
+                    // Reset the consecutive counter so we don't re-fire
+                    // on the very next check after the active window
+                    // closes — require a fresh `checks_required`-cycle
+                    // run of dead-state observations before restarting.
+                    state.consecutive_dead_checks = 0;
+                } else {
+                    info!(
+                        dead_checks,
+                        "shell prompt confirmed -- restarting Claude Code"
+                    );
+                    restart_claude(&effective_pane, state, &config.claude).await;
+                    state.consecutive_dead_checks = 0;
+                    state.consecutive_failures = 0;
+                    state.alert_count = 0;
+                }
             } else if dead_checks >= config.dead_process.fresh_inject_checks
                 && !state.fresh_session_injected
                 && tmux::is_idle(&effective_pane).await
@@ -1395,6 +1471,54 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                         return;
                     }
                 }
+            }
+
+            // Active-turn suppression (2026-04-27 false-positive fix):
+            // The token range [min_tokens, max_tokens) AND `bashes == 0`
+            // are both point-in-time predicates that the main loop
+            // briefly satisfies between two tool calls (a small turn
+            // that just got back, say, 3000 tokens; bashes momentarily 0
+            // before the next tool call fires). Without this gate the
+            // alert fires mid-turn and injects "resume" into active
+            // work. If the loop ran ANY tool call within
+            // `active_window_secs`, suppress both the inject and the
+            // alert — the loop is clearly alive.
+            let actively_turning = fresh_clear_inject_suppressed(
+                state,
+                bashes,
+                config.fresh_clear.suppress_when_active,
+                config.fresh_clear.active_window_secs,
+            );
+            if actively_turning {
+                let last_active_age = state
+                    .last_active_at
+                    .as_deref()
+                    .and_then(elapsed_since)
+                    .map(|e| e as u64);
+                info!(
+                    tokens,
+                    bashes,
+                    last_active_age_secs = ?last_active_age,
+                    "fresh /clear inject suppressed: main loop actively turning"
+                );
+                write_jsonl_log(
+                    &config.general.log_file,
+                    "fresh_clear_inject_suppressed",
+                    serde_json::json!({
+                        "tokens": tokens,
+                        "bashes": bashes,
+                        "reason": "main_loop_actively_turning",
+                        "last_active_age_secs": last_active_age,
+                        "active_window_secs": config.fresh_clear.active_window_secs,
+                    }),
+                );
+                // Reset the consecutive counter so we don't re-fire on
+                // the very next check after the active window closes.
+                // The detection has to re-build from scratch.
+                state.consecutive_fast_detections = 0;
+                state.last_check = Some(now);
+                crate::state::save_state(&config.general.state_file, state);
+                return;
             }
 
             info!(tokens, "fresh /clear detected -- injecting resume");
@@ -2617,5 +2741,168 @@ mod tests {
         let mut state = State::default();
         state.last_active_at = Some("not a timestamp".to_string());
         assert!(!main_loop_actively_turning(&state, 0, 30));
+    }
+
+    // --- fresh-/clear and dead-process suppression tests (2026-04-27, q-2026-04-27-ce5f) ---
+    //
+    // Both alert paths fire on point-in-time predicates that the main
+    // loop transiently satisfies between two tool calls (a small turn
+    // sitting at a few thousand tokens with bashes momentarily 0; or a
+    // brief pane swap making tokens=0 and bashes=0 look like a dead
+    // process). These tests pin the suppression-decision logic so the
+    // false positives Andrew flagged at 02:45 ET 2026-04-27 don't
+    // regress.
+
+    #[test]
+    fn test_fresh_clear_suppressed_when_actively_turning() {
+        // bashes > 0 right now: the loop is mid-tool-call, so even if
+        // the [min_tokens, max_tokens) gate matches we MUST suppress.
+        let state = State::default();
+        assert!(fresh_clear_inject_suppressed(&state, 1, true, 60));
+    }
+
+    #[test]
+    fn test_fresh_clear_suppressed_when_recent_activity_in_window() {
+        // bashes == 0 NOW but a tool call ran 10s ago: the loop is
+        // demonstrably alive — the bashes gauge is just between calls.
+        // The fresh-/clear inject would derail real work, so suppress.
+        let mut state = State::default();
+        state.last_active_at = Some(iso_secs_ago(10));
+        assert!(fresh_clear_inject_suppressed(&state, 0, true, 60));
+    }
+
+    #[test]
+    fn test_fresh_clear_not_suppressed_when_idle_outside_window() {
+        // Last activity 120s ago, window is 60s: loop is genuinely
+        // idle on a fresh /clear, so the fast-path SHOULD fire.
+        let mut state = State::default();
+        state.last_active_at = Some(iso_secs_ago(120));
+        assert!(!fresh_clear_inject_suppressed(&state, 0, true, 60));
+    }
+
+    #[test]
+    fn test_fresh_clear_not_suppressed_when_no_history() {
+        // Brand-new daemon, no last_active_at recorded, bashes == 0:
+        // can't infer activity, so DON'T suppress. The fast-path keeps
+        // its existing behaviour for the genuine fresh-/clear case.
+        let state = State::default();
+        assert!(!fresh_clear_inject_suppressed(&state, 0, true, 60));
+    }
+
+    #[test]
+    fn test_fresh_clear_not_suppressed_when_disabled() {
+        // suppress_when_active = false (operator override): even with a
+        // live tool call the suppression gate is bypassed, restoring
+        // pre-fix behaviour. Useful escape hatch if the predicate
+        // misfires for some workload.
+        let mut state = State::default();
+        state.last_active_at = Some(iso_secs_ago(5));
+        assert!(!fresh_clear_inject_suppressed(&state, 1, false, 60));
+        assert!(!fresh_clear_inject_suppressed(&state, 0, false, 60));
+    }
+
+    #[test]
+    fn test_fresh_clear_window_zero_still_honors_live_bashes() {
+        // active_window_secs = 0 disables the time-window check, but a
+        // live tool call (bashes > 0) MUST still suppress. Mirrors the
+        // main_loop_actively_turning semantics exactly.
+        let state = State::default();
+        assert!(fresh_clear_inject_suppressed(&state, 1, true, 0));
+    }
+
+    #[test]
+    fn test_fresh_clear_window_zero_idle_does_not_suppress() {
+        // active_window_secs = 0 + bashes == 0 + recent activity 1s
+        // ago: window check is disabled, and bashes is 0 right now,
+        // so the gate stays open and the inject can fire.
+        let mut state = State::default();
+        state.last_active_at = Some(iso_secs_ago(1));
+        assert!(!fresh_clear_inject_suppressed(&state, 0, true, 0));
+    }
+
+    #[test]
+    fn test_dead_process_suppressed_when_actively_turning() {
+        // bashes > 0 right now: the process is demonstrably alive.
+        // Restarting it would kill an active session and fire a false
+        // claude-crashed alert. MUST suppress.
+        let state = State::default();
+        assert!(dead_process_restart_suppressed(&state, 2, true, 60));
+    }
+
+    #[test]
+    fn test_dead_process_suppressed_when_recent_activity_in_window() {
+        // bashes == 0 NOW but a tool call ran 30s ago. The dead-process
+        // checks_required is 3 (default) at ~10s intervals, so a 30s
+        // window perfectly straddles "could the parser have missed
+        // 3 cycles in a row?" — yes, easily. Suppress to be safe.
+        let mut state = State::default();
+        state.last_active_at = Some(iso_secs_ago(30));
+        assert!(dead_process_restart_suppressed(&state, 0, true, 60));
+    }
+
+    #[test]
+    fn test_dead_process_not_suppressed_when_idle_outside_window() {
+        // Last tool call 90s ago, window is 60s: process has been
+        // genuinely silent past the window. If the shell-prompt check
+        // also confirms, restart the process for real.
+        let mut state = State::default();
+        state.last_active_at = Some(iso_secs_ago(90));
+        assert!(!dead_process_restart_suppressed(&state, 0, true, 60));
+    }
+
+    #[test]
+    fn test_dead_process_not_suppressed_when_no_history() {
+        // Brand-new daemon, no last_active_at, bashes == 0: nothing to
+        // infer activity from. Don't suppress — the dead_checks_required
+        // counter and is_shell_prompt() check are the other safety belts.
+        let state = State::default();
+        assert!(!dead_process_restart_suppressed(&state, 0, true, 60));
+    }
+
+    #[test]
+    fn test_dead_process_not_suppressed_when_disabled() {
+        // suppress_when_active = false: gate is bypassed entirely.
+        // Restores pre-fix behaviour for an operator who wants it.
+        let mut state = State::default();
+        state.last_active_at = Some(iso_secs_ago(5));
+        assert!(!dead_process_restart_suppressed(&state, 1, false, 60));
+        assert!(!dead_process_restart_suppressed(&state, 0, false, 60));
+    }
+
+    #[test]
+    fn test_dead_process_uses_wider_default_window_than_watcher_down() {
+        // Documents the policy choice: a dead-process false positive
+        // restarts Claude Code (destroys an in-flight session), which
+        // is far more destructive than a missed watcher-down inject
+        // (just defers a notification by 5 min). The default
+        // active_window_secs for dead_process is 60s vs watcher_monitor's
+        // 30s. Test the boundary: 45s ago should suppress at 60s
+        // window but not at 30s window.
+        let mut state = State::default();
+        state.last_active_at = Some(iso_secs_ago(45));
+        // dead_process default window (60s) suppresses
+        assert!(dead_process_restart_suppressed(&state, 0, true, 60));
+        // watcher_monitor default window (30s) would NOT
+        assert!(!main_loop_actively_turning(&state, 0, 30));
+    }
+
+    #[test]
+    fn test_dead_process_invalid_timestamp_treated_as_idle() {
+        // Same defensive check as test_main_loop_actively_turning_invalid_timestamp_treated_as_idle:
+        // garbage timestamp parses to None, treated as idle (no suppression).
+        // A corrupt persisted state file MUST NOT silently disable the
+        // restart path forever.
+        let mut state = State::default();
+        state.last_active_at = Some("garbage".to_string());
+        assert!(!dead_process_restart_suppressed(&state, 0, true, 60));
+    }
+
+    #[test]
+    fn test_fresh_clear_invalid_timestamp_treated_as_idle() {
+        // Mirror of dead_process variant. Garbage in last_active_at
+        // must NOT be treated as recent activity.
+        let mut state = State::default();
+        state.last_active_at = Some("garbage".to_string());
+        assert!(!fresh_clear_inject_suppressed(&state, 0, true, 60));
     }
 }
