@@ -84,10 +84,33 @@ pub struct DeadProcessConfig {
     /// (not via claude-watch restart), so pending_resume_inject is never set.
     #[serde(default = "default_fresh_inject_checks")]
     pub fresh_inject_checks: u32,
+    /// When true, suppress the `restart_claude` action (and the
+    /// `claude-crashed` alert it fires) when the main loop is actively
+    /// turning — a tool call ran within `active_window_secs`. The
+    /// `tokens == 0 && bashes == 0` predicate is point-in-time and can
+    /// briefly satisfy during a tmux pane swap, status-parser miss, or
+    /// the gap between two tool calls; restarting Claude in those moments
+    /// kills an active session. The shell-prompt confirmation is the
+    /// other safety belt and remains required, but a recent tool call is
+    /// equally strong evidence the process is alive. Default: true.
+    #[serde(default = "default_suppress_when_active")]
+    pub suppress_when_active: bool,
+    /// Window (seconds) of recent tool-call activity that counts as
+    /// "actively turning" for `suppress_when_active`. If `bashes > 0` was
+    /// last observed within this many seconds, the restart is suppressed.
+    /// Default: 60 — wider than the watcher-down window because a
+    /// dead-process false positive is more destructive (kills a live
+    /// Claude Code session) than a missed inject.
+    #[serde(default = "default_dead_process_active_window_secs")]
+    pub active_window_secs: u64,
 }
 
 fn default_fresh_inject_checks() -> u32 {
     5 // ~60s at 12s intervals
+}
+
+fn default_dead_process_active_window_secs() -> u64 {
+    60
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -96,6 +119,32 @@ pub struct FreshClearConfig {
     pub max_tokens: u64,
     pub detections_required: u32,
     pub cooldown: u64,
+    /// When true, suppress the `fresh-clear-stuck` alert and inject when
+    /// the main loop is actively turning. The token range
+    /// `[min_tokens, max_tokens)` overlaps with normal mid-turn token
+    /// counts (a small turn that has just received a few thousand tokens
+    /// from a tool call), and `bashes == 0` is point-in-time and can be
+    /// transiently true between two tool calls. Without this gate the
+    /// alert fires while Claude is mid-turn and injects "resume" into
+    /// active work. Default: true.
+    #[serde(default = "default_suppress_when_active")]
+    pub suppress_when_active: bool,
+    /// Window (seconds) of recent tool-call activity that counts as
+    /// "actively turning" for `suppress_when_active`. If `bashes > 0`
+    /// was last observed within this many seconds, the inject is
+    /// suppressed. Default: 60 — wider than the watcher-down window
+    /// because a fresh-clear false positive injects "resume" mid-turn,
+    /// which derails the active task.
+    #[serde(default = "default_fresh_clear_active_window_secs")]
+    pub active_window_secs: u64,
+}
+
+fn default_suppress_when_active() -> bool {
+    true
+}
+
+fn default_fresh_clear_active_window_secs() -> u64 {
+    60
 }
 
 #[derive(Debug, Deserialize, Clone)]
