@@ -323,6 +323,12 @@ enum WatcherAction {
         /// Output as JSON
         #[arg(long)]
         json: bool,
+        /// Only emit output if at least one enabled watcher is DOWN.
+        /// Stays completely silent (exit 0) when everything is healthy.
+        /// Designed for the PostToolUse hook that surfaces watcher health
+        /// after every tool call without spamming on healthy state.
+        #[arg(long)]
+        unhealthy_only: bool,
     },
     /// Enable a watcher (toggle + start)
     Enable {
@@ -782,8 +788,11 @@ async fn run_watcher(action: WatcherAction) {
             watcher::cmd_list(&cfg, json);
             0
         }
-        WatcherAction::Status { json } => {
-            watcher::cmd_status(&cfg, json).await;
+        WatcherAction::Status {
+            json,
+            unhealthy_only,
+        } => {
+            watcher::cmd_status(&cfg, json, unhealthy_only).await;
             0
         }
         WatcherAction::Enable { name } => watcher::cmd_toggle(&cfg, &name, true).await,
