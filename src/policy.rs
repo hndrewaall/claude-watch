@@ -158,7 +158,15 @@ async fn restart_claude(pane: &str, state: &mut State, config: &crate::config::C
         state.restart_claude_interrupts_total.saturating_add(1);
     state.pending_resume_inject = true;
 
-    alert::send_pingme("claude-watch: Claude Code crashed -- auto-restarting").await;
+    alert::notify(crate::event_bus::ClaudeWatchAlert {
+        alert_type: "claude-crashed",
+        stuck_reason: "claude code process gone",
+        stale_minutes: None,
+        affected_watchers: vec![],
+        severity: crate::event_bus::Severity::High,
+        message: "claude-watch: Claude Code crashed -- auto-restarting",
+    })
+    .await;
 }
 
 /// Run a foreground-only check cycle. This is called more frequently than
@@ -285,6 +293,22 @@ pub async fn check_foreground(
                                 "interrupt_count": state.thinking_interrupt_count,
                             }),
                         );
+                        // Third sink: claude-event so the main loop can
+                        // see this stuck-state via structured fields and
+                        // not just react reflexively to the injected
+                        // string.
+                        let pt_reason = format!(
+                            "prolonged thinking ({}s, interrupt #{})",
+                            elapsed as u64, state.thinking_interrupt_count,
+                        );
+                        alert::emit_event(crate::event_bus::ClaudeWatchAlert {
+                            alert_type: "prolonged-thinking",
+                            stuck_reason: &pt_reason,
+                            stale_minutes: None,
+                            affected_watchers: vec![],
+                            severity: crate::event_bus::Severity::Medium,
+                            message: &msg,
+                        });
                     } else {
                         info!(
                             elapsed_secs = elapsed,
@@ -571,7 +595,15 @@ async fn check_reauth(config: &Config, state: &mut State, pane: &str) {
                 let now = Local::now().to_rfc3339();
                 warn!("sending high-priority reauth alert with URL");
                 let alert_msg = format!("Claude Code login needed. URL: {}", login_url);
-                alert::send_pingme_with_priority(&alert_msg, "high").await;
+                alert::notify(crate::event_bus::ClaudeWatchAlert {
+                    alert_type: "reauth-needed",
+                    stuck_reason: "claude code 401, login url present",
+                    stale_minutes: None,
+                    affected_watchers: vec![],
+                    severity: crate::event_bus::Severity::High,
+                    message: &alert_msg,
+                })
+                .await;
                 write_jsonl_log(
                     &config.general.log_file,
                     "reauth_alert",
@@ -868,7 +900,15 @@ async fn run_auto_update(pane: &str, old_version: &str, new_version: &str, confi
             "auto_update_failed",
             serde_json::json!({"reason": "exit_timeout"}),
         );
-        alert::send_pingme("claude-watch: auto-update FAILED — Claude Code did not exit").await;
+        alert::notify(crate::event_bus::ClaudeWatchAlert {
+            alert_type: "auto-update-failed",
+            stuck_reason: "auto-update: claude code did not exit within 45s",
+            stale_minutes: None,
+            affected_watchers: vec![],
+            severity: crate::event_bus::Severity::High,
+            message: "claude-watch: auto-update FAILED — Claude Code did not exit",
+        })
+        .await;
         return;
     }
     info!("auto-update: Claude Code exited");
@@ -961,7 +1001,15 @@ async fn run_auto_update(pane: &str, old_version: &str, new_version: &str, confi
         "claude-watch: auto-update complete ({} → {})",
         old_version, new_version
     );
-    alert::send_pingme(&msg).await;
+    alert::notify(crate::event_bus::ClaudeWatchAlert {
+        alert_type: "auto-update-complete",
+        stuck_reason: "auto-update finished",
+        stale_minutes: None,
+        affected_watchers: vec![],
+        severity: crate::event_bus::Severity::Low,
+        message: &msg,
+    })
+    .await;
     info!("auto-update: complete ({} → {})", old_version, new_version);
 }
 
@@ -1322,10 +1370,18 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
             }
 
             info!(tokens, "fresh /clear detected -- injecting resume");
-            alert::send_pingme(&format!(
+            let fresh_msg = format!(
                 "Fresh /clear detected (tokens={}, bashes=0). Injecting resume.",
                 tokens
-            ))
+            );
+            alert::notify(crate::event_bus::ClaudeWatchAlert {
+                alert_type: "fresh-clear-stuck",
+                stuck_reason: "fresh /clear with no follow-up activity",
+                stale_minutes: None,
+                affected_watchers: vec![],
+                severity: crate::event_bus::Severity::Medium,
+                message: &fresh_msg,
+            })
             .await;
 
             // Dismiss feedback prompt if present
@@ -1351,6 +1407,9 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
     // --- Heartbeat stale detection ---
     let mut stuck = false;
     let mut stuck_reason = String::new();
+    // Captured for the claude-event sink so the main loop can parse
+    // `stale_minutes` as a number rather than re-regex'ing the string.
+    let mut stuck_stale_minutes: Option<u64> = None;
 
     match std::fs::metadata(&config.claude.heartbeat_file) {
         Ok(meta) => {
@@ -1362,12 +1421,14 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                 let stale_secs = config.heartbeat.stale_minutes * 60;
                 if age >= stale_secs {
                     stuck = true;
+                    let age_min = age / 60;
                     stuck_reason = format!(
                         "heartbeat stale ({}min, threshold={}min, watchmen={})",
-                        age / 60,
+                        age_min,
                         config.heartbeat.stale_minutes,
                         watchmen_count
                     );
+                    stuck_stale_minutes = Some(age_min);
                     state.heartbeat_stale_count += 1;
                 }
             }
@@ -1623,7 +1684,16 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                     let alert_msg = format!(
                         "claude-watch: agent wedged ({reason}) -- running self-clear",
                     );
-                    alert::send_pingme(&alert_msg).await;
+                    let wedged_reason = format!("wedged pane: {reason}");
+                    alert::notify(crate::event_bus::ClaudeWatchAlert {
+                        alert_type: "wedged-pane",
+                        stuck_reason: &wedged_reason,
+                        stale_minutes: None,
+                        affected_watchers: vec![],
+                        severity: crate::event_bus::Severity::High,
+                        message: &alert_msg,
+                    })
+                    .await;
 
                     spawn_immediate_clear(state);
 
@@ -1764,6 +1834,23 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                     restart_cmds.join(", ")
                 );
                 tmux::inject_text(&effective_pane, &prompt).await;
+                // Third sink: claude-event so the main loop sees the
+                // missing-watchers list as structured data and can
+                // decide which restart command(s) to actually run,
+                // rather than reflexively reading the prompt string.
+                let watcher_reason = format!(
+                    "{} watcher(s) missing: {}",
+                    missing_names.len(),
+                    missing_list,
+                );
+                alert::emit_event(crate::event_bus::ClaudeWatchAlert {
+                    alert_type: "watcher-down",
+                    stuck_reason: &watcher_reason,
+                    stale_minutes: None,
+                    affected_watchers: missing_names.clone(),
+                    severity: crate::event_bus::Severity::Medium,
+                    message: &prompt,
+                });
                 state.last_watcher_inject = Some(now.clone());
                 state.last_interrupt_at = Some(now.clone());
                 state.watcher_inject_count += 1;
@@ -1876,7 +1963,32 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                     "Claude stuck: {}. {} consecutive checks failed.",
                     stuck_reason, state.consecutive_failures
                 );
-                alert::alert(&msg, &alert_pane, &config.alerts.resume_prompt, use_pingme).await;
+                // Severity escalates with the alert count: first few
+                // alerts are High; once we're past the pingme cap (the
+                // sustained-stuck case), bump to Critical. Andrew's
+                // 574-min heartbeat-stale incident was the canonical
+                // case where the loop should have noticed depth.
+                let severity = if state.alert_count > config.alerts.max_pingme_alerts {
+                    crate::event_bus::Severity::Critical
+                } else {
+                    crate::event_bus::Severity::High
+                };
+                let event_alert = crate::event_bus::ClaudeWatchAlert {
+                    alert_type: "heartbeat-stale",
+                    stuck_reason: &stuck_reason,
+                    stale_minutes: stuck_stale_minutes,
+                    affected_watchers: vec![],
+                    severity,
+                    message: &msg,
+                };
+                alert::alert(
+                    &msg,
+                    &alert_pane,
+                    &config.alerts.resume_prompt,
+                    use_pingme,
+                    event_alert,
+                )
+                .await;
             }
 
             state.last_alert = Some(now.clone());

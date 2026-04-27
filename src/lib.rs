@@ -5,6 +5,7 @@
 pub mod agent;
 pub mod cmd;
 pub mod config;
+pub mod event_bus;
 pub mod proc_util;
 pub mod reminders;
 pub mod session_event;
