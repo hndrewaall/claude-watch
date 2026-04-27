@@ -129,7 +129,7 @@ pub(crate) fn parse_status_bar_with_diag(pane_text: &str) -> (ParsedStatusBar, b
     //
     // If we see a status bar indicator anywhere, enable token parsing for all
     // lines in the tail.
-    let has_status_bar = lines[start..].iter().any(|line| {
+    let is_status_bar_marker = |line: &str| -> bool {
         line.contains('\u{23f5}') // ⏵ — permission mode icon (bypass / accept edits)
             || line.contains("bypass permissi")
             || line.contains("-- INSERT --")
@@ -142,7 +142,9 @@ pub(crate) fn parse_status_bar_with_diag(pane_text: &str) -> (ParsedStatusBar, b
             || line.contains("active agents")
             || line.contains("active agent")
             || line.contains("auto-compact")
-    });
+    };
+
+    let has_status_bar = lines[start..].iter().any(|l| is_status_bar_marker(l));
 
     for line in &lines[start..] {
         if has_status_bar {
@@ -188,7 +190,78 @@ pub(crate) fn parse_status_bar_with_diag(pane_text: &str) -> (ParsedStatusBar, b
         }
     }
 
-    (result, has_status_bar)
+    // Overlay-fallback pass: when the inline status-bar pass fails to
+    // extract counts but the FULL pane (not just the bottom 10 lines)
+    // contains overlay markers OR a thinking-indicator token line, scan
+    // the entire pane. This handles the "Background tasks" overlay
+    // (2026-04-27 incident) where:
+    //   - The overlay is taller than 10 lines (header + count + "Shells (N)"
+    //     section + per-shell rows + "Local agents (N)" section + per-agent
+    //     rows + nav-hint row), AND
+    //   - tmux capture preserves blank lines that the parse_miss_tail
+    //     diagnostic strips, so the WARN tail looks like the count line
+    //     should have been visible — but the parser's bottom-10-line
+    //     window had been pushed past it by intervening blanks.
+    //
+    // The thinking-indicator regex (↑/↓ N tokens) and the overlay's
+    // "N active shells" / "N active agent" pattern are both unique enough
+    // that scanning the whole pane is safe (no risk of matching prose).
+    let overlay_visible = lines.iter().any(|line| {
+        line.contains("Background tasks")
+            || line.contains("active shells")
+            || line.contains("active shell")
+            || line.contains("active agents")
+            || line.contains("active agent")
+            || line.contains("Local agents")
+            || line.starts_with("  Shells (")
+            || line.contains(" Shells (")
+    });
+
+    if overlay_visible {
+        // Whole-pane scan for bashes (overlay layout), but only if not
+        // already found.
+        if result.bashes.is_none() {
+            for line in &lines {
+                if let Some(caps) = bash_re.captures(line) {
+                    if let Some(m) = caps.get(1) {
+                        if let Ok(v) = m.as_str().parse::<u64>() {
+                            result.bashes = Some(v);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Whole-pane scan for thinking-indicator tokens (always safe because
+    // the ↑/↓ + tok anchor never appears in chat prose). Catches cases
+    // where a thinking line is more than 10 lines above the bottom.
+    if result.tokens.is_none() {
+        for line in &lines {
+            if let Some(caps) = token_thinking_re.captures(line) {
+                if let (Some(num), Some(suffix)) = (caps.get(1), caps.get(2)) {
+                    if let Ok(base) = num.as_str().parse::<f64>() {
+                        let mult: f64 = match suffix.as_str() {
+                            "k" | "K" => 1_000.0,
+                            "m" | "M" => 1_000_000.0,
+                            _ => 1.0,
+                        };
+                        let v = (base * mult).round() as u64;
+                        result.tokens = Some(v);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    // Treat the overlay as a status-bar marker: even though it visually
+    // replaces the bar, it's a known UI state with a count present, and
+    // we don't want is_parse_miss to flag it.
+    let saw_status_bar = has_status_bar || overlay_visible;
+
+    (result, saw_status_bar)
 }
 
 /// Pure function: determine whether a parse-bar result + pane capture
@@ -781,6 +854,142 @@ mod tests {
         assert_eq!(parsed.bashes, Some(4));
         // Thinking-indicator token recovery: "↑ 286 tokens".
         assert_eq!(parsed.tokens, Some(286));
+    }
+
+    #[test]
+    fn test_parse_status_bar_overlay_with_shells_and_agents_section_2026_04_27() {
+        // 2026-04-27T03:20:43Z parse-miss reproduction. The Background-tasks
+        // overlay introduced a new two-section layout:
+        //     Background tasks
+        //     3 active shells · 1 active agent
+        //       Shells (3)
+        //         watcher-ctl run signal-wait-dm (running)
+        //         watcher-ctl run memory-remind (running)
+        //         watcher-ctl run signal-wait-group (running)
+        //       Local agents (1)
+        //         Execute startup-context-trim (running)
+        //       ↑/↓ to select · Enter to view · ...
+        //
+        // The overlay is taller than 10 lines AND tmux capture preserves
+        // blank lines that parse_miss_tail's diagnostic strips, so the WARN
+        // looked like the parser saw the count line — but the parser's
+        // bottom-10 window had been pushed past it by intervening blanks.
+        // Padding with blanks here reproduces the exact failure mode
+        // observed in production.
+        let input = "previous chat output\n\
+\n\
+\u{25cf} Some action\n\
+\n\
+  \u{2500}\u{2500}\u{2500}\u{2500}\n\
+\n\
+  Background tasks\n\
+\n\
+   3 active shells \u{00b7} 1 active agent\n\
+\n\
+     Shells (3)\n\
+\n\
+   \u{276f} watcher-ctl run signal-wait-dm (running)\n\
+     watcher-ctl run memory-remind (running)\n\
+     watcher-ctl run signal-wait-group (running)\n\
+     Local agents (1)\n\
+     Execute startup-context-trim (running)\n\
+   \u{2191}/\u{2193} to select \u{00b7} Enter to view \u{00b7} x to stop \u{00b7} ctrl+x ctrl+k to stop all agents \u{00b7} \u{2190}/Esc\n\
+   to close";
+        let (parsed, saw_bar) = parse_status_bar_with_diag(input);
+        assert_eq!(
+            parsed.bashes,
+            Some(3),
+            "overlay layout: 3 active shells must be extracted from full pane scan"
+        );
+        assert!(
+            saw_bar,
+            "overlay markers (Background tasks / active shells / Local agents) \
+             must register as status-bar visible to suppress is_parse_miss"
+        );
+    }
+
+    #[test]
+    fn test_parse_status_bar_overlay_thinking_token_pushed_above_window() {
+        // 2026-04-27T01:59:17Z parse-miss reproduction. An idle status bar
+        // (no counts) is at the bottom of the pane, but a thinking line
+        // (`↓ 1.3k tokens`) is more than 10 lines above. Previously the
+        // parser only scanned the bottom 10 lines for token_thinking_re
+        // and missed it.
+        let input = "\u{25cf} Background command \"Restart memory-remind\" failed with exit code 1\n\
+\u{25cf} Background command \"Restart claude-event-watch\" failed with exit code 1\n\
+\u{25cf} Read(/home/hndrewaall/.claude/projects/-home-hndrewaall/e34f3a78-8c8e-4b5b-b2c6-7cd0a32684a2/tool-results/bgvq1ijn1.txt)\n\
+  \u{239d}  Read 244 lines\n\
+\u{25cf} Zigzagging\u{2026} (37s \u{00b7} \u{2193} 1.3k tokens \u{00b7} thought for 13s)\n\
+\n\
+\n\
+\n\
+\n\
+\n\
+\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n\
+\u{276f}\n\
+\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n\
+  \u{23f5}\u{23f5} bypass permissions on (shift+tab to cycle) \u{00b7} esc to interrupt";
+        let (parsed, saw_bar) = parse_status_bar_with_diag(input);
+        assert_eq!(
+            parsed.tokens,
+            Some(1300),
+            "thinking-indicator above the 10-line window must be recovered \
+             by the whole-pane fallback scan"
+        );
+        assert!(
+            saw_bar,
+            "⏵⏵ icon at bottom must register as status bar"
+        );
+    }
+
+    #[test]
+    fn test_parse_status_bar_overlay_active_shell_singular() {
+        // Defensive: overlay with "1 active shell" (singular) should also
+        // parse correctly via the whole-pane scan.
+        let input = "previous output\n\
+\n\
+\n\
+\n\
+\n\
+\n\
+  Background tasks\n\
+\n\
+   1 active shell\n\
+\n\
+     Shells (1)\n\
+\n\
+     watcher-ctl run signal-wait-dm (running)\n\
+   \u{2191}/\u{2193} to select \u{00b7} Enter to view \u{00b7} x to stop \u{00b7} \u{2190}/Esc to close";
+        let parsed = parse_status_bar(input);
+        assert_eq!(parsed.bashes, Some(1));
+    }
+
+    #[test]
+    fn test_parse_status_bar_overlay_does_not_overshadow_inline_bar() {
+        // When BOTH an overlay-looking line AND an inline status bar are
+        // present (defensive — shouldn't really happen), the inline bar's
+        // shell count (the bottom-10 hit) takes precedence: bash_re's
+        // first-match-wins via assigning to result.bashes inside the loop,
+        // and the overlay-fallback only runs if result.bashes is None.
+        let input = "  Background tasks\n\
+   3 active shells \u{00b7} 1 active agent\n\
+\n\
+\n\
+\n\
+\n\
+\n\
+\n\
+\n\
+\n\
+\n\
+\u{2500}\u{2500}\u{2500}\u{2500}\n\
+\u{276f}\n\
+\u{2500}\u{2500}\u{2500}\u{2500}\n\
+\u{23f5}\u{23f5} bypass permissions on \u{00b7} 7 shells \u{00b7} 999 tokens";
+        let parsed = parse_status_bar(input);
+        // Inline bar wins.
+        assert_eq!(parsed.bashes, Some(7));
+        assert_eq!(parsed.tokens, Some(999));
     }
 
     #[test]
