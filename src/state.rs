@@ -171,6 +171,14 @@ pub struct State {
     /// never becomes active within N minutes after inject, allow resetting the flag.
     #[serde(default)]
     pub last_fresh_inject: Option<String>,
+    /// Timestamp of the last check where the main loop was observed actively
+    /// running a tool call (`bashes > 0`). Used by the watcher-down inject
+    /// suppression gate so we don't preempt an in-flight turn with a
+    /// `WATCHER(S) DOWN` prompt. Updated on every check that sees
+    /// `bashes > 0`. Not cleared on daemon restart — a stale value just
+    /// suppresses one inject cycle, which is the safer side to err on.
+    #[serde(default)]
+    pub last_active_at: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

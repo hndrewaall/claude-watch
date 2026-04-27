@@ -76,6 +76,28 @@ pub(crate) fn interrupt_in_global_cooldown(state: &State, cooldown_secs: u64) ->
         .is_some_and(|e| e < cooldown_secs as f64)
 }
 
+/// Returns true if the main loop is "actively turning" — either a tool
+/// call is currently running (`bashes > 0` this check) or one fired
+/// within the last `window_secs` (per `state.last_active_at`).
+///
+/// Used by the watcher-down inject suppression gate so the daemon does
+/// not preempt an in-flight turn with a `WATCHER(S) DOWN` prompt. A
+/// `window_secs` of 0 still honors the live `bashes > 0` check.
+pub(crate) fn main_loop_actively_turning(
+    state: &State,
+    bashes: u64,
+    window_secs: u64,
+) -> bool {
+    if bashes > 0 {
+        return true;
+    }
+    state
+        .last_active_at
+        .as_deref()
+        .and_then(elapsed_since)
+        .is_some_and(|e| e < window_secs as f64)
+}
+
 /// If the given reminder fired within the last `max_age_secs` (we default
 /// to 1 hour — beyond that we assume the self-action is unrelated),
 /// record the reminder -> action latency sample into the state-based
@@ -1149,6 +1171,12 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
     if bashes > 0 || tokens > 0 {
         state.last_known_bashes = bashes;
     }
+    // Mark "actively turning" whenever a tool call is in flight. The
+    // watcher-down inject path consults this timestamp to avoid
+    // preempting a busy main loop with a `WATCHER(S) DOWN` prompt.
+    if bashes > 0 {
+        state.last_active_at = Some(now.clone());
+    }
 
     // --- Dead process detection ---
     if tokens == 0 && bashes == 0 && !effective_pane.is_empty() {
@@ -1797,6 +1825,20 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
             // defer this one to avoid cascading interrupts.
             let global_cooldown_blocks =
                 interrupt_in_global_cooldown(state, config.general.post_interrupt_cooldown_secs);
+            // Active-turn suppression: if the main loop is currently
+            // running a tool call (or ran one within the last
+            // `active_window_secs`), suppress ONLY the in-pane preemption.
+            // The structured claude-event still fires so Andrew is
+            // notified out-of-band. The reflexive cascade — inject fires
+            // mid-turn → loop pivots to "restart watcher" → original ask
+            // is abandoned half-finished — only happens if we keep
+            // typing into the pane, so dropping the inject is enough.
+            let actively_turning = config.watcher_monitor.suppress_inject_when_active
+                && main_loop_actively_turning(
+                    state,
+                    bashes,
+                    config.watcher_monitor.active_window_secs,
+                );
             if should_inject && global_cooldown_blocks {
                 debug!(
                     cooldown = config.general.post_interrupt_cooldown_secs,
@@ -1805,58 +1847,110 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
             }
             if should_inject && !global_cooldown_blocks {
                 let missing_list = missing_names.join(", ");
-                warn!(missing = %missing_list, "watchers down — interrupting and injecting restart");
-                write_jsonl_log(
-                    &config.general.log_file,
-                    "watcher_inject",
-                    serde_json::json!({
-                        "missing": missing_names,
-                    }),
-                );
-
-                // Interrupt first (like prolonged-thinking) to break any inline work
-                if tmux::interrupt_and_wait(&effective_pane, 10).await {
-                    info!("watcher inject: Claude Code is idle after interrupt");
-                } else {
-                    warn!("watcher inject: could not confirm idle, injecting anyway");
-                }
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-
-                // Build specific restart commands
-                let restart_cmds: Vec<String> = missing_names
-                    .iter()
-                    .map(|n| format!("watcher-ctl run {}", n))
-                    .collect();
-                let prompt = format!(
-                    "[CLAUDE-WATCH] WATCHER(S) DOWN: {}. You MUST restart them NOW. \
-                     Run these as background tasks immediately: {}",
-                    missing_list,
-                    restart_cmds.join(", ")
-                );
-                tmux::inject_text(&effective_pane, &prompt).await;
-                // Third sink: claude-event so the main loop sees the
-                // missing-watchers list as structured data and can
-                // decide which restart command(s) to actually run,
-                // rather than reflexively reading the prompt string.
                 let watcher_reason = format!(
                     "{} watcher(s) missing: {}",
                     missing_names.len(),
                     missing_list,
                 );
-                alert::emit_event(crate::event_bus::ClaudeWatchAlert {
-                    alert_type: "watcher-down",
-                    stuck_reason: &watcher_reason,
-                    stale_minutes: None,
-                    affected_watchers: missing_names.clone(),
-                    severity: crate::event_bus::Severity::Medium,
-                    message: &prompt,
-                });
-                state.last_watcher_inject = Some(now.clone());
-                state.last_interrupt_at = Some(now.clone());
-                state.watcher_inject_count += 1;
-                state.watcher_down_interrupts_total =
-                    state.watcher_down_interrupts_total.saturating_add(1);
-                crate::state::save_state(&config.general.state_file, state);
+
+                if actively_turning {
+                    // Suppression path: still emit the structured
+                    // claude-event (out-of-band notify) and log it,
+                    // but do NOT interrupt or inject into the pane.
+                    let bashes_now = bashes;
+                    let last_active_age = state
+                        .last_active_at
+                        .as_deref()
+                        .and_then(elapsed_since)
+                        .map(|e| e as u64);
+                    info!(
+                        missing = %missing_list,
+                        bashes = bashes_now,
+                        last_active_age_secs = ?last_active_age,
+                        "watcher-down inject suppressed: main loop actively turning"
+                    );
+                    write_jsonl_log(
+                        &config.general.log_file,
+                        "watcher_inject_suppressed",
+                        serde_json::json!({
+                            "missing": missing_names,
+                            "reason": "main_loop_actively_turning",
+                            "bashes": bashes_now,
+                            "last_active_age_secs": last_active_age,
+                            "active_window_secs": config.watcher_monitor.active_window_secs,
+                        }),
+                    );
+                    // Out-of-band sink still fires — message reflects
+                    // suppression so downstream consumers can tell
+                    // this fire did not preempt the pane.
+                    let suppressed_msg = format!(
+                        "[CLAUDE-WATCH] watcher-down (inject suppressed: main loop active): {}",
+                        missing_list,
+                    );
+                    alert::emit_event(crate::event_bus::ClaudeWatchAlert {
+                        alert_type: "watcher-down",
+                        stuck_reason: &watcher_reason,
+                        stale_minutes: None,
+                        affected_watchers: missing_names.clone(),
+                        severity: crate::event_bus::Severity::Medium,
+                        message: &suppressed_msg,
+                    });
+                    // Bump the cooldown clock so we don't re-emit the
+                    // event every 10s while the loop stays busy. Do
+                    // NOT touch last_interrupt_at — no interrupt fired,
+                    // and that flag drives the global post-interrupt
+                    // cooldown for OTHER fire paths.
+                    state.last_watcher_inject = Some(now.clone());
+                    crate::state::save_state(&config.general.state_file, state);
+                } else {
+                    warn!(missing = %missing_list, "watchers down — interrupting and injecting restart");
+                    write_jsonl_log(
+                        &config.general.log_file,
+                        "watcher_inject",
+                        serde_json::json!({
+                            "missing": missing_names,
+                        }),
+                    );
+
+                    // Interrupt first (like prolonged-thinking) to break any inline work
+                    if tmux::interrupt_and_wait(&effective_pane, 10).await {
+                        info!("watcher inject: Claude Code is idle after interrupt");
+                    } else {
+                        warn!("watcher inject: could not confirm idle, injecting anyway");
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+                    // Build specific restart commands
+                    let restart_cmds: Vec<String> = missing_names
+                        .iter()
+                        .map(|n| format!("watcher-ctl run {}", n))
+                        .collect();
+                    let prompt = format!(
+                        "[CLAUDE-WATCH] WATCHER(S) DOWN: {}. You MUST restart them NOW. \
+                         Run these as background tasks immediately: {}",
+                        missing_list,
+                        restart_cmds.join(", ")
+                    );
+                    tmux::inject_text(&effective_pane, &prompt).await;
+                    // Third sink: claude-event so the main loop sees the
+                    // missing-watchers list as structured data and can
+                    // decide which restart command(s) to actually run,
+                    // rather than reflexively reading the prompt string.
+                    alert::emit_event(crate::event_bus::ClaudeWatchAlert {
+                        alert_type: "watcher-down",
+                        stuck_reason: &watcher_reason,
+                        stale_minutes: None,
+                        affected_watchers: missing_names.clone(),
+                        severity: crate::event_bus::Severity::Medium,
+                        message: &prompt,
+                    });
+                    state.last_watcher_inject = Some(now.clone());
+                    state.last_interrupt_at = Some(now.clone());
+                    state.watcher_inject_count += 1;
+                    state.watcher_down_interrupts_total =
+                        state.watcher_down_interrupts_total.saturating_add(1);
+                    crate::state::save_state(&config.general.state_file, state);
+                }
             }
         }
     }
@@ -2450,5 +2544,78 @@ mod tests {
         assert_eq!(state.wedged_clear_interrupts_total, 0);
         assert_eq!(state.auto_update_interrupts_total, 0);
         assert_eq!(state.restart_claude_interrupts_total, 0);
+    }
+
+    // --- main_loop_actively_turning suppression-gate tests (2026-04-27) ---
+    //
+    // The watcher-down inject path consults this predicate. When it returns
+    // true, the daemon skips the tmux interrupt + inject (the in-pane
+    // preemption) but still emits the structured claude-event sink so
+    // Andrew is notified out-of-band. The in-pane preemption is the only
+    // cause of the "inject fires mid-turn → loop pivots to restart watcher
+    // → original ask is abandoned half-finished" cascade Andrew flagged
+    // 2026-04-27.
+
+    fn iso_secs_ago(seconds_ago: i64) -> String {
+        let dt = chrono::Utc::now() - chrono::Duration::seconds(seconds_ago);
+        dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+    }
+
+    #[test]
+    fn test_main_loop_actively_turning_when_bashes_nonzero() {
+        // bashes > 0 RIGHT NOW: actively turning, regardless of last_active_at.
+        let state = State::default();
+        assert!(main_loop_actively_turning(&state, 1, 30));
+    }
+
+    #[test]
+    fn test_main_loop_actively_turning_recent_activity_in_window() {
+        // bashes == 0 NOW but a tool call ran 5s ago: still actively turning.
+        let mut state = State::default();
+        state.last_active_at = Some(iso_secs_ago(5));
+        assert!(main_loop_actively_turning(&state, 0, 30));
+    }
+
+    #[test]
+    fn test_main_loop_actively_turning_stale_activity_outside_window() {
+        // last_active_at is 60s ago, window is 30s: not actively turning.
+        let mut state = State::default();
+        state.last_active_at = Some(iso_secs_ago(60));
+        assert!(!main_loop_actively_turning(&state, 0, 30));
+    }
+
+    #[test]
+    fn test_main_loop_actively_turning_no_history_idle() {
+        // No last_active_at, bashes == 0: definitely not actively turning.
+        let state = State::default();
+        assert!(!main_loop_actively_turning(&state, 0, 30));
+    }
+
+    #[test]
+    fn test_main_loop_actively_turning_window_zero_still_honors_live_bashes() {
+        // window_secs = 0 disables the recent-activity gate, but a live
+        // tool call (bashes > 0) MUST still count as actively turning.
+        let state = State::default();
+        assert!(main_loop_actively_turning(&state, 1, 0));
+    }
+
+    #[test]
+    fn test_main_loop_actively_turning_window_zero_idle_returns_false() {
+        // window_secs = 0 + bashes == 0 + recent activity 1s ago:
+        // recent-activity gate is disabled, so this must NOT count as
+        // actively turning.
+        let mut state = State::default();
+        state.last_active_at = Some(iso_secs_ago(1));
+        assert!(!main_loop_actively_turning(&state, 0, 0));
+    }
+
+    #[test]
+    fn test_main_loop_actively_turning_invalid_timestamp_treated_as_idle() {
+        // Garbage in last_active_at parses to None and must NOT be
+        // treated as "recent" — that would silently disable the inject
+        // forever after a single corrupt write.
+        let mut state = State::default();
+        state.last_active_at = Some("not a timestamp".to_string());
+        assert!(!main_loop_actively_turning(&state, 0, 30));
     }
 }

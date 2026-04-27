@@ -161,6 +161,20 @@ pub struct WatcherMonitorConfig {
     /// Cooldown in seconds between watcher-missing injections (default: 300)
     #[serde(default = "default_watcher_inject_cooldown")]
     pub inject_cooldown: u64,
+    /// When true, suppress the tmux-INJECT (interrupt + prompt) part of
+    /// the watcher-down alert when the main loop is actively turning
+    /// (a tool call is running, or one ran within `active_window_secs`).
+    /// The structured claude-event STILL fires so Andrew is notified
+    /// out-of-band — only the in-pane preemption is skipped. Heartbeat-
+    /// stale and other alert paths are unaffected. Default: true.
+    #[serde(default = "default_suppress_inject_when_active")]
+    pub suppress_inject_when_active: bool,
+    /// Window (seconds) of recent tool-call activity that counts as
+    /// "actively turning" for the purposes of `suppress_inject_when_active`.
+    /// If `bashes > 0` was last observed within this many seconds, the
+    /// watcher-down INJECT is suppressed. Default: 30.
+    #[serde(default = "default_active_window_secs")]
+    pub active_window_secs: u64,
 }
 
 fn default_watcher_inject_threshold() -> u32 {
@@ -169,6 +183,14 @@ fn default_watcher_inject_threshold() -> u32 {
 
 fn default_watcher_inject_cooldown() -> u64 {
     300
+}
+
+fn default_suppress_inject_when_active() -> bool {
+    true
+}
+
+fn default_active_window_secs() -> u64 {
+    30
 }
 
 #[derive(Debug, Deserialize, Clone)]
