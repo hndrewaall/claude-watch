@@ -23,6 +23,7 @@ mod agent;
 mod alert;
 mod cmd;
 mod config;
+mod event_bus;
 mod hook_fire;
 mod logging;
 mod metrics;
