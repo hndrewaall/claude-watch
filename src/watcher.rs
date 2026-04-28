@@ -7,12 +7,13 @@ use crate::cmd::run_cmd_any;
 use crate::status::{parse_watchers_config, WatcherEntry};
 use serde::Serialize;
 use std::io::Write;
+use std::os::unix::process::ExitStatusExt;
 
 /// Default config path for watchers.
 const DEFAULT_CONFIG: &str = ".config/watchmen/watchers.conf";
 
 /// PID file directory for watcher liveness tracking.
-const PID_DIR: &str = "/var/run/claude";
+pub const PID_DIR: &str = "/var/run/claude";
 
 /// Resolve the watchers.conf path (respects $WATCHERS_CONFIG for testing).
 pub fn config_path() -> String {
@@ -162,7 +163,33 @@ pub async fn watcher_run(config_path: &str, name: &str) -> Result<i32, String> {
         .await
         .map_err(|e| format!("failed to wait for '{}': {}", name, e))?;
 
-    Ok(status.code().unwrap_or(1))
+    Ok(exit_code_from_status(
+        status.code(),
+        ExitStatusExt::signal(&status),
+    ))
+}
+
+/// Translate a child `ExitStatus` into a Unix-conventional integer exit code.
+///
+/// - Normal exit: returns the child's exit code (0..=255).
+/// - Signal-killed exit: returns `128 + signal_number`, matching the standard
+///   shell convention (e.g. SIGTERM=15 -> 143, SIGKILL=9 -> 137).
+/// - Neither code nor signal (should be impossible on Unix): returns 1.
+///
+/// The previous implementation collapsed signal-killed children into a flat
+/// exit code of 1, indistinguishable from a real `exit 1` from the script.
+/// That made every signal-terminated watcher (e.g. memory-remind getting
+/// SIGTERM during /clear, watcher-restart, or compaction) look like a real
+/// failure. With this translation the caller can tell exit-1 (logic failure)
+/// from exit-143 (SIGTERM during normal shutdown) apart.
+pub fn exit_code_from_status(code: Option<i32>, signal: Option<i32>) -> i32 {
+    if let Some(c) = code {
+        return c;
+    }
+    if let Some(s) = signal {
+        return 128 + s;
+    }
+    1
 }
 
 /// Enable or disable a watcher by rewriting the config file.
@@ -617,5 +644,60 @@ mod tests {
         assert!(output.contains("NAME"));
         // Just headers, no entries
         assert_eq!(output.lines().count(), 2);
+    }
+
+    // --- exit_code_from_status tests ---
+    //
+    // Regression suite for memory-remind exit-1 bug: when bash gets SIGTERM
+    // (during /clear, watcher-restart, or compaction) we used to collapse the
+    // signal-killed exit into a flat `1` via `unwrap_or(1)`, indistinguishable
+    // from a real script `exit 1`. The fix returns `128 + signo` (Unix
+    // convention) so SIGTERM surfaces as 143 instead.
+
+    #[test]
+    fn test_exit_code_from_status_normal_zero() {
+        assert_eq!(super::exit_code_from_status(Some(0), None), 0);
+    }
+
+    #[test]
+    fn test_exit_code_from_status_normal_nonzero() {
+        // A real `exit 1` from the script should still be reported as 1.
+        assert_eq!(super::exit_code_from_status(Some(1), None), 1);
+        assert_eq!(super::exit_code_from_status(Some(2), None), 2);
+        assert_eq!(super::exit_code_from_status(Some(127), None), 127);
+    }
+
+    #[test]
+    fn test_exit_code_from_status_sigterm() {
+        // SIGTERM (15) — this is the case that bit memory-remind. Must NOT
+        // collapse to 1; must report 143 so the caller can see "killed by
+        // SIGTERM" rather than mistake it for a logic failure.
+        assert_eq!(super::exit_code_from_status(None, Some(15)), 143);
+    }
+
+    #[test]
+    fn test_exit_code_from_status_sigkill() {
+        // SIGKILL (9) — surfaces as 137.
+        assert_eq!(super::exit_code_from_status(None, Some(9)), 137);
+    }
+
+    #[test]
+    fn test_exit_code_from_status_sigint() {
+        // SIGINT (2) — surfaces as 130.
+        assert_eq!(super::exit_code_from_status(None, Some(2)), 130);
+    }
+
+    #[test]
+    fn test_exit_code_from_status_neither_falls_back_to_one() {
+        // Defensive: if neither code nor signal is present (should be
+        // impossible on Unix), preserve the old fallback of 1.
+        assert_eq!(super::exit_code_from_status(None, None), 1);
+    }
+
+    #[test]
+    fn test_exit_code_from_status_normal_takes_precedence() {
+        // If both are somehow present, prefer the explicit exit code.
+        assert_eq!(super::exit_code_from_status(Some(0), Some(15)), 0);
+        assert_eq!(super::exit_code_from_status(Some(7), Some(15)), 7);
     }
 }
