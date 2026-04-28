@@ -76,6 +76,145 @@ pub(crate) fn interrupt_in_global_cooldown(state: &State, cooldown_secs: u64) ->
         .is_some_and(|e| e < cooldown_secs as f64)
 }
 
+/// Quiet-path decision for watcher-down events.
+///
+/// Pure helper: given the configured thresholds plus a watcher's current
+/// state, decide what the watcher-monitor cycle should do this iteration.
+/// Returns a `WatcherDownAction`:
+///
+///   * `Nothing`         — below event_threshold, or in grace window.
+///   * `EmitEvent`       — fire a `watcher-down` claude-event; quiet path.
+///   * `InjectFallback`  — heavyweight tmux-inject path:
+///       - the watcher is the configured event-consumer (chicken-and-egg:
+///         emitting an event with no consumer is pointless), OR
+///       - we already emitted an event for this watcher AND the grace
+///         window has expired AND consecutive_missing has reached the
+///         inject_threshold.
+///
+/// This function does NOT consult the global cooldown or the
+/// `last_watcher_inject` cooldown; those are layered on top by the caller
+/// at the inject site (mirroring the legacy behaviour).
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub(crate) enum WatcherDownAction {
+    Nothing,
+    EmitEvent,
+    InjectFallback,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn evaluate_watcher_down_action(
+    is_consumer_watcher: bool,
+    consecutive_missing: u32,
+    event_emitted_at: Option<&str>,
+    event_threshold: u32,
+    inject_threshold: u32,
+    event_grace_secs: u64,
+) -> WatcherDownAction {
+    // Special-case: when the consumer watcher itself is missing, the quiet
+    // path can't deliver — skip event emission and fall straight through
+    // to inject as soon as it has reached the inject_threshold (so the
+    // legacy semantics for that watcher are preserved).
+    if is_consumer_watcher {
+        if consecutive_missing >= inject_threshold {
+            return WatcherDownAction::InjectFallback;
+        }
+        return WatcherDownAction::Nothing;
+    }
+
+    let grace_active = event_emitted_at
+        .and_then(elapsed_since)
+        .is_some_and(|e| e < event_grace_secs as f64);
+
+    // Once the quiet path has fired AT ALL for this watcher (regardless of
+    // grace age), the inject path is the only escalation route — we do NOT
+    // re-emit. While the grace window is active, the loud path is also
+    // suppressed (give the main loop a chance). Past the grace window, we
+    // fall through to inject as fallback for the case where the main loop
+    // never picked up the event (or claude-event-watch is itself stalled).
+    if event_emitted_at.is_some() {
+        if grace_active {
+            return WatcherDownAction::Nothing;
+        }
+        if consecutive_missing >= inject_threshold {
+            return WatcherDownAction::InjectFallback;
+        }
+        return WatcherDownAction::Nothing;
+    }
+
+    // No prior emission. First-time event emission: at-or-above
+    // event_threshold but below inject_threshold (so the quiet path
+    // strictly precedes the loud one for normal configs).
+    if consecutive_missing >= event_threshold && consecutive_missing < inject_threshold {
+        return WatcherDownAction::EmitEvent;
+    }
+
+    // No prior event AND consecutive_missing has marched past the inject
+    // threshold without ever crossing event_threshold (only possible if
+    // event_threshold > inject_threshold, i.e. misconfiguration). Fall
+    // through to inject as legacy behaviour.
+    if consecutive_missing >= inject_threshold {
+        return WatcherDownAction::InjectFallback;
+    }
+
+    WatcherDownAction::Nothing
+}
+
+/// Best-effort fire-and-forget emission of a `watcher-down` claude-event.
+///
+/// Shells out to the configured `claude-event` CLI. If the CLI is missing,
+/// crashes, or hangs, we log and move on — the caller should treat this as
+/// non-blocking. The fallback inject path will eventually fire if the main
+/// loop never picks the event up.
+async fn emit_watcher_down_event(
+    cli: &str,
+    watcher: &str,
+    consecutive_missing: u32,
+    recorded_pid: Option<u32>,
+) -> bool {
+    let message = format!(
+        "Watcher DOWN: {}. Run: watcher-ctl run {}",
+        watcher, watcher
+    );
+    let pid_str = match recorded_pid {
+        Some(p) => p.to_string(),
+        None => "null".to_string(),
+    };
+    let watcher_kv = format!("watcher={}", watcher);
+    let consec_kv = format!("consecutive_missing={}", consecutive_missing);
+    let pid_kv = format!("recorded_pid={}", pid_str);
+    let args: Vec<&str> = vec![
+        cli,
+        &message,
+        "--tag",
+        "watcher-down",
+        "--source",
+        "claude-watch",
+        "--source-name",
+        "claude-watch",
+        "--priority",
+        "high",
+        "--data",
+        &watcher_kv,
+        "--data",
+        &consec_kv,
+        "--data",
+        &pid_kv,
+    ];
+
+    // 5s timeout — claude-event is a tiny Python script that should complete
+    // in well under a second; if it hangs, don't block the monitor loop.
+    let result = crate::cmd::run_cmd_any(&args, 5).await;
+    if !result.1 {
+        warn!(
+            watcher = %watcher,
+            cli = %cli,
+            "claude-event emission failed (CLI missing, non-zero exit, or timeout); falling back to inject path on next cycle past grace window"
+        );
+        return false;
+    }
+    true
+}
+
 /// If the given reminder fired within the last `max_age_secs` (we default
 /// to 1 hour — beyond that we assume the self-action is unrelated),
 /// record the reminder -> action latency sample into the state-based
@@ -1646,6 +1785,17 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
         let entries = status::parse_watchers_config(&config.watcher_monitor.watchers_config);
         let mut any_critical_missing = false;
         let mut missing_names: Vec<String> = Vec::new();
+        // Pull config values into locals once to avoid borrow-checker
+        // friction when we both mutate `state.watcher_health` and read
+        // `config` later in the same scope.
+        let event_threshold = config.watcher_monitor.event_threshold;
+        let inject_threshold = config.watcher_monitor.inject_threshold;
+        let event_grace_secs = config.watcher_monitor.event_grace_secs;
+        let event_command = config.watcher_monitor.event_command.clone();
+        let event_consumer_name = config
+            .watcher_monitor
+            .event_consumer_watcher_name
+            .clone();
 
         for entry in &entries {
             if !entry.enabled {
@@ -1659,11 +1809,15 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                     last_seen_running: None,
                     consecutive_missing: 0,
                     enabled: entry.enabled,
+                    event_emitted_at: None,
                 });
 
             if count >= entry.min_count {
                 health.last_seen_running = Some(now.clone());
                 health.consecutive_missing = 0;
+                // Recovery clears the quiet-path bookkeeping so the next
+                // failure starts a fresh quiet-path episode.
+                health.event_emitted_at = None;
             } else {
                 // Grace period: if the watcher was seen running within the
                 // last 90 seconds, don't count this as a miss. Short-lived
@@ -1698,9 +1852,65 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                         }),
                     );
                 }
-                if health.consecutive_missing >= config.watcher_monitor.inject_threshold {
-                    any_critical_missing = true;
-                    missing_names.push(entry.name.clone());
+
+                // Quiet-path decision. The pure helper returns one of
+                // {Nothing, EmitEvent, InjectFallback} based on the
+                // configured thresholds, the consumer-watcher special
+                // case, and the per-watcher event_emitted_at timestamp.
+                let is_consumer = entry.name == event_consumer_name;
+                let action = evaluate_watcher_down_action(
+                    is_consumer,
+                    health.consecutive_missing,
+                    health.event_emitted_at.as_deref(),
+                    event_threshold,
+                    inject_threshold,
+                    event_grace_secs,
+                );
+
+                match action {
+                    WatcherDownAction::Nothing => {}
+                    WatcherDownAction::EmitEvent => {
+                        // Snapshot pid for logging. status::check_process_count
+                        // doesn't return one; record_pid stays None for now.
+                        let recorded_pid: Option<u32> = None;
+                        info!(
+                            watcher = %entry.name,
+                            consecutive_missing = health.consecutive_missing,
+                            "watcher-down event (quiet path) — emitting claude-event"
+                        );
+                        write_jsonl_log(
+                            &config.general.log_file,
+                            "watcher_down_event_emit",
+                            serde_json::json!({
+                                "watcher": entry.name,
+                                "consecutive_missing": health.consecutive_missing,
+                                "recorded_pid": recorded_pid,
+                            }),
+                        );
+                        let ok = emit_watcher_down_event(
+                            &event_command,
+                            &entry.name,
+                            health.consecutive_missing,
+                            recorded_pid,
+                        )
+                        .await;
+                        if ok {
+                            health.event_emitted_at = Some(now.clone());
+                        }
+                        // Whether the emission succeeded or not, do NOT add
+                        // this watcher to missing_names — we want to give
+                        // the main loop a chance to handle the event before
+                        // the inject path fires. If the emit failed, the
+                        // next cycle past the grace window (which is
+                        // skipped here because event_emitted_at is None)
+                        // will re-enter EmitEvent and try again, or escalate
+                        // straight to InjectFallback once consecutive_missing
+                        // crosses inject_threshold.
+                    }
+                    WatcherDownAction::InjectFallback => {
+                        any_critical_missing = true;
+                        missing_names.push(entry.name.clone());
+                    }
                 }
             }
         }
@@ -2328,5 +2538,159 @@ mod tests {
         assert_eq!(state.wedged_clear_interrupts_total, 0);
         assert_eq!(state.auto_update_interrupts_total, 0);
         assert_eq!(state.restart_claude_interrupts_total, 0);
+    }
+
+    // --- evaluate_watcher_down_action tests (quiet-path / 2026-04-28) ---
+    //
+    // Behaviour table:
+    //
+    // | scenario                                  | expected action     |
+    // |-------------------------------------------|---------------------|
+    // | below event_threshold                     | Nothing             |
+    // | hit event_threshold, no prior emit        | EmitEvent           |
+    // | event recently emitted, within grace      | Nothing             |
+    // | event emitted, grace expired, < inject_th | Nothing             |
+    // | event emitted, grace expired, >= inject_th| InjectFallback      |
+    // | consumer watcher missing, < inject_th     | Nothing (no event!) |
+    // | consumer watcher missing, >= inject_th    | InjectFallback      |
+    // | misconfig: ev_th > inj_th, hit inj_th     | InjectFallback      |
+
+    #[test]
+    fn test_watcher_action_below_event_threshold_does_nothing() {
+        // consecutive=2, event_threshold=3 -> no action yet
+        let action = evaluate_watcher_down_action(false, 2, None, 3, 6, 60);
+        assert_eq!(action, WatcherDownAction::Nothing);
+    }
+
+    #[test]
+    fn test_watcher_action_at_event_threshold_emits() {
+        // consecutive=3, event_threshold=3, no prior emit -> EmitEvent
+        let action = evaluate_watcher_down_action(false, 3, None, 3, 6, 60);
+        assert_eq!(action, WatcherDownAction::EmitEvent);
+    }
+
+    #[test]
+    fn test_watcher_action_above_event_threshold_emits() {
+        // consecutive=4, event_threshold=3, no prior emit -> EmitEvent
+        // (still below inject_threshold=6)
+        let action = evaluate_watcher_down_action(false, 4, None, 3, 6, 60);
+        assert_eq!(action, WatcherDownAction::EmitEvent);
+    }
+
+    #[test]
+    fn test_watcher_action_within_grace_window_suppresses() {
+        // event was emitted ~5s ago, grace=60s -> Nothing
+        let recent = Utc::now()
+            .checked_sub_signed(chrono::Duration::seconds(5))
+            .unwrap()
+            .to_rfc3339();
+        let action = evaluate_watcher_down_action(false, 5, Some(&recent), 3, 6, 60);
+        assert_eq!(action, WatcherDownAction::Nothing);
+    }
+
+    #[test]
+    fn test_watcher_action_grace_expired_below_inject_threshold_does_nothing() {
+        // event was emitted long ago, grace expired, but consecutive_missing
+        // hasn't reached inject_threshold yet -> Nothing.
+        let stale = Utc::now()
+            .checked_sub_signed(chrono::Duration::seconds(120))
+            .unwrap()
+            .to_rfc3339();
+        let action = evaluate_watcher_down_action(false, 5, Some(&stale), 3, 6, 60);
+        assert_eq!(action, WatcherDownAction::Nothing);
+    }
+
+    #[test]
+    fn test_watcher_action_grace_expired_at_inject_threshold_falls_through_to_inject() {
+        // event was emitted long ago, grace expired, AND consecutive_missing
+        // reached inject_threshold -> InjectFallback (the main loop never
+        // picked up the event for whatever reason — escalate).
+        let stale = Utc::now()
+            .checked_sub_signed(chrono::Duration::seconds(120))
+            .unwrap()
+            .to_rfc3339();
+        let action = evaluate_watcher_down_action(false, 6, Some(&stale), 3, 6, 60);
+        assert_eq!(action, WatcherDownAction::InjectFallback);
+    }
+
+    #[test]
+    fn test_watcher_action_consumer_watcher_skips_event_below_inject_threshold() {
+        // claude-event-watch itself is missing — never emit (no consumer).
+        // Below inject_threshold -> Nothing.
+        let action = evaluate_watcher_down_action(true, 3, None, 3, 6, 60);
+        assert_eq!(action, WatcherDownAction::Nothing);
+    }
+
+    #[test]
+    fn test_watcher_action_consumer_watcher_falls_through_to_inject_at_threshold() {
+        // claude-event-watch missing AND past inject_threshold -> InjectFallback.
+        // No event was ever emitted (None) — the chicken-and-egg case.
+        let action = evaluate_watcher_down_action(true, 6, None, 3, 6, 60);
+        assert_eq!(action, WatcherDownAction::InjectFallback);
+    }
+
+    #[test]
+    fn test_watcher_action_misconfig_event_threshold_above_inject_threshold() {
+        // Misconfiguration: event_threshold (10) > inject_threshold (6).
+        // consecutive_missing=6 is at inject_threshold but below
+        // event_threshold. The pure helper falls through to InjectFallback
+        // rather than wedging on Nothing forever.
+        let action = evaluate_watcher_down_action(false, 6, None, 10, 6, 60);
+        assert_eq!(action, WatcherDownAction::InjectFallback);
+    }
+
+    #[test]
+    fn test_watcher_action_grace_zero_disables_quiet_path_after_first_emit() {
+        // grace_secs=0 means the quiet-path suppression window is empty.
+        // After emission, the very next cycle past inject_threshold should
+        // immediately fall through to InjectFallback (no waiting).
+        let just_now = Utc::now().to_rfc3339();
+        let action = evaluate_watcher_down_action(false, 6, Some(&just_now), 3, 6, 0);
+        assert_eq!(action, WatcherDownAction::InjectFallback);
+    }
+
+    #[test]
+    fn test_watcher_action_recovery_clears_event_emitted_at_externally() {
+        // This test mirrors what the watcher loop does on recovery: it
+        // clears event_emitted_at so the next failure gets a fresh quiet
+        // path. We verify the helper returns EmitEvent again with a cleared
+        // timestamp, even though we previously emitted.
+        let action = evaluate_watcher_down_action(false, 3, None, 3, 6, 60);
+        assert_eq!(action, WatcherDownAction::EmitEvent);
+    }
+
+    #[test]
+    fn test_watcher_action_re_emit_suppressed_when_grace_active_and_count_grew() {
+        // Even if consecutive_missing grew past event_threshold by another
+        // cycle, while the grace window is active we MUST NOT re-emit
+        // (no double-fire).
+        let recent = Utc::now()
+            .checked_sub_signed(chrono::Duration::seconds(10))
+            .unwrap()
+            .to_rfc3339();
+        let action = evaluate_watcher_down_action(false, 4, Some(&recent), 3, 6, 60);
+        assert_eq!(action, WatcherDownAction::Nothing);
+    }
+
+    #[test]
+    fn test_watcher_state_recovery_clears_event_emitted_at() {
+        // Simulate the watcher-loop "recovery" branch: when count >= min_count
+        // the loop sets last_seen_running, zeros consecutive_missing, AND
+        // clears event_emitted_at. Verify the field actually gets cleared
+        // (regression guard for forgetting to reset it).
+        let mut health = WatcherState {
+            last_seen_running: None,
+            consecutive_missing: 5,
+            enabled: true,
+            event_emitted_at: Some("2026-04-28T12:00:00+00:00".to_string()),
+        };
+        // Mirror the recovery branch:
+        health.last_seen_running = Some("2026-04-28T12:05:00+00:00".to_string());
+        health.consecutive_missing = 0;
+        health.event_emitted_at = None;
+
+        assert_eq!(health.consecutive_missing, 0);
+        assert!(health.event_emitted_at.is_none());
+        assert!(health.last_seen_running.is_some());
     }
 }

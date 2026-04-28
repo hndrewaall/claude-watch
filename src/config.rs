@@ -151,6 +151,28 @@ pub struct WatcherMonitorConfig {
     /// Cooldown in seconds between watcher-missing injections (default: 300)
     #[serde(default = "default_watcher_inject_cooldown")]
     pub inject_cooldown: u64,
+    /// Quiet path: emit a `watcher-down` claude-event after this many
+    /// consecutive missing checks. Set lower than `inject_threshold` so the
+    /// quiet path runs first; the heavyweight tmux-inject is the fallback.
+    /// Default: 3 (~30s at 10s interval).
+    #[serde(default = "default_watcher_event_threshold")]
+    pub event_threshold: u32,
+    /// Grace period (seconds) after a `watcher-down` event has been emitted
+    /// during which the tmux-inject path is suppressed. If the watcher is
+    /// still down after this many seconds, fall through to the inject path
+    /// as a fallback. Default: 60.
+    #[serde(default = "default_watcher_event_grace_secs")]
+    pub event_grace_secs: u64,
+    /// Path to the `claude-event` CLI used by the quiet path. Defaults to
+    /// `claude-event` (resolved via $PATH). Override for tests or non-standard
+    /// installs.
+    #[serde(default = "default_watcher_event_command")]
+    pub event_command: String,
+    /// The watcher name that consumes claude-events. If THIS watcher goes
+    /// down, the quiet path is useless (no consumer) and we fall straight
+    /// through to the tmux-inject path. Default: "claude-event-watch".
+    #[serde(default = "default_watcher_event_consumer_name")]
+    pub event_consumer_watcher_name: String,
 }
 
 fn default_watcher_inject_threshold() -> u32 {
@@ -159,6 +181,22 @@ fn default_watcher_inject_threshold() -> u32 {
 
 fn default_watcher_inject_cooldown() -> u64 {
     300
+}
+
+fn default_watcher_event_threshold() -> u32 {
+    3
+}
+
+fn default_watcher_event_grace_secs() -> u64 {
+    60
+}
+
+fn default_watcher_event_command() -> String {
+    "claude-event".to_string()
+}
+
+fn default_watcher_event_consumer_name() -> String {
+    "claude-event-watch".to_string()
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -706,6 +744,14 @@ cooldown = 300
         assert_eq!(config.alerts.escalation_tiers.len(), 5);
         assert!(config.foreground_monitor.enabled);
         assert!(config.watcher_monitor.enabled);
+        // Quiet-path defaults (no event_* keys in SAMPLE_CONFIG -> defaults).
+        assert_eq!(config.watcher_monitor.event_threshold, 3);
+        assert_eq!(config.watcher_monitor.event_grace_secs, 60);
+        assert_eq!(config.watcher_monitor.event_command, "claude-event");
+        assert_eq!(
+            config.watcher_monitor.event_consumer_watcher_name,
+            "claude-event-watch"
+        );
         assert!(config.reauth.enabled);
         assert_eq!(config.reauth.alert_interval_seconds, 10800);
         assert!(config.task_watch.enabled);
