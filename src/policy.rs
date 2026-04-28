@@ -372,6 +372,55 @@ fn is_pid_alive(pid: u32) -> bool {
         .unwrap_or(false)
 }
 
+/// Read a watcher PID file and return the recorded PID, if the file exists
+/// and contains a parseable integer. Whitespace is trimmed.
+///
+/// Returns:
+/// - `Some(pid)` if the file exists and parses cleanly.
+/// - `None` if the file is missing, unreadable, or contains non-numeric data.
+fn read_watcher_pid(pid_dir: &str, name: &str) -> Option<u32> {
+    let path = format!("{}/{}.pid", pid_dir, name);
+    let content = std::fs::read_to_string(&path).ok()?;
+    content.trim().parse::<u32>().ok()
+}
+
+/// Decide whether a watcher should be considered DOWN, given:
+/// - the live process count (from `pgrep -fc`)
+/// - the configured `min_count`
+/// - the recorded PID file (if any)
+/// - a process-liveness probe (typically `is_pid_alive`)
+///
+/// Returns `true` when the watcher is missing/orphaned.
+///
+/// The orphan-detection branch is the bug-2 fix: if a PID file exists and its
+/// recorded PID is dead, the watcher is DOWN even when `pgrep -fc` happens to
+/// match some other process by accident (e.g. a stale shell whose argv still
+/// contains the watcher's name pattern, or a self-matching wrapper). This
+/// matches the legacy `watchmen` shell-script's `kill -0` cross-check that
+/// was lost when watchmen was rewritten in Rust.
+///
+/// Watchers without a PID file fall through to the existing pgrep-only logic
+/// (preserves backward compat for watchers we don't explicitly track).
+pub fn watcher_is_down(
+    pgrep_count: u32,
+    min_count: u32,
+    recorded_pid: Option<u32>,
+    pid_alive: impl Fn(u32) -> bool,
+) -> bool {
+    // Standard pgrep-only check first.
+    if pgrep_count < min_count {
+        return true;
+    }
+    // Orphan-detection: pgrep saw a match, but the PID Claude actually
+    // started has died. The match is a false positive — count as DOWN.
+    if let Some(pid) = recorded_pid {
+        if !pid_alive(pid) {
+            return true;
+        }
+    }
+    false
+}
+
 /// Spawn `self-clear` immediately (no grace period). Used for the
 /// wedged-pane recovery path: when the agent is too stuck to run any tool
 /// call (context limit reached, persistent 429), claude-watch must drive
@@ -1652,6 +1701,17 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                 continue;
             }
             let count = status::check_process_count(&entry.pattern).await;
+            // Orphan-PID cross-check (bug-2 fix): pgrep can match the wrong
+            // process if a stale shell or self-matching wrapper happens to
+            // contain the watcher's name pattern in its argv. The legacy
+            // `watchmen` shell-script handled this with a `kill -0` probe of
+            // the recorded PID; we restore that behaviour here so that a
+            // dead memory-remind whose pidfile still points at PID N
+            // (now reaped) is reported as DOWN rather than masked by a
+            // coincidental pgrep hit.
+            let recorded_pid = read_watcher_pid(crate::watcher::PID_DIR, &entry.name);
+            let down = watcher_is_down(count, entry.min_count, recorded_pid, is_pid_alive);
+            let orphaned = down && count >= entry.min_count;
             let health = state
                 .watcher_health
                 .entry(entry.name.clone())
@@ -1661,7 +1721,7 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                     enabled: entry.enabled,
                 });
 
-            if count >= entry.min_count {
+            if !down {
                 health.last_seen_running = Some(now.clone());
                 health.consecutive_missing = 0;
             } else {
@@ -1686,6 +1746,7 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                         watcher = %entry.name,
                         pattern = %entry.pattern,
                         consecutive_missing = health.consecutive_missing,
+                        orphaned = orphaned,
                         "watcher missing"
                     );
                     write_jsonl_log(
@@ -1695,6 +1756,7 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                             "watcher": entry.name,
                             "pattern": entry.pattern,
                             "consecutive_missing": health.consecutive_missing,
+                            "orphaned": orphaned,
                         }),
                     );
                 }
@@ -1940,6 +2002,115 @@ mod tests {
     #[test]
     fn test_self_heal_no_trigger_at_zero() {
         assert!(!should_self_heal(0, 5, 1000, 2));
+    }
+
+    // --- watcher_is_down tests ---
+    //
+    // Regression suite for bug 2: the legacy `watchmen` shell-script did a
+    // `kill -0` cross-check on the recorded PID file so a pgrep false-match
+    // (stale wrapper, self-matching shell, etc.) didn't mask a dead watcher.
+    // The Rust rewrite dropped that check; these tests pin down the
+    // restored behaviour. Most importantly: pgrep_count >= min_count but
+    // recorded_pid is dead -> DOWN (orphan-detected).
+
+    #[test]
+    fn test_watcher_is_down_count_below_min() {
+        // No PID file, count = 0 < min_count = 1 -> DOWN.
+        assert!(watcher_is_down(0, 1, None, |_| true));
+    }
+
+    #[test]
+    fn test_watcher_is_down_count_meets_min_no_pidfile() {
+        // No PID file -> fall back to pgrep-only logic. Count meets min ->
+        // not DOWN. Preserves backward-compat for watchers we don't track.
+        assert!(!watcher_is_down(1, 1, None, |_| panic!("should not probe")));
+        assert!(!watcher_is_down(3, 1, None, |_| panic!("should not probe")));
+    }
+
+    #[test]
+    fn test_watcher_is_down_pidfile_alive() {
+        // Count meets min AND recorded PID is alive -> not DOWN.
+        assert!(!watcher_is_down(1, 1, Some(42), |pid| pid == 42));
+    }
+
+    #[test]
+    fn test_watcher_is_down_pidfile_dead_orphan() {
+        // The bug-2 fix: count meets min via pgrep BUT recorded PID is dead.
+        // Used to be reported as ok; now reported as DOWN (orphan).
+        assert!(watcher_is_down(1, 1, Some(42), |_| false));
+    }
+
+    #[test]
+    fn test_watcher_is_down_pidfile_dead_with_higher_count() {
+        // Even when pgrep shows multiple matches (e.g. transient self-match),
+        // a dead recorded PID is the canonical signal — DOWN.
+        assert!(watcher_is_down(5, 1, Some(42), |_| false));
+    }
+
+    #[test]
+    fn test_watcher_is_down_count_below_min_with_pidfile() {
+        // Count below min AND PID dead -> DOWN regardless.
+        assert!(watcher_is_down(0, 1, Some(42), |_| false));
+        // Count below min but PID alive -> still DOWN (count is canonical
+        // signal that the watcher isn't running with min_count instances).
+        assert!(watcher_is_down(0, 1, Some(42), |pid| pid == 42));
+    }
+
+    #[test]
+    fn test_watcher_is_down_min_count_zero() {
+        // Edge case: min_count = 0 means always meets count requirement.
+        // Without a PID file, never DOWN.
+        assert!(!watcher_is_down(0, 0, None, |_| panic!("no probe")));
+        // With a PID file and dead PID, DOWN by orphan detection.
+        assert!(watcher_is_down(0, 0, Some(42), |_| false));
+    }
+
+    // --- read_watcher_pid tests ---
+
+    #[test]
+    fn test_read_watcher_pid_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            read_watcher_pid(dir.path().to_str().unwrap(), "nonexistent"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_read_watcher_pid_valid() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("foo.pid"), "12345\n").unwrap();
+        assert_eq!(
+            read_watcher_pid(dir.path().to_str().unwrap(), "foo"),
+            Some(12345)
+        );
+    }
+
+    #[test]
+    fn test_read_watcher_pid_trims_whitespace() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("bar.pid"), "  9876  \n").unwrap();
+        assert_eq!(
+            read_watcher_pid(dir.path().to_str().unwrap(), "bar"),
+            Some(9876)
+        );
+    }
+
+    #[test]
+    fn test_read_watcher_pid_garbage() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("baz.pid"), "not-a-pid\n").unwrap();
+        assert_eq!(read_watcher_pid(dir.path().to_str().unwrap(), "baz"), None);
+    }
+
+    #[test]
+    fn test_read_watcher_pid_empty_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("empty.pid"), "").unwrap();
+        assert_eq!(
+            read_watcher_pid(dir.path().to_str().unwrap(), "empty"),
+            None
+        );
     }
 
     // --- check_context_threshold tests ---
