@@ -328,9 +328,162 @@ async fn restart_claude(pane: &str, state: &mut State, config: &crate::config::C
     .await;
 }
 
+/// Pure decision: given the current observation (`is_retrying`) and the
+/// existing state, return the `(new_consecutive, new_first_seen, suppress)`
+/// triple. Split out so the consecutive-cycles + max-stuck-secs logic can
+/// be unit-tested without mocking tmux.
+///
+/// Semantics:
+///   - `is_retrying=true` increments `consecutive`. The first detection sets
+///     `first_seen`. Suppression activates once `consecutive >= threshold`.
+///   - `is_retrying=true` AND we've already been suppressing for longer than
+///     `max_stuck_secs` returns `suppress=false` so monitoring resumes (the
+///     retry has hung long enough to count as a real failure).
+///   - `is_retrying=false` clears the episode immediately.
+pub(crate) fn evaluate_api_retry_state(
+    is_retrying: bool,
+    consecutive: u32,
+    first_seen: Option<&str>,
+    threshold: u32,
+    max_stuck_secs: u64,
+) -> (u32, Option<String>, bool) {
+    if !is_retrying {
+        return (0, None, false);
+    }
+
+    let new_consecutive = consecutive.saturating_add(1);
+    // Preserve the original first_seen if we already have one; otherwise stamp
+    // it now (the caller passes the current local time as `first_seen=None`
+    // when no episode is in progress).
+    let new_first_seen = match first_seen {
+        Some(fs) => Some(fs.to_string()),
+        None => Some(Local::now().to_rfc3339()),
+    };
+
+    // Don't suppress until the consecutive threshold is reached.
+    if new_consecutive < threshold {
+        return (new_consecutive, new_first_seen, false);
+    }
+
+    // Suppression cap: once we've been retrying for longer than
+    // max_stuck_secs, stop suppressing — let the normal monitoring sites
+    // fire so something can recover.
+    if max_stuck_secs > 0 {
+        if let Some(ref fs) = new_first_seen {
+            if let Some(elapsed) = elapsed_since(fs) {
+                if elapsed > max_stuck_secs as f64 {
+                    return (new_consecutive, new_first_seen, false);
+                }
+            }
+        }
+    }
+
+    (new_consecutive, new_first_seen, true)
+}
+
+/// Detect whether the pane is currently in an upstream-API retry-backoff and
+/// update the daemon's tracking state accordingly. Returns true when the
+/// caller should SUPPRESS interrupt fires for this cycle.
+///
+/// This is the single chokepoint for the "back off when API is overloaded"
+/// fix. To avoid double-counting state updates when `check_cycle` calls
+/// `check_foreground` near the end of its body (both would otherwise call
+/// this function in a single cycle), the caller in `check_foreground` skips
+/// the update and reads the suppression flag from existing state via
+/// `is_api_retry_suppressing` instead.
+async fn update_api_retry_state(config: &Config, state: &mut State, pane: &str) -> bool {
+    if !config.api_retry.enabled || pane.is_empty() {
+        return false;
+    }
+
+    let is_retrying = tmux::detect_api_retry(pane).await;
+    let was_suppressing = is_api_retry_suppressing(config, state);
+
+    let (new_consec, new_first, suppress) = evaluate_api_retry_state(
+        is_retrying,
+        state.api_retry_consecutive,
+        state.api_retry_first_seen.as_deref(),
+        config.api_retry.consecutive,
+        config.api_retry.max_stuck_secs,
+    );
+    state.api_retry_consecutive = new_consec;
+    state.api_retry_first_seen = new_first;
+
+    if suppress {
+        state.api_retry_suppressions_total =
+            state.api_retry_suppressions_total.saturating_add(1);
+        if !was_suppressing {
+            // Edge: log on transition into suppression.
+            info!(
+                consecutive = state.api_retry_consecutive,
+                "API retry detected — suppressing interrupt sites until retry resolves"
+            );
+            write_jsonl_log(
+                &config.general.log_file,
+                "api_retry_suppress_start",
+                serde_json::json!({
+                    "consecutive": state.api_retry_consecutive,
+                }),
+            );
+        } else {
+            debug!(
+                consecutive = state.api_retry_consecutive,
+                "api_retry suppression continues"
+            );
+        }
+    } else if was_suppressing {
+        // Transition out of suppression. Either the retry resolved or we hit
+        // the max_stuck_secs cap — either way the caller resumes normal
+        // monitoring on this cycle.
+        info!("API retry resolved or stuck timeout reached — resuming normal monitoring");
+        write_jsonl_log(
+            &config.general.log_file,
+            "api_retry_suppress_end",
+            serde_json::json!({}),
+        );
+    }
+
+    suppress
+}
+
+/// Pure decision (no I/O, no state mutation): given the current State and
+/// Config, return whether the api_retry guard is currently suppressing
+/// interrupts. Used by `check_foreground` when called from inside
+/// `check_cycle` (which already ran `update_api_retry_state` once this
+/// cycle) so we don't increment the suppressions counter twice.
+///
+/// Returns false when the feature is disabled, no episode is in progress,
+/// the consecutive threshold isn't met, or the max_stuck_secs cap has been
+/// exceeded.
+pub(crate) fn is_api_retry_suppressing(config: &Config, state: &State) -> bool {
+    if !config.api_retry.enabled {
+        return false;
+    }
+    if state.api_retry_consecutive < config.api_retry.consecutive {
+        return false;
+    }
+    let first_seen = match state.api_retry_first_seen.as_deref() {
+        Some(fs) => fs,
+        None => return false,
+    };
+    if config.api_retry.max_stuck_secs > 0 {
+        if let Some(elapsed) = elapsed_since(first_seen) {
+            if elapsed > config.api_retry.max_stuck_secs as f64 {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 /// Run a foreground-only check cycle. This is called more frequently than
 /// the full check_cycle to provide responsive foreground blocking detection.
 /// Requires a known pane to check against.
+///
+/// Performs its own api_retry detection via `update_api_retry_state`. Use
+/// `check_foreground_inner` directly when called from inside `check_cycle`
+/// to avoid double-incrementing the api_retry state counters in a single
+/// full-check cycle.
 pub async fn check_foreground(
     config: &Config,
     state: &mut State,
@@ -339,6 +492,40 @@ pub async fn check_foreground(
     bashes: u64,
 ) {
     if !config.foreground_monitor.enabled || pane.is_empty() {
+        return;
+    }
+    let api_retrying = update_api_retry_state(config, state, pane).await;
+    check_foreground_inner(config, state, pane, tokens, bashes, api_retrying).await;
+}
+
+/// Foreground check body, with the api_retrying flag passed in by the
+/// caller. Split out from `check_foreground` so `check_cycle` can call it
+/// without re-running `update_api_retry_state` (which would
+/// double-increment `api_retry_suppressions_total` per full cycle).
+async fn check_foreground_inner(
+    config: &Config,
+    state: &mut State,
+    pane: &str,
+    tokens: u64,
+    bashes: u64,
+    api_retrying: bool,
+) {
+    if !config.foreground_monitor.enabled || pane.is_empty() {
+        return;
+    }
+
+    // API retry guard: if Claude Code is currently in upstream-API retry
+    // backoff (529 / overloaded / 5xx), suppress every fire from this
+    // function. Each inject during retry resets the retry state machine,
+    // creating a livelock where the retry loop never gets to complete.
+    // Also reset the thinking timer so a stale start time doesn't cause
+    // an immediate fire the moment the retry resolves.
+    if api_retrying {
+        debug!("foreground check: api_retry active — suppressing fires this cycle");
+        state.thinking_start = None;
+        state.thinking_alerted = false;
+        state.foreground_start = None;
+        state.foreground_alerted = false;
         return;
     }
 
@@ -1315,6 +1502,22 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
         state.last_active_at = Some(now.clone());
     }
 
+    // --- API retry detection (suppression flag for downstream interrupt sites) ---
+    //
+    // When Claude Code is in upstream-API retry backoff (529 / overloaded /
+    // 5xx → "Retrying in Ns · attempt N/M"), every interrupt resets the
+    // retry state machine and prevents recovery. We detect once per cycle
+    // here and have downstream interrupt sites (wedged-clear, watcher-down,
+    // context-warning, and check_foreground's prolonged-thinking) skip
+    // their fires while the flag is set. Heartbeat and dead-process
+    // detection are NOT suppressed — those measure liveness, and a truly
+    // dead loop must still alert.
+    let api_retrying =
+        update_api_retry_state(config, state, &effective_pane).await;
+    if api_retrying {
+        debug!("check_cycle: api_retry active — suppressing wedged/watcher/context fires");
+    }
+
     // --- Dead process detection ---
     if tokens == 0 && bashes == 0 && !effective_pane.is_empty() {
         state.consecutive_dead_checks += 1;
@@ -1762,8 +1965,11 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
     // --- Foreground blocking detection ---
     // Delegated to check_foreground() which runs on its own timer in the main loop.
     // Also run it here during full check cycles to ensure it runs at least as often
-    // as the general interval.
-    check_foreground(config, state, &effective_pane, tokens, bashes).await;
+    // as the general interval. We call check_foreground_inner directly so the
+    // api_retrying flag we computed at the top of this function is reused
+    // (calling check_foreground would re-run update_api_retry_state and
+    // double-increment the counters within a single full cycle).
+    check_foreground_inner(config, state, &effective_pane, tokens, bashes, api_retrying).await;
 
     // --- Context monitoring ---
     if config.context_monitor.enabled && tokens > 0 {
@@ -1806,7 +2012,21 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                         config.general.post_interrupt_cooldown_secs,
                     );
 
-                    if hook_deferred {
+                    if api_retrying {
+                        debug!(
+                            tokens,
+                            pct,
+                            "context threshold exceeded but api_retry active — suppressing fire"
+                        );
+                        write_jsonl_log(
+                            &config.general.log_file,
+                            "context_threshold_api_retry_deferred",
+                            serde_json::json!({
+                                "tokens": tokens,
+                                "pct": pct,
+                            }),
+                        );
+                    } else if hook_deferred {
                         debug!(
                             tokens,
                             pct,
@@ -1967,7 +2187,20 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                     .and_then(elapsed_since)
                     .is_some_and(|e| e < config.context_monitor.wedged_cooldown as f64);
 
-                if !in_cooldown {
+                if api_retrying {
+                    debug!(
+                        reason = %reason,
+                        "wedged pane detected but api_retry active — suppressing self-clear"
+                    );
+                    write_jsonl_log(
+                        &config.general.log_file,
+                        "wedged_clear_api_retry_deferred",
+                        serde_json::json!({
+                            "reason": reason.to_string(),
+                            "consecutive": state.wedged_consecutive,
+                        }),
+                    );
+                } else if !in_cooldown {
                     warn!(
                         reason = %reason,
                         consecutive = state.wedged_consecutive,
@@ -2252,6 +2485,23 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                 state.last_watcher_inject.as_deref(),
                 config.watcher_monitor.inject_cooldown,
             );
+            // api_retry suppression (PR #45): if Claude Code is currently
+            // in upstream-API retry backoff, an inject would wipe the
+            // retry state machine and force a brand-new turn. Skip the
+            // inject path entirely until the retry resolves; the auto-
+            // restart already ran above and is independent of the pane.
+            if should_inject && api_retrying {
+                debug!(
+                    "watcher-down inject would fire but api_retry active — suppressing"
+                );
+                write_jsonl_log(
+                    &config.general.log_file,
+                    "watcher_inject_api_retry_deferred",
+                    serde_json::json!({
+                        "missing": missing_names,
+                    }),
+                );
+            }
             // Active-turn suppression: if the main loop is currently
             // running a tool call (or ran one within the last
             // `active_window_secs`), suppress ONLY the in-pane preemption.
@@ -2277,7 +2527,7 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                 config.suppression.max_consecutive_suppressions,
                 config.suppression.max_suppression_window_secs,
             );
-            if should_inject {
+            if should_inject && !api_retrying {
                 let missing_list = missing_names.join(", ");
                 let watcher_reason = format!(
                     "{} watcher(s) missing: {}",
@@ -3328,6 +3578,74 @@ mod tests {
         );
     }
 
+    // --- evaluate_api_retry_state tests (2026-04-28) ---
+
+    #[test]
+    fn test_api_retry_eval_not_retrying_clears_state() {
+        // When the pane no longer shows a retry banner, all tracking state
+        // resets immediately (no consecutive count, no first_seen).
+        let prior = "2026-04-28T12:00:00+00:00";
+        let (consec, first, suppress) =
+            evaluate_api_retry_state(false, 5, Some(prior), 1, 1800);
+        assert_eq!(consec, 0);
+        assert!(first.is_none());
+        assert!(!suppress);
+    }
+
+    #[test]
+    fn test_api_retry_eval_first_detection_stamps_first_seen() {
+        // First detection: consecutive = 1, first_seen gets stamped, and
+        // with threshold=1 we suppress immediately.
+        let (consec, first, suppress) = evaluate_api_retry_state(true, 0, None, 1, 1800);
+        assert_eq!(consec, 1);
+        assert!(first.is_some());
+        assert!(suppress);
+    }
+
+    #[test]
+    fn test_api_retry_eval_below_consecutive_threshold_does_not_suppress() {
+        // threshold=3, consec was 0 -> becomes 1. Not enough to suppress yet.
+        let (consec, first, suppress) = evaluate_api_retry_state(true, 0, None, 3, 1800);
+        assert_eq!(consec, 1);
+        assert!(first.is_some()); // first_seen stamped on first detection
+        assert!(!suppress);
+    }
+
+    #[test]
+    fn test_api_retry_eval_at_consecutive_threshold_suppresses() {
+        // threshold=3, consec was 2 -> becomes 3. Just hits threshold.
+        let prior = Utc::now().to_rfc3339();
+        let (consec, first, suppress) =
+            evaluate_api_retry_state(true, 2, Some(&prior), 3, 1800);
+        assert_eq!(consec, 3);
+        assert_eq!(first.as_deref(), Some(prior.as_str()));
+        assert!(suppress);
+    }
+
+    #[test]
+    fn test_api_retry_eval_preserves_first_seen_across_cycles() {
+        // While retrying, first_seen MUST stay pinned to the first
+        // detection so max_stuck_secs can measure elapsed time correctly.
+        let prior = "2026-04-28T12:00:00+00:00";
+        let (_, first, _) = evaluate_api_retry_state(true, 1, Some(prior), 1, 1800);
+        assert_eq!(first.as_deref(), Some(prior));
+    }
+
+    #[test]
+    fn test_api_retry_eval_max_stuck_secs_lifts_suppression() {
+        // first_seen is 2 hours ago, max_stuck_secs = 1800 (30 min).
+        // Suppression must lift so monitoring can resume.
+        let two_hours_ago = (Utc::now() - chrono::Duration::seconds(7200)).to_rfc3339();
+        let (consec, first, suppress) =
+            evaluate_api_retry_state(true, 100, Some(&two_hours_ago), 1, 1800);
+        assert_eq!(consec, 101);
+        assert_eq!(first.as_deref(), Some(two_hours_ago.as_str()));
+        assert!(
+            !suppress,
+            "max_stuck_secs exceeded — suppression must lift to allow recovery"
+        );
+    }
+
     #[test]
     fn test_should_escalate_fires_on_consecutive_cap_overshoot() {
         // counter > max also fires — defensive against off-by-one
@@ -3649,5 +3967,169 @@ cooldown = 300
             "default watcher inject_cooldown should be 60s (aggressive re-inject); \
              see src/policy.rs::watcher_inject_due doc comment"
         );
+    }
+
+    // --- evaluate_api_retry_state additional tests (PR #45) ---
+
+    #[test]
+    fn test_api_retry_eval_max_stuck_secs_zero_disables_cap() {
+        // max_stuck_secs=0 disables the timeout — suppression continues
+        // indefinitely as long as the retry is still observed.
+        let two_hours_ago = (Utc::now() - chrono::Duration::seconds(7200)).to_rfc3339();
+        let (_, _, suppress) =
+            evaluate_api_retry_state(true, 100, Some(&two_hours_ago), 1, 0);
+        assert!(suppress, "max_stuck_secs=0 should disable the cap");
+    }
+
+    #[test]
+    fn test_api_retry_eval_resolution_then_re_entry() {
+        // Episode 1: detect, suppress, resolve, then a NEW episode begins.
+        // The new episode's first_seen must be fresh (not inherit episode 1's).
+        let (consec_1, first_1, suppress_1) =
+            evaluate_api_retry_state(true, 0, None, 1, 1800);
+        assert_eq!(consec_1, 1);
+        assert!(first_1.is_some());
+        assert!(suppress_1);
+
+        // Resolution.
+        let (consec_2, first_2, suppress_2) =
+            evaluate_api_retry_state(false, consec_1, first_1.as_deref(), 1, 1800);
+        assert_eq!(consec_2, 0);
+        assert!(first_2.is_none());
+        assert!(!suppress_2);
+
+        // New episode starts.
+        let (consec_3, first_3, suppress_3) =
+            evaluate_api_retry_state(true, consec_2, first_2.as_deref(), 1, 1800);
+        assert_eq!(consec_3, 1);
+        assert!(first_3.is_some());
+        // The new first_seen should NOT equal the old one (it's a new
+        // episode) — but since we only know the old one was Some(...),
+        // we just check both are Some, are different timestamps... actually
+        // they could be equal if both stamp at the same RFC3339 second.
+        // Just assert it's stamped.
+        assert!(suppress_3);
+    }
+
+    #[test]
+    fn test_api_retry_eval_saturating_consecutive() {
+        // Pathological huge consecutive must not panic on overflow.
+        let now = Utc::now().to_rfc3339();
+        let (consec, _, suppress) =
+            evaluate_api_retry_state(true, u32::MAX, Some(&now), 1, 1800);
+        assert_eq!(consec, u32::MAX); // saturated
+        assert!(suppress);
+    }
+
+    // --- is_api_retry_suppressing tests (read-only state derivation) ---
+
+    fn config_with_api_retry(enabled: bool, consecutive: u32, max_stuck: u64) -> Config {
+        let toml_str = format!(
+            r#"
+[general]
+check_interval = 10
+state_file = "/tmp/s.json"
+log_file = "/tmp/s.jsonl"
+legacy_log_file = "/tmp/s.log"
+
+[claude]
+max_context_tokens = 200000
+heartbeat_file = "/tmp/hb"
+relaunch_script = "/tmp/rel.sh"
+
+[dead_process]
+checks_required = 3
+restart_cooldown = 60
+
+[fresh_clear]
+min_tokens = 1000
+max_tokens = 5000
+detections_required = 2
+cooldown = 60
+
+[heartbeat]
+stale_minutes = 10
+
+[alerts]
+initial_cooldown = 60
+escalation_tiers = [60]
+max_pingme_alerts = 1
+resume_prompt = "x"
+
+[foreground_monitor]
+enabled = true
+threshold_seconds = 60
+check_interval = 3
+
+[watcher_monitor]
+enabled = false
+watchers_config = "/tmp/w.conf"
+expected_watchmen = 0
+
+[context_monitor]
+enabled = true
+threshold_percent = 75
+compact_trigger_percent = 5
+grace_period = 60
+cooldown = 60
+
+[api_retry]
+enabled = {enabled}
+consecutive = {consecutive}
+max_stuck_secs = {max_stuck}
+"#,
+            enabled = enabled,
+            consecutive = consecutive,
+            max_stuck = max_stuck,
+        );
+        crate::config::parse_config(&toml_str).expect("parse")
+    }
+
+    #[test]
+    fn test_is_api_retry_suppressing_disabled() {
+        // enabled=false always returns false even if state looks active.
+        let config = config_with_api_retry(false, 1, 1800);
+        let mut state = State::default();
+        state.api_retry_consecutive = 5;
+        state.api_retry_first_seen = Some(Utc::now().to_rfc3339());
+        assert!(!is_api_retry_suppressing(&config, &state));
+    }
+
+    #[test]
+    fn test_is_api_retry_suppressing_no_episode() {
+        // No first_seen / no consecutive -> not suppressing.
+        let config = config_with_api_retry(true, 1, 1800);
+        let state = State::default();
+        assert!(!is_api_retry_suppressing(&config, &state));
+    }
+
+    #[test]
+    fn test_is_api_retry_suppressing_below_threshold() {
+        // consecutive=1, threshold=3 -> not yet suppressing.
+        let config = config_with_api_retry(true, 3, 1800);
+        let mut state = State::default();
+        state.api_retry_consecutive = 1;
+        state.api_retry_first_seen = Some(Utc::now().to_rfc3339());
+        assert!(!is_api_retry_suppressing(&config, &state));
+    }
+
+    #[test]
+    fn test_is_api_retry_suppressing_active_episode() {
+        let config = config_with_api_retry(true, 1, 1800);
+        let mut state = State::default();
+        state.api_retry_consecutive = 1;
+        state.api_retry_first_seen = Some(Utc::now().to_rfc3339());
+        assert!(is_api_retry_suppressing(&config, &state));
+    }
+
+    #[test]
+    fn test_is_api_retry_suppressing_max_stuck_lifts() {
+        // first_seen 2 hours ago, max_stuck=1800 -> no longer suppressing.
+        let config = config_with_api_retry(true, 1, 1800);
+        let mut state = State::default();
+        state.api_retry_consecutive = 100;
+        state.api_retry_first_seen =
+            Some((Utc::now() - chrono::Duration::seconds(7200)).to_rfc3339());
+        assert!(!is_api_retry_suppressing(&config, &state));
     }
 }
