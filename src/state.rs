@@ -171,6 +171,24 @@ pub struct State {
     /// never becomes active within N minutes after inject, allow resetting the flag.
     #[serde(default)]
     pub last_fresh_inject: Option<String>,
+    /// Number of consecutive check cycles where the pane has shown an
+    /// upstream-API retry banner ("Retrying in Ns / attempt N/M" with a 5xx
+    /// or "Overloaded" cue). Once this reaches `api_retry.consecutive`,
+    /// claude-watch suppresses all inject sites until the retry resolves.
+    /// Transient — reset on daemon load.
+    #[serde(default)]
+    pub api_retry_consecutive: u32,
+    /// Timestamp of the first cycle in the current api_retrying episode.
+    /// Used as the `max_stuck_secs` guard so a hung retry banner can't
+    /// suppress monitoring forever. Cleared when the pane no longer shows
+    /// a retry banner. Transient — reset on daemon load.
+    #[serde(default)]
+    pub api_retry_first_seen: Option<String>,
+    /// Cumulative count of cycles where claude-watch suppressed an interrupt
+    /// fire because api_retry was active. Persisted across daemon restarts
+    /// so Prometheus metrics can graph the suppression rate.
+    #[serde(default)]
+    pub api_retry_suppressions_total: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -216,6 +234,12 @@ pub fn load_state(path: &str) -> State {
     // "consecutive" semantics. Reset on load. (last_wedged_clear and
     // wedged_clear_count persist for cooldown + metrics.)
     state.wedged_consecutive = 0;
+    // api_retry tracking is transient — daemon downtime makes the
+    // "current episode" timestamp meaningless and the consecutive count
+    // unreliable. Reset on load. (api_retry_suppressions_total persists
+    // for metrics.)
+    state.api_retry_consecutive = 0;
+    state.api_retry_first_seen = None;
     state
 }
 
@@ -388,6 +412,40 @@ mod tests {
         // Transient state cleared (guarded by existing behavior in load_state)
         assert_eq!(loaded.thinking_interrupt_count, 0);
         assert!(loaded.last_interrupt_at.is_none());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_api_retry_state_transient_reset_on_load() {
+        // api_retry_consecutive and api_retry_first_seen are transient and
+        // must reset on load. The cumulative counter (suppressions_total)
+        // must persist.
+        let path = "/tmp/claude-watch-test-api-retry-transient.json";
+        let mut state = State::default();
+        state.api_retry_consecutive = 5;
+        state.api_retry_first_seen = Some("2026-04-28T18:00:00+00:00".to_string());
+        state.api_retry_suppressions_total = 42;
+        save_state(path, &state);
+
+        let loaded = load_state(path);
+        // Transient cleared
+        assert_eq!(loaded.api_retry_consecutive, 0);
+        assert!(loaded.api_retry_first_seen.is_none());
+        // Cumulative preserved
+        assert_eq!(loaded.api_retry_suppressions_total, 42);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_api_retry_suppressions_total_default_to_zero() {
+        // Old state files (written before this field existed) deserialize
+        // cleanly with the counter at 0.
+        let path = "/tmp/claude-watch-test-api-retry-default.json";
+        std::fs::write(path, "{}").unwrap();
+        let loaded = load_state(path);
+        assert_eq!(loaded.api_retry_suppressions_total, 0);
+        assert_eq!(loaded.api_retry_consecutive, 0);
+        assert!(loaded.api_retry_first_seen.is_none());
         let _ = std::fs::remove_file(path);
     }
 
