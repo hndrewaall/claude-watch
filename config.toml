@@ -124,6 +124,25 @@ inject_cooldown = 60
 # default 10s general interval, which keeps wait-and-exit watchers
 # (claude-event-watch) reliably re-spawned between event deliveries.
 auto_restart_cooldown_secs = 30
+# Quiet path (PR #48): emit a `watcher-down` claude-event
+# (source=claude-watch, tag=watcher-down) when consecutive_missing hits
+# this threshold. Set below inject_threshold so the quiet path runs first
+# and the loud tmux-inject is reserved as a fallback. Default 3 (~30s at
+# 10s interval).
+event_threshold = 3
+# Grace period (seconds) after a quiet-path event is emitted, during
+# which the heavyweight tmux-inject path is suppressed for the same
+# watcher. If the watcher is still missing past the grace window, the
+# inject path activates as fallback (covers the chicken-and-egg case
+# where the consumer watcher itself is missing or stalled). Default 60.
+event_grace_secs = 60
+# Path to the `claude-event` CLI used to fire watcher-down events.
+# Resolved via $PATH by default.
+event_command = "claude-event"
+# Watcher name whose absence makes the quiet path useless (no consumer
+# for the event). When THIS watcher is the missing one, claude-watch
+# skips event emission and falls through to inject immediately.
+event_consumer_watcher_name = "claude-event-watch"
 
 [context_monitor]
 # Enable context usage monitoring and deferred self-clear
