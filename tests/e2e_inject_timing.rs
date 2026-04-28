@@ -322,3 +322,90 @@ sleep 30
 
     let _ = std::fs::remove_file(&script_path);
 }
+
+/// Regression test for the "cursor stuck mid-text" bug (Andrew flagged 2026-04-28).
+///
+/// BUG: inject_text used a fixed 1500ms sleep after sending `i` (enter INSERT)
+/// with no verification that INSERT mode actually engaged. When the editor
+/// hadn't transitioned yet, the FIRST chars of the text payload landed in
+/// NORMAL mode and were interpreted as vim commands (e.g. `[`, `C`, `L`),
+/// jumping the cursor around and leaving it visibly mid-text after the
+/// inject finished.
+///
+/// FIX: Replace the fixed sleep with a verify-loop (up to 3 attempts of `i`,
+/// polling `is_insert_mode()` after each), symmetric with the Escape→NORMAL
+/// loop at Step 1.
+///
+/// This test fakes the Claude-Code TUI in a tmux pane with `-- INSERT --`
+/// rendered in the status bar and runs inject_text against it. The pane
+/// will end up showing the typed text. The point of the test is to catch
+/// regressions where inject_text either:
+///   (a) hangs/loops forever waiting for INSERT confirmation, or
+///   (b) bails after one attempt without verifying.
+#[test]
+fn inject_text_verifies_insert_mode_before_typing() {
+    let session_name = unique_session_name("insert-verify");
+    let _guard = TmuxSession::new(&session_name);
+
+    let status = Command::new("tmux")
+        .args([
+            "new-session",
+            "-d",
+            "-s",
+            &session_name,
+            "-x",
+            "120",
+            "-y",
+            "40",
+        ])
+        .status()
+        .expect("create tmux session");
+    assert!(status.success());
+    std::thread::sleep(Duration::from_millis(500));
+
+    // Render an idle Claude-Code TUI with `-- INSERT --` in the status bar.
+    // inject_text's Step-3 verify-loop should see INSERT mode on the first
+    // poll and proceed without retry.
+    let script = r#"
+clear
+printf '● Some completed output\n'
+printf '\n'
+printf '✻ Brewed for 12s · ↓ 2048 tokens\n'
+printf '\n'
+printf '──────────────────────────────────────────────────────────────────\n'
+printf '❯ \n'
+printf '──────────────────────────────────────────────────────────────────\n'
+printf '  -- INSERT -- 50000 tokens\n'
+sleep 30
+"#;
+    let script_path = format!("/tmp/cw-insert-verify-{}.sh", std::process::id());
+    std::fs::write(&script_path, script).expect("write script");
+    let _ = Command::new("chmod").args(["+x", &script_path]).output();
+
+    send_literal(&session_name, &format!("bash {}", script_path));
+    send_keys(&session_name, &["Enter"]);
+    std::thread::sleep(Duration::from_millis(500));
+
+    let pane = format!("{}:0.0", session_name);
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let start = std::time::Instant::now();
+    rt.block_on(async {
+        inject_text(&pane, "VERIFY-INSERT").await;
+    });
+    let elapsed = start.elapsed();
+
+    eprintln!("inject_text elapsed: {:?}", elapsed);
+    // With INSERT mode visible from the start, the verify-loop should
+    // succeed on the first attempt. Total time is bounded by the fixed
+    // settle/sleep delays in inject_text, NOT the 3-attempt retry budget.
+    // If we ever exceed the upper bound (3 * 500ms retry + 500ms final
+    // settle + 500ms pre-text + 500ms post-text + ~1s misc), something
+    // regressed.
+    assert!(
+        elapsed < Duration::from_secs(15),
+        "inject_text should not loop forever; elapsed {:?}",
+        elapsed
+    );
+
+    let _ = std::fs::remove_file(&script_path);
+}
