@@ -141,6 +141,22 @@ pub struct TestEnvOptions {
     pub show_shell_prompt: bool,
     /// Whether to show the Claude idle prompt in the tmux pane.
     pub show_idle_prompt: bool,
+    /// Watcher monitor: consecutive missing checks before injecting (default: 6).
+    /// Lower this in tests that exercise the watcher-down inject path so the
+    /// daemon fires within a few seconds rather than the production ~60s.
+    pub watcher_inject_threshold: u32,
+    /// Watcher monitor: cooldown between injections (default: 60).
+    pub watcher_inject_cooldown: u64,
+    /// Watcher monitor: grace period (seconds) after last_seen_running during
+    /// which a missing watcher does not count toward consecutive_missing.
+    /// Default 90 matches production; lower to 0 in tests where you start
+    /// the watcher then kill it and want immediate detection.
+    pub watcher_grace_secs: u64,
+    /// Don't create the test tmux session in TestEnv::new (caller will
+    /// create it themselves with custom layout). When true, set_status's
+    /// default healthy MockStatus still references the configured pane,
+    /// but no tmux session is spawned.
+    pub skip_tmux_session: bool,
 }
 
 impl Default for TestEnvOptions {
@@ -157,6 +173,10 @@ impl Default for TestEnvOptions {
             foreground_check_interval: 1,
             show_shell_prompt: false,
             show_idle_prompt: false,
+            watcher_inject_threshold: 6,
+            watcher_inject_cooldown: 60,
+            watcher_grace_secs: 90,
+            skip_tmux_session: false,
         }
     }
 }
@@ -218,8 +238,10 @@ impl TestEnv {
         // Set initial mock status (healthy)
         env.set_status(&MockStatus::healthy(&env.tmux_pane));
 
-        // Create tmux session
-        env.create_tmux_session(&opts);
+        // Create tmux session (unless caller wants to manage it themselves)
+        if !opts.skip_tmux_session {
+            env.create_tmux_session(&opts);
+        }
 
         // Write test config
         env.write_config(&opts);
@@ -348,6 +370,9 @@ interrupt_message = "{foreground_interrupt_message}"
 enabled = true
 watchers_config = "{watchers_config}"
 expected_watchmen = 0
+inject_threshold = {watcher_inject_threshold}
+inject_cooldown = {watcher_inject_cooldown}
+grace_secs = {watcher_grace_secs}
 
 [context_monitor]
 enabled = false
@@ -378,6 +403,9 @@ resume_prompt = "resume"
             foreground_interrupt_enabled = opts.foreground_interrupt_enabled,
             foreground_interrupt_message = opts.foreground_interrupt_message,
             watchers_config = self.watchers_config.display(),
+            watcher_inject_threshold = opts.watcher_inject_threshold,
+            watcher_inject_cooldown = opts.watcher_inject_cooldown,
+            watcher_grace_secs = opts.watcher_grace_secs,
         );
         fs::write(&self.config_path, &config).expect("write test config");
     }
