@@ -165,6 +165,34 @@ max_panes = 20
 # Show all tasks including persistent watchers (false = workloads only)
 show_all = false
 
+[api_retry]
+# Upstream-API retry-backoff detection.
+#
+# When Anthropic returns 529 (overloaded) or transient 5xx errors, Claude Code
+# retries with exponential backoff and prints lines like:
+#   API Error: 529 {"type":"error","error":{"type":"overloaded_error",...}}
+#   ⎿  Retrying in 24s · attempt 3/10
+# During that window every claude-watch inject (Escape + text) wipes the retry
+# state machine and forces Claude to start a brand-new turn — which then hits
+# the same overload and re-enters retry. The result is a livelock where the
+# daemon's interrupts perpetually reset the retry timer (seen 2026-04-28).
+#
+# When this guard is enabled, the daemon detects the retry banner each cycle
+# and suppresses fires from the four sites that matter (prolonged-thinking,
+# watcher-down, context-warning, wedged-clear) until the retry resolves OR
+# max_stuck_secs elapses (whichever happens first). Heartbeat / dead-process
+# detection are NOT suppressed — those measure liveness and must still alert.
+enabled = true
+# Number of consecutive check cycles a retry banner must be observed before
+# suppression activates. Default 1 (suppress on first detection — the cost of
+# a missed interrupt is negligible compared to the cost of resetting the
+# retry loop).
+consecutive = 1
+# Maximum seconds the suppression may persist before the daemon resumes
+# normal monitoring (so a hung retry banner doesn't suppress recovery
+# forever). Default 1800 = 30 minutes.
+max_stuck_secs = 1800
+
 [hybrid]
 # Hybrid hooks + daemon-fallback tuning.
 #
