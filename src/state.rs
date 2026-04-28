@@ -191,6 +191,14 @@ pub struct WatcherState {
     pub last_seen_running: Option<String>,
     pub consecutive_missing: u32,
     pub enabled: bool,
+    /// RFC3339 timestamp of the last `watcher-down` claude-event emission for
+    /// this watcher (the "quiet path"). When set, subsequent watcher-monitor
+    /// cycles suppress re-emission within the configured grace window AND
+    /// suppress the heavyweight tmux-inject path entirely until the grace
+    /// window expires (at which point we fall through to inject as a
+    /// fallback). Cleared on recovery (count >= min_count).
+    #[serde(default)]
+    pub event_emitted_at: Option<String>,
 }
 
 pub fn load_state(path: &str) -> State {
@@ -271,6 +279,7 @@ mod tests {
                 last_seen_running: Some("2026-03-16T12:00:00-05:00".to_string()),
                 consecutive_missing: 0,
                 enabled: true,
+                event_emitted_at: None,
             },
         );
 
