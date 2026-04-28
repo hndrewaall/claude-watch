@@ -23,6 +23,7 @@ mod agent;
 mod alert;
 mod cmd;
 mod config;
+mod event_bus;
 mod hook_fire;
 mod logging;
 mod metrics;
@@ -322,6 +323,12 @@ enum WatcherAction {
         /// Output as JSON
         #[arg(long)]
         json: bool,
+        /// Only emit output if at least one enabled watcher is DOWN.
+        /// Stays completely silent (exit 0) when everything is healthy.
+        /// Designed for the PostToolUse hook that surfaces watcher health
+        /// after every tool call without spamming on healthy state.
+        #[arg(long)]
+        unhealthy_only: bool,
     },
     /// Enable a watcher (toggle + start)
     Enable {
@@ -501,6 +508,11 @@ async fn run_daemon() {
     let config = load_config();
     let mut state = load_state(&config.general.state_file);
 
+    // Wire the post-escape settle delay into the tmux module's process-global
+    // atomic. Default is 0 (no extra wait — fast path); see TmuxConfig for
+    // when to tune it up.
+    tmux::set_post_escape_settle_ms(config.tmux.post_escape_settle_ms);
+
     // Ensure log directory exists
     for path in [&config.general.log_file, &config.general.legacy_log_file] {
         if let Some(parent) = Path::new(path).parent() {
@@ -597,6 +609,9 @@ async fn run_daemon() {
             reload.store(false, Ordering::Relaxed);
             info!("reloading config");
             current_config = load_config();
+            // Refresh the post-escape settle delay in case the operator
+            // tuned it via config.toml + SIGHUP.
+            tmux::set_post_escape_settle_ms(current_config.tmux.post_escape_settle_ms);
             write_jsonl_log(
                 &current_config.general.log_file,
                 "config_reload",
@@ -773,8 +788,11 @@ async fn run_watcher(action: WatcherAction) {
             watcher::cmd_list(&cfg, json);
             0
         }
-        WatcherAction::Status { json } => {
-            watcher::cmd_status(&cfg, json).await;
+        WatcherAction::Status {
+            json,
+            unhealthy_only,
+        } => {
+            watcher::cmd_status(&cfg, json, unhealthy_only).await;
             0
         }
         WatcherAction::Enable { name } => watcher::cmd_toggle(&cfg, &name, true).await,
