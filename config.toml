@@ -111,6 +111,13 @@ inject_threshold = 6
 # every 5 min is plenty to nudge the main loop; rapid re-fires just
 # generate alert fatigue and Pushover noise without fixing anything.
 inject_cooldown = 300
+# Per-watcher cooldown (seconds) between daemon-side auto-restart attempts
+# (q-2026-04-28-5481). Distinct from inject_cooldown — auto-restart spawns
+# the start_cmd as a detached child without touching the tmux pane, so it
+# can fire much faster. 30s = ~3 check cycles at the default 10s general
+# interval, which keeps wait-and-exit watchers (claude-event-watch) reliably
+# re-spawned between event deliveries.
+auto_restart_cooldown_secs = 30
 
 [context_monitor]
 # Enable context usage monitoring and deferred self-clear

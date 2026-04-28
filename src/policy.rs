@@ -2028,6 +2028,7 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                     last_seen_running: None,
                     consecutive_missing: 0,
                     enabled: entry.enabled,
+                    last_auto_restart_at: None,
                 });
 
             if count >= entry.min_count {
@@ -2095,85 +2096,100 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
         // still gets the claude-event for visibility, and the inject path
         // still tries to nudge the main loop when appropriate.
         //
-        // NOTE: this does NOT depend on `effective_pane` (the auto-restart
-        // path is pane-independent). The auto-restart cooldown reuses the
-        // existing `last_watcher_inject` clock so we don't hammer
-        // `nohup start_cmd` every check cycle (one restart per
-        // `inject_cooldown`, default 300s, is plenty — the watcher binds
-        // its own resources and will pgrep-show within seconds of spawn).
+        // Cooldown is PER-WATCHER (`WatcherState.last_auto_restart_at`)
+        // and uses `config.watcher_monitor.auto_restart_cooldown_secs`
+        // (default 30s) — distinct from the much-longer `inject_cooldown`
+        // used for the tmux-pane prompt. The shorter clock is what makes
+        // the wait-and-exit watcher pattern (claude-event-watch exits
+        // after each event delivery) work cleanly: the daemon re-spawns
+        // it within ~30s rather than ~5min.
         if any_critical_missing {
-            let auto_restart_due = match &state.last_watcher_inject {
-                Some(ref last) => elapsed_since(last)
-                    .is_none_or(|e| e >= config.watcher_monitor.inject_cooldown as f64),
-                None => true,
-            };
-            if auto_restart_due {
-                let mut spawned: Vec<(String, u32)> = Vec::new();
-                let mut errors: Vec<(String, String)> = Vec::new();
-                for name in &missing_names {
-                    match crate::watcher::auto_restart_watcher(
-                        &config.watcher_monitor.watchers_config,
-                        name,
-                    )
-                    .await
-                    {
-                        Ok((pid, _)) => spawned.push((name.clone(), pid)),
-                        Err(e) => errors.push((name.clone(), e)),
-                    }
+            let cooldown = config.watcher_monitor.auto_restart_cooldown_secs;
+            let mut spawned: Vec<(String, u32)> = Vec::new();
+            let mut errors: Vec<(String, String)> = Vec::new();
+            let mut deferred: Vec<String> = Vec::new();
+            for name in &missing_names {
+                let due = state
+                    .watcher_health
+                    .get(name)
+                    .and_then(|h| h.last_auto_restart_at.as_deref())
+                    .and_then(elapsed_since)
+                    .is_none_or(|e| e >= cooldown as f64);
+                if !due {
+                    deferred.push(name.clone());
+                    continue;
                 }
-                if !spawned.is_empty() {
-                    let summary = spawned
-                        .iter()
-                        .map(|(n, p)| format!("{}={}", n, p))
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    warn!(
-                        spawned = %summary,
-                        "watcher-down auto-restart fired"
-                    );
-                    write_jsonl_log(
-                        &config.general.log_file,
-                        "watcher_auto_restart",
-                        serde_json::json!({
-                            "spawned": spawned
-                                .iter()
-                                .map(|(n, p)| serde_json::json!({"name": n, "pid": p}))
-                                .collect::<Vec<_>>(),
-                        }),
-                    );
-                    // Reset per-watcher consecutive_missing for the ones
-                    // we just respawned. The next check cycle will see
-                    // the new process via pgrep and confirm health; we
-                    // pre-zero here so a stale 6+ counter doesn't keep
-                    // counting the watcher as down for one extra cycle
-                    // and re-fire on the next check.
-                    for (name, _) in &spawned {
+                match crate::watcher::auto_restart_watcher(
+                    &config.watcher_monitor.watchers_config,
+                    name,
+                )
+                .await
+                {
+                    Ok((pid, _)) => {
+                        spawned.push((name.clone(), pid));
                         if let Some(h) = state.watcher_health.get_mut(name) {
-                            h.consecutive_missing = 0;
+                            h.last_auto_restart_at = Some(now.clone());
                         }
                     }
+                    Err(e) => errors.push((name.clone(), e)),
                 }
-                if !errors.is_empty() {
-                    for (name, err) in &errors {
-                        warn!(watcher = %name, error = %err, "watcher-down auto-restart failed");
-                    }
-                    write_jsonl_log(
-                        &config.general.log_file,
-                        "watcher_auto_restart_failed",
-                        serde_json::json!({
-                            "errors": errors
-                                .iter()
-                                .map(|(n, e)| serde_json::json!({"name": n, "error": e}))
-                                .collect::<Vec<_>>(),
-                        }),
-                    );
-                }
-                crate::state::save_state(&config.general.state_file, state);
-            } else {
-                debug!(
-                    cooldown = config.watcher_monitor.inject_cooldown,
-                    "watcher-down auto-restart skipped: still in cooldown from previous restart"
+            }
+            if !spawned.is_empty() {
+                let summary = spawned
+                    .iter()
+                    .map(|(n, p)| format!("{}={}", n, p))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                warn!(
+                    spawned = %summary,
+                    "watcher-down auto-restart fired"
                 );
+                write_jsonl_log(
+                    &config.general.log_file,
+                    "watcher_auto_restart",
+                    serde_json::json!({
+                        "spawned": spawned
+                            .iter()
+                            .map(|(n, p)| serde_json::json!({"name": n, "pid": p}))
+                            .collect::<Vec<_>>(),
+                    }),
+                );
+                // Reset per-watcher consecutive_missing for the ones
+                // we just respawned. The next check cycle will see
+                // the new process via pgrep and confirm health; we
+                // pre-zero here so a stale 6+ counter doesn't keep
+                // counting the watcher as down for one extra cycle
+                // and re-fire on the next check.
+                for (name, _) in &spawned {
+                    if let Some(h) = state.watcher_health.get_mut(name) {
+                        h.consecutive_missing = 0;
+                    }
+                }
+            }
+            if !errors.is_empty() {
+                for (name, err) in &errors {
+                    warn!(watcher = %name, error = %err, "watcher-down auto-restart failed");
+                }
+                write_jsonl_log(
+                    &config.general.log_file,
+                    "watcher_auto_restart_failed",
+                    serde_json::json!({
+                        "errors": errors
+                            .iter()
+                            .map(|(n, e)| serde_json::json!({"name": n, "error": e}))
+                            .collect::<Vec<_>>(),
+                    }),
+                );
+            }
+            if !deferred.is_empty() {
+                debug!(
+                    deferred = %deferred.join(", "),
+                    cooldown_secs = cooldown,
+                    "watcher-down auto-restart deferred: per-watcher cooldown active"
+                );
+            }
+            if !spawned.is_empty() || !errors.is_empty() {
+                crate::state::save_state(&config.general.state_file, state);
             }
         }
 
