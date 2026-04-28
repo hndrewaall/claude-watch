@@ -62,7 +62,17 @@ pub(crate) fn thinking_backoff_threshold_with_multiplier(
 
 /// Returns true if a previous interrupt fired within the last
 /// `cooldown_secs` seconds. Used to suppress cascading interrupts across
-/// all fire paths (prolonged-thinking, watcher-down, context-warning).
+/// the prolonged-thinking and context-warning fire paths.
+///
+/// NOTE (2026-04-28): The watcher-down inject path is intentionally
+/// EXEMPT from this gate. A down watcher (signal-wait, claude-event-
+/// watch, torrent-wait, etc.) is a hard liveness failure — silence in
+/// the cooldown window means inbound messages, events, and torrents go
+/// unprocessed for as long as it takes to clear. The watcher-down
+/// inject must be allowed to fire even when another interrupt fired
+/// recently. The per-watcher `last_watcher_inject` cooldown
+/// (`watcher_monitor.inject_cooldown`, default 60s) still rate-limits
+/// re-injects on the same fire path.
 ///
 /// A `cooldown_secs` of 0 disables the gate entirely.
 pub(crate) fn interrupt_in_global_cooldown(state: &State, cooldown_secs: u64) -> bool {
@@ -74,6 +84,26 @@ pub(crate) fn interrupt_in_global_cooldown(state: &State, cooldown_secs: u64) ->
         .as_deref()
         .and_then(elapsed_since)
         .is_some_and(|e| e < cooldown_secs as f64)
+}
+
+/// Pure predicate: should the watcher-down inject path fire now, given
+/// the timestamp of the last watcher-inject and the configured cooldown?
+///
+/// - `None` last-inject (never fired before) -> always allow.
+/// - `Some(ts)` -> allow iff elapsed >= cooldown_secs (or the timestamp
+///   is malformed and `elapsed_since` returns None — fail-open so the
+///   gate never wedges).
+///
+/// Intentionally does NOT consult `interrupt_in_global_cooldown`: see
+/// the doc-comment above for the rationale.
+pub(crate) fn watcher_inject_due(
+    last_watcher_inject: Option<&str>,
+    cooldown_secs: u64,
+) -> bool {
+    match last_watcher_inject {
+        Some(last) => elapsed_since(last).is_none_or(|e| e >= cooldown_secs as f64),
+        None => true,
+    }
 }
 
 /// If the given reminder fired within the last `max_age_secs` (we default
@@ -1705,25 +1735,26 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
             }
         }
 
-        // Inject restart commands if watchers are down and cooldown has passed
+        // Inject restart commands if watchers are down and cooldown has passed.
+        //
+        // NOTE (2026-04-28): The watcher-down inject path is intentionally
+        // EXEMPT from `interrupt_in_global_cooldown`. A down watcher is a
+        // hard liveness failure — we have no signal-wait, no claude-event-
+        // watch, no torrent-wait — and silence here means messages /
+        // events / completions sit unprocessed for the cooldown window.
+        // Prior attempts to gate this on "main loop actively turning"
+        // (q-2026-04-27-b8e1) or supervise the auto-restart via systemd
+        // (q-2026-04-28-6602) violated the heartbeat-liveness invariant
+        // and were reverted. The correct shape is: keep the spawn target
+        // in the main-loop tmux pane (watchers must die when the main
+        // loop dies), and let the inject re-fire on the per-watcher
+        // cooldown regardless of recent unrelated interrupts.
         if any_critical_missing && !effective_pane.is_empty() {
-            let should_inject = match &state.last_watcher_inject {
-                Some(ref last) => elapsed_since(last)
-                    .is_none_or(|e| e >= config.watcher_monitor.inject_cooldown as f64),
-                None => true,
-            };
-            // Global post-interrupt cooldown: if any interrupt (thinking,
-            // context-warning, or a prior watcher-down) fired recently,
-            // defer this one to avoid cascading interrupts.
-            let global_cooldown_blocks =
-                interrupt_in_global_cooldown(state, config.general.post_interrupt_cooldown_secs);
-            if should_inject && global_cooldown_blocks {
-                debug!(
-                    cooldown = config.general.post_interrupt_cooldown_secs,
-                    "watcher-down inject would fire but global post-interrupt cooldown active"
-                );
-            }
-            if should_inject && !global_cooldown_blocks {
+            let should_inject = watcher_inject_due(
+                state.last_watcher_inject.as_deref(),
+                config.watcher_monitor.inject_cooldown,
+            );
+            if should_inject {
                 let missing_list = missing_names.join(", ");
                 warn!(missing = %missing_list, "watchers down — interrupting and injecting restart");
                 write_jsonl_log(
@@ -2328,5 +2359,130 @@ mod tests {
         assert_eq!(state.wedged_clear_interrupts_total, 0);
         assert_eq!(state.auto_update_interrupts_total, 0);
         assert_eq!(state.restart_claude_interrupts_total, 0);
+    }
+
+    // --- Watcher-down inject due-predicate tests (2026-04-28) ---
+    //
+    // These pin the new behavior:
+    //   1. Never-injected -> always due.
+    //   2. Recent inject (< cooldown) -> NOT due.
+    //   3. Old inject (>= cooldown) -> due.
+    //   4. Malformed timestamp -> due (fail-open).
+    //   5. cooldown=0 with recent inject -> due (cooldown disabled).
+    //   6. The watcher-down predicate does NOT consult
+    //      interrupt_in_global_cooldown — i.e. an unrelated recent
+    //      interrupt MUST NOT block the watcher-down fire path.
+    //      This is the regression guard for the actual bug Andrew filed
+    //      (q-2026-04-28-713a) and for the prior reverted attempts.
+
+    #[test]
+    fn test_watcher_inject_due_never_injected() {
+        assert!(watcher_inject_due(None, 60));
+    }
+
+    #[test]
+    fn test_watcher_inject_due_within_cooldown() {
+        let recent = (Utc::now() - chrono::Duration::seconds(10)).to_rfc3339();
+        assert!(!watcher_inject_due(Some(&recent), 60));
+    }
+
+    #[test]
+    fn test_watcher_inject_due_after_cooldown() {
+        let old = (Utc::now() - chrono::Duration::seconds(120)).to_rfc3339();
+        assert!(watcher_inject_due(Some(&old), 60));
+    }
+
+    #[test]
+    fn test_watcher_inject_due_malformed_timestamp_fails_open() {
+        // Garbage timestamp must fail OPEN (allow inject) rather than
+        // wedge the gate forever.
+        assert!(watcher_inject_due(Some("not a date"), 60));
+    }
+
+    #[test]
+    fn test_watcher_inject_due_cooldown_zero_always_due() {
+        // cooldown=0 means "no rate limit"; even a 1s-ago inject is due.
+        let just_now = (Utc::now() - chrono::Duration::seconds(1)).to_rfc3339();
+        assert!(watcher_inject_due(Some(&just_now), 0));
+    }
+
+    #[test]
+    fn test_watcher_inject_ignores_global_cooldown() {
+        // REGRESSION GUARD (q-2026-04-28-713a): the watcher-down inject
+        // path is intentionally exempt from interrupt_in_global_cooldown.
+        // Set up state where a different interrupt fired 5s ago; the
+        // global cooldown gate would block, but the watcher-down
+        // predicate does not consult it.
+        let mut state = State::default();
+        state.last_interrupt_at =
+            Some((Utc::now() - chrono::Duration::seconds(5)).to_rfc3339());
+        // Sanity: global cooldown would block.
+        assert!(interrupt_in_global_cooldown(&state, 60));
+        // But watcher-down predicate ignores last_interrupt_at and only
+        // considers last_watcher_inject. With None, it's due.
+        assert!(watcher_inject_due(state.last_watcher_inject.as_deref(), 60));
+    }
+
+    #[test]
+    fn test_default_watcher_inject_cooldown_is_aggressive() {
+        // Pin the new 60s default in case someone bumps it back to
+        // 300s without realizing the original cascade-suppression
+        // rationale was retired. If you genuinely want a longer
+        // default, also update CLAUDE.md / the comment in config.rs.
+        use crate::config::parse_config;
+        let cfg = r#"
+[general]
+check_interval = 10
+state_file = "/tmp/s.json"
+log_file = "/tmp/s.jsonl"
+legacy_log_file = "/tmp/s.log"
+
+[claude]
+max_context_tokens = 200000
+heartbeat_file = "/tmp/hb"
+relaunch_script = "/tmp/rel.sh"
+
+[dead_process]
+checks_required = 3
+restart_cooldown = 60
+
+[fresh_clear]
+min_tokens = 1000
+max_tokens = 5000
+detections_required = 2
+cooldown = 60
+
+[heartbeat]
+stale_minutes = 10
+
+[alerts]
+initial_cooldown = 60
+escalation_tiers = [60]
+max_pingme_alerts = 3
+resume_prompt = "r"
+
+[foreground_monitor]
+enabled = false
+threshold_seconds = 180
+check_interval = 3
+
+[watcher_monitor]
+enabled = true
+watchers_config = "/tmp/w.conf"
+expected_watchmen = 0
+
+[context_monitor]
+enabled = true
+threshold_percent = 75
+compact_trigger_percent = 5
+grace_period = 120
+cooldown = 300
+"#;
+        let cfg = parse_config(cfg).expect("parse");
+        assert_eq!(
+            cfg.watcher_monitor.inject_cooldown, 60,
+            "default watcher inject_cooldown should be 60s (aggressive re-inject); \
+             see src/policy.rs::watcher_inject_due doc comment"
+        );
     }
 }
