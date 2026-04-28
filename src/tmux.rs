@@ -1016,6 +1016,77 @@ pub async fn detect_wedged(pane: &str) -> Option<WedgedReason> {
     check_lines_for_wedged(&out)
 }
 
+/// Pure function: detect whether the pane shows Claude Code in an upstream-API
+/// retry-backoff state. When Anthropic returns 5xx (overloaded / 529) or
+/// transient 5xx errors, Claude Code retries with exponential backoff and
+/// prints lines like:
+///
+///   API Error: 529 {"type":"error","error":{"type":"overloaded_error",...}}
+///   ⎿  Retrying in 24s · attempt 3/10
+///
+/// During this window Claude Code is NOT thinking and NOT busy in the normal
+/// sense — it is waiting on a sleep before the next HTTP attempt. claude-watch
+/// MUST NOT inject during that window: every inject (Escape + text) wipes the
+/// retry state machine and forces Claude to start a brand-new turn, which then
+/// hits the same overload and re-enters retry. The result is a livelock where
+/// the daemon's interrupts perpetually reset the retry timer.
+///
+/// Detection requirements (BOTH must hold so chat-history references to the
+/// strings don't trip the detector):
+///   1. A line containing "Retrying in <N>s" or "Retrying in <N> seconds"
+///      OR a line containing "attempt N/M" (Claude Code prints this pair as
+///      one structured cue when actively retrying).
+///   2. Either the same line OR a nearby line carries an "API Error: 5xx"
+///      / "API Error: 429" / "Overloaded" / "overloaded_error" marker so we
+///      know the retry is upstream-API driven.
+///
+/// We intentionally scope the inspection to the LAST ~25 lines so the cue must
+/// be currently visible (not just somewhere in scrollback chat history).
+pub(crate) fn check_lines_for_api_retry(pane_output: &str) -> bool {
+    let lines: Vec<&str> = pane_output.lines().collect();
+    let start = if lines.len() > 25 {
+        lines.len() - 25
+    } else {
+        0
+    };
+    let tail = &lines[start..];
+    let lower: String = tail.join("\n").to_lowercase();
+
+    // Cue 1: "Retrying in Ns" or "attempt N/M" must be present in the live
+    // tail. Both phrases are emitted directly by Claude Code's retry loop
+    // — they don't appear in normal conversation.
+    let retrying_in = regex_lite::Regex::new(r"retrying in\s+\d+\s*(s|sec|seconds)\b")
+        .ok()
+        .is_some_and(|re| re.is_match(&lower));
+    let attempt_n_of_m = regex_lite::Regex::new(r"attempt\s+\d+\s*/\s*\d+\b")
+        .ok()
+        .is_some_and(|re| re.is_match(&lower));
+    if !(retrying_in || attempt_n_of_m) {
+        return false;
+    }
+
+    // Cue 2: an upstream-API error marker must accompany the retry cue. This
+    // is the load-bearing safety check — without it, an isolated "attempt
+    // 2/3" mention in chat history would falsely flag every session as
+    // retrying.
+    let has_api_error_5xx = regex_lite::Regex::new(r"api error:\s*5\d{2}\b")
+        .ok()
+        .is_some_and(|re| re.is_match(&lower));
+    let has_api_error_429 = lower.contains("api error: 429") || lower.contains("api error:429");
+    let has_overloaded = lower.contains("overloaded_error") || lower.contains("overloaded");
+
+    has_api_error_5xx || has_api_error_429 || has_overloaded
+}
+
+/// Capture the pane and check whether Claude Code is in an upstream-API retry
+/// backoff. Returns true on detection.
+pub async fn detect_api_retry(pane: &str) -> bool {
+    if let Some(out) = capture_pane_history(pane, 60).await {
+        return check_lines_for_api_retry(&out);
+    }
+    false
+}
+
 /// Run tmux healthcheck brief.
 pub async fn healthcheck_brief() -> String {
     run_cmd(&["tmux-healthcheck", "--brief"], 5)
@@ -1835,6 +1906,112 @@ API Error: Request rejected (429)\n";
     fn test_wedged_reason_display() {
         assert_eq!(format!("{}", WedgedReason::ContextLimit), "context_limit");
         assert_eq!(format!("{}", WedgedReason::RateLimited), "rate_limited");
+    }
+
+    // --- check_lines_for_api_retry tests ---
+
+    #[test]
+    fn test_api_retry_overload_with_retrying_in() {
+        // The exact failure mode from 2026-04-28: 529 + retry-in-Ns banner.
+        let output = "\
+\u{276f} a tool call\n\
+API Error: 529 {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\
+\u{23ba}  Retrying in 24s \u{00b7} attempt 3/10\n\
+";
+        assert!(check_lines_for_api_retry(output));
+    }
+
+    #[test]
+    fn test_api_retry_attempt_marker_with_5xx() {
+        // "attempt N/M" alone with the 5xx error nearby is enough.
+        let output = "\
+API Error: 503 service unavailable\n\
+attempt 2/10\n\
+";
+        assert!(check_lines_for_api_retry(output));
+    }
+
+    #[test]
+    fn test_api_retry_overloaded_keyword_alone() {
+        // "Overloaded" + "Retrying in Ns" — sufficient even without an
+        // explicit "API Error: 5xx" prefix.
+        let output = "\
+overloaded_error: Overloaded\n\
+Retrying in 8 seconds\n\
+";
+        assert!(check_lines_for_api_retry(output));
+    }
+
+    #[test]
+    fn test_api_retry_429_with_retrying_in() {
+        // A 429 backoff also counts — same livelock failure mode.
+        let output = "\
+API Error: 429 rate limited\n\
+Retrying in 32s\n\
+";
+        assert!(check_lines_for_api_retry(output));
+    }
+
+    #[test]
+    fn test_not_api_retry_without_error_marker() {
+        // "attempt 2/3" on its own (e.g. chat history mentioning a retry)
+        // must NOT trip the detector — we require a 5xx/429/Overloaded cue.
+        let output = "\
+\u{276f} doing attempt 2/3 of the test plan\n\
+\u{276f}\n\
+";
+        assert!(!check_lines_for_api_retry(output));
+    }
+
+    #[test]
+    fn test_not_api_retry_normal_thinking() {
+        // Normal long thinking shouldn't trip — no retry banner, no error.
+        let output = "\
+\u{2731} Thinking\u{2026} (45s \u{00b7} \u{2193} 384 tokens)\n\
+";
+        assert!(!check_lines_for_api_retry(output));
+    }
+
+    #[test]
+    fn test_not_api_retry_old_history_only() {
+        // A "Retrying in 12s" + "529" mentioned 100 lines ago shouldn't
+        // count — only the last ~25 lines are inspected.
+        let mut lines: Vec<String> = vec![
+            "API Error: 529 Overloaded".to_string(),
+            "Retrying in 12s".to_string(),
+        ];
+        for _ in 0..50 {
+            lines.push("\u{276f} normal chat line".to_string());
+        }
+        let output = lines.join("\n");
+        assert!(!check_lines_for_api_retry(&output));
+    }
+
+    #[test]
+    fn test_api_retry_empty_input() {
+        assert!(!check_lines_for_api_retry(""));
+    }
+
+    #[test]
+    fn test_api_retry_resolved_no_banner() {
+        // After the retry succeeds, the banner is gone — only normal
+        // working state remains. No suppression should happen.
+        let output = "\
+\u{276f} Now processing your request\n\
+\u{2731} Thinking\u{2026} (3s)\n\
+";
+        assert!(!check_lines_for_api_retry(output));
+    }
+
+    #[test]
+    fn test_api_retry_isolated_overloaded_word() {
+        // Bare "Overloaded" without any retrying-in cue must NOT trip —
+        // we require both a retry marker AND an upstream-API error cue.
+        let output = "\
+\u{276f} The server is sometimes Overloaded but not now\n\
+\u{276f}\n\
+";
+        assert!(!check_lines_for_api_retry(output));
     }
 
     /// Verify the post-escape settle delay is wired through the global

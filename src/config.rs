@@ -25,6 +25,8 @@ pub struct Config {
     pub hybrid: HybridConfig,
     #[serde(default)]
     pub suppression: SuppressionConfig,
+    #[serde(default)]
+    pub api_retry: ApiRetryConfig,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -547,6 +549,63 @@ fn default_max_consecutive_suppressions() -> u32 {
 
 fn default_max_suppression_window_secs() -> u64 {
     600
+}
+
+/// Upstream-API retry detection.
+///
+/// When Anthropic's API returns 529 (overloaded) or transient 5xx errors,
+/// Claude Code retries with exponential backoff and prints lines like
+/// "Retrying in 24s · attempt 3/10". During the retry window the daemon's
+/// normal interrupt sites (prolonged-thinking, watcher-down, context-warning,
+/// wedged-clear) MUST suppress fires — every inject during retry resets the
+/// retry state machine and the loop never recovers.
+///
+/// Detection in `tmux::check_lines_for_api_retry()` requires both a retry
+/// marker ("Retrying in Ns" / "attempt N/M") AND an upstream-API error cue
+/// ("API Error: 5xx", "Overloaded", etc.) in the LAST ~25 pane lines, so
+/// chat-history references to the strings don't trip it.
+#[derive(Debug, Deserialize, Clone)]
+pub struct ApiRetryConfig {
+    /// Master switch. Default: true (the feature is opt-out).
+    #[serde(default = "default_api_retry_enabled")]
+    pub enabled: bool,
+    /// Number of consecutive check cycles a retry pattern must be observed
+    /// before suppression activates. Single-cycle blips would otherwise
+    /// suppress legitimate interrupts on a flicker. Default: 1 (suppress
+    /// immediately on first detection — the cost of a missed interrupt is
+    /// negligible compared to the cost of resetting the retry loop).
+    #[serde(default = "default_api_retry_consecutive")]
+    pub consecutive: u32,
+    /// Maximum seconds api_retrying state may persist before claude-watch
+    /// stops suppressing and resumes normal monitoring. Guards against
+    /// "stuck retry" where Claude Code hangs in the retry banner forever
+    /// (e.g. a network split kills outgoing requests so the retry loop
+    /// can't make progress and we still need to alert/recover). Default:
+    /// 1800 (30 min).
+    #[serde(default = "default_api_retry_max_stuck_secs")]
+    pub max_stuck_secs: u64,
+}
+
+impl Default for ApiRetryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_api_retry_enabled(),
+            consecutive: default_api_retry_consecutive(),
+            max_stuck_secs: default_api_retry_max_stuck_secs(),
+        }
+    }
+}
+
+fn default_api_retry_enabled() -> bool {
+    true
+}
+
+fn default_api_retry_consecutive() -> u32 {
+    1
+}
+
+fn default_api_retry_max_stuck_secs() -> u64 {
+    1800 // 30 minutes
 }
 
 /// Load config from well-known paths or CLAUDE_WATCH_CONFIG env var.
