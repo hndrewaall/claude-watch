@@ -229,6 +229,13 @@ pub async fn interrupt_and_wait(pane: &str, timeout_secs: u64) -> bool {
         if get_activity(pane).await == ClaudeActivity::Idle {
             sleep(Duration::from_millis(150)).await;
             if get_activity(pane).await == ClaudeActivity::Idle {
+                // Idle confirmed. Settle BEFORE returning so any caller
+                // about to send follow-up keystrokes (typed prompt text,
+                // vim-mode dd/i, /clear) doesn't race the just-sent
+                // Escape that brought us idle. Without this, downstream
+                // inject_* keys can land before Claude finishes processing
+                // the interrupt and get garbled or eaten.
+                settle_after_escape().await;
                 return true;
             }
         }
@@ -267,6 +274,16 @@ pub async fn interrupt_and_wait(pane: &str, timeout_secs: u64) -> bool {
 /// scrollback, custom theme, etc.) and waiting longer doesn't help.
 /// We send anyway.
 pub async fn inject_text(pane: &str, text: &str) {
+    // Step 0: Settle. Most callers reach inject_text right after
+    // interrupt_and_wait, which has already fired Escape repeatedly.
+    // If interrupt_and_wait returned false (idle never confirmed) the
+    // pane may still be processing the very last Escape — settling here
+    // gives Claude Code time to finish before our own Escape loop below
+    // piles on. interrupt_and_wait's success path also settles, so this
+    // is a low-cost extra guard, not a duplicate delay. No-op when
+    // post_escape_settle_ms is 0 (fast-path default).
+    settle_after_escape().await;
+
     // Step 1: Escape to NORMAL mode (up to 3 attempts). The is_insert_mode()
     // check confirms tmux processed each Escape before we send the next.
     for _ in 0..3 {
