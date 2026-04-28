@@ -47,7 +47,7 @@ fn default_post_interrupt_cooldown_secs() -> u64 {
     60
 }
 
-#[derive(Debug, Deserialize, Clone, Default)]
+#[derive(Debug, Default, Deserialize, Clone)]
 pub struct TmuxConfig {
     /// Known dashboard pane for Claude Code (e.g. "dashboard:0.2").
     /// Empty string = auto-detect via find_claude_pane().
@@ -64,7 +64,8 @@ pub struct TmuxConfig {
     /// Code's pane hasn't finished processing the Escape before the next
     /// keys arrive. Most setups don't need this — the ESC loop's
     /// per-iteration `is_insert_mode()` check already confirms each
-    /// Escape was processed before the next is sent.
+    /// Escape was processed before the next is sent (and PR #46 adds
+    /// explicit INSERT-mode verification after the `i` keystroke).
     #[serde(default)]
     pub post_escape_settle_ms: u64,
 }
@@ -209,7 +210,11 @@ pub struct WatcherMonitorConfig {
     /// Consecutive missing checks before injecting a restart prompt (default: 6 = ~60s)
     #[serde(default = "default_watcher_inject_threshold")]
     pub inject_threshold: u32,
-    /// Cooldown in seconds between watcher-missing injections (default: 300)
+    /// Cooldown in seconds between watcher-missing injections (default: 60).
+    /// Tightened 300 -> 60 on 2026-04-28: a down watcher is a hard liveness
+    /// failure (no signal, no events, no torrents getting through), so when
+    /// the previous inject didn't land we want to re-inject quickly rather
+    /// than wait 5 minutes while the user is silent.
     #[serde(default = "default_watcher_inject_cooldown")]
     pub inject_cooldown: u64,
     /// When true, suppress the tmux-INJECT (interrupt + prompt) part of
@@ -237,6 +242,15 @@ pub struct WatcherMonitorConfig {
     /// crashing on launch.
     #[serde(default = "default_auto_restart_cooldown_secs")]
     pub auto_restart_cooldown_secs: u64,
+    /// Grace period (seconds) after `last_seen_running` during which a
+    /// missing watcher is NOT counted toward `consecutive_missing`. Short-
+    /// lived watchers (e.g. signal-wait that exits when a message arrives)
+    /// have a natural gap between exit and the main loop's restart, so we
+    /// avoid firing spurious "watcher missing" alerts every time a message
+    /// arrives. Default: 90 seconds. Lowered to 0 in e2e tests so a freshly
+    /// killed watcher fires within the inject_threshold window.
+    #[serde(default = "default_watcher_grace_secs")]
+    pub grace_secs: u64,
 }
 
 fn default_watcher_inject_threshold() -> u32 {
@@ -244,7 +258,11 @@ fn default_watcher_inject_threshold() -> u32 {
 }
 
 fn default_watcher_inject_cooldown() -> u64 {
-    300
+    60
+}
+
+fn default_watcher_grace_secs() -> u64 {
+    90
 }
 
 fn default_suppress_inject_when_active() -> bool {
@@ -838,6 +856,127 @@ cooldown = 300
 "#;
         let config =
             parse_config(config_empty_tmux).expect("should parse with empty [tmux] section");
+        assert_eq!(config.tmux.dashboard_pane, "");
+        assert_eq!(config.tmux.dashboard_session, "");
+        // New knob (added 2026-04-25; combined-PR default lowered 500 -> 0,
+        // 2026-04-28 PR #43+#46): should default to 0ms (fast-path) when
+        // omitted. PR #46 adds explicit INSERT-mode verification after the
+        // `i` keystroke, so the prior 500ms cushion is no longer needed.
+        assert_eq!(config.tmux.post_escape_settle_ms, 0);
+    }
+
+    #[test]
+    fn test_post_escape_settle_ms_default_when_tmux_section_missing() {
+        // No [tmux] section at all -> TmuxConfig::default() -> 0ms (fast-path).
+        let cfg = r#"
+[general]
+check_interval = 10
+state_file = "/tmp/s.json"
+log_file = "/tmp/s.jsonl"
+legacy_log_file = "/tmp/s.log"
+
+[claude]
+max_context_tokens = 200000
+heartbeat_file = "/tmp/hb"
+relaunch_script = "/tmp/rel.sh"
+
+[dead_process]
+checks_required = 3
+restart_cooldown = 60
+
+[fresh_clear]
+min_tokens = 1000
+max_tokens = 5000
+detections_required = 2
+cooldown = 60
+
+[heartbeat]
+stale_minutes = 10
+
+[alerts]
+initial_cooldown = 60
+escalation_tiers = [60]
+max_pingme_alerts = 3
+resume_prompt = "r"
+
+[foreground_monitor]
+enabled = false
+threshold_seconds = 180
+check_interval = 3
+
+[watcher_monitor]
+enabled = false
+watchers_config = "/tmp/w.conf"
+expected_watchmen = 0
+
+[context_monitor]
+enabled = true
+threshold_percent = 75
+compact_trigger_percent = 5
+grace_period = 120
+cooldown = 300
+"#;
+        let config = parse_config(cfg).expect("should parse without [tmux] section");
+        assert_eq!(config.tmux.post_escape_settle_ms, 0);
+    }
+
+    #[test]
+    fn test_post_escape_settle_ms_explicit_override() {
+        // Explicit override in [tmux] should win over the 500ms default.
+        let cfg = r#"
+[general]
+check_interval = 10
+state_file = "/tmp/s.json"
+log_file = "/tmp/s.jsonl"
+legacy_log_file = "/tmp/s.log"
+
+[tmux]
+post_escape_settle_ms = 1500
+
+[claude]
+max_context_tokens = 200000
+heartbeat_file = "/tmp/hb"
+relaunch_script = "/tmp/rel.sh"
+
+[dead_process]
+checks_required = 3
+restart_cooldown = 60
+
+[fresh_clear]
+min_tokens = 1000
+max_tokens = 5000
+detections_required = 2
+cooldown = 60
+
+[heartbeat]
+stale_minutes = 10
+
+[alerts]
+initial_cooldown = 60
+escalation_tiers = [60]
+max_pingme_alerts = 3
+resume_prompt = "r"
+
+[foreground_monitor]
+enabled = false
+threshold_seconds = 180
+check_interval = 3
+
+[watcher_monitor]
+enabled = false
+watchers_config = "/tmp/w.conf"
+expected_watchmen = 0
+
+[context_monitor]
+enabled = true
+threshold_percent = 75
+compact_trigger_percent = 5
+grace_period = 120
+cooldown = 300
+"#;
+        let config = parse_config(cfg).expect("should parse with override");
+        assert_eq!(config.tmux.post_escape_settle_ms, 1500);
+        // Other tmux defaults should still apply (untouched in the override).
         assert_eq!(config.tmux.dashboard_pane, "");
         assert_eq!(config.tmux.dashboard_session, "");
     }

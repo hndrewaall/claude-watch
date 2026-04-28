@@ -32,7 +32,8 @@ dashboard_session = "dashboard"
 # etc.) being garbled or eaten because Claude Code's pane hasn't finished
 # processing the Escape before the next keys arrive. Most setups don't
 # need this — the ESC loop's per-iteration is_insert_mode() check already
-# confirms each Escape was processed before the next is sent.
+# confirms each Escape was processed before the next is sent (and PR #46
+# adds explicit INSERT-mode verification after `i`).
 post_escape_settle_ms = 0
 
 [claude]
@@ -107,16 +108,21 @@ expected_watchmen = 0
 # Consecutive missing checks before injecting restart (6 = ~60s at 10s interval)
 inject_threshold = 6
 # Cooldown between watcher-missing injections (seconds).
-# Raised 120 -> 300 on 2026-04-21: when watchers are down, one interrupt
-# every 5 min is plenty to nudge the main loop; rapid re-fires just
-# generate alert fatigue and Pushover noise without fixing anything.
-inject_cooldown = 300
+# 2026-04-28: Tightened 300 -> 60 (PR #44). A down watcher is a hard
+# liveness failure (no signal, no events, no torrents getting through),
+# so when the previous inject didn't land — e.g. main loop was
+# mid-tool-call and ate the tmux keystroke — we want to re-inject
+# quickly rather than wait 5 minutes while the user is silent. Paired
+# with the global-post-interrupt-cooldown EXEMPTION on the watcher-down
+# path (src/policy.rs check_once); the prior cascade-suppression
+# rationale from the 2026-04-21 raise no longer applies.
+inject_cooldown = 60
 # Per-watcher cooldown (seconds) between daemon-side auto-restart attempts
-# (q-2026-04-28-5481). Distinct from inject_cooldown — auto-restart spawns
-# the start_cmd as a detached child without touching the tmux pane, so it
-# can fire much faster. 30s = ~3 check cycles at the default 10s general
-# interval, which keeps wait-and-exit watchers (claude-event-watch) reliably
-# re-spawned between event deliveries.
+# (q-2026-04-28-5481, PR #43). Distinct from inject_cooldown —
+# auto-restart spawns the start_cmd as a detached child without touching
+# the tmux pane, so it can fire much faster. 30s = ~3 check cycles at the
+# default 10s general interval, which keeps wait-and-exit watchers
+# (claude-event-watch) reliably re-spawned between event deliveries.
 auto_restart_cooldown_secs = 30
 
 [context_monitor]
