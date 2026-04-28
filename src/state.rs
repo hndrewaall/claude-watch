@@ -171,6 +171,41 @@ pub struct State {
     /// never becomes active within N minutes after inject, allow resetting the flag.
     #[serde(default)]
     pub last_fresh_inject: Option<String>,
+    /// Timestamp of the last check where the main loop was observed actively
+    /// running a tool call (`bashes > 0`). Used by the watcher-down inject
+    /// suppression gate so we don't preempt an in-flight turn with a
+    /// `WATCHER(S) DOWN` prompt. Updated on every check that sees
+    /// `bashes > 0`. Not cleared on daemon restart — a stale value just
+    /// suppresses one inject cycle, which is the safer side to err on.
+    #[serde(default)]
+    pub last_active_at: Option<String>,
+    /// Number of consecutive cycles where ANY of the three suppression
+    /// gates (watcher-down, fresh-/clear, dead-process) suppressed an
+    /// inject because the main loop was actively turning. When this
+    /// reaches `[suppression] max_consecutive_suppressions` OR the
+    /// wall-clock since `first_suppression_at` exceeds
+    /// `max_suppression_window_secs`, the next gate fire force-injects
+    /// regardless of `actively_turning`.
+    ///
+    /// Reset to 0 when an actual inject lands at any of the three gates
+    /// (a force-inject or a non-suppressed inject — either way the gate
+    /// has demonstrably "made progress"). The wall-clock backstop is
+    /// what catches the slow-drip case where progress is never made;
+    /// trying to reset on per-gate "predicate stopped matching" would
+    /// be incorrect for a counter shared across three independent gates.
+    /// Transient — cleared on daemon restart so a long-stale daemon
+    /// doesn't escalate immediately on the first suppression after
+    /// coming back up.
+    #[serde(default)]
+    pub consecutive_suppressions: u32,
+    /// Wall-clock timestamp of the first suppression in the current run.
+    /// Set the first time `consecutive_suppressions` increments from 0
+    /// to 1; cleared whenever `consecutive_suppressions` resets to 0.
+    /// Used by the wall-clock backstop in the escalation predicate.
+    /// Transient — cleared on daemon restart for the same reason as
+    /// `consecutive_suppressions`.
+    #[serde(default)]
+    pub first_suppression_at: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -186,11 +221,18 @@ pub struct StatusSnapshot {
     pub watchmen: u32,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct WatcherState {
     pub last_seen_running: Option<String>,
     pub consecutive_missing: u32,
     pub enabled: bool,
+    /// Timestamp of the last daemon-side auto-restart for this watcher
+    /// (q-2026-04-28-5481). Per-watcher so a wait-and-exit watcher (like
+    /// claude-event-watch, which exits after delivering each event) can
+    /// be re-spawned quickly without sharing the much longer global
+    /// `inject_cooldown` clock used for tmux-pane injects.
+    #[serde(default)]
+    pub last_auto_restart_at: Option<String>,
 }
 
 pub fn load_state(path: &str) -> State {
@@ -216,6 +258,12 @@ pub fn load_state(path: &str) -> State {
     // "consecutive" semantics. Reset on load. (last_wedged_clear and
     // wedged_clear_count persist for cooldown + metrics.)
     state.wedged_consecutive = 0;
+    // Suppression-escalation counter and first-suppression timestamp are
+    // transient for the same reason: a daemon that's been down for an
+    // hour shouldn't escalate immediately on the first suppression
+    // after coming back up. The escalation re-builds from scratch.
+    state.consecutive_suppressions = 0;
+    state.first_suppression_at = None;
     state
 }
 
@@ -271,6 +319,7 @@ mod tests {
                 last_seen_running: Some("2026-03-16T12:00:00-05:00".to_string()),
                 consecutive_missing: 0,
                 enabled: true,
+                last_auto_restart_at: None,
             },
         );
 
@@ -388,6 +437,27 @@ mod tests {
         // Transient state cleared (guarded by existing behavior in load_state)
         assert_eq!(loaded.thinking_interrupt_count, 0);
         assert!(loaded.last_interrupt_at.is_none());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_suppression_counters_cleared_on_load() {
+        // consecutive_suppressions and first_suppression_at are
+        // transient — daemon downtime breaks the "consecutive" semantics
+        // (watcher conditions could have churned during downtime) and a
+        // stale persisted timestamp would cause the wall-clock backstop
+        // to escalate immediately on the first suppression after restart.
+        // load_state() must clear both fields, alongside the other
+        // transient timers (thinking_start, last_interrupt_at, etc.).
+        let path = "/tmp/claude-watch-test-suppression-counters.json";
+        let mut state = State::default();
+        state.consecutive_suppressions = 5;
+        state.first_suppression_at = Some("2026-04-28T00:00:00+00:00".to_string());
+        save_state(path, &state);
+
+        let loaded = load_state(path);
+        assert_eq!(loaded.consecutive_suppressions, 0);
+        assert!(loaded.first_suppression_at.is_none());
         let _ = std::fs::remove_file(path);
     }
 

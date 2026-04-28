@@ -76,6 +76,133 @@ pub(crate) fn interrupt_in_global_cooldown(state: &State, cooldown_secs: u64) ->
         .is_some_and(|e| e < cooldown_secs as f64)
 }
 
+/// Returns true if the main loop is "actively turning" — either a tool
+/// call is currently running (`bashes > 0` this check) or one fired
+/// within the last `window_secs` (per `state.last_active_at`).
+///
+/// Used by the watcher-down inject suppression gate so the daemon does
+/// not preempt an in-flight turn with a `WATCHER(S) DOWN` prompt. A
+/// `window_secs` of 0 still honors the live `bashes > 0` check.
+pub(crate) fn main_loop_actively_turning(
+    state: &State,
+    bashes: u64,
+    window_secs: u64,
+) -> bool {
+    if bashes > 0 {
+        return true;
+    }
+    state
+        .last_active_at
+        .as_deref()
+        .and_then(elapsed_since)
+        .is_some_and(|e| e < window_secs as f64)
+}
+
+/// Pure predicate: should the fresh-/clear inject be suppressed because
+/// the main loop is actively turning? Mirrors the decision we make at
+/// the fire site so unit tests don't have to mock tmux pane reads.
+///
+/// Returns true iff `suppress_enabled && main_loop_actively_turning(...)`.
+pub(crate) fn fresh_clear_inject_suppressed(
+    state: &State,
+    bashes: u64,
+    suppress_enabled: bool,
+    window_secs: u64,
+) -> bool {
+    suppress_enabled && main_loop_actively_turning(state, bashes, window_secs)
+}
+
+/// Pure predicate: should the dead-process restart be suppressed because
+/// the main loop is actively turning? Mirrors the decision we make at
+/// the fire site so unit tests don't have to mock tmux pane reads.
+///
+/// Returns true iff `suppress_enabled && main_loop_actively_turning(...)`.
+pub(crate) fn dead_process_restart_suppressed(
+    state: &State,
+    bashes: u64,
+    suppress_enabled: bool,
+    window_secs: u64,
+) -> bool {
+    suppress_enabled && main_loop_actively_turning(state, bashes, window_secs)
+}
+
+/// Reason a force-inject escalation should fire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EscalationReason {
+    /// `consecutive_suppressions >= max_consecutive_suppressions`.
+    ConsecutiveCap,
+    /// `now - first_suppression_at > max_suppression_window_secs`.
+    WindowExceeded,
+}
+
+impl EscalationReason {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            EscalationReason::ConsecutiveCap => "consecutive_cap",
+            EscalationReason::WindowExceeded => "window_exceeded",
+        }
+    }
+}
+
+/// Pure predicate: has the cross-gate suppression run been long/persistent
+/// enough that the next gate fire should force-inject regardless of
+/// `actively_turning`? Returns the triggering reason if so.
+///
+/// Both limits are checked on EVERY gate fire — the consecutive counter
+/// catches "many suppressions in a tight window" and the wall-clock window
+/// catches "fewer suppressions, but the active turn has been running so
+/// long the gate's been open way too long".
+///
+/// `consecutive_suppressions == 0` short-circuits to None: the first
+/// suppression of a run can never escalate (escalation only fires when
+/// the gate has demonstrably failed to drain at least once).
+pub(crate) fn should_escalate_suppression(
+    state: &State,
+    max_consecutive_suppressions: u32,
+    max_suppression_window_secs: u64,
+) -> Option<EscalationReason> {
+    if state.consecutive_suppressions == 0 {
+        return None;
+    }
+    if max_consecutive_suppressions > 0
+        && state.consecutive_suppressions >= max_consecutive_suppressions
+    {
+        return Some(EscalationReason::ConsecutiveCap);
+    }
+    if max_suppression_window_secs > 0 {
+        if let Some(elapsed) = state
+            .first_suppression_at
+            .as_deref()
+            .and_then(elapsed_since)
+        {
+            if elapsed > max_suppression_window_secs as f64 {
+                return Some(EscalationReason::WindowExceeded);
+            }
+        }
+    }
+    None
+}
+
+/// Record that a suppression-gate fired and was suppressed (the `actively_
+/// turning` path took the "skip the inject" branch). Increments the shared
+/// counter and stamps `first_suppression_at` on the 0 -> 1 transition.
+/// Idempotent w.r.t. `first_suppression_at` after the first call.
+pub(crate) fn record_suppression(state: &mut State, now: &str) {
+    if state.consecutive_suppressions == 0 {
+        state.first_suppression_at = Some(now.to_string());
+    }
+    state.consecutive_suppressions = state.consecutive_suppressions.saturating_add(1);
+}
+
+/// Reset the shared suppression counter and timestamp. Called when an
+/// inject lands successfully OR when the underlying suppression condition
+/// resolves (the gate's predicate stops matching). Cheap no-op when the
+/// counter is already 0.
+pub(crate) fn reset_suppression(state: &mut State) {
+    state.consecutive_suppressions = 0;
+    state.first_suppression_at = None;
+}
+
 /// If the given reminder fired within the last `max_age_secs` (we default
 /// to 1 hour — beyond that we assume the self-action is unrelated),
 /// record the reminder -> action latency sample into the state-based
@@ -158,7 +285,15 @@ async fn restart_claude(pane: &str, state: &mut State, config: &crate::config::C
         state.restart_claude_interrupts_total.saturating_add(1);
     state.pending_resume_inject = true;
 
-    alert::send_pingme("claude-watch: Claude Code crashed -- auto-restarting").await;
+    alert::notify(crate::event_bus::ClaudeWatchAlert {
+        alert_type: "claude-crashed",
+        stuck_reason: "claude code process gone",
+        stale_minutes: None,
+        affected_watchers: vec![],
+        severity: crate::event_bus::Severity::High,
+        message: "claude-watch: Claude Code crashed -- auto-restarting",
+    })
+    .await;
 }
 
 /// Run a foreground-only check cycle. This is called more frequently than
@@ -260,7 +395,11 @@ pub async fn check_foreground(
                         state.prolonged_thinking_interrupts_total = state
                             .prolonged_thinking_interrupts_total
                             .saturating_add(1);
-                        tmux::interrupt_and_wait(pane, 30).await;
+                        // 5s budget: Escape blasts every 250ms. If Claude
+                        // hasn't honored the interrupt by ~5s, it almost
+                        // certainly won't — proceed with the inject anyway.
+                        // Pre-fix: 30s, dominated perceived recovery latency.
+                        tmux::interrupt_and_wait(pane, 5).await;
                         let msg = format!(
                                 "[CLAUDE-WATCH] Prolonged thinking detected (>{}s in thinking state, interrupt #{}). \
                                 You appear to be stuck in a long generation. If you have complex work to do, \
@@ -281,6 +420,22 @@ pub async fn check_foreground(
                                 "interrupt_count": state.thinking_interrupt_count,
                             }),
                         );
+                        // Third sink: claude-event so the main loop can
+                        // see this stuck-state via structured fields and
+                        // not just react reflexively to the injected
+                        // string.
+                        let pt_reason = format!(
+                            "prolonged thinking ({}s, interrupt #{})",
+                            elapsed as u64, state.thinking_interrupt_count,
+                        );
+                        alert::emit_event(crate::event_bus::ClaudeWatchAlert {
+                            alert_type: "prolonged-thinking",
+                            stuck_reason: &pt_reason,
+                            stale_minutes: None,
+                            affected_watchers: vec![],
+                            severity: crate::event_bus::Severity::Medium,
+                            message: &msg,
+                        });
                     } else {
                         info!(
                             elapsed_secs = elapsed,
@@ -327,7 +482,9 @@ pub async fn check_foreground(
                             state.foreground_blocking_interrupts_total = state
                                 .foreground_blocking_interrupts_total
                                 .saturating_add(1);
-                            tmux::interrupt_and_wait(pane, 30).await;
+                            // 5s budget — see comment at the prolonged-thinking
+                            // interrupt site above.
+                            tmux::interrupt_and_wait(pane, 5).await;
                             tmux::inject_text(pane, &config.foreground_monitor.interrupt_message)
                                 .await;
                             write_jsonl_log(
@@ -473,7 +630,8 @@ async fn inject_context_warning(pane: &str, pct: f64, compact_remaining: Option<
         Forced clear in {}s if you don't act.",
         context_info, grace
     );
-    tmux::interrupt_and_wait(pane, 30).await;
+    // 5s budget — same rationale as the other inline interrupt sites.
+    tmux::interrupt_and_wait(pane, 5).await;
     tmux::inject_text(pane, &msg).await;
 }
 
@@ -564,7 +722,15 @@ async fn check_reauth(config: &Config, state: &mut State, pane: &str) {
                 let now = Local::now().to_rfc3339();
                 warn!("sending high-priority reauth alert with URL");
                 let alert_msg = format!("Claude Code login needed. URL: {}", login_url);
-                alert::send_pingme_with_priority(&alert_msg, "high").await;
+                alert::notify(crate::event_bus::ClaudeWatchAlert {
+                    alert_type: "reauth-needed",
+                    stuck_reason: "claude code 401, login url present",
+                    stale_minutes: None,
+                    affected_watchers: vec![],
+                    severity: crate::event_bus::Severity::High,
+                    message: &alert_msg,
+                })
+                .await;
                 write_jsonl_log(
                     &config.general.log_file,
                     "reauth_alert",
@@ -835,11 +1001,14 @@ async fn run_auto_update(pane: &str, old_version: &str, new_version: &str, confi
         serde_json::json!({}),
     );
 
-    // Step 1: Interrupt and wait for idle
-    if tmux::interrupt_and_wait(pane, 30).await {
+    // Step 1: Interrupt and wait for idle. 10s budget — auto-update is
+    // a rare path so we're a bit more patient than the inline interrupt
+    // sites (5s), but still bounded so a stuck pane doesn't pin the
+    // updater for half a minute.
+    if tmux::interrupt_and_wait(pane, 10).await {
         info!("auto-update: Claude Code is idle");
     } else {
-        warn!("auto-update: could not confirm idle after 30s, proceeding anyway");
+        warn!("auto-update: could not confirm idle after 10s, proceeding anyway");
     }
 
     // Settle time after interruption
@@ -858,7 +1027,15 @@ async fn run_auto_update(pane: &str, old_version: &str, new_version: &str, confi
             "auto_update_failed",
             serde_json::json!({"reason": "exit_timeout"}),
         );
-        alert::send_pingme("claude-watch: auto-update FAILED — Claude Code did not exit").await;
+        alert::notify(crate::event_bus::ClaudeWatchAlert {
+            alert_type: "auto-update-failed",
+            stuck_reason: "auto-update: claude code did not exit within 45s",
+            stale_minutes: None,
+            affected_watchers: vec![],
+            severity: crate::event_bus::Severity::High,
+            message: "claude-watch: auto-update FAILED — Claude Code did not exit",
+        })
+        .await;
         return;
     }
     info!("auto-update: Claude Code exited");
@@ -951,7 +1128,15 @@ async fn run_auto_update(pane: &str, old_version: &str, new_version: &str, confi
         "claude-watch: auto-update complete ({} → {})",
         old_version, new_version
     );
-    alert::send_pingme(&msg).await;
+    alert::notify(crate::event_bus::ClaudeWatchAlert {
+        alert_type: "auto-update-complete",
+        stuck_reason: "auto-update finished",
+        stale_minutes: None,
+        affected_watchers: vec![],
+        severity: crate::event_bus::Severity::Low,
+        message: &msg,
+    })
+    .await;
     info!("auto-update: complete ({} → {})", old_version, new_version);
 }
 
@@ -1091,6 +1276,12 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
     if bashes > 0 || tokens > 0 {
         state.last_known_bashes = bashes;
     }
+    // Mark "actively turning" whenever a tool call is in flight. The
+    // watcher-down inject path consults this timestamp to avoid
+    // preempting a busy main loop with a `WATCHER(S) DOWN` prompt.
+    if bashes > 0 {
+        state.last_active_at = Some(now.clone());
+    }
 
     // --- Dead process detection ---
     if tokens == 0 && bashes == 0 && !effective_pane.is_empty() {
@@ -1212,14 +1403,94 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
             }
 
             if tmux::is_shell_prompt(&effective_pane).await {
-                info!(
-                    dead_checks,
-                    "shell prompt confirmed -- restarting Claude Code"
+                // Active-turn suppression (2026-04-27 false-positive fix):
+                // `tokens == 0 && bashes == 0` is point-in-time and can
+                // briefly hold during a tmux pane swap, a status-parser
+                // miss, or the gap between two tool calls. The
+                // shell-prompt confirmation is the strong-side check
+                // here, but the parser can ALSO mis-classify mixed
+                // pane content as a shell prompt (e.g. a backgrounded
+                // bash command output line ending in `$`). If the loop
+                // ran ANY tool call within `active_window_secs`,
+                // suppress the restart — the process is demonstrably
+                // alive and `restart_claude` would kill an active
+                // session and fire a false `claude-crashed` alert.
+                let actively_turning = dead_process_restart_suppressed(
+                    state,
+                    bashes,
+                    config.dead_process.suppress_when_active,
+                    config.dead_process.active_window_secs,
                 );
-                restart_claude(&effective_pane, state, &config.claude).await;
-                state.consecutive_dead_checks = 0;
-                state.consecutive_failures = 0;
-                state.alert_count = 0;
+                // Cross-gate escalation backstop (2026-04-28
+                // q-2026-04-28-2449): if the suppression run has been
+                // long/persistent enough, force the restart even though
+                // the active-turn predicate matches. Catches the case
+                // where a sustained dispatcher window holds the gate
+                // open indefinitely.
+                let escalation = should_escalate_suppression(
+                    state,
+                    config.suppression.max_consecutive_suppressions,
+                    config.suppression.max_suppression_window_secs,
+                );
+                if actively_turning && escalation.is_none() {
+                    let last_active_age = state
+                        .last_active_at
+                        .as_deref()
+                        .and_then(elapsed_since)
+                        .map(|e| e as u64);
+                    info!(
+                        dead_checks,
+                        bashes,
+                        last_active_age_secs = ?last_active_age,
+                        "dead-process restart suppressed: main loop actively turning"
+                    );
+                    write_jsonl_log(
+                        &config.general.log_file,
+                        "dead_process_restart_suppressed",
+                        serde_json::json!({
+                            "dead_checks": dead_checks,
+                            "bashes": bashes,
+                            "reason": "main_loop_actively_turning",
+                            "last_active_age_secs": last_active_age,
+                            "active_window_secs": config.dead_process.active_window_secs,
+                            "consecutive_suppressions": state.consecutive_suppressions + 1,
+                        }),
+                    );
+                    record_suppression(state, &now);
+                    // Reset the consecutive counter so we don't re-fire
+                    // on the very next check after the active window
+                    // closes — require a fresh `checks_required`-cycle
+                    // run of dead-state observations before restarting.
+                    state.consecutive_dead_checks = 0;
+                } else {
+                    if let Some(reason) = escalation {
+                        warn!(
+                            dead_checks,
+                            consecutive_suppressions = state.consecutive_suppressions,
+                            escalation_reason = reason.as_str(),
+                            "dead-process restart escalating: suppression run capped — forcing restart"
+                        );
+                        write_jsonl_log(
+                            &config.general.log_file,
+                            "suppression_escalated",
+                            serde_json::json!({
+                                "site": "dead_process",
+                                "reason": reason.as_str(),
+                                "consecutive_suppressions": state.consecutive_suppressions,
+                                "first_suppression_at": state.first_suppression_at,
+                            }),
+                        );
+                    }
+                    info!(
+                        dead_checks,
+                        "shell prompt confirmed -- restarting Claude Code"
+                    );
+                    restart_claude(&effective_pane, state, &config.claude).await;
+                    state.consecutive_dead_checks = 0;
+                    state.consecutive_failures = 0;
+                    state.alert_count = 0;
+                    reset_suppression(state);
+                }
             } else if dead_checks >= config.dead_process.fresh_inject_checks
                 && !state.fresh_session_injected
                 && tmux::is_idle(&effective_pane).await
@@ -1311,11 +1582,94 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                 }
             }
 
+            // Active-turn suppression (2026-04-27 false-positive fix):
+            // The token range [min_tokens, max_tokens) AND `bashes == 0`
+            // are both point-in-time predicates that the main loop
+            // briefly satisfies between two tool calls (a small turn
+            // that just got back, say, 3000 tokens; bashes momentarily 0
+            // before the next tool call fires). Without this gate the
+            // alert fires mid-turn and injects "resume" into active
+            // work. If the loop ran ANY tool call within
+            // `active_window_secs`, suppress both the inject and the
+            // alert — the loop is clearly alive.
+            let actively_turning = fresh_clear_inject_suppressed(
+                state,
+                bashes,
+                config.fresh_clear.suppress_when_active,
+                config.fresh_clear.active_window_secs,
+            );
+            // Cross-gate escalation backstop (2026-04-28 q-2026-04-28-2449).
+            let escalation = should_escalate_suppression(
+                state,
+                config.suppression.max_consecutive_suppressions,
+                config.suppression.max_suppression_window_secs,
+            );
+            if actively_turning && escalation.is_none() {
+                let last_active_age = state
+                    .last_active_at
+                    .as_deref()
+                    .and_then(elapsed_since)
+                    .map(|e| e as u64);
+                info!(
+                    tokens,
+                    bashes,
+                    last_active_age_secs = ?last_active_age,
+                    "fresh /clear inject suppressed: main loop actively turning"
+                );
+                write_jsonl_log(
+                    &config.general.log_file,
+                    "fresh_clear_inject_suppressed",
+                    serde_json::json!({
+                        "tokens": tokens,
+                        "bashes": bashes,
+                        "reason": "main_loop_actively_turning",
+                        "last_active_age_secs": last_active_age,
+                        "active_window_secs": config.fresh_clear.active_window_secs,
+                        "consecutive_suppressions": state.consecutive_suppressions + 1,
+                    }),
+                );
+                record_suppression(state, &now);
+                // Reset the consecutive counter so we don't re-fire on
+                // the very next check after the active window closes.
+                // The detection has to re-build from scratch.
+                state.consecutive_fast_detections = 0;
+                state.last_check = Some(now);
+                crate::state::save_state(&config.general.state_file, state);
+                return;
+            }
+
+            if let Some(reason) = escalation {
+                warn!(
+                    tokens,
+                    consecutive_suppressions = state.consecutive_suppressions,
+                    escalation_reason = reason.as_str(),
+                    "fresh /clear inject escalating: suppression run capped — forcing inject"
+                );
+                write_jsonl_log(
+                    &config.general.log_file,
+                    "suppression_escalated",
+                    serde_json::json!({
+                        "site": "fresh_clear",
+                        "reason": reason.as_str(),
+                        "consecutive_suppressions": state.consecutive_suppressions,
+                        "first_suppression_at": state.first_suppression_at,
+                    }),
+                );
+            }
+
             info!(tokens, "fresh /clear detected -- injecting resume");
-            alert::send_pingme(&format!(
+            let fresh_msg = format!(
                 "Fresh /clear detected (tokens={}, bashes=0). Injecting resume.",
                 tokens
-            ))
+            );
+            alert::notify(crate::event_bus::ClaudeWatchAlert {
+                alert_type: "fresh-clear-stuck",
+                stuck_reason: "fresh /clear with no follow-up activity",
+                stale_minutes: None,
+                affected_watchers: vec![],
+                severity: crate::event_bus::Severity::Medium,
+                message: &fresh_msg,
+            })
             .await;
 
             // Dismiss feedback prompt if present
@@ -1330,6 +1684,7 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
             state.fresh_clear_resume_inject_interrupts_total = state
                 .fresh_clear_resume_inject_interrupts_total
                 .saturating_add(1);
+            reset_suppression(state);
             state.last_check = Some(now);
             crate::state::save_state(&config.general.state_file, state);
             return;
@@ -1341,6 +1696,9 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
     // --- Heartbeat stale detection ---
     let mut stuck = false;
     let mut stuck_reason = String::new();
+    // Captured for the claude-event sink so the main loop can parse
+    // `stale_minutes` as a number rather than re-regex'ing the string.
+    let mut stuck_stale_minutes: Option<u64> = None;
 
     match std::fs::metadata(&config.claude.heartbeat_file) {
         Ok(meta) => {
@@ -1352,12 +1710,14 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                 let stale_secs = config.heartbeat.stale_minutes * 60;
                 if age >= stale_secs {
                     stuck = true;
+                    let age_min = age / 60;
                     stuck_reason = format!(
                         "heartbeat stale ({}min, threshold={}min, watchmen={})",
-                        age / 60,
+                        age_min,
                         config.heartbeat.stale_minutes,
                         watchmen_count
                     );
+                    stuck_stale_minutes = Some(age_min);
                     state.heartbeat_stale_count += 1;
                 }
             }
@@ -1613,7 +1973,16 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                     let alert_msg = format!(
                         "claude-watch: agent wedged ({reason}) -- running self-clear",
                     );
-                    alert::send_pingme(&alert_msg).await;
+                    let wedged_reason = format!("wedged pane: {reason}");
+                    alert::notify(crate::event_bus::ClaudeWatchAlert {
+                        alert_type: "wedged-pane",
+                        stuck_reason: &wedged_reason,
+                        stale_minutes: None,
+                        affected_watchers: vec![],
+                        severity: crate::event_bus::Severity::High,
+                        message: &alert_msg,
+                    })
+                    .await;
 
                     spawn_immediate_clear(state);
 
@@ -1659,6 +2028,7 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                     last_seen_running: None,
                     consecutive_missing: 0,
                     enabled: entry.enabled,
+                    last_auto_restart_at: None,
                 });
 
             if count >= entry.min_count {
@@ -1705,6 +2075,124 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
             }
         }
 
+        // Auto-restart down watchers (q-2026-04-28-5481).
+        //
+        // BUG HISTORY: Before this branch, the daemon emitted a
+        // `watcher-down` claude-event and (when the main loop wasn't
+        // actively turning) injected a restart prompt into the tmux pane,
+        // BUT it did not actually restart the watcher itself. The 2026-04-28
+        // incident: claude-event-watch was DOWN for 30+ minutes — the
+        // suppression branch fired repeatedly ("inject suppressed: main
+        // loop active"), the inject path never fired (suppression was
+        // active the whole time, didn't escalate within the test window),
+        // and the watcher stayed dead.
+        //
+        // FIX: Run the actual restart UNCONDITIONALLY here, before the
+        // inject/suppression decision. The restart is purely additive (it
+        // spawns a detached child via the same `nohup start_cmd` pattern
+        // used by `watcher-ctl enable`) and does not touch the tmux pane,
+        // so it's safe even when the main loop is mid-tool-call. The
+        // existing alert/inject logic below is preserved verbatim — Andrew
+        // still gets the claude-event for visibility, and the inject path
+        // still tries to nudge the main loop when appropriate.
+        //
+        // Cooldown is PER-WATCHER (`WatcherState.last_auto_restart_at`)
+        // and uses `config.watcher_monitor.auto_restart_cooldown_secs`
+        // (default 30s) — distinct from the much-longer `inject_cooldown`
+        // used for the tmux-pane prompt. The shorter clock is what makes
+        // the wait-and-exit watcher pattern (claude-event-watch exits
+        // after each event delivery) work cleanly: the daemon re-spawns
+        // it within ~30s rather than ~5min.
+        if any_critical_missing {
+            let cooldown = config.watcher_monitor.auto_restart_cooldown_secs;
+            let mut spawned: Vec<(String, u32)> = Vec::new();
+            let mut errors: Vec<(String, String)> = Vec::new();
+            let mut deferred: Vec<String> = Vec::new();
+            for name in &missing_names {
+                let due = state
+                    .watcher_health
+                    .get(name)
+                    .and_then(|h| h.last_auto_restart_at.as_deref())
+                    .and_then(elapsed_since)
+                    .is_none_or(|e| e >= cooldown as f64);
+                if !due {
+                    deferred.push(name.clone());
+                    continue;
+                }
+                match crate::watcher::auto_restart_watcher(
+                    &config.watcher_monitor.watchers_config,
+                    name,
+                )
+                .await
+                {
+                    Ok((pid, _)) => {
+                        spawned.push((name.clone(), pid));
+                        if let Some(h) = state.watcher_health.get_mut(name) {
+                            h.last_auto_restart_at = Some(now.clone());
+                        }
+                    }
+                    Err(e) => errors.push((name.clone(), e)),
+                }
+            }
+            if !spawned.is_empty() {
+                let summary = spawned
+                    .iter()
+                    .map(|(n, p)| format!("{}={}", n, p))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                warn!(
+                    spawned = %summary,
+                    "watcher-down auto-restart fired"
+                );
+                write_jsonl_log(
+                    &config.general.log_file,
+                    "watcher_auto_restart",
+                    serde_json::json!({
+                        "spawned": spawned
+                            .iter()
+                            .map(|(n, p)| serde_json::json!({"name": n, "pid": p}))
+                            .collect::<Vec<_>>(),
+                    }),
+                );
+                // Reset per-watcher consecutive_missing for the ones
+                // we just respawned. The next check cycle will see
+                // the new process via pgrep and confirm health; we
+                // pre-zero here so a stale 6+ counter doesn't keep
+                // counting the watcher as down for one extra cycle
+                // and re-fire on the next check.
+                for (name, _) in &spawned {
+                    if let Some(h) = state.watcher_health.get_mut(name) {
+                        h.consecutive_missing = 0;
+                    }
+                }
+            }
+            if !errors.is_empty() {
+                for (name, err) in &errors {
+                    warn!(watcher = %name, error = %err, "watcher-down auto-restart failed");
+                }
+                write_jsonl_log(
+                    &config.general.log_file,
+                    "watcher_auto_restart_failed",
+                    serde_json::json!({
+                        "errors": errors
+                            .iter()
+                            .map(|(n, e)| serde_json::json!({"name": n, "error": e}))
+                            .collect::<Vec<_>>(),
+                    }),
+                );
+            }
+            if !deferred.is_empty() {
+                debug!(
+                    deferred = %deferred.join(", "),
+                    cooldown_secs = cooldown,
+                    "watcher-down auto-restart deferred: per-watcher cooldown active"
+                );
+            }
+            if !spawned.is_empty() || !errors.is_empty() {
+                crate::state::save_state(&config.general.state_file, state);
+            }
+        }
+
         // Inject restart commands if watchers are down and cooldown has passed
         if any_critical_missing && !effective_pane.is_empty() {
             let should_inject = match &state.last_watcher_inject {
@@ -1717,6 +2205,31 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
             // defer this one to avoid cascading interrupts.
             let global_cooldown_blocks =
                 interrupt_in_global_cooldown(state, config.general.post_interrupt_cooldown_secs);
+            // Active-turn suppression: if the main loop is currently
+            // running a tool call (or ran one within the last
+            // `active_window_secs`), suppress ONLY the in-pane preemption.
+            // The structured claude-event still fires so Andrew is
+            // notified out-of-band. The reflexive cascade — inject fires
+            // mid-turn → loop pivots to "restart watcher" → original ask
+            // is abandoned half-finished — only happens if we keep
+            // typing into the pane, so dropping the inject is enough.
+            let actively_turning = config.watcher_monitor.suppress_inject_when_active
+                && main_loop_actively_turning(
+                    state,
+                    bashes,
+                    config.watcher_monitor.active_window_secs,
+                );
+            // Cross-gate escalation backstop (2026-04-28 q-2026-04-28-2449):
+            // if the suppression run has been long/persistent enough, force
+            // the inject regardless of `actively_turning`. Catches the
+            // sustained-dispatcher-window case where the gate would
+            // otherwise hold open indefinitely (real-world incident:
+            // claude-event-watch suppressed for 33 min).
+            let escalation = should_escalate_suppression(
+                state,
+                config.suppression.max_consecutive_suppressions,
+                config.suppression.max_suppression_window_secs,
+            );
             if should_inject && global_cooldown_blocks {
                 debug!(
                     cooldown = config.general.post_interrupt_cooldown_secs,
@@ -1725,41 +2238,137 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
             }
             if should_inject && !global_cooldown_blocks {
                 let missing_list = missing_names.join(", ");
-                warn!(missing = %missing_list, "watchers down — interrupting and injecting restart");
-                write_jsonl_log(
-                    &config.general.log_file,
-                    "watcher_inject",
-                    serde_json::json!({
-                        "missing": missing_names,
-                    }),
-                );
-
-                // Interrupt first (like prolonged-thinking) to break any inline work
-                if tmux::interrupt_and_wait(&effective_pane, 10).await {
-                    info!("watcher inject: Claude Code is idle after interrupt");
-                } else {
-                    warn!("watcher inject: could not confirm idle, injecting anyway");
-                }
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-
-                // Build specific restart commands
-                let restart_cmds: Vec<String> = missing_names
-                    .iter()
-                    .map(|n| format!("watcher-ctl run {}", n))
-                    .collect();
-                let prompt = format!(
-                    "[CLAUDE-WATCH] WATCHER(S) DOWN: {}. You MUST restart them NOW. \
-                     Run these as background tasks immediately: {}",
+                let watcher_reason = format!(
+                    "{} watcher(s) missing: {}",
+                    missing_names.len(),
                     missing_list,
-                    restart_cmds.join(", ")
                 );
-                tmux::inject_text(&effective_pane, &prompt).await;
-                state.last_watcher_inject = Some(now.clone());
-                state.last_interrupt_at = Some(now.clone());
-                state.watcher_inject_count += 1;
-                state.watcher_down_interrupts_total =
-                    state.watcher_down_interrupts_total.saturating_add(1);
-                crate::state::save_state(&config.general.state_file, state);
+
+                if actively_turning && escalation.is_none() {
+                    // Suppression path: still emit the structured
+                    // claude-event (out-of-band notify) and log it,
+                    // but do NOT interrupt or inject into the pane.
+                    let bashes_now = bashes;
+                    let last_active_age = state
+                        .last_active_at
+                        .as_deref()
+                        .and_then(elapsed_since)
+                        .map(|e| e as u64);
+                    info!(
+                        missing = %missing_list,
+                        bashes = bashes_now,
+                        last_active_age_secs = ?last_active_age,
+                        "watcher-down inject suppressed: main loop actively turning"
+                    );
+                    write_jsonl_log(
+                        &config.general.log_file,
+                        "watcher_inject_suppressed",
+                        serde_json::json!({
+                            "missing": missing_names,
+                            "reason": "main_loop_actively_turning",
+                            "bashes": bashes_now,
+                            "last_active_age_secs": last_active_age,
+                            "active_window_secs": config.watcher_monitor.active_window_secs,
+                            "consecutive_suppressions": state.consecutive_suppressions + 1,
+                        }),
+                    );
+                    record_suppression(state, &now);
+                    // Out-of-band sink still fires — message reflects
+                    // suppression so downstream consumers can tell
+                    // this fire did not preempt the pane.
+                    let suppressed_msg = format!(
+                        "[CLAUDE-WATCH] watcher-down (inject suppressed: main loop active): {}",
+                        missing_list,
+                    );
+                    alert::emit_event(crate::event_bus::ClaudeWatchAlert {
+                        alert_type: "watcher-down",
+                        stuck_reason: &watcher_reason,
+                        stale_minutes: None,
+                        affected_watchers: missing_names.clone(),
+                        severity: crate::event_bus::Severity::Medium,
+                        message: &suppressed_msg,
+                    });
+                    // NOTE (2026-04-28 q-2026-04-28-2449): we used to
+                    // bump `last_watcher_inject` here so the cooldown
+                    // clock advanced even on suppressed fires. That was
+                    // a bug: a single suppressed attempt ate the full
+                    // 5-min `inject_cooldown` slot, so even after the
+                    // main loop went idle 1s later, the next inject was
+                    // deferred until the cooldown elapsed. Now we leave
+                    // the cooldown clock untouched on suppression — the
+                    // shared `consecutive_suppressions` counter and the
+                    // wall-clock window backstop are the things that
+                    // bound the suppression run, not the cooldown clock.
+                    crate::state::save_state(&config.general.state_file, state);
+                } else {
+                    if let Some(reason) = escalation {
+                        warn!(
+                            missing = %missing_list,
+                            consecutive_suppressions = state.consecutive_suppressions,
+                            escalation_reason = reason.as_str(),
+                            "watcher-down inject escalating: suppression run capped — forcing inject"
+                        );
+                        write_jsonl_log(
+                            &config.general.log_file,
+                            "suppression_escalated",
+                            serde_json::json!({
+                                "site": "watcher_monitor",
+                                "reason": reason.as_str(),
+                                "consecutive_suppressions": state.consecutive_suppressions,
+                                "first_suppression_at": state.first_suppression_at,
+                                "missing": missing_names,
+                            }),
+                        );
+                    }
+                    warn!(missing = %missing_list, "watchers down — interrupting and injecting restart");
+                    write_jsonl_log(
+                        &config.general.log_file,
+                        "watcher_inject",
+                        serde_json::json!({
+                            "missing": missing_names,
+                        }),
+                    );
+
+                    // Interrupt first (like prolonged-thinking) to break any inline work
+                    if tmux::interrupt_and_wait(&effective_pane, 10).await {
+                        info!("watcher inject: Claude Code is idle after interrupt");
+                    } else {
+                        warn!("watcher inject: could not confirm idle, injecting anyway");
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+                    // Build specific restart commands
+                    let restart_cmds: Vec<String> = missing_names
+                        .iter()
+                        .map(|n| format!("watcher-ctl run {}", n))
+                        .collect();
+                    let prompt = format!(
+                        "[CLAUDE-WATCH] WATCHER(S) DOWN: {}. You MUST restart them NOW. \
+                         Run these as background tasks immediately: {}",
+                        missing_list,
+                        restart_cmds.join(", ")
+                    );
+                    tmux::inject_text(&effective_pane, &prompt).await;
+                    // Third sink: claude-event so the main loop sees the
+                    // missing-watchers list as structured data and can
+                    // decide which restart command(s) to actually run,
+                    // rather than reflexively reading the prompt string.
+                    alert::emit_event(crate::event_bus::ClaudeWatchAlert {
+                        alert_type: "watcher-down",
+                        stuck_reason: &watcher_reason,
+                        stale_minutes: None,
+                        affected_watchers: missing_names.clone(),
+                        severity: crate::event_bus::Severity::Medium,
+                        message: &prompt,
+                    });
+                    state.last_watcher_inject = Some(now.clone());
+                    state.last_interrupt_at = Some(now.clone());
+                    state.watcher_inject_count += 1;
+                    state.watcher_down_interrupts_total =
+                        state.watcher_down_interrupts_total.saturating_add(1);
+                    reset_suppression(state);
+                    crate::state::save_state(&config.general.state_file, state);
+                }
             }
         }
     }
@@ -1866,7 +2475,32 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                     "Claude stuck: {}. {} consecutive checks failed.",
                     stuck_reason, state.consecutive_failures
                 );
-                alert::alert(&msg, &alert_pane, &config.alerts.resume_prompt, use_pingme).await;
+                // Severity escalates with the alert count: first few
+                // alerts are High; once we're past the pingme cap (the
+                // sustained-stuck case), bump to Critical. Andrew's
+                // 574-min heartbeat-stale incident was the canonical
+                // case where the loop should have noticed depth.
+                let severity = if state.alert_count > config.alerts.max_pingme_alerts {
+                    crate::event_bus::Severity::Critical
+                } else {
+                    crate::event_bus::Severity::High
+                };
+                let event_alert = crate::event_bus::ClaudeWatchAlert {
+                    alert_type: "heartbeat-stale",
+                    stuck_reason: &stuck_reason,
+                    stale_minutes: stuck_stale_minutes,
+                    affected_watchers: vec![],
+                    severity,
+                    message: &msg,
+                };
+                alert::alert(
+                    &msg,
+                    &alert_pane,
+                    &config.alerts.resume_prompt,
+                    use_pingme,
+                    event_alert,
+                )
+                .await;
             }
 
             state.last_alert = Some(now.clone());
@@ -2328,5 +2962,526 @@ mod tests {
         assert_eq!(state.wedged_clear_interrupts_total, 0);
         assert_eq!(state.auto_update_interrupts_total, 0);
         assert_eq!(state.restart_claude_interrupts_total, 0);
+    }
+
+    // --- main_loop_actively_turning suppression-gate tests (2026-04-27) ---
+    //
+    // The watcher-down inject path consults this predicate. When it returns
+    // true, the daemon skips the tmux interrupt + inject (the in-pane
+    // preemption) but still emits the structured claude-event sink so
+    // Andrew is notified out-of-band. The in-pane preemption is the only
+    // cause of the "inject fires mid-turn → loop pivots to restart watcher
+    // → original ask is abandoned half-finished" cascade Andrew flagged
+    // 2026-04-27.
+
+    fn iso_secs_ago(seconds_ago: i64) -> String {
+        let dt = chrono::Utc::now() - chrono::Duration::seconds(seconds_ago);
+        dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+    }
+
+    #[test]
+    fn test_main_loop_actively_turning_when_bashes_nonzero() {
+        // bashes > 0 RIGHT NOW: actively turning, regardless of last_active_at.
+        let state = State::default();
+        assert!(main_loop_actively_turning(&state, 1, 30));
+    }
+
+    #[test]
+    fn test_main_loop_actively_turning_recent_activity_in_window() {
+        // bashes == 0 NOW but a tool call ran 5s ago: still actively turning.
+        let mut state = State::default();
+        state.last_active_at = Some(iso_secs_ago(5));
+        assert!(main_loop_actively_turning(&state, 0, 30));
+    }
+
+    #[test]
+    fn test_main_loop_actively_turning_stale_activity_outside_window() {
+        // last_active_at is 60s ago, window is 30s: not actively turning.
+        let mut state = State::default();
+        state.last_active_at = Some(iso_secs_ago(60));
+        assert!(!main_loop_actively_turning(&state, 0, 30));
+    }
+
+    #[test]
+    fn test_main_loop_actively_turning_no_history_idle() {
+        // No last_active_at, bashes == 0: definitely not actively turning.
+        let state = State::default();
+        assert!(!main_loop_actively_turning(&state, 0, 30));
+    }
+
+    #[test]
+    fn test_main_loop_actively_turning_window_zero_still_honors_live_bashes() {
+        // window_secs = 0 disables the recent-activity gate, but a live
+        // tool call (bashes > 0) MUST still count as actively turning.
+        let state = State::default();
+        assert!(main_loop_actively_turning(&state, 1, 0));
+    }
+
+    #[test]
+    fn test_main_loop_actively_turning_window_zero_idle_returns_false() {
+        // window_secs = 0 + bashes == 0 + recent activity 1s ago:
+        // recent-activity gate is disabled, so this must NOT count as
+        // actively turning.
+        let mut state = State::default();
+        state.last_active_at = Some(iso_secs_ago(1));
+        assert!(!main_loop_actively_turning(&state, 0, 0));
+    }
+
+    #[test]
+    fn test_main_loop_actively_turning_invalid_timestamp_treated_as_idle() {
+        // Garbage in last_active_at parses to None and must NOT be
+        // treated as "recent" — that would silently disable the inject
+        // forever after a single corrupt write.
+        let mut state = State::default();
+        state.last_active_at = Some("not a timestamp".to_string());
+        assert!(!main_loop_actively_turning(&state, 0, 30));
+    }
+
+    // --- fresh-/clear and dead-process suppression tests (2026-04-27, q-2026-04-27-ce5f) ---
+    //
+    // Both alert paths fire on point-in-time predicates that the main
+    // loop transiently satisfies between two tool calls (a small turn
+    // sitting at a few thousand tokens with bashes momentarily 0; or a
+    // brief pane swap making tokens=0 and bashes=0 look like a dead
+    // process). These tests pin the suppression-decision logic so the
+    // false positives Andrew flagged at 02:45 ET 2026-04-27 don't
+    // regress.
+
+    #[test]
+    fn test_fresh_clear_suppressed_when_actively_turning() {
+        // bashes > 0 right now: the loop is mid-tool-call, so even if
+        // the [min_tokens, max_tokens) gate matches we MUST suppress.
+        let state = State::default();
+        assert!(fresh_clear_inject_suppressed(&state, 1, true, 60));
+    }
+
+    #[test]
+    fn test_fresh_clear_suppressed_when_recent_activity_in_window() {
+        // bashes == 0 NOW but a tool call ran 10s ago: the loop is
+        // demonstrably alive — the bashes gauge is just between calls.
+        // The fresh-/clear inject would derail real work, so suppress.
+        let mut state = State::default();
+        state.last_active_at = Some(iso_secs_ago(10));
+        assert!(fresh_clear_inject_suppressed(&state, 0, true, 60));
+    }
+
+    #[test]
+    fn test_fresh_clear_not_suppressed_when_idle_outside_window() {
+        // Last activity 120s ago, window is 60s: loop is genuinely
+        // idle on a fresh /clear, so the fast-path SHOULD fire.
+        let mut state = State::default();
+        state.last_active_at = Some(iso_secs_ago(120));
+        assert!(!fresh_clear_inject_suppressed(&state, 0, true, 60));
+    }
+
+    #[test]
+    fn test_fresh_clear_not_suppressed_when_no_history() {
+        // Brand-new daemon, no last_active_at recorded, bashes == 0:
+        // can't infer activity, so DON'T suppress. The fast-path keeps
+        // its existing behaviour for the genuine fresh-/clear case.
+        let state = State::default();
+        assert!(!fresh_clear_inject_suppressed(&state, 0, true, 60));
+    }
+
+    #[test]
+    fn test_fresh_clear_not_suppressed_when_disabled() {
+        // suppress_when_active = false (operator override): even with a
+        // live tool call the suppression gate is bypassed, restoring
+        // pre-fix behaviour. Useful escape hatch if the predicate
+        // misfires for some workload.
+        let mut state = State::default();
+        state.last_active_at = Some(iso_secs_ago(5));
+        assert!(!fresh_clear_inject_suppressed(&state, 1, false, 60));
+        assert!(!fresh_clear_inject_suppressed(&state, 0, false, 60));
+    }
+
+    #[test]
+    fn test_fresh_clear_window_zero_still_honors_live_bashes() {
+        // active_window_secs = 0 disables the time-window check, but a
+        // live tool call (bashes > 0) MUST still suppress. Mirrors the
+        // main_loop_actively_turning semantics exactly.
+        let state = State::default();
+        assert!(fresh_clear_inject_suppressed(&state, 1, true, 0));
+    }
+
+    #[test]
+    fn test_fresh_clear_window_zero_idle_does_not_suppress() {
+        // active_window_secs = 0 + bashes == 0 + recent activity 1s
+        // ago: window check is disabled, and bashes is 0 right now,
+        // so the gate stays open and the inject can fire.
+        let mut state = State::default();
+        state.last_active_at = Some(iso_secs_ago(1));
+        assert!(!fresh_clear_inject_suppressed(&state, 0, true, 0));
+    }
+
+    #[test]
+    fn test_dead_process_suppressed_when_actively_turning() {
+        // bashes > 0 right now: the process is demonstrably alive.
+        // Restarting it would kill an active session and fire a false
+        // claude-crashed alert. MUST suppress.
+        let state = State::default();
+        assert!(dead_process_restart_suppressed(&state, 2, true, 60));
+    }
+
+    #[test]
+    fn test_dead_process_suppressed_when_recent_activity_in_window() {
+        // bashes == 0 NOW but a tool call ran 30s ago. The dead-process
+        // checks_required is 3 (default) at ~10s intervals, so a 30s
+        // window perfectly straddles "could the parser have missed
+        // 3 cycles in a row?" — yes, easily. Suppress to be safe.
+        let mut state = State::default();
+        state.last_active_at = Some(iso_secs_ago(30));
+        assert!(dead_process_restart_suppressed(&state, 0, true, 60));
+    }
+
+    #[test]
+    fn test_dead_process_not_suppressed_when_idle_outside_window() {
+        // Last tool call 90s ago, window is 60s: process has been
+        // genuinely silent past the window. If the shell-prompt check
+        // also confirms, restart the process for real.
+        let mut state = State::default();
+        state.last_active_at = Some(iso_secs_ago(90));
+        assert!(!dead_process_restart_suppressed(&state, 0, true, 60));
+    }
+
+    #[test]
+    fn test_dead_process_not_suppressed_when_no_history() {
+        // Brand-new daemon, no last_active_at, bashes == 0: nothing to
+        // infer activity from. Don't suppress — the dead_checks_required
+        // counter and is_shell_prompt() check are the other safety belts.
+        let state = State::default();
+        assert!(!dead_process_restart_suppressed(&state, 0, true, 60));
+    }
+
+    #[test]
+    fn test_dead_process_not_suppressed_when_disabled() {
+        // suppress_when_active = false: gate is bypassed entirely.
+        // Restores pre-fix behaviour for an operator who wants it.
+        let mut state = State::default();
+        state.last_active_at = Some(iso_secs_ago(5));
+        assert!(!dead_process_restart_suppressed(&state, 1, false, 60));
+        assert!(!dead_process_restart_suppressed(&state, 0, false, 60));
+    }
+
+    #[test]
+    fn test_dead_process_uses_wider_default_window_than_watcher_down() {
+        // Documents the policy choice: a dead-process false positive
+        // restarts Claude Code (destroys an in-flight session), which
+        // is far more destructive than a missed watcher-down inject
+        // (just defers a notification by 5 min). The default
+        // active_window_secs for dead_process is 60s vs watcher_monitor's
+        // 30s. Test the boundary: 45s ago should suppress at 60s
+        // window but not at 30s window.
+        let mut state = State::default();
+        state.last_active_at = Some(iso_secs_ago(45));
+        // dead_process default window (60s) suppresses
+        assert!(dead_process_restart_suppressed(&state, 0, true, 60));
+        // watcher_monitor default window (30s) would NOT
+        assert!(!main_loop_actively_turning(&state, 0, 30));
+    }
+
+    #[test]
+    fn test_dead_process_invalid_timestamp_treated_as_idle() {
+        // Same defensive check as test_main_loop_actively_turning_invalid_timestamp_treated_as_idle:
+        // garbage timestamp parses to None, treated as idle (no suppression).
+        // A corrupt persisted state file MUST NOT silently disable the
+        // restart path forever.
+        let mut state = State::default();
+        state.last_active_at = Some("garbage".to_string());
+        assert!(!dead_process_restart_suppressed(&state, 0, true, 60));
+    }
+
+    #[test]
+    fn test_fresh_clear_invalid_timestamp_treated_as_idle() {
+        // Mirror of dead_process variant. Garbage in last_active_at
+        // must NOT be treated as recent activity.
+        let mut state = State::default();
+        state.last_active_at = Some("garbage".to_string());
+        assert!(!fresh_clear_inject_suppressed(&state, 0, true, 60));
+    }
+
+    // --- Cross-gate suppression-escalation tests (2026-04-28, q-2026-04-28-2449) ---
+    //
+    // These pin the behavior of the shared escalation mechanism that backstops
+    // the three suppression gates. Real-world incident: claude-event-watch
+    // died at 19:27Z and stayed down 33 min because watcher_monitor's
+    // suppression gate kept holding through a sustained dispatcher window.
+    // These tests guarantee the next time that happens we escalate at the
+    // configured cap and force-inject.
+
+    #[test]
+    fn test_record_suppression_first_call_stamps_timestamp() {
+        // 0 -> 1 transition: first_suppression_at should be set, counter
+        // bumped to 1.
+        let mut state = State::default();
+        let now = chrono::Utc::now().to_rfc3339();
+        record_suppression(&mut state, &now);
+        assert_eq!(state.consecutive_suppressions, 1);
+        assert_eq!(state.first_suppression_at.as_deref(), Some(now.as_str()));
+    }
+
+    #[test]
+    fn test_record_suppression_subsequent_calls_preserve_timestamp() {
+        // Once first_suppression_at is set, subsequent calls must NOT
+        // overwrite it (otherwise the wall-clock backstop would never
+        // fire — the window would keep resetting).
+        let mut state = State::default();
+        let t0 = "2026-04-28T00:00:00+00:00".to_string();
+        let t1 = "2026-04-28T00:01:00+00:00".to_string();
+        let t2 = "2026-04-28T00:02:00+00:00".to_string();
+        record_suppression(&mut state, &t0);
+        record_suppression(&mut state, &t1);
+        record_suppression(&mut state, &t2);
+        assert_eq!(state.consecutive_suppressions, 3);
+        // t0 is the first, must persist across the next two.
+        assert_eq!(state.first_suppression_at, Some(t0));
+    }
+
+    #[test]
+    fn test_record_suppression_saturates_at_u32_max() {
+        // Sanity: catastrophic counter overflow must not panic.
+        let mut state = State::default();
+        state.consecutive_suppressions = u32::MAX;
+        state.first_suppression_at = Some(iso_secs_ago(60));
+        record_suppression(&mut state, "now");
+        assert_eq!(state.consecutive_suppressions, u32::MAX);
+    }
+
+    #[test]
+    fn test_reset_suppression_clears_both_fields() {
+        let mut state = State::default();
+        state.consecutive_suppressions = 5;
+        state.first_suppression_at = Some(iso_secs_ago(120));
+        reset_suppression(&mut state);
+        assert_eq!(state.consecutive_suppressions, 0);
+        assert!(state.first_suppression_at.is_none());
+    }
+
+    #[test]
+    fn test_reset_suppression_idempotent_when_already_clear() {
+        let mut state = State::default();
+        reset_suppression(&mut state);
+        assert_eq!(state.consecutive_suppressions, 0);
+        assert!(state.first_suppression_at.is_none());
+    }
+
+    #[test]
+    fn test_should_escalate_returns_none_when_counter_zero() {
+        // The very first suppression of a run can never escalate — the
+        // gate has not yet demonstrably failed to drain. Required so the
+        // happy path (one suppression, then the active turn ends, then
+        // the watcher comes back) doesn't escalate.
+        let state = State::default();
+        assert_eq!(should_escalate_suppression(&state, 3, 600), None);
+    }
+
+    #[test]
+    fn test_should_escalate_fires_on_consecutive_cap() {
+        // counter == max: escalation due to consecutive cap.
+        let mut state = State::default();
+        state.consecutive_suppressions = 3;
+        state.first_suppression_at = Some(iso_secs_ago(10));
+        assert_eq!(
+            should_escalate_suppression(&state, 3, 600),
+            Some(EscalationReason::ConsecutiveCap)
+        );
+    }
+
+    #[test]
+    fn test_should_escalate_fires_on_consecutive_cap_overshoot() {
+        // counter > max also fires — defensive against off-by-one
+        // bumps from a code-path that increments after the predicate
+        // check.
+        let mut state = State::default();
+        state.consecutive_suppressions = 10;
+        state.first_suppression_at = Some(iso_secs_ago(10));
+        assert_eq!(
+            should_escalate_suppression(&state, 3, 600),
+            Some(EscalationReason::ConsecutiveCap)
+        );
+    }
+
+    #[test]
+    fn test_should_escalate_fires_on_window_exceeded() {
+        // Counter is below the consecutive cap but the wall-clock
+        // window has been exceeded — escalate via the window backstop.
+        // Mirrors the slow-drip case where suppressions land less often
+        // than the cap implies (e.g. a check that satisfies the gate
+        // every other cycle).
+        let mut state = State::default();
+        state.consecutive_suppressions = 1;
+        state.first_suppression_at = Some(iso_secs_ago(700));
+        assert_eq!(
+            should_escalate_suppression(&state, 3, 600),
+            Some(EscalationReason::WindowExceeded)
+        );
+    }
+
+    #[test]
+    fn test_should_escalate_returns_none_below_both_limits() {
+        // counter < cap AND elapsed < window: no escalation, normal
+        // suppression continues.
+        let mut state = State::default();
+        state.consecutive_suppressions = 1;
+        state.first_suppression_at = Some(iso_secs_ago(60));
+        assert_eq!(should_escalate_suppression(&state, 3, 600), None);
+    }
+
+    #[test]
+    fn test_should_escalate_consecutive_cap_zero_disables_consecutive_check() {
+        // max_consecutive_suppressions=0 disables the consecutive-cap
+        // limb (operator escape hatch). With counter=10 and the cap
+        // disabled, only the window backstop can escalate.
+        let mut state = State::default();
+        state.consecutive_suppressions = 10;
+        state.first_suppression_at = Some(iso_secs_ago(10));
+        // Window also too short to fire: should NOT escalate.
+        assert_eq!(should_escalate_suppression(&state, 0, 600), None);
+        // Window exceeded: window-side escalation still fires.
+        state.first_suppression_at = Some(iso_secs_ago(700));
+        assert_eq!(
+            should_escalate_suppression(&state, 0, 600),
+            Some(EscalationReason::WindowExceeded)
+        );
+    }
+
+    #[test]
+    fn test_should_escalate_window_zero_disables_window_check() {
+        // max_suppression_window_secs=0 disables the window backstop.
+        // Useful escape hatch for environments that want only the
+        // consecutive-cap behaviour.
+        let mut state = State::default();
+        state.consecutive_suppressions = 1;
+        state.first_suppression_at = Some(iso_secs_ago(10000));
+        // Even with a 10000s gap, window=0 means no escalation.
+        assert_eq!(should_escalate_suppression(&state, 3, 0), None);
+        // Counter still triggers escalation independently.
+        state.consecutive_suppressions = 5;
+        assert_eq!(
+            should_escalate_suppression(&state, 3, 0),
+            Some(EscalationReason::ConsecutiveCap)
+        );
+    }
+
+    #[test]
+    fn test_should_escalate_invalid_first_suppression_at_treated_as_no_window_data() {
+        // Garbage timestamp → window check skips, falls through to None
+        // unless the consecutive cap also fires. Mirrors the defensive
+        // semantics elsewhere.
+        let mut state = State::default();
+        state.consecutive_suppressions = 1;
+        state.first_suppression_at = Some("garbage".to_string());
+        assert_eq!(should_escalate_suppression(&state, 3, 600), None);
+    }
+
+    #[test]
+    fn test_should_escalate_consecutive_cap_takes_precedence_over_window() {
+        // When BOTH limits would fire, ConsecutiveCap is reported — the
+        // counter check runs first. Documents the precedence so log
+        // analysis is stable.
+        let mut state = State::default();
+        state.consecutive_suppressions = 10;
+        state.first_suppression_at = Some(iso_secs_ago(10000));
+        assert_eq!(
+            should_escalate_suppression(&state, 3, 600),
+            Some(EscalationReason::ConsecutiveCap)
+        );
+    }
+
+    #[test]
+    fn test_record_then_reset_returns_to_pristine_state() {
+        // End-to-end: a suppression run that ends with a successful
+        // inject (reset_suppression called) leaves state ready for a
+        // brand-new run, with no leftover history.
+        let mut state = State::default();
+        record_suppression(&mut state, "2026-04-28T00:00:00+00:00");
+        record_suppression(&mut state, "2026-04-28T00:00:30+00:00");
+        record_suppression(&mut state, "2026-04-28T00:01:00+00:00");
+        assert_eq!(state.consecutive_suppressions, 3);
+        reset_suppression(&mut state);
+        // Next run starts from scratch — consecutive_suppressions=0
+        // means should_escalate returns None.
+        assert_eq!(should_escalate_suppression(&state, 3, 600), None);
+        // And first_suppression_at gets re-stamped on the next record.
+        record_suppression(&mut state, "2026-04-28T01:00:00+00:00");
+        assert_eq!(state.consecutive_suppressions, 1);
+        assert_eq!(
+            state.first_suppression_at.as_deref(),
+            Some("2026-04-28T01:00:00+00:00")
+        );
+    }
+
+    // --- Regression test for the cooldown-bump bug (2026-04-28) ---
+    //
+    // Pre-fix, the watcher_monitor suppression path bumped
+    // `state.last_watcher_inject = now` even though no inject ran.
+    // That ate the full 5-min `inject_cooldown` slot on a single
+    // suppressed attempt — even if the active window closed 1s later,
+    // the next inject was deferred until the cooldown elapsed.
+    //
+    // The fix is intentional structural: the suppression branch in
+    // watcher_monitor no longer touches `last_watcher_inject`. We
+    // assert via a focused unit test of `record_suppression` (which
+    // is what the suppression branch now calls) PLUS a no-op state
+    // mutation check.
+
+    #[test]
+    fn test_record_suppression_does_not_touch_last_watcher_inject() {
+        // Pin the contract: record_suppression bumps the suppression
+        // counter ONLY. It must not silently update the watcher-down
+        // cooldown clock — that field tracks the last actual inject,
+        // which is the cooldown-bump bug we're fixing.
+        let mut state = State::default();
+        state.last_watcher_inject = Some("2026-04-28T00:00:00+00:00".to_string());
+        record_suppression(&mut state, "2026-04-28T01:00:00+00:00");
+        // last_watcher_inject is untouched — only consecutive_suppressions
+        // and first_suppression_at moved.
+        assert_eq!(
+            state.last_watcher_inject.as_deref(),
+            Some("2026-04-28T00:00:00+00:00")
+        );
+        assert_eq!(state.consecutive_suppressions, 1);
+        assert_eq!(
+            state.first_suppression_at.as_deref(),
+            Some("2026-04-28T01:00:00+00:00")
+        );
+    }
+
+    #[test]
+    fn test_record_suppression_does_not_touch_last_interrupt_at() {
+        // Same contract for the global post-interrupt cooldown clock.
+        // No interrupt fired (we suppressed), so last_interrupt_at must
+        // not move — otherwise other fire paths (prolonged-thinking,
+        // context-warning) would be cooled-down by a non-event.
+        let mut state = State::default();
+        state.last_interrupt_at = Some("2026-04-28T00:00:00+00:00".to_string());
+        record_suppression(&mut state, "2026-04-28T01:00:00+00:00");
+        assert_eq!(
+            state.last_interrupt_at.as_deref(),
+            Some("2026-04-28T00:00:00+00:00")
+        );
+    }
+
+    // --- State transient-reset on daemon load (2026-04-28) ---
+    //
+    // The escalation state fields (consecutive_suppressions,
+    // first_suppression_at) are transient — daemon downtime makes the
+    // "consecutive" semantics meaningless and a stale persisted timestamp
+    // would cause the wall-clock backstop to fire immediately on the
+    // first suppression after restart. load_state must clear both.
+    // The actual reset lives in src/state.rs::load_state; this test
+    // documents the expected behaviour from policy's perspective (a
+    // fresh State has both fields zeroed).
+
+    #[test]
+    fn test_default_state_has_clean_suppression_counters() {
+        // Stand-in for the "load_state from missing file" case — the
+        // reset semantics in load_state mean a brand-new daemon never
+        // sees stale escalation state.
+        let state = State::default();
+        assert_eq!(state.consecutive_suppressions, 0);
+        assert!(state.first_suppression_at.is_none());
+        // And no escalation fires on a pristine state.
+        assert_eq!(should_escalate_suppression(&state, 3, 600), None);
     }
 }

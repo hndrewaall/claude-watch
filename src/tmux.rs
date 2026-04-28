@@ -2,9 +2,48 @@
 
 use crate::cmd::{run_cmd, run_cmd_any};
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::time::sleep;
 use tracing::debug;
+
+/// Settle delay (milliseconds) inserted between the ESC -> NORMAL-mode
+/// transition and the dd/i/text sequence in `inject_text`. See
+/// `TmuxConfig::post_escape_settle_ms` for the rationale. Initialized at
+/// daemon startup from config; defaults to 0 (disabled) so the fast path
+/// is the default. Set via `set_post_escape_settle_ms()`.
+static POST_ESCAPE_SETTLE_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Update the global post-escape settle delay. Called from main.rs at daemon
+/// startup and on every config reload. Safe to call concurrently — uses a
+/// relaxed atomic store.
+pub fn set_post_escape_settle_ms(ms: u64) {
+    POST_ESCAPE_SETTLE_MS.store(ms, Ordering::Relaxed);
+}
+
+/// Read the current post-escape settle delay. Used internally by injection
+/// helpers; exposed for tests.
+pub fn post_escape_settle_ms() -> u64 {
+    POST_ESCAPE_SETTLE_MS.load(Ordering::Relaxed)
+}
+
+/// Sleep for the configured post-escape settle delay. No-op when the knob
+/// is set to 0 (the default). Call this AFTER Escape keystroke(s) and
+/// BEFORE any further keystrokes (typed text, vim-mode dd/i, /clear,
+/// Enter, etc.) when extra settle time is needed to keep follow-up keys
+/// from being garbled or eaten.
+///
+/// Currently invoked only at the ESC -> NORMAL-mode boundary inside
+/// `inject_text` (replacing what used to be a hardcoded 500ms sleep).
+/// Default is 0 so the fast path is the default; set
+/// `[tmux].post_escape_settle_ms` in config.toml if a particular
+/// environment needs the extra cushion.
+async fn settle_after_escape() {
+    let ms = post_escape_settle_ms();
+    if ms > 0 {
+        sleep(Duration::from_millis(ms)).await;
+    }
+}
 
 /// Current activity state of Claude Code as observed from tmux pane output.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -169,17 +208,26 @@ pub async fn dismiss_feedback_prompt(pane: &str) {
 }
 
 /// Actively interrupt Claude Code: rapid-fire Escape, periodically Ctrl-B x2.
-/// Returns true if idle state confirmed within timeout.
+/// Returns true if idle state confirmed within `timeout_secs`. Returns false
+/// at the deadline; callers should still proceed with their inject (the
+/// pane may not match `detect_activity()`'s idle predicate but Claude Code
+/// has typically responded long before the timeout fires).
 ///
 /// Uses `get_activity()` (content-area aware) instead of `is_idle()` (prompt-only)
 /// to ensure the thinking indicator has fully cleared before returning.
+///
+/// Timing: blasts Escape every 250ms. A 1s wall-clock budget gives ~4
+/// Escape sends, which is enough to interrupt anything Claude is doing
+/// short of a foreground bash command (those need Ctrl-C, not Escape).
+/// Idle confirmation requires two consecutive Idle reads 150ms apart to
+/// guard against transient state during the pane redraw.
 pub async fn interrupt_and_wait(pane: &str, timeout_secs: u64) -> bool {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
     let mut escape_count: u32 = 0;
 
     while tokio::time::Instant::now() < deadline {
         if get_activity(pane).await == ClaudeActivity::Idle {
-            sleep(Duration::from_millis(300)).await;
+            sleep(Duration::from_millis(150)).await;
             if get_activity(pane).await == ClaudeActivity::Idle {
                 return true;
             }
@@ -187,22 +235,40 @@ pub async fn interrupt_and_wait(pane: &str, timeout_secs: u64) -> bool {
 
         if escape_count > 0 && escape_count % 5 == 0 {
             send_keys(pane, &["C-b"]).await;
-            sleep(Duration::from_millis(300)).await;
+            sleep(Duration::from_millis(150)).await;
             send_keys(pane, &["C-b"]).await;
-            sleep(Duration::from_millis(500)).await;
+            sleep(Duration::from_millis(250)).await;
         } else {
             send_keys(pane, &["Escape"]).await;
-            sleep(Duration::from_millis(500)).await;
+            sleep(Duration::from_millis(250)).await;
         }
         escape_count += 1;
     }
+    debug!(
+        pane = %pane,
+        timeout_secs,
+        escape_count,
+        "interrupt_and_wait: idle never observed within timeout, proceeding"
+    );
     false
 }
 
 /// Inject text into Claude Code via vim-mode keystrokes.
 /// Escape(s) -> wait for Idle -> dd -> i -> type -> Escape -> Enter
+///
+/// Designed to be FAST. Most callers reach inject_text right after
+/// `interrupt_and_wait` has already brought the pane to idle, so the
+/// per-step waits below should be the worst case, not the typical case.
+/// The Step 1b idle-wait uses a short fast-path bail
+/// (`INJECT_IDLE_FAST_PATH_MS`) rather than blocking for the full pre-fix
+/// 10s window — if Claude Code's pane hasn't shown Idle within ~1.5s
+/// after our Escape loop, it's overwhelmingly likely the predicate just
+/// isn't matching what the pane actually shows (stale thinking line in
+/// scrollback, custom theme, etc.) and waiting longer doesn't help.
+/// We send anyway.
 pub async fn inject_text(pane: &str, text: &str) {
-    // Step 1: Escape to NORMAL mode (up to 3 attempts)
+    // Step 1: Escape to NORMAL mode (up to 3 attempts). The is_insert_mode()
+    // check confirms tmux processed each Escape before we send the next.
     for _ in 0..3 {
         send_keys(pane, &["Escape"]).await;
         sleep(Duration::from_secs(1)).await;
@@ -210,18 +276,39 @@ pub async fn inject_text(pane: &str, text: &str) {
             break;
         }
     }
-    sleep(Duration::from_millis(500)).await;
+    // Step 1a: Optional configurable settle after the Escape loop, before
+    // typing dd/i/text. Default 0 (no extra wait — fast path). Tunable
+    // via [tmux].post_escape_settle_ms when a slow environment needs the
+    // extra cushion. Replaced what used to be a hardcoded 500ms sleep so
+    // the wait is opt-in rather than always-paid.
+    settle_after_escape().await;
 
-    // Step 1b: Wait for activity to settle to Idle (thinking indicator cleared).
-    // The prompt may be visible while thinking text is still rendering in the
-    // content area above. Wait up to 10s for get_activity() == Idle before
-    // proceeding with dd/i/type to avoid typing over stale thinking text.
-    let idle_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    // Step 1b: Wait briefly for the activity indicator to settle to Idle
+    // (thinking indicator cleared). `interrupt_and_wait` is normally
+    // called first and has already done the heavy lifting — this is a
+    // last-line check in case the predicate flickers across the Escape
+    // boundary. Fast-path bails after `INJECT_IDLE_FAST_PATH_MS` and
+    // sends anyway: if the pane's idle predicate hasn't matched by then,
+    // it almost certainly never will (stale scrollback thinking text,
+    // custom prompt, etc.), and blocking longer just makes recovery feel
+    // sluggish without changing the outcome.
+    const INJECT_IDLE_FAST_PATH_MS: u64 = 1500;
+    let idle_deadline =
+        tokio::time::Instant::now() + Duration::from_millis(INJECT_IDLE_FAST_PATH_MS);
+    let mut idle_observed = false;
     while tokio::time::Instant::now() < idle_deadline {
         if get_activity(pane).await == ClaudeActivity::Idle {
+            idle_observed = true;
             break;
         }
-        sleep(Duration::from_millis(500)).await;
+        sleep(Duration::from_millis(200)).await;
+    }
+    if !idle_observed {
+        debug!(
+            pane = %pane,
+            fast_path_ms = INJECT_IDLE_FAST_PATH_MS,
+            "inject_text: idle not observed within fast-path window, sending anyway"
+        );
     }
 
     // Step 2: dd -- delete entire line
@@ -1731,5 +1818,24 @@ API Error: Request rejected (429)\n";
     fn test_wedged_reason_display() {
         assert_eq!(format!("{}", WedgedReason::ContextLimit), "context_limit");
         assert_eq!(format!("{}", WedgedReason::RateLimited), "rate_limited");
+    }
+
+    /// Verify the post-escape settle delay is wired through the global
+    /// atomic. We don't test the full settle_after_escape() async helper
+    /// here (it's exercised by the e2e inject tests); we just verify the
+    /// getter reflects the setter so the daemon's startup wiring is sound.
+    ///
+    /// NOTE: this mutates a process-global. Other tests in the same
+    /// process must not depend on a specific value for the setting. We
+    /// restore the default at the end so subsequent tests aren't surprised.
+    #[test]
+    fn test_post_escape_settle_ms_get_set_roundtrip() {
+        let original = post_escape_settle_ms();
+        set_post_escape_settle_ms(1234);
+        assert_eq!(post_escape_settle_ms(), 1234);
+        set_post_escape_settle_ms(0);
+        assert_eq!(post_escape_settle_ms(), 0);
+        // Restore for downstream tests.
+        set_post_escape_settle_ms(original);
     }
 }
