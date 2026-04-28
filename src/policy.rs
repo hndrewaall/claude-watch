@@ -2074,6 +2074,109 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
             }
         }
 
+        // Auto-restart down watchers (q-2026-04-28-5481).
+        //
+        // BUG HISTORY: Before this branch, the daemon emitted a
+        // `watcher-down` claude-event and (when the main loop wasn't
+        // actively turning) injected a restart prompt into the tmux pane,
+        // BUT it did not actually restart the watcher itself. The 2026-04-28
+        // incident: claude-event-watch was DOWN for 30+ minutes — the
+        // suppression branch fired repeatedly ("inject suppressed: main
+        // loop active"), the inject path never fired (suppression was
+        // active the whole time, didn't escalate within the test window),
+        // and the watcher stayed dead.
+        //
+        // FIX: Run the actual restart UNCONDITIONALLY here, before the
+        // inject/suppression decision. The restart is purely additive (it
+        // spawns a detached child via the same `nohup start_cmd` pattern
+        // used by `watcher-ctl enable`) and does not touch the tmux pane,
+        // so it's safe even when the main loop is mid-tool-call. The
+        // existing alert/inject logic below is preserved verbatim — Andrew
+        // still gets the claude-event for visibility, and the inject path
+        // still tries to nudge the main loop when appropriate.
+        //
+        // NOTE: this does NOT depend on `effective_pane` (the auto-restart
+        // path is pane-independent). The auto-restart cooldown reuses the
+        // existing `last_watcher_inject` clock so we don't hammer
+        // `nohup start_cmd` every check cycle (one restart per
+        // `inject_cooldown`, default 300s, is plenty — the watcher binds
+        // its own resources and will pgrep-show within seconds of spawn).
+        if any_critical_missing {
+            let auto_restart_due = match &state.last_watcher_inject {
+                Some(ref last) => elapsed_since(last)
+                    .is_none_or(|e| e >= config.watcher_monitor.inject_cooldown as f64),
+                None => true,
+            };
+            if auto_restart_due {
+                let mut spawned: Vec<(String, u32)> = Vec::new();
+                let mut errors: Vec<(String, String)> = Vec::new();
+                for name in &missing_names {
+                    match crate::watcher::auto_restart_watcher(
+                        &config.watcher_monitor.watchers_config,
+                        name,
+                    )
+                    .await
+                    {
+                        Ok((pid, _)) => spawned.push((name.clone(), pid)),
+                        Err(e) => errors.push((name.clone(), e)),
+                    }
+                }
+                if !spawned.is_empty() {
+                    let summary = spawned
+                        .iter()
+                        .map(|(n, p)| format!("{}={}", n, p))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    warn!(
+                        spawned = %summary,
+                        "watcher-down auto-restart fired"
+                    );
+                    write_jsonl_log(
+                        &config.general.log_file,
+                        "watcher_auto_restart",
+                        serde_json::json!({
+                            "spawned": spawned
+                                .iter()
+                                .map(|(n, p)| serde_json::json!({"name": n, "pid": p}))
+                                .collect::<Vec<_>>(),
+                        }),
+                    );
+                    // Reset per-watcher consecutive_missing for the ones
+                    // we just respawned. The next check cycle will see
+                    // the new process via pgrep and confirm health; we
+                    // pre-zero here so a stale 6+ counter doesn't keep
+                    // counting the watcher as down for one extra cycle
+                    // and re-fire on the next check.
+                    for (name, _) in &spawned {
+                        if let Some(h) = state.watcher_health.get_mut(name) {
+                            h.consecutive_missing = 0;
+                        }
+                    }
+                }
+                if !errors.is_empty() {
+                    for (name, err) in &errors {
+                        warn!(watcher = %name, error = %err, "watcher-down auto-restart failed");
+                    }
+                    write_jsonl_log(
+                        &config.general.log_file,
+                        "watcher_auto_restart_failed",
+                        serde_json::json!({
+                            "errors": errors
+                                .iter()
+                                .map(|(n, e)| serde_json::json!({"name": n, "error": e}))
+                                .collect::<Vec<_>>(),
+                        }),
+                    );
+                }
+                crate::state::save_state(&config.general.state_file, state);
+            } else {
+                debug!(
+                    cooldown = config.watcher_monitor.inject_cooldown,
+                    "watcher-down auto-restart skipped: still in cooldown from previous restart"
+                );
+            }
+        }
+
         // Inject restart commands if watchers are down and cooldown has passed
         if any_critical_missing && !effective_pane.is_empty() {
             let should_inject = match &state.last_watcher_inject {

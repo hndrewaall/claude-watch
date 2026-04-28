@@ -401,6 +401,73 @@ pub async fn watcher_toggle(config_path: &str, name: &str, enable: bool) -> Resu
     }
 }
 
+/// Auto-restart a single watcher by name. Looks up the entry in config,
+/// spawns the start_cmd as a detached child via `nohup` (parent = init),
+/// and writes the PID file. Returns the spawned PID on success.
+///
+/// This is the daemon-side restart path used when claude-watch detects a
+/// watcher is DOWN. It's purely additive — it does NOT inject into the
+/// main-loop tmux pane, so it's safe to fire even when the loop is
+/// actively turning. The watcher will register normally with watcher-status
+/// (pgrep-based detection) and can write to its heartbeat / PID file as
+/// usual.
+///
+/// This is intentionally distinct from `watcher_run` (which is the
+/// foreground supervisor invoked by `watcher-ctl run X`): the daemon can't
+/// block on a foreground supervisor, and parenting under systemd /
+/// claude-watch is fine for the heartbeat-liveness invariant since
+/// watcher-status looks up running watchers via pgrep, not by walking
+/// the parent process tree.
+///
+/// Returns `Ok((pid, name))` on success or `Err(message)` if the watcher
+/// is unknown / disabled / has no start_cmd / spawn failed.
+pub async fn auto_restart_watcher(config_path: &str, name: &str) -> Result<(u32, String), String> {
+    let entries = parse_watchers_config(config_path);
+    let entry = entries
+        .iter()
+        .find(|e| e.name == name)
+        .ok_or_else(|| format!("watcher '{}' not found in config", name))?;
+
+    if !entry.enabled {
+        return Err(format!("watcher '{}' is disabled", name));
+    }
+
+    let start_cmd = entry
+        .start_cmd
+        .as_deref()
+        .ok_or_else(|| format!("no start command configured for '{}'", name))?;
+
+    let args: Vec<&str> = start_cmd.split_whitespace().collect();
+    if args.is_empty() {
+        return Err(format!("empty start command for '{}'", name));
+    }
+
+    // Ensure PID directory exists (best-effort).
+    let _ = std::fs::create_dir_all(PID_DIR);
+
+    // Spawn the start_cmd as a detached child via `nohup`. Mirrors
+    // `watcher_toggle`'s enable path (which is the existing pattern for
+    // launching a watcher without blocking the caller). Stdout/stderr go
+    // to /dev/null — the watcher's own logging path is already wired up
+    // via its start_cmd.
+    let child = tokio::process::Command::new("nohup")
+        .args(&args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| format!("failed to spawn '{}': {}", start_cmd, e))?;
+
+    let pid = child.id().unwrap_or(0);
+
+    // Write the PID file so subsequent watcher_run / status checks see a
+    // canonical PID. Best-effort — on EROFS / EPERM we just continue;
+    // pgrep-based liveness checks don't depend on the file.
+    let pid_file = format!("{}/{}.pid", PID_DIR, name);
+    let _ = std::fs::write(&pid_file, pid.to_string());
+
+    Ok((pid, name.to_string()))
+}
+
 /// Kill all enabled watcher processes and clean PID files.
 pub async fn watcher_restart(config_path: &str) -> String {
     let entries = parse_watchers_config(config_path);
@@ -994,5 +1061,102 @@ mod tests {
         // PID 0 doesn't have a /proc entry on Linux → should return false
         // without panicking. Same for any PID that isn't currently alive.
         assert!(!is_supervisor_comm(0));
+    }
+
+    // --- auto_restart_watcher tests (q-2026-04-28-5481) -----------------
+    //
+    // The 2026-04-28 incident: claude-event-watch was DOWN for 30+ minutes
+    // and claude-watch never restarted it. Root cause: the watcher_monitor
+    // suppression branch (when main loop is "actively turning") emitted the
+    // watcher-down alert but skipped any restart action. These tests cover
+    // the new daemon-side restart helper that fires REGARDLESS of
+    // active-turn suppression.
+
+    #[tokio::test]
+    async fn test_auto_restart_watcher_unknown_name() {
+        // Use a tempfile-style path that contains a single dummy entry —
+        // an unknown watcher name should yield an Err that names the
+        // missing entry verbatim.
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("watchers.conf");
+        std::fs::write(&cfg, "real|real-pat|1|true|true\n").unwrap();
+
+        let result = auto_restart_watcher(cfg.to_str().unwrap(), "ghost").await;
+        assert!(result.is_err(), "unknown watcher must error");
+        let msg = result.unwrap_err();
+        assert!(
+            msg.contains("ghost") && msg.contains("not found"),
+            "error should mention 'ghost' and 'not found', got: {}",
+            msg
+        );
+    }
+
+    #[tokio::test]
+    async fn test_auto_restart_watcher_disabled() {
+        // A watcher whose `enabled` field is `false` must NOT be restarted —
+        // we don't want the daemon resurrecting watchers Andrew explicitly
+        // turned off.
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("watchers.conf");
+        std::fs::write(&cfg, "off-watcher|pat|1|false|true\n").unwrap();
+
+        let result = auto_restart_watcher(cfg.to_str().unwrap(), "off-watcher").await;
+        assert!(result.is_err(), "disabled watcher must error");
+        assert!(
+            result.unwrap_err().contains("disabled"),
+            "error must mention 'disabled'"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_auto_restart_watcher_no_start_cmd() {
+        // No start_cmd configured → can't restart, must error cleanly.
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("watchers.conf");
+        // Only 4 fields, no start_cmd
+        std::fs::write(&cfg, "x|pat|1|true\n").unwrap();
+
+        let result = auto_restart_watcher(cfg.to_str().unwrap(), "x").await;
+        assert!(result.is_err(), "missing start_cmd must error");
+        let msg = result.unwrap_err();
+        assert!(
+            msg.contains("no start command") || msg.contains("empty start"),
+            "error must mention missing start_cmd, got: {}",
+            msg
+        );
+    }
+
+    #[tokio::test]
+    async fn test_auto_restart_watcher_spawns_detached_child() {
+        // Happy-path: a watcher with a real start_cmd should spawn the
+        // child and return its PID. We use `sleep 30` as the start_cmd —
+        // it's a real process we can kill via the returned PID, and 30s
+        // is long enough that the test's PID-existence check is reliable
+        // even on slow CI.
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("watchers.conf");
+        std::fs::write(&cfg, "test-watcher|sleep 30|1|true|sleep 30\n").unwrap();
+
+        let result = auto_restart_watcher(cfg.to_str().unwrap(), "test-watcher").await;
+        assert!(result.is_ok(), "spawn must succeed: {:?}", result);
+        let (pid, name) = result.unwrap();
+        assert_eq!(name, "test-watcher");
+        assert!(pid > 1, "spawned PID must be a real PID, got {}", pid);
+
+        // Verify the child is actually alive — /proc/<pid> should exist.
+        let proc_path = format!("/proc/{}", pid);
+        assert!(
+            std::path::Path::new(&proc_path).exists(),
+            "spawned child PID {} must exist in /proc",
+            pid
+        );
+
+        // Cleanup: kill the spawned sleep so the test doesn't leave a
+        // zombie process. The kill is best-effort — even if it fails
+        // (e.g. the child already exited), the test is done. We don't
+        // unwrap because we don't want a zombie to fail the test.
+        unsafe {
+            libc::kill(pid as libc::pid_t, libc::SIGTERM);
+        }
     }
 }
