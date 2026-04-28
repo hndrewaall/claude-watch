@@ -285,9 +285,46 @@ pub async fn inject_text(pane: &str, text: &str) {
     send_keys(pane, &["d"]).await;
     sleep(Duration::from_millis(500)).await;
 
-    // Step 3: i -- enter INSERT mode
-    send_keys(pane, &["i"]).await;
-    sleep(Duration::from_millis(1500)).await;
+    // Step 3: i -- enter INSERT mode, AND VERIFY we actually entered INSERT
+    // before typing the payload.
+    //
+    // ROOT CAUSE of "cursor stuck mid-text" bug (Andrew flagged 2026-04-28):
+    // The old code was a fixed 1500ms sleep after `i` with NO verification.
+    // When that wasn't long enough (Claude Code's input editor still
+    // processing the previous keystrokes — Escape, dd — under load), the
+    // FIRST characters of `send_literal(text)` arrived while the editor was
+    // still in NORMAL mode. NORMAL-mode interpretation of typical inject-text
+    // characters jumps the cursor around:
+    //   `[`  — back to previous section
+    //   `C`  — change-to-end-of-line
+    //   `L`  — jump to bottom of viewport
+    //   `A`  — append at end of line (FINALLY enters INSERT)
+    //   etc.
+    // After `A` finally engaged INSERT, the rest of the text inserted at
+    // wherever the NORMAL-mode commands had left the cursor, leaving the
+    // cursor visibly mid-text on a letter (the "n" in `event-watch` Andrew
+    // saw). Symmetric design fix: do the SAME verify-loop the Escape→NORMAL
+    // path does at Step 1 (lines 256-262), but in reverse — verify
+    // INSERT mode is active before proceeding.
+    let mut entered_insert = false;
+    for _ in 0..3 {
+        send_keys(pane, &["i"]).await;
+        sleep(Duration::from_millis(500)).await;
+        if is_insert_mode(pane).await {
+            entered_insert = true;
+            break;
+        }
+    }
+    // Final settle even on success — Claude Code may render `-- INSERT --`
+    // before the input editor has fully accepted typed characters.
+    sleep(Duration::from_millis(500)).await;
+    if !entered_insert {
+        debug!(
+            pane = pane,
+            "inject_text: INSERT mode not confirmed after 3 `i` attempts; \
+             proceeding anyway (fall-through to legacy behavior)"
+        );
+    }
 
     // Step 4: Type the text
     send_literal(pane, text).await;
