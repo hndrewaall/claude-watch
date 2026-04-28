@@ -116,6 +116,7 @@ fn build_metrics(state: &Value, current_version: &str, latest_version: &str) -> 
     let fresh_clear_resume_inject_interrupts =
         num(state, "fresh_clear_resume_inject_interrupts_total");
     let restart_claude_interrupts = num(state, "restart_claude_interrupts_total");
+    let api_retry_suppressions = num(state, "api_retry_suppressions_total");
     let reminder_to_clear_count = num(state, "reminder_to_clear_latency_count");
     let reminder_to_update_count = num(state, "reminder_to_update_latency_count");
     let reminder_to_clear_sum = state
@@ -262,6 +263,13 @@ fn build_metrics(state: &Value, current_version: &str, latest_version: &str) -> 
         format!(
             "claude_interrupts_total{{kind=\"restart_claude\"}} {}",
             restart_claude_interrupts
+        ),
+        "".to_string(),
+        "# HELP claude_watch_api_retry_suppressions_total Cycles where claude-watch suppressed an interrupt because Claude Code was in upstream-API retry backoff".to_string(),
+        "# TYPE claude_watch_api_retry_suppressions_total counter".to_string(),
+        format!(
+            "claude_watch_api_retry_suppressions_total {}",
+            api_retry_suppressions
         ),
         "".to_string(),
         "# HELP claude_watch_reminder_to_action_latency_seconds_sum Sum of seconds between hook reminder and Claude self-action".to_string(),
