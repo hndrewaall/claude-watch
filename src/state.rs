@@ -251,6 +251,14 @@ pub struct WatcherState {
     /// `inject_cooldown` clock used for tmux-pane injects.
     #[serde(default)]
     pub last_auto_restart_at: Option<String>,
+    /// RFC3339 timestamp of the last `watcher-down` claude-event emission for
+    /// this watcher (the "quiet path", PR #48). When set, subsequent
+    /// watcher-monitor cycles suppress re-emission within the configured
+    /// grace window AND suppress the heavyweight tmux-inject path entirely
+    /// until the grace window expires (at which point we fall through to
+    /// inject as a fallback). Cleared on recovery (count >= min_count).
+    #[serde(default)]
+    pub event_emitted_at: Option<String>,
 }
 
 pub fn load_state(path: &str) -> State {
@@ -344,6 +352,7 @@ mod tests {
                 consecutive_missing: 0,
                 enabled: true,
                 last_auto_restart_at: None,
+                event_emitted_at: None,
             },
         );
 
