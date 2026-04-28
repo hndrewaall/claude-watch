@@ -180,6 +180,15 @@ pub struct WatcherMonitorConfig {
     /// than wait 5 minutes while the user is silent.
     #[serde(default = "default_watcher_inject_cooldown")]
     pub inject_cooldown: u64,
+    /// Grace period (seconds) after `last_seen_running` during which a
+    /// missing watcher is NOT counted toward `consecutive_missing`. Short-
+    /// lived watchers (e.g. signal-wait that exits when a message arrives)
+    /// have a natural gap between exit and the main loop's restart, so we
+    /// avoid firing spurious "watcher missing" alerts every time a message
+    /// arrives. Default: 90 seconds. Lowered to 0 in e2e tests so a freshly
+    /// killed watcher fires within the inject_threshold window.
+    #[serde(default = "default_watcher_grace_secs")]
+    pub grace_secs: u64,
 }
 
 fn default_watcher_inject_threshold() -> u32 {
@@ -188,6 +197,10 @@ fn default_watcher_inject_threshold() -> u32 {
 
 fn default_watcher_inject_cooldown() -> u64 {
     60
+}
+
+fn default_watcher_grace_secs() -> u64 {
+    90
 }
 
 #[derive(Debug, Deserialize, Clone)]
