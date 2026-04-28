@@ -126,6 +126,83 @@ pub(crate) fn dead_process_restart_suppressed(
     suppress_enabled && main_loop_actively_turning(state, bashes, window_secs)
 }
 
+/// Reason a force-inject escalation should fire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EscalationReason {
+    /// `consecutive_suppressions >= max_consecutive_suppressions`.
+    ConsecutiveCap,
+    /// `now - first_suppression_at > max_suppression_window_secs`.
+    WindowExceeded,
+}
+
+impl EscalationReason {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            EscalationReason::ConsecutiveCap => "consecutive_cap",
+            EscalationReason::WindowExceeded => "window_exceeded",
+        }
+    }
+}
+
+/// Pure predicate: has the cross-gate suppression run been long/persistent
+/// enough that the next gate fire should force-inject regardless of
+/// `actively_turning`? Returns the triggering reason if so.
+///
+/// Both limits are checked on EVERY gate fire — the consecutive counter
+/// catches "many suppressions in a tight window" and the wall-clock window
+/// catches "fewer suppressions, but the active turn has been running so
+/// long the gate's been open way too long".
+///
+/// `consecutive_suppressions == 0` short-circuits to None: the first
+/// suppression of a run can never escalate (escalation only fires when
+/// the gate has demonstrably failed to drain at least once).
+pub(crate) fn should_escalate_suppression(
+    state: &State,
+    max_consecutive_suppressions: u32,
+    max_suppression_window_secs: u64,
+) -> Option<EscalationReason> {
+    if state.consecutive_suppressions == 0 {
+        return None;
+    }
+    if max_consecutive_suppressions > 0
+        && state.consecutive_suppressions >= max_consecutive_suppressions
+    {
+        return Some(EscalationReason::ConsecutiveCap);
+    }
+    if max_suppression_window_secs > 0 {
+        if let Some(elapsed) = state
+            .first_suppression_at
+            .as_deref()
+            .and_then(elapsed_since)
+        {
+            if elapsed > max_suppression_window_secs as f64 {
+                return Some(EscalationReason::WindowExceeded);
+            }
+        }
+    }
+    None
+}
+
+/// Record that a suppression-gate fired and was suppressed (the `actively_
+/// turning` path took the "skip the inject" branch). Increments the shared
+/// counter and stamps `first_suppression_at` on the 0 -> 1 transition.
+/// Idempotent w.r.t. `first_suppression_at` after the first call.
+pub(crate) fn record_suppression(state: &mut State, now: &str) {
+    if state.consecutive_suppressions == 0 {
+        state.first_suppression_at = Some(now.to_string());
+    }
+    state.consecutive_suppressions = state.consecutive_suppressions.saturating_add(1);
+}
+
+/// Reset the shared suppression counter and timestamp. Called when an
+/// inject lands successfully OR when the underlying suppression condition
+/// resolves (the gate's predicate stops matching). Cheap no-op when the
+/// counter is already 0.
+pub(crate) fn reset_suppression(state: &mut State) {
+    state.consecutive_suppressions = 0;
+    state.first_suppression_at = None;
+}
+
 /// If the given reminder fired within the last `max_age_secs` (we default
 /// to 1 hour — beyond that we assume the self-action is unrelated),
 /// record the reminder -> action latency sample into the state-based
@@ -1344,7 +1421,18 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                     config.dead_process.suppress_when_active,
                     config.dead_process.active_window_secs,
                 );
-                if actively_turning {
+                // Cross-gate escalation backstop (2026-04-28
+                // q-2026-04-28-2449): if the suppression run has been
+                // long/persistent enough, force the restart even though
+                // the active-turn predicate matches. Catches the case
+                // where a sustained dispatcher window holds the gate
+                // open indefinitely.
+                let escalation = should_escalate_suppression(
+                    state,
+                    config.suppression.max_consecutive_suppressions,
+                    config.suppression.max_suppression_window_secs,
+                );
+                if actively_turning && escalation.is_none() {
                     let last_active_age = state
                         .last_active_at
                         .as_deref()
@@ -1365,14 +1453,34 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                             "reason": "main_loop_actively_turning",
                             "last_active_age_secs": last_active_age,
                             "active_window_secs": config.dead_process.active_window_secs,
+                            "consecutive_suppressions": state.consecutive_suppressions + 1,
                         }),
                     );
+                    record_suppression(state, &now);
                     // Reset the consecutive counter so we don't re-fire
                     // on the very next check after the active window
                     // closes — require a fresh `checks_required`-cycle
                     // run of dead-state observations before restarting.
                     state.consecutive_dead_checks = 0;
                 } else {
+                    if let Some(reason) = escalation {
+                        warn!(
+                            dead_checks,
+                            consecutive_suppressions = state.consecutive_suppressions,
+                            escalation_reason = reason.as_str(),
+                            "dead-process restart escalating: suppression run capped — forcing restart"
+                        );
+                        write_jsonl_log(
+                            &config.general.log_file,
+                            "suppression_escalated",
+                            serde_json::json!({
+                                "site": "dead_process",
+                                "reason": reason.as_str(),
+                                "consecutive_suppressions": state.consecutive_suppressions,
+                                "first_suppression_at": state.first_suppression_at,
+                            }),
+                        );
+                    }
                     info!(
                         dead_checks,
                         "shell prompt confirmed -- restarting Claude Code"
@@ -1381,6 +1489,7 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                     state.consecutive_dead_checks = 0;
                     state.consecutive_failures = 0;
                     state.alert_count = 0;
+                    reset_suppression(state);
                 }
             } else if dead_checks >= config.dead_process.fresh_inject_checks
                 && !state.fresh_session_injected
@@ -1489,7 +1598,13 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                 config.fresh_clear.suppress_when_active,
                 config.fresh_clear.active_window_secs,
             );
-            if actively_turning {
+            // Cross-gate escalation backstop (2026-04-28 q-2026-04-28-2449).
+            let escalation = should_escalate_suppression(
+                state,
+                config.suppression.max_consecutive_suppressions,
+                config.suppression.max_suppression_window_secs,
+            );
+            if actively_turning && escalation.is_none() {
                 let last_active_age = state
                     .last_active_at
                     .as_deref()
@@ -1510,8 +1625,10 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                         "reason": "main_loop_actively_turning",
                         "last_active_age_secs": last_active_age,
                         "active_window_secs": config.fresh_clear.active_window_secs,
+                        "consecutive_suppressions": state.consecutive_suppressions + 1,
                     }),
                 );
+                record_suppression(state, &now);
                 // Reset the consecutive counter so we don't re-fire on
                 // the very next check after the active window closes.
                 // The detection has to re-build from scratch.
@@ -1519,6 +1636,25 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                 state.last_check = Some(now);
                 crate::state::save_state(&config.general.state_file, state);
                 return;
+            }
+
+            if let Some(reason) = escalation {
+                warn!(
+                    tokens,
+                    consecutive_suppressions = state.consecutive_suppressions,
+                    escalation_reason = reason.as_str(),
+                    "fresh /clear inject escalating: suppression run capped — forcing inject"
+                );
+                write_jsonl_log(
+                    &config.general.log_file,
+                    "suppression_escalated",
+                    serde_json::json!({
+                        "site": "fresh_clear",
+                        "reason": reason.as_str(),
+                        "consecutive_suppressions": state.consecutive_suppressions,
+                        "first_suppression_at": state.first_suppression_at,
+                    }),
+                );
             }
 
             info!(tokens, "fresh /clear detected -- injecting resume");
@@ -1548,6 +1684,7 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
             state.fresh_clear_resume_inject_interrupts_total = state
                 .fresh_clear_resume_inject_interrupts_total
                 .saturating_add(1);
+            reset_suppression(state);
             state.last_check = Some(now);
             crate::state::save_state(&config.general.state_file, state);
             return;
@@ -1963,6 +2100,17 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                     bashes,
                     config.watcher_monitor.active_window_secs,
                 );
+            // Cross-gate escalation backstop (2026-04-28 q-2026-04-28-2449):
+            // if the suppression run has been long/persistent enough, force
+            // the inject regardless of `actively_turning`. Catches the
+            // sustained-dispatcher-window case where the gate would
+            // otherwise hold open indefinitely (real-world incident:
+            // claude-event-watch suppressed for 33 min).
+            let escalation = should_escalate_suppression(
+                state,
+                config.suppression.max_consecutive_suppressions,
+                config.suppression.max_suppression_window_secs,
+            );
             if should_inject && global_cooldown_blocks {
                 debug!(
                     cooldown = config.general.post_interrupt_cooldown_secs,
@@ -1977,7 +2125,7 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                     missing_list,
                 );
 
-                if actively_turning {
+                if actively_turning && escalation.is_none() {
                     // Suppression path: still emit the structured
                     // claude-event (out-of-band notify) and log it,
                     // but do NOT interrupt or inject into the pane.
@@ -2002,8 +2150,10 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                             "bashes": bashes_now,
                             "last_active_age_secs": last_active_age,
                             "active_window_secs": config.watcher_monitor.active_window_secs,
+                            "consecutive_suppressions": state.consecutive_suppressions + 1,
                         }),
                     );
+                    record_suppression(state, &now);
                     // Out-of-band sink still fires — message reflects
                     // suppression so downstream consumers can tell
                     // this fire did not preempt the pane.
@@ -2019,14 +2169,38 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                         severity: crate::event_bus::Severity::Medium,
                         message: &suppressed_msg,
                     });
-                    // Bump the cooldown clock so we don't re-emit the
-                    // event every 10s while the loop stays busy. Do
-                    // NOT touch last_interrupt_at — no interrupt fired,
-                    // and that flag drives the global post-interrupt
-                    // cooldown for OTHER fire paths.
-                    state.last_watcher_inject = Some(now.clone());
+                    // NOTE (2026-04-28 q-2026-04-28-2449): we used to
+                    // bump `last_watcher_inject` here so the cooldown
+                    // clock advanced even on suppressed fires. That was
+                    // a bug: a single suppressed attempt ate the full
+                    // 5-min `inject_cooldown` slot, so even after the
+                    // main loop went idle 1s later, the next inject was
+                    // deferred until the cooldown elapsed. Now we leave
+                    // the cooldown clock untouched on suppression — the
+                    // shared `consecutive_suppressions` counter and the
+                    // wall-clock window backstop are the things that
+                    // bound the suppression run, not the cooldown clock.
                     crate::state::save_state(&config.general.state_file, state);
                 } else {
+                    if let Some(reason) = escalation {
+                        warn!(
+                            missing = %missing_list,
+                            consecutive_suppressions = state.consecutive_suppressions,
+                            escalation_reason = reason.as_str(),
+                            "watcher-down inject escalating: suppression run capped — forcing inject"
+                        );
+                        write_jsonl_log(
+                            &config.general.log_file,
+                            "suppression_escalated",
+                            serde_json::json!({
+                                "site": "watcher_monitor",
+                                "reason": reason.as_str(),
+                                "consecutive_suppressions": state.consecutive_suppressions,
+                                "first_suppression_at": state.first_suppression_at,
+                                "missing": missing_names,
+                            }),
+                        );
+                    }
                     warn!(missing = %missing_list, "watchers down — interrupting and injecting restart");
                     write_jsonl_log(
                         &config.general.log_file,
@@ -2073,6 +2247,7 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                     state.watcher_inject_count += 1;
                     state.watcher_down_interrupts_total =
                         state.watcher_down_interrupts_total.saturating_add(1);
+                    reset_suppression(state);
                     crate::state::save_state(&config.general.state_file, state);
                 }
             }
@@ -2904,5 +3079,290 @@ mod tests {
         let mut state = State::default();
         state.last_active_at = Some("garbage".to_string());
         assert!(!fresh_clear_inject_suppressed(&state, 0, true, 60));
+    }
+
+    // --- Cross-gate suppression-escalation tests (2026-04-28, q-2026-04-28-2449) ---
+    //
+    // These pin the behavior of the shared escalation mechanism that backstops
+    // the three suppression gates. Real-world incident: claude-event-watch
+    // died at 19:27Z and stayed down 33 min because watcher_monitor's
+    // suppression gate kept holding through a sustained dispatcher window.
+    // These tests guarantee the next time that happens we escalate at the
+    // configured cap and force-inject.
+
+    #[test]
+    fn test_record_suppression_first_call_stamps_timestamp() {
+        // 0 -> 1 transition: first_suppression_at should be set, counter
+        // bumped to 1.
+        let mut state = State::default();
+        let now = chrono::Utc::now().to_rfc3339();
+        record_suppression(&mut state, &now);
+        assert_eq!(state.consecutive_suppressions, 1);
+        assert_eq!(state.first_suppression_at.as_deref(), Some(now.as_str()));
+    }
+
+    #[test]
+    fn test_record_suppression_subsequent_calls_preserve_timestamp() {
+        // Once first_suppression_at is set, subsequent calls must NOT
+        // overwrite it (otherwise the wall-clock backstop would never
+        // fire — the window would keep resetting).
+        let mut state = State::default();
+        let t0 = "2026-04-28T00:00:00+00:00".to_string();
+        let t1 = "2026-04-28T00:01:00+00:00".to_string();
+        let t2 = "2026-04-28T00:02:00+00:00".to_string();
+        record_suppression(&mut state, &t0);
+        record_suppression(&mut state, &t1);
+        record_suppression(&mut state, &t2);
+        assert_eq!(state.consecutive_suppressions, 3);
+        // t0 is the first, must persist across the next two.
+        assert_eq!(state.first_suppression_at, Some(t0));
+    }
+
+    #[test]
+    fn test_record_suppression_saturates_at_u32_max() {
+        // Sanity: catastrophic counter overflow must not panic.
+        let mut state = State::default();
+        state.consecutive_suppressions = u32::MAX;
+        state.first_suppression_at = Some(iso_secs_ago(60));
+        record_suppression(&mut state, "now");
+        assert_eq!(state.consecutive_suppressions, u32::MAX);
+    }
+
+    #[test]
+    fn test_reset_suppression_clears_both_fields() {
+        let mut state = State::default();
+        state.consecutive_suppressions = 5;
+        state.first_suppression_at = Some(iso_secs_ago(120));
+        reset_suppression(&mut state);
+        assert_eq!(state.consecutive_suppressions, 0);
+        assert!(state.first_suppression_at.is_none());
+    }
+
+    #[test]
+    fn test_reset_suppression_idempotent_when_already_clear() {
+        let mut state = State::default();
+        reset_suppression(&mut state);
+        assert_eq!(state.consecutive_suppressions, 0);
+        assert!(state.first_suppression_at.is_none());
+    }
+
+    #[test]
+    fn test_should_escalate_returns_none_when_counter_zero() {
+        // The very first suppression of a run can never escalate — the
+        // gate has not yet demonstrably failed to drain. Required so the
+        // happy path (one suppression, then the active turn ends, then
+        // the watcher comes back) doesn't escalate.
+        let state = State::default();
+        assert_eq!(should_escalate_suppression(&state, 3, 600), None);
+    }
+
+    #[test]
+    fn test_should_escalate_fires_on_consecutive_cap() {
+        // counter == max: escalation due to consecutive cap.
+        let mut state = State::default();
+        state.consecutive_suppressions = 3;
+        state.first_suppression_at = Some(iso_secs_ago(10));
+        assert_eq!(
+            should_escalate_suppression(&state, 3, 600),
+            Some(EscalationReason::ConsecutiveCap)
+        );
+    }
+
+    #[test]
+    fn test_should_escalate_fires_on_consecutive_cap_overshoot() {
+        // counter > max also fires — defensive against off-by-one
+        // bumps from a code-path that increments after the predicate
+        // check.
+        let mut state = State::default();
+        state.consecutive_suppressions = 10;
+        state.first_suppression_at = Some(iso_secs_ago(10));
+        assert_eq!(
+            should_escalate_suppression(&state, 3, 600),
+            Some(EscalationReason::ConsecutiveCap)
+        );
+    }
+
+    #[test]
+    fn test_should_escalate_fires_on_window_exceeded() {
+        // Counter is below the consecutive cap but the wall-clock
+        // window has been exceeded — escalate via the window backstop.
+        // Mirrors the slow-drip case where suppressions land less often
+        // than the cap implies (e.g. a check that satisfies the gate
+        // every other cycle).
+        let mut state = State::default();
+        state.consecutive_suppressions = 1;
+        state.first_suppression_at = Some(iso_secs_ago(700));
+        assert_eq!(
+            should_escalate_suppression(&state, 3, 600),
+            Some(EscalationReason::WindowExceeded)
+        );
+    }
+
+    #[test]
+    fn test_should_escalate_returns_none_below_both_limits() {
+        // counter < cap AND elapsed < window: no escalation, normal
+        // suppression continues.
+        let mut state = State::default();
+        state.consecutive_suppressions = 1;
+        state.first_suppression_at = Some(iso_secs_ago(60));
+        assert_eq!(should_escalate_suppression(&state, 3, 600), None);
+    }
+
+    #[test]
+    fn test_should_escalate_consecutive_cap_zero_disables_consecutive_check() {
+        // max_consecutive_suppressions=0 disables the consecutive-cap
+        // limb (operator escape hatch). With counter=10 and the cap
+        // disabled, only the window backstop can escalate.
+        let mut state = State::default();
+        state.consecutive_suppressions = 10;
+        state.first_suppression_at = Some(iso_secs_ago(10));
+        // Window also too short to fire: should NOT escalate.
+        assert_eq!(should_escalate_suppression(&state, 0, 600), None);
+        // Window exceeded: window-side escalation still fires.
+        state.first_suppression_at = Some(iso_secs_ago(700));
+        assert_eq!(
+            should_escalate_suppression(&state, 0, 600),
+            Some(EscalationReason::WindowExceeded)
+        );
+    }
+
+    #[test]
+    fn test_should_escalate_window_zero_disables_window_check() {
+        // max_suppression_window_secs=0 disables the window backstop.
+        // Useful escape hatch for environments that want only the
+        // consecutive-cap behaviour.
+        let mut state = State::default();
+        state.consecutive_suppressions = 1;
+        state.first_suppression_at = Some(iso_secs_ago(10000));
+        // Even with a 10000s gap, window=0 means no escalation.
+        assert_eq!(should_escalate_suppression(&state, 3, 0), None);
+        // Counter still triggers escalation independently.
+        state.consecutive_suppressions = 5;
+        assert_eq!(
+            should_escalate_suppression(&state, 3, 0),
+            Some(EscalationReason::ConsecutiveCap)
+        );
+    }
+
+    #[test]
+    fn test_should_escalate_invalid_first_suppression_at_treated_as_no_window_data() {
+        // Garbage timestamp → window check skips, falls through to None
+        // unless the consecutive cap also fires. Mirrors the defensive
+        // semantics elsewhere.
+        let mut state = State::default();
+        state.consecutive_suppressions = 1;
+        state.first_suppression_at = Some("garbage".to_string());
+        assert_eq!(should_escalate_suppression(&state, 3, 600), None);
+    }
+
+    #[test]
+    fn test_should_escalate_consecutive_cap_takes_precedence_over_window() {
+        // When BOTH limits would fire, ConsecutiveCap is reported — the
+        // counter check runs first. Documents the precedence so log
+        // analysis is stable.
+        let mut state = State::default();
+        state.consecutive_suppressions = 10;
+        state.first_suppression_at = Some(iso_secs_ago(10000));
+        assert_eq!(
+            should_escalate_suppression(&state, 3, 600),
+            Some(EscalationReason::ConsecutiveCap)
+        );
+    }
+
+    #[test]
+    fn test_record_then_reset_returns_to_pristine_state() {
+        // End-to-end: a suppression run that ends with a successful
+        // inject (reset_suppression called) leaves state ready for a
+        // brand-new run, with no leftover history.
+        let mut state = State::default();
+        record_suppression(&mut state, "2026-04-28T00:00:00+00:00");
+        record_suppression(&mut state, "2026-04-28T00:00:30+00:00");
+        record_suppression(&mut state, "2026-04-28T00:01:00+00:00");
+        assert_eq!(state.consecutive_suppressions, 3);
+        reset_suppression(&mut state);
+        // Next run starts from scratch — consecutive_suppressions=0
+        // means should_escalate returns None.
+        assert_eq!(should_escalate_suppression(&state, 3, 600), None);
+        // And first_suppression_at gets re-stamped on the next record.
+        record_suppression(&mut state, "2026-04-28T01:00:00+00:00");
+        assert_eq!(state.consecutive_suppressions, 1);
+        assert_eq!(
+            state.first_suppression_at.as_deref(),
+            Some("2026-04-28T01:00:00+00:00")
+        );
+    }
+
+    // --- Regression test for the cooldown-bump bug (2026-04-28) ---
+    //
+    // Pre-fix, the watcher_monitor suppression path bumped
+    // `state.last_watcher_inject = now` even though no inject ran.
+    // That ate the full 5-min `inject_cooldown` slot on a single
+    // suppressed attempt — even if the active window closed 1s later,
+    // the next inject was deferred until the cooldown elapsed.
+    //
+    // The fix is intentional structural: the suppression branch in
+    // watcher_monitor no longer touches `last_watcher_inject`. We
+    // assert via a focused unit test of `record_suppression` (which
+    // is what the suppression branch now calls) PLUS a no-op state
+    // mutation check.
+
+    #[test]
+    fn test_record_suppression_does_not_touch_last_watcher_inject() {
+        // Pin the contract: record_suppression bumps the suppression
+        // counter ONLY. It must not silently update the watcher-down
+        // cooldown clock — that field tracks the last actual inject,
+        // which is the cooldown-bump bug we're fixing.
+        let mut state = State::default();
+        state.last_watcher_inject = Some("2026-04-28T00:00:00+00:00".to_string());
+        record_suppression(&mut state, "2026-04-28T01:00:00+00:00");
+        // last_watcher_inject is untouched — only consecutive_suppressions
+        // and first_suppression_at moved.
+        assert_eq!(
+            state.last_watcher_inject.as_deref(),
+            Some("2026-04-28T00:00:00+00:00")
+        );
+        assert_eq!(state.consecutive_suppressions, 1);
+        assert_eq!(
+            state.first_suppression_at.as_deref(),
+            Some("2026-04-28T01:00:00+00:00")
+        );
+    }
+
+    #[test]
+    fn test_record_suppression_does_not_touch_last_interrupt_at() {
+        // Same contract for the global post-interrupt cooldown clock.
+        // No interrupt fired (we suppressed), so last_interrupt_at must
+        // not move — otherwise other fire paths (prolonged-thinking,
+        // context-warning) would be cooled-down by a non-event.
+        let mut state = State::default();
+        state.last_interrupt_at = Some("2026-04-28T00:00:00+00:00".to_string());
+        record_suppression(&mut state, "2026-04-28T01:00:00+00:00");
+        assert_eq!(
+            state.last_interrupt_at.as_deref(),
+            Some("2026-04-28T00:00:00+00:00")
+        );
+    }
+
+    // --- State transient-reset on daemon load (2026-04-28) ---
+    //
+    // The escalation state fields (consecutive_suppressions,
+    // first_suppression_at) are transient — daemon downtime makes the
+    // "consecutive" semantics meaningless and a stale persisted timestamp
+    // would cause the wall-clock backstop to fire immediately on the
+    // first suppression after restart. load_state must clear both.
+    // The actual reset lives in src/state.rs::load_state; this test
+    // documents the expected behaviour from policy's perspective (a
+    // fresh State has both fields zeroed).
+
+    #[test]
+    fn test_default_state_has_clean_suppression_counters() {
+        // Stand-in for the "load_state from missing file" case — the
+        // reset semantics in load_state mean a brand-new daemon never
+        // sees stale escalation state.
+        let state = State::default();
+        assert_eq!(state.consecutive_suppressions, 0);
+        assert!(state.first_suppression_at.is_none());
+        // And no escalation fires on a pristine state.
+        assert_eq!(should_escalate_suppression(&state, 3, 600), None);
     }
 }

@@ -168,6 +168,21 @@ max_panes = 20
 # Show all tasks including persistent watchers (false = workloads only)
 show_all = false
 
+[suppression]
+# Cross-gate suppression-escalation backstop. The watcher-down, fresh-/clear,
+# and dead-process suppression gates each defer their inject when the main
+# loop is "actively turning". A long sustained dispatcher window can hold
+# the gate open indefinitely (real incident 2026-04-27: claude-event-watch
+# was suppressed for 33 min). These two limits cap the suppression run.
+# When EITHER trips on the next gate-fire, the fire force-injects regardless.
+# Counters are SHARED across all three gates (see State.consecutive_suppressions).
+#
+# After this many consecutive suppressed fires, the next fire force-injects.
+max_consecutive_suppressions = 3
+# Wall-clock backstop (seconds) since the FIRST suppression in the current run.
+# 600 = 10 min; the 33-min real-world incident would have triggered at 10 min.
+max_suppression_window_secs = 600
+
 [hybrid]
 # Hybrid hooks + daemon-fallback tuning.
 #
