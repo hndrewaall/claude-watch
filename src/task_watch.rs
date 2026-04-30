@@ -728,9 +728,13 @@ pub async fn run_task_watch_loop(config: TaskWatchConfig, shutdown: Arc<AtomicBo
     // Orphan pane cleanup: scan existing panes in the session and kill any
     // that aren't tracked (leftover from a previous daemon instance).
     // Pane 0 is the daemon/status pane — never kill it.
+    // Workload panes (registered in /tmp/claude-workloads/state.json by the
+    // `workload` CLI) are NOT in state.tracked but must also be preserved —
+    // see the 2026-04-30 promote-layl-s01 incident (pane %1832 killed mid-run).
     let existing_panes = list_existing_panes(&session).await;
     let tracked_pane_ids: std::collections::HashSet<String> =
         state.tracked.values().map(|t| t.pane_id.clone()).collect();
+    let workload_pane_ids = load_workload_pane_ids();
     let mut orphan_count = 0;
     for pane in &existing_panes {
         // Skip pane 0 (daemon pane)
@@ -739,6 +743,17 @@ pub async fn run_task_watch_loop(config: TaskWatchConfig, shutdown: Arc<AtomicBo
         }
         // Skip panes we just adopted during initial sync
         if tracked_pane_ids.contains(&pane.pane_id) {
+            continue;
+        }
+        // Skip panes registered as active workloads. The workload registry
+        // lives in a separate state file from agent task outputs, so these
+        // panes will never appear in state.tracked even when fully alive.
+        if workload_pane_ids.contains(&pane.pane_id) {
+            info!(
+                pane_id = %pane.pane_id,
+                pane_index = pane.pane_index,
+                "preserving workload pane from cleanup"
+            );
             continue;
         }
         // This pane is untracked — it's an orphan from a previous daemon instance.
@@ -1190,11 +1205,68 @@ fn setup_notify_watcher(
     Some(watcher)
 }
 
+/// Path to the workload registry state file.
+///
+/// The `workload` CLI writes a JSON registry keyed by workload label, with
+/// each entry containing a `pane_id`. Tests can override the path via the
+/// `CLAUDE_WATCH_WORKLOAD_STATE` env var (default: `/tmp/claude-workloads/state.json`).
+fn workload_state_path() -> PathBuf {
+    if let Ok(p) = std::env::var("CLAUDE_WATCH_WORKLOAD_STATE") {
+        if !p.is_empty() {
+            return PathBuf::from(p);
+        }
+    }
+    PathBuf::from("/tmp/claude-workloads/state.json")
+}
+
+/// Load the set of pane IDs registered as active workloads.
+///
+/// Default-open semantics: a missing or malformed state file MUST NOT cause
+/// the daemon to crash or skip cleanup — it just yields an empty set, so the
+/// orphan-pane sweep proceeds as if no workloads exist. This matches the
+/// general "broken hook never blackholes the loop" rule for claude-watch.
+fn load_workload_pane_ids() -> std::collections::HashSet<String> {
+    let path = workload_state_path();
+    let content = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(e) => {
+            // Missing file is the common case (no workloads registered yet).
+            // Anything else is worth a debug breadcrumb but still default-open.
+            if e.kind() != std::io::ErrorKind::NotFound {
+                debug!(path = %path.display(), error = %e, "workload state read failed");
+            }
+            return std::collections::HashSet::new();
+        }
+    };
+    let state: serde_json::Value = match serde_json::from_str(&content) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(path = %path.display(), error = %e, "workload state malformed; treating as empty");
+            return std::collections::HashSet::new();
+        }
+    };
+    let obj = match state.as_object() {
+        Some(o) => o,
+        None => {
+            warn!(path = %path.display(), "workload state is not a JSON object; treating as empty");
+            return std::collections::HashSet::new();
+        }
+    };
+    obj.values()
+        .filter_map(|info| {
+            info.get("pane_id")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+        })
+        .collect()
+}
+
 /// Get the list of running workloads by reading workload state and intersecting
 /// with the currently alive panes in the tasks session.
 async fn get_running_workloads(session: &str) -> Vec<String> {
-    let state_file = "/tmp/claude-workloads/state.json";
-    let content = match std::fs::read_to_string(state_file) {
+    let path = workload_state_path();
+    let content = match std::fs::read_to_string(&path) {
         Ok(s) => s,
         Err(_) => return Vec::new(),
     };
@@ -1846,6 +1918,149 @@ mod tests {
         assert_eq!(
             extract_task_id_from_pane_cmd(cmd),
             Some("my-task-123".to_string())
+        );
+    }
+
+    // --- load_workload_pane_ids boundary tests ---
+    //
+    // Each test installs a unique mock state.json path via the
+    // `CLAUDE_WATCH_WORKLOAD_STATE` env var, then calls `load_workload_pane_ids`.
+    // The env var is process-global, so we use a single mutex to serialize the
+    // tests against each other (and against any concurrent unit test that might
+    // touch this var). We deliberately do NOT serialize against e2e tests —
+    // those run in their own binary, in a separate process.
+    use std::sync::Mutex;
+    static WORKLOAD_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct EnvGuard;
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            std::env::remove_var("CLAUDE_WATCH_WORKLOAD_STATE");
+        }
+    }
+
+    #[test]
+    fn test_load_workload_pane_ids_missing_file() {
+        let _lock = WORKLOAD_ENV_LOCK.lock().unwrap();
+        let _guard = EnvGuard;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("does-not-exist.json");
+        std::env::set_var("CLAUDE_WATCH_WORKLOAD_STATE", &path);
+        // Default-open: missing file → empty set, no panic.
+        let ids = load_workload_pane_ids();
+        assert!(ids.is_empty(), "missing file should yield empty set");
+    }
+
+    #[test]
+    fn test_load_workload_pane_ids_malformed_json() {
+        let _lock = WORKLOAD_ENV_LOCK.lock().unwrap();
+        let _guard = EnvGuard;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad.json");
+        std::fs::write(&path, "{ this is not valid json").unwrap();
+        std::env::set_var("CLAUDE_WATCH_WORKLOAD_STATE", &path);
+        // Default-open: malformed JSON → empty set + warn log, no panic.
+        let ids = load_workload_pane_ids();
+        assert!(ids.is_empty(), "malformed JSON should yield empty set");
+    }
+
+    #[test]
+    fn test_load_workload_pane_ids_empty_object() {
+        let _lock = WORKLOAD_ENV_LOCK.lock().unwrap();
+        let _guard = EnvGuard;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty.json");
+        std::fs::write(&path, "{}").unwrap();
+        std::env::set_var("CLAUDE_WATCH_WORKLOAD_STATE", &path);
+        let ids = load_workload_pane_ids();
+        assert!(ids.is_empty(), "empty object should yield empty set");
+    }
+
+    #[test]
+    fn test_load_workload_pane_ids_single_workload() {
+        let _lock = WORKLOAD_ENV_LOCK.lock().unwrap();
+        let _guard = EnvGuard;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        std::fs::write(
+            &path,
+            r#"{"promote-layl-s01":{"pane_id":"%1832","command":"stv-promote ...","output":"/tmp/x.output","started_at":"2026-04-30T18:00:00"}}"#,
+        )
+        .unwrap();
+        std::env::set_var("CLAUDE_WATCH_WORKLOAD_STATE", &path);
+        let ids = load_workload_pane_ids();
+        assert_eq!(ids.len(), 1);
+        assert!(ids.contains("%1832"));
+    }
+
+    #[test]
+    fn test_load_workload_pane_ids_multiple_workloads() {
+        let _lock = WORKLOAD_ENV_LOCK.lock().unwrap();
+        let _guard = EnvGuard;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "wa": {"pane_id": "%100", "command": "x"},
+                "wb": {"pane_id": "%200", "command": "y"},
+                "wc": {"pane_id": "", "command": "z"}
+            }"#,
+        )
+        .unwrap();
+        std::env::set_var("CLAUDE_WATCH_WORKLOAD_STATE", &path);
+        let ids = load_workload_pane_ids();
+        // Empty pane_id should be filtered out.
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains("%100"));
+        assert!(ids.contains("%200"));
+    }
+
+    #[test]
+    fn test_load_workload_pane_ids_root_is_array() {
+        // A JSON array at the root is malformed for our schema (we expect an object).
+        // Default-open: warn + empty set.
+        let _lock = WORKLOAD_ENV_LOCK.lock().unwrap();
+        let _guard = EnvGuard;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("array.json");
+        std::fs::write(&path, "[1, 2, 3]").unwrap();
+        std::env::set_var("CLAUDE_WATCH_WORKLOAD_STATE", &path);
+        let ids = load_workload_pane_ids();
+        assert!(ids.is_empty(), "non-object root should yield empty set");
+    }
+
+    #[test]
+    fn test_workload_state_path_default() {
+        let _lock = WORKLOAD_ENV_LOCK.lock().unwrap();
+        let _guard = EnvGuard;
+        std::env::remove_var("CLAUDE_WATCH_WORKLOAD_STATE");
+        assert_eq!(
+            workload_state_path(),
+            PathBuf::from("/tmp/claude-workloads/state.json")
+        );
+    }
+
+    #[test]
+    fn test_workload_state_path_env_override() {
+        let _lock = WORKLOAD_ENV_LOCK.lock().unwrap();
+        let _guard = EnvGuard;
+        std::env::set_var("CLAUDE_WATCH_WORKLOAD_STATE", "/custom/path/state.json");
+        assert_eq!(
+            workload_state_path(),
+            PathBuf::from("/custom/path/state.json")
+        );
+    }
+
+    #[test]
+    fn test_workload_state_path_empty_env_falls_back_to_default() {
+        let _lock = WORKLOAD_ENV_LOCK.lock().unwrap();
+        let _guard = EnvGuard;
+        std::env::set_var("CLAUDE_WATCH_WORKLOAD_STATE", "");
+        // Empty string should NOT redirect to "" — fall back to the default path.
+        assert_eq!(
+            workload_state_path(),
+            PathBuf::from("/tmp/claude-workloads/state.json")
         );
     }
 }
