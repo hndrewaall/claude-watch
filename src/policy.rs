@@ -3340,6 +3340,35 @@ mod tests {
         assert!(result.is_none(), "margin should override percent threshold");
     }
 
+    #[test]
+    fn test_context_threshold_margin_fires_even_when_compact_remaining_present() {
+        // Regression test for the 2026-04-30 incident: tokens at 95.97%
+        // (well past the 90% / 100K margin threshold) but
+        // compact_remaining=Some(30) blocked the margin check via the old
+        // else-if chain. The session climbed from 912K → 959K over 12 minutes
+        // with zero context_threshold events emitted.
+        //
+        // Required behavior: compact-trigger and margin/percent triggers must
+        // be INDEPENDENT. compact_remaining is the primary signal, but when
+        // it's present and not triggering, the margin/percent fallback must
+        // still run as a safety net.
+        let result = check_context_threshold_with_margin(
+            959_756,         // tokens
+            1_000_000,       // max
+            Some(30),        // compact_remaining > compact_trigger_percent
+            75,              // threshold_percent
+            5,               // compact_trigger_percent
+            Some(100_000),   // threshold_margin (trigger at 900K)
+        );
+        assert!(
+            result.is_some(),
+            "margin must fire when compact_remaining is present but not triggering"
+        );
+        let (pct, by_compact) = result.unwrap();
+        assert!((pct - 95.9756).abs() < 0.01);
+        assert!(!by_compact, "should be by_margin, not by_compact");
+    }
+
     // --- Thinking backoff threshold tests ---
 
     #[test]
