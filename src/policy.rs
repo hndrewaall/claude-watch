@@ -1044,6 +1044,18 @@ async fn inject_context_warning(pane: &str, pct: f64, compact_remaining: Option<
 
 /// Determine if context threshold is exceeded.
 /// Returns Some((pct, triggered_by_compact)) if triggered, None otherwise.
+///
+/// The three trigger paths are INDEPENDENT — any one firing causes a trigger:
+///
+/// 1. **BY_COMPACT** (primary): `compact_remaining <= compact_trigger_percent`.
+///    The most accurate signal when Claude Code reports it.
+/// 2. **BY_MARGIN** (safety net): `tokens >= max_context_tokens - threshold_margin`.
+///    Runs even when compact_remaining is Some but not triggering — this is the
+///    fix for the 2026-04-30 incident where a session sat at 95.97% for 12 min
+///    with no auto-clear because the old else-if chain skipped this check.
+/// 3. **BY_PERCENT** (legacy fallback): `pct >= threshold_percent`. Only used
+///    when threshold_margin is unset (per documented config semantics:
+///    "ignored when threshold_margin is set").
 pub(crate) fn check_context_threshold_with_margin(
     tokens: u64,
     max_context_tokens: u64,
@@ -1054,16 +1066,27 @@ pub(crate) fn check_context_threshold_with_margin(
 ) -> Option<(f64, bool)> {
     let pct = (tokens as f64 / max_context_tokens as f64) * 100.0;
 
+    // Primary: compact_remaining is the most accurate signal when present.
     if let Some(cr) = compact_remaining {
         if cr <= compact_trigger_percent {
             return Some((pct, true));
         }
-    } else if let Some(margin) = threshold_margin {
-        // Fixed margin: trigger when tokens >= max - margin
+    }
+
+    // Safety net: fixed token margin from max. Runs independently of the
+    // compact_remaining check — if compact didn't trigger above, margin still
+    // gets a chance to fire.
+    if let Some(margin) = threshold_margin {
         if max_context_tokens > margin && tokens >= max_context_tokens - margin {
             return Some((pct, false));
         }
-    } else if pct >= threshold_percent as f64 {
+        // When threshold_margin is set, threshold_percent is ignored
+        // (legacy fallback semantics, documented in ContextMonitorConfig).
+        return None;
+    }
+
+    // Legacy fallback: percent of max.
+    if pct >= threshold_percent as f64 {
         return Some((pct, false));
     }
 
@@ -3271,8 +3294,10 @@ mod tests {
 
     #[test]
     fn test_context_threshold_compact_remaining_safe() {
-        // compact_remaining = 50% > 5% trigger — no trigger
-        let result = check_context_threshold_with_margin(150000, 200000, Some(50), 75, 5, None);
+        // compact_remaining = 50% > 5% trigger — compact path doesn't fire.
+        // Use low tokens (50K of 200K = 25%) so the percent fallback also
+        // doesn't fire; expect None.
+        let result = check_context_threshold_with_margin(50000, 200000, Some(50), 75, 5, None);
         assert!(result.is_none());
     }
 
@@ -3306,14 +3331,24 @@ mod tests {
     }
 
     #[test]
-    fn test_context_threshold_compact_overrides_token() {
-        // compact_remaining is present and safe (50%), even though tokens are at 80%
-        // Primary trigger (compact) takes precedence — not triggered
+    fn test_context_threshold_compact_does_not_block_percent_fallback() {
+        // compact_remaining is present and safe (50%, > 5% trigger), tokens
+        // are at 80% (>= 75% threshold), and threshold_margin is unset.
+        //
+        // The compact check is the PRIMARY signal but does not BLOCK the
+        // fallback paths — when compact doesn't trigger, the legacy percent
+        // fallback must still run. Expected: BY_PERCENT trigger.
+        //
+        // (Previously this test asserted is_none(), encoding the very bug
+        // fixed in this commit — see test_context_threshold_margin_fires_*.)
         let result = check_context_threshold_with_margin(160000, 200000, Some(50), 75, 5, None);
         assert!(
-            result.is_none(),
-            "compact_remaining safe should prevent trigger even with high tokens"
+            result.is_some(),
+            "compact-safe should not block percent fallback"
         );
+        let (pct, by_compact) = result.unwrap();
+        assert!(!by_compact, "should be BY_PERCENT, not BY_COMPACT");
+        assert!((pct - 80.0).abs() < 0.1);
     }
 
     #[test]
@@ -3367,6 +3402,63 @@ mod tests {
         let (pct, by_compact) = result.unwrap();
         assert!((pct - 95.9756).abs() < 0.01);
         assert!(!by_compact, "should be by_margin, not by_compact");
+    }
+
+    #[test]
+    fn test_context_threshold_compact_wins_over_margin() {
+        // compact_remaining=Some(3) (triggers, <= 5) AND margin would not fire
+        // (tokens at 200K, far from max-margin=900K). compact_remaining takes
+        // precedence — BY_COMPACT path.
+        let result = check_context_threshold_with_margin(
+            200_000,
+            1_000_000,
+            Some(3),
+            75,
+            5,
+            Some(100_000),
+        );
+        assert!(result.is_some());
+        let (_, by_compact) = result.unwrap();
+        assert!(by_compact, "compact_remaining=3 should win over margin");
+    }
+
+    #[test]
+    fn test_context_threshold_neither_compact_nor_margin_fires() {
+        // compact_remaining=Some(30) doesn't trigger and tokens=500K is below
+        // the margin threshold (900K). Expect None — no trigger.
+        let result = check_context_threshold_with_margin(
+            500_000,
+            1_000_000,
+            Some(30),
+            75,
+            5,
+            Some(100_000),
+        );
+        assert!(result.is_none(), "neither compact nor margin should fire");
+    }
+
+    #[test]
+    fn test_context_threshold_compact_present_but_safe_falls_through_to_percent() {
+        // When compact_remaining is present but doesn't trigger, AND
+        // threshold_margin is unset, the legacy percent fallback must still
+        // run. Tokens=160K of 200K = 80% > 75% threshold. Expect BY_PERCENT.
+        // This is the regression guard for the bug fix: the old else-if chain
+        // would skip this check entirely when compact_remaining was Some.
+        let result = check_context_threshold_with_margin(
+            160_000,
+            200_000,
+            Some(30), // compact present but not triggering
+            75,
+            5,
+            None, // no margin set, legacy percent path
+        );
+        assert!(
+            result.is_some(),
+            "percent fallback must fire when compact present but not triggering"
+        );
+        let (pct, by_compact) = result.unwrap();
+        assert!(!by_compact, "should be BY_PERCENT, not BY_COMPACT");
+        assert!((pct - 80.0).abs() < 0.1);
     }
 
     // --- Thinking backoff threshold tests ---
