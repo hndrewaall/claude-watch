@@ -202,6 +202,128 @@ pub fn emit(alert: &ClaudeWatchAlert<'_>) {
     );
 }
 
+/// One workload-done event. Emitted exactly once per workload run when
+/// the underlying tmux-pane wrapper script finishes (or `workload kill`
+/// terminates it). Surfaced to the main loop via `claude-event-watch`
+/// as `EVENT[workload/workload-done] ...`, replacing the "fire a
+/// `workload wait` background task and poll" pattern.
+#[derive(Debug, Clone)]
+pub struct WorkloadDoneEvent<'a> {
+    pub label: &'a str,
+    /// Exit code as reported by the wrapper script. Negative values
+    /// indicate non-natural termination — `-15` for `workload kill`
+    /// (SIGTERM marker), other negative for future kill modes.
+    pub exit_code: i32,
+    /// True iff the wrapper script did not write its own exit code
+    /// (i.e. `workload kill` raced ahead and synthesised this event).
+    pub killed: bool,
+    /// Path to the workload's output log so the main loop can `Read`
+    /// the tail without re-deriving paths.
+    pub log_path: &'a str,
+}
+
+/// Build the JSON event body for a workload-done event. Public for
+/// testability; production callers should use `emit_workload_done()`.
+pub fn build_workload_done_json(ev: &WorkloadDoneEvent<'_>) -> serde_json::Value {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0);
+    let now_iso = chrono::Local::now().to_rfc3339();
+    let hostname = hostname_string();
+    let user = std::env::var("USER").unwrap_or_default();
+    let pid = std::process::id();
+
+    // Human-readable message — same string the main loop sees in the
+    // `EVENT[workload/workload-done] <preview>` one-liner.
+    let message = if ev.killed {
+        format!(
+            "workload {} killed (rc={}, log={})",
+            ev.label, ev.exit_code, ev.log_path
+        )
+    } else {
+        format!(
+            "workload {} done rc={} log={}",
+            ev.label, ev.exit_code, ev.log_path
+        )
+    };
+
+    // Priority: success = low (informational), failure/kill = normal
+    // (still not urgent — the main loop should react but it's not an
+    // alert).
+    let priority = if ev.exit_code == 0 { "low" } else { "normal" };
+
+    serde_json::json!({
+        "timestamp": now,
+        "timestamp_iso": now_iso,
+        "hostname": hostname,
+        "source": "workload",
+        "source_name": ev.label,
+        "tag": "workload-done",
+        "priority": priority,
+        "message": message,
+        "data": {
+            "label": ev.label,
+            "exit_code": ev.exit_code,
+            "killed": ev.killed,
+            "log_path": ev.log_path,
+        },
+        "pid": pid,
+        "user": user,
+    })
+}
+
+/// Emit a workload-done event into the queue dir. Idempotency is the
+/// caller's responsibility — this function unconditionally writes one
+/// event file per call. Default-open: I/O failure is logged at warn
+/// level and swallowed (the wrapper script's exit-file write already
+/// happened; losing the event is recoverable via `workload list`).
+pub fn emit_workload_done(ev: &WorkloadDoneEvent<'_>) {
+    let dir = queue_dir();
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        tracing::warn!(error = %e, dir = %dir.display(),
+            "workload-done emit: failed to create queue dir, skipping");
+        return;
+    }
+
+    let event = build_workload_done_json(ev);
+    let body = match serde_json::to_string_pretty(&event) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(error = %e, "workload-done emit: failed to serialize event");
+            return;
+        }
+    };
+
+    let ts_ns = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let final_name = format!("{}_workload-done.json", ts_ns);
+    let final_path = dir.join(&final_name);
+    let tmp_path = dir.join(format!(".{}.tmp", final_name));
+
+    if let Err(e) = std::fs::write(&tmp_path, body.as_bytes()) {
+        tracing::warn!(error = %e, path = %tmp_path.display(),
+            "workload-done emit: failed to write tmp file");
+        return;
+    }
+    if let Err(e) = std::fs::rename(&tmp_path, &final_path) {
+        tracing::warn!(error = %e, src = %tmp_path.display(), dst = %final_path.display(),
+            "workload-done emit: failed to rename tmp into place");
+        let _ = std::fs::remove_file(&tmp_path);
+        return;
+    }
+
+    tracing::info!(
+        path = %final_path.display(),
+        label = %ev.label,
+        exit_code = ev.exit_code,
+        killed = ev.killed,
+        "workload-done event emitted"
+    );
+}
+
 /// Cheap, no-deps hostname lookup. Falls back to `gethostname`'s
 /// failure mode (empty string) — the event still emits, the field is
 /// just blank.
@@ -367,5 +489,116 @@ mod tests {
             serde_json::from_str(&content).expect("event is valid JSON");
         assert_eq!(parsed["tag"], "claude-watch-alert");
         assert_eq!(parsed["data"]["alert_type"], "prolonged-thinking");
+    }
+
+    #[test]
+    fn build_workload_done_natural_exit() {
+        let ev = WorkloadDoneEvent {
+            label: "ebook-twilight",
+            exit_code: 0,
+            killed: false,
+            log_path: "/tmp/claude-workloads/ebook-twilight.output",
+        };
+        let v = build_workload_done_json(&ev);
+
+        assert_eq!(v["tag"], "workload-done");
+        assert_eq!(v["source"], "workload");
+        assert_eq!(v["source_name"], "ebook-twilight");
+        assert_eq!(v["priority"], "low"); // exit 0 → low
+        assert!(v["message"]
+            .as_str()
+            .unwrap()
+            .contains("workload ebook-twilight done rc=0"));
+        let data = &v["data"];
+        assert_eq!(data["label"], "ebook-twilight");
+        assert_eq!(data["exit_code"], 0);
+        assert_eq!(data["killed"], false);
+        assert_eq!(
+            data["log_path"],
+            "/tmp/claude-workloads/ebook-twilight.output"
+        );
+    }
+
+    #[test]
+    fn build_workload_done_failure_exit() {
+        let ev = WorkloadDoneEvent {
+            label: "broken-task",
+            exit_code: 2,
+            killed: false,
+            log_path: "/tmp/claude-workloads/broken-task.output",
+        };
+        let v = build_workload_done_json(&ev);
+        assert_eq!(v["priority"], "normal"); // non-zero exit → normal
+        assert_eq!(v["data"]["exit_code"], 2);
+        assert_eq!(v["data"]["killed"], false);
+    }
+
+    #[test]
+    fn build_workload_done_killed() {
+        let ev = WorkloadDoneEvent {
+            label: "dead-task",
+            exit_code: -15,
+            killed: true,
+            log_path: "/tmp/claude-workloads/dead-task.output",
+        };
+        let v = build_workload_done_json(&ev);
+        assert_eq!(v["priority"], "normal");
+        assert_eq!(v["data"]["killed"], true);
+        assert_eq!(v["data"]["exit_code"], -15);
+        assert!(v["message"]
+            .as_str()
+            .unwrap()
+            .contains("workload dead-task killed"));
+    }
+
+    #[test]
+    fn emit_workload_done_writes_file_with_correct_shape() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let prev = std::env::var("CLAUDE_EVENT_QUEUE").ok();
+        // SAFETY: tests in this module don't concurrently mutate this var
+        // beyond the single set/restore window per test.
+        unsafe {
+            std::env::set_var("CLAUDE_EVENT_QUEUE", tmp.path());
+        }
+
+        let ev = WorkloadDoneEvent {
+            label: "translate-book",
+            exit_code: 0,
+            killed: false,
+            log_path: "/tmp/claude-workloads/translate-book.output",
+        };
+        emit_workload_done(&ev);
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("CLAUDE_EVENT_QUEUE", v),
+                None => std::env::remove_var("CLAUDE_EVENT_QUEUE"),
+            }
+        }
+
+        let entries: Vec<_> = std::fs::read_dir(tmp.path())
+            .expect("read tempdir")
+            .filter_map(Result::ok)
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .ends_with("_workload-done.json")
+            })
+            .collect();
+        assert_eq!(
+            entries.len(),
+            1,
+            "expected exactly one workload-done event file"
+        );
+
+        let content = std::fs::read_to_string(entries[0].path()).expect("read event");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&content).expect("event is valid JSON");
+        assert_eq!(parsed["tag"], "workload-done");
+        assert_eq!(parsed["source"], "workload");
+        assert_eq!(parsed["source_name"], "translate-book");
+        assert_eq!(parsed["data"]["label"], "translate-book");
+        assert_eq!(parsed["data"]["exit_code"], 0);
+        assert_eq!(parsed["data"]["killed"], false);
     }
 }

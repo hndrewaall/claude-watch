@@ -162,6 +162,23 @@ enum WorkloadAction {
         /// Workload label
         label: String,
     },
+    /// Internal: emit a workload-done claude-event. Called by the
+    /// wrapper script after the workload exits. Hidden from `--help`.
+    #[command(hide = true, name = "emit-done")]
+    EmitDone {
+        /// Workload label
+        #[arg(long)]
+        label: String,
+        /// Exit code from the wrapper (negative = kill marker)
+        #[arg(long)]
+        exit_code: i32,
+        /// Path to the workload's output log
+        #[arg(long)]
+        log_path: String,
+        /// Set if this exit was synthesised by `workload kill`
+        #[arg(long)]
+        killed: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -824,6 +841,12 @@ fn run_workload(action: WorkloadAction) -> i32 {
             lines,
         } => workload::cmd_log(&label, lines, follow),
         WorkloadAction::Kill { label } => workload::cmd_kill(&label),
+        WorkloadAction::EmitDone {
+            label,
+            exit_code,
+            log_path,
+            killed,
+        } => workload::cmd_emit_done(&label, exit_code, &log_path, killed),
     }
 }
 
