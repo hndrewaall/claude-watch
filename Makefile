@@ -1,4 +1,4 @@
-.PHONY: test test-verbose test-unit test-e2e test-live test-session-task test-hooks test-agent-msg test-claude-event test-self-clear test-watchers build deploy install install-hooks clean
+.PHONY: test test-verbose test-unit test-e2e test-live test-session-task test-hooks test-agent-msg test-agent-tail test-claude-event test-self-clear test-watchers build deploy install install-hooks clean
 
 # Default: run all tests in parallel via nextest (preferred) or cargo test
 test:
@@ -52,6 +52,13 @@ test-hooks:
 test-agent-msg:
 	python3 tools/agent-msg/agent-msg --test
 
+# Run the agent-tail embedded test suite (CLI for streaming agent
+# JSONL transcripts). Tests cover pure helpers, format_record dispatch,
+# resolution under a fake projects tree, and the follow-mode handler
+# (truncation + rotation). All cases run in-process against tmpdirs.
+test-agent-tail:
+	python3 tools/agent-tail/agent-tail --test
+
 # Run the claude-event + claude-event-tail unit tests.
 test-claude-event:
 	python3 tools/claude-event/tests/test_claude_event.py
@@ -97,6 +104,7 @@ install: build
 	@install -m 0755 tools/hooks/post-tool-obligations-update-hook $(BIN_DIR)/post-tool-obligations-update-hook
 	@install -m 0755 tools/hooks/post-tool-mark-attachment-read-hook $(BIN_DIR)/post-tool-mark-attachment-read-hook
 	@install -m 0755 tools/agent-msg/agent-msg $(BIN_DIR)/agent-msg
+	@install -m 0755 tools/agent-tail/agent-tail $(BIN_DIR)/agent-tail
 	@install -m 0755 tools/claude-event/claude-event $(BIN_DIR)/claude-event
 	@install -m 0755 tools/claude-event/claude-event-tail $(BIN_DIR)/claude-event-tail
 	@install -m 0755 tools/watchers/claude-event-watch $(BIN_DIR)/claude-event-watch
@@ -110,6 +118,7 @@ install: build
 	@echo "  - post-tool-obligations-update-hook"
 	@echo "  - post-tool-mark-attachment-read-hook"
 	@echo "  - agent-msg"
+	@echo "  - agent-tail"
 	@echo "  - claude-event"
 	@echo "  - claude-event-tail"
 	@echo "  - claude-event-watch"
