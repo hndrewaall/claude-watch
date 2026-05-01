@@ -105,6 +105,18 @@ enum Commands {
         /// Output as JSON (default: human-readable)
         #[arg(long)]
         json: bool,
+        /// Max JSONL-mtime age (seconds) for an agent to count as alive.
+        /// Subagents share the parent Claude PID, so per-subagent /proc
+        /// liveness is impossible — we infer "still working" from the
+        /// transcript being actively appended. Default: 120s.
+        #[arg(long, default_value_t = active_agents::DEFAULT_AGENT_ALIVE_MAX_AGE_SECS)]
+        max_age_seconds: u64,
+        /// If set, also write the JSON output atomically to this path.
+        /// Intended for cron-driven publishing to a bind-mountable
+        /// location (e.g. /var/lib/claude-watch/active-agents.json) so
+        /// other processes can read it without shelling out.
+        #[arg(long, value_name = "PATH")]
+        write_state: Option<String>,
     },
     /// Manage task-watch (background task tmux panes)
     Task {
@@ -673,6 +685,7 @@ async fn run_status(json: bool, tokens_only: bool, bashes_only: bool) {
     let agents = agents.unwrap_or(active_agents::ActiveAgents {
         subagents: Vec::new(),
         workloads: Vec::new(),
+        agents: Vec::new(),
     });
 
     let healthy_watchers = watchers.iter().filter(|w| w.status == "ok").count() as u32;
@@ -1206,8 +1219,16 @@ async fn main() {
         Some(Commands::Agent { action }) => {
             run_agent(action);
         }
-        Some(Commands::ActiveAgents { json }) => {
-            let code = active_agents::cmd_active_agents(json);
+        Some(Commands::ActiveAgents {
+            json,
+            max_age_seconds,
+            write_state,
+        }) => {
+            let code = active_agents::cmd_active_agents(
+                json,
+                max_age_seconds,
+                write_state.as_deref(),
+            );
             if code != 0 {
                 std::process::exit(code);
             }
