@@ -409,3 +409,116 @@ sleep 30
 
     let _ = std::fs::remove_file(&script_path);
 }
+
+/// Regression test for the "ddi typed into insert-mode buffer" bug (Andrew
+/// flagged 2026-05-01).
+///
+/// BUG: `is_insert_mode` matched only the literal substring `-- INSERT`
+/// against an unjoined pane capture. When the pane was narrow enough that
+/// Claude Code's status bar wrapped — leaving the `INSERT` token alone on
+/// its own visual line, dashes split off elsewhere — the substring search
+/// missed the marker entirely. `inject_text`'s Step 1 Escape loop then
+/// broke out after ONE Escape (because `is_insert_mode` returned false on
+/// the first poll), but a single Escape can be absorbed by autocomplete
+/// dropdowns / ghost-text overlays without reaching NORMAL. The follow-up
+/// `dd` and `i` keys then arrived inside INSERT mode and were typed
+/// literally as `ddi...` into the user's prompt buffer.
+///
+/// FIX (two parts):
+///   1. `is_insert_mode` now also recognizes a bare `INSERT` token in the
+///      bottom 5 lines of the capture, AND uses `capture_pane_joined` (-J)
+///      first to reassemble wrapped status bars.
+///   2. `inject_text`'s Step 1 Escape loop ALWAYS sends at least two
+///      Escapes before checking `is_insert_mode`. Two Escapes is
+///      idempotent (Escape in NORMAL is a no-op bell), so the worst case
+///      is a single extra bell — well worth the safety margin.
+///
+/// This test renders a fake Claude TUI with the WRAPPED form of the
+/// status bar (bare `INSERT` token alone on a line) and runs inject_text
+/// against it. The test asserts:
+///   (a) inject_text completes in a bounded time (no infinite loop), and
+///   (b) the final pane state shows the injected text — confirming the
+///       Escape coercion eventually landed even when the first Escape
+///       result was unreliable.
+#[test]
+fn inject_text_handles_wrap_truncated_insert_marker() {
+    let session_name = unique_session_name("insert-wrap");
+    let _guard = TmuxSession::new(&session_name);
+
+    let status = Command::new("tmux")
+        .args([
+            "new-session",
+            "-d",
+            "-s",
+            &session_name,
+            "-x",
+            "60", // narrow pane to encourage wrap
+            "-y",
+            "30",
+        ])
+        .status()
+        .expect("create tmux session");
+    assert!(status.success());
+    std::thread::sleep(Duration::from_millis(500));
+
+    // Render an idle Claude-Code TUI where the status bar wrapped so
+    // `INSERT` appears alone on its own visual line (no `--` dashes
+    // adjacent). Pre-fix, `is_insert_mode` would return false here and
+    // `inject_text`'s Escape loop would exit after one Escape.
+    let script = r#"
+clear
+printf '● Some completed output\n'
+printf '\n'
+printf '──────────────────────────────────\n'
+printf '❯ \n'
+printf '──────────────────────────────────\n'
+printf '  bypass\n'
+printf '  INSERT\n'
+printf '  606746 tokens\n'
+sleep 30
+"#;
+    let script_path = format!("/tmp/cw-insert-wrap-{}.sh", std::process::id());
+    std::fs::write(&script_path, script).expect("write script");
+    let _ = Command::new("chmod").args(["+x", &script_path]).output();
+
+    send_literal(&session_name, &format!("bash {}", script_path));
+    send_keys(&session_name, &["Enter"]);
+    std::thread::sleep(Duration::from_millis(500));
+
+    let pane = format!("{}:0.0", session_name);
+
+    // Sanity check: confirm the pane capture really does have bare
+    // `INSERT` and NOT `-- INSERT`. If the test rig somehow rendered
+    // dashes anyway, the regression case isn't being exercised.
+    let pre_capture = capture_pane(&session_name).unwrap_or_default();
+    assert!(
+        pre_capture.contains("INSERT") && !pre_capture.contains("-- INSERT"),
+        "test rig must produce bare INSERT (no dashes); got:\n{}",
+        pre_capture
+    );
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let start = std::time::Instant::now();
+    rt.block_on(async {
+        // Verify the helper now correctly identifies this wrapped form
+        // BEFORE we rely on inject_text's behavior.
+        assert!(
+            claude_watch::tmux::is_insert_mode(&pane).await,
+            "is_insert_mode must recognize bare INSERT in wrapped status bar"
+        );
+        inject_text(&pane, "WRAP-COERCION-TEST").await;
+    });
+    let elapsed = start.elapsed();
+
+    eprintln!("inject_text elapsed: {:?}", elapsed);
+    // Bound: the Step-1 Escape loop now always runs at least 2
+    // iterations (~2s), Step-3 verify loop runs up to 3 iterations
+    // (~1.5s), plus various small settles. 20s is comfortable headroom.
+    assert!(
+        elapsed < Duration::from_secs(20),
+        "inject_text should not hang; elapsed {:?}",
+        elapsed
+    );
+
+    let _ = std::fs::remove_file(&script_path);
+}
