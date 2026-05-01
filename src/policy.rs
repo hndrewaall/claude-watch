@@ -2761,7 +2761,6 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                     last_seen_running: None,
                     consecutive_missing: 0,
                     enabled: entry.enabled,
-                    last_auto_restart_at: None,
                     event_emitted_at: None,
                 });
 
@@ -2873,125 +2872,31 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
             }
         }
 
-        // Auto-restart down watchers (q-2026-04-28-5481).
+        // Daemon-side watcher auto-restart was REMOVED 2026-05-01.
         //
-        // BUG HISTORY: Before this branch, the daemon emitted a
-        // `watcher-down` claude-event and (when the main loop wasn't
-        // actively turning) injected a restart prompt into the tmux pane,
-        // BUT it did not actually restart the watcher itself. The 2026-04-28
-        // incident: claude-event-watch was DOWN for 30+ minutes — the
-        // suppression branch fired repeatedly ("inject suppressed: main
-        // loop active"), the inject path never fired (suppression was
-        // active the whole time, didn't escalate within the test window),
-        // and the watcher stayed dead.
+        // Cardinal rule: watchers can ONLY be started by Claude Code's main
+        // loop, in the main loop's process tree. The previous block here
+        // called `crate::watcher::auto_restart_watcher` which spawned the
+        // watcher inside a transient `claude-watch-watcher-<name>.service`
+        // user systemd unit — that unit lives in `user@1000.service`, NOT
+        // as a descendant of Claude Code, so the watcher was orphaned from
+        // birth and invisible to the main-loop's obligation gate.
         //
-        // FIX: Run the actual restart UNCONDITIONALLY here, before the
-        // inject/suppression decision. The restart is purely additive (it
-        // spawns a detached child via the same `nohup start_cmd` pattern
-        // used by `watcher-ctl enable`) and does not touch the tmux pane,
-        // so it's safe even when the main loop is mid-tool-call. The
-        // existing alert/inject logic below is preserved verbatim — Andrew
-        // still gets the claude-event for visibility, and the inject path
-        // still tries to nudge the main loop when appropriate.
+        // The replacement is the existing tmux-inject path BELOW. When a
+        // watcher is missing-and-past-threshold the daemon types
+        // `watcher-ctl run <name>` into the Claude Code tmux pane, and the
+        // MAIN LOOP spawns the watcher in its own process tree. claude-watch
+        // (the daemon) never spawns watchers itself.
         //
-        // Cooldown is PER-WATCHER (`WatcherState.last_auto_restart_at`)
-        // and uses `config.watcher_monitor.auto_restart_cooldown_secs`
-        // (default 30s) — distinct from the much-longer `inject_cooldown`
-        // used for the tmux-pane prompt. The shorter clock is what makes
-        // the wait-and-exit watcher pattern (claude-event-watch exits
-        // after each event delivery) work cleanly: the daemon re-spawns
-        // it within ~30s rather than ~5min.
-        if any_critical_missing {
-            let cooldown = config.watcher_monitor.auto_restart_cooldown_secs;
-            let mut spawned: Vec<(String, u32)> = Vec::new();
-            let mut errors: Vec<(String, String)> = Vec::new();
-            let mut deferred: Vec<String> = Vec::new();
-            for name in &missing_names {
-                let due = state
-                    .watcher_health
-                    .get(name)
-                    .and_then(|h| h.last_auto_restart_at.as_deref())
-                    .and_then(elapsed_since)
-                    .is_none_or(|e| e >= cooldown as f64);
-                if !due {
-                    deferred.push(name.clone());
-                    continue;
-                }
-                match crate::watcher::auto_restart_watcher(
-                    &config.watcher_monitor.watchers_config,
-                    name,
-                )
-                .await
-                {
-                    Ok((pid, _)) => {
-                        spawned.push((name.clone(), pid));
-                        if let Some(h) = state.watcher_health.get_mut(name) {
-                            h.last_auto_restart_at = Some(now.clone());
-                        }
-                    }
-                    Err(e) => errors.push((name.clone(), e)),
-                }
-            }
-            if !spawned.is_empty() {
-                let summary = spawned
-                    .iter()
-                    .map(|(n, p)| format!("{}={}", n, p))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                warn!(
-                    spawned = %summary,
-                    "watcher-down auto-restart fired"
-                );
-                write_jsonl_log(
-                    &config.general.log_file,
-                    "watcher_auto_restart",
-                    serde_json::json!({
-                        "spawned": spawned
-                            .iter()
-                            .map(|(n, p)| serde_json::json!({"name": n, "pid": p}))
-                            .collect::<Vec<_>>(),
-                    }),
-                );
-                // Reset per-watcher consecutive_missing for the ones
-                // we just respawned. The next check cycle will see
-                // the new process via pgrep and confirm health; we
-                // pre-zero here so a stale 6+ counter doesn't keep
-                // counting the watcher as down for one extra cycle
-                // and re-fire on the next check.
-                for (name, _) in &spawned {
-                    if let Some(h) = state.watcher_health.get_mut(name) {
-                        h.consecutive_missing = 0;
-                    }
-                }
-            }
-            if !errors.is_empty() {
-                for (name, err) in &errors {
-                    warn!(watcher = %name, error = %err, "watcher-down auto-restart failed");
-                }
-                write_jsonl_log(
-                    &config.general.log_file,
-                    "watcher_auto_restart_failed",
-                    serde_json::json!({
-                        "errors": errors
-                            .iter()
-                            .map(|(n, e)| serde_json::json!({"name": n, "error": e}))
-                            .collect::<Vec<_>>(),
-                    }),
-                );
-            }
-            if !deferred.is_empty() {
-                debug!(
-                    deferred = %deferred.join(", "),
-                    cooldown_secs = cooldown,
-                    "watcher-down auto-restart deferred: per-watcher cooldown active"
-                );
-            }
-            if !spawned.is_empty() || !errors.is_empty() {
-                crate::state::save_state(&config.general.state_file, state);
-            }
-        }
+        // See: feedback_watcher-architecture-cardinal.md in claude-config.
 
         // Inject restart commands if watchers are down and cooldown has passed.
+        //
+        // The tmux-inject path is the SOLE daemon-side recovery action for
+        // a down watcher (cardinal rule, 2026-05-01). When a watcher misses
+        // enough consecutive checks, we type `watcher-ctl run <name>` into
+        // the Claude Code pane so the main loop spawns the watcher in its
+        // own process tree. The daemon never spawns watchers directly.
         //
         // NOTE (2026-04-28, PR #44): The watcher-down inject path is
         // intentionally EXEMPT from `interrupt_in_global_cooldown`. A down
@@ -3018,8 +2923,9 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
             // api_retry suppression (PR #45): if Claude Code is currently
             // in upstream-API retry backoff, an inject would wipe the
             // retry state machine and force a brand-new turn. Skip the
-            // inject path entirely until the retry resolves; the auto-
-            // restart already ran above and is independent of the pane.
+            // inject path entirely until the retry resolves. The next check
+            // cycle will re-evaluate and re-fire the inject once the
+            // api-retry episode clears.
             if should_inject && api_retrying {
                 debug!(
                     "watcher-down inject would fire but api_retry active — suppressing"
@@ -5025,7 +4931,6 @@ max_stuck_secs = {max_stuck}
             last_seen_running: None,
             consecutive_missing: 5,
             enabled: true,
-            last_auto_restart_at: None,
             event_emitted_at: Some("2026-04-28T12:00:00+00:00".to_string()),
         };
         // Mirror the recovery branch:

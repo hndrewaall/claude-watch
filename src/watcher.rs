@@ -322,8 +322,19 @@ pub fn exit_code_from_status(code: Option<i32>, signal: Option<i32>) -> i32 {
 }
 
 /// Enable or disable a watcher by rewriting the config file.
-/// On disable, kills matching processes.
-/// On enable, kills existing instances and starts via nohup.
+///
+/// **Cardinal rule (2026-05-01):** watchers can ONLY be started by Claude
+/// Code's main loop, in the main loop's process tree. `enable` therefore
+/// flips the config bit and stops there — the next `watcher-restart` /
+/// session-resume run *by the main loop* is what actually spawns the
+/// watcher. We do NOT `nohup` (or any other supervisor mechanism) the
+/// start_cmd from this process: a daemon-spawned watcher would live in the
+/// wrong process tree and become invisible to the main loop's obligation
+/// gate. See `feedback_watcher-architecture-cardinal.md` in claude-config.
+///
+/// On disable, kills matching processes (this side is fine — the main loop
+/// owns the watcher, killing it cleanly is not the same as spawning).
+///
 /// Watchers that must never be disabled (guardrails).
 const PROTECTED_WATCHERS: &[&str] = &["memory-remind"];
 
@@ -342,7 +353,6 @@ pub async fn watcher_toggle(config_path: &str, name: &str, enable: bool) -> Resu
     let new_val = if enable { "true" } else { "false" };
     let mut found = false;
     let mut target_pattern = String::new();
-    let mut target_start_cmd: Option<String> = None;
     let mut output_lines = Vec::new();
 
     for line in content.lines() {
@@ -357,9 +367,6 @@ pub async fn watcher_toggle(config_path: &str, name: &str, enable: bool) -> Resu
             target_pattern = parts[1].to_string();
             let min_count = parts.get(2).unwrap_or(&"1");
             let start_cmd = parts.get(4).unwrap_or(&"");
-            if !start_cmd.is_empty() {
-                target_start_cmd = Some(start_cmd.to_string());
-            }
             output_lines.push(format!(
                 "{}|{}|{}|{}|{}",
                 parts[0], parts[1], min_count, new_val, start_cmd
@@ -381,37 +388,14 @@ pub async fn watcher_toggle(config_path: &str, name: &str, enable: bool) -> Resu
         .map_err(|e| format!("failed to write config: {}", e))?;
 
     if enable {
-        // Kill any existing instances first to avoid duplicates
-        let pids = process_pids(&target_pattern).await;
-        if !pids.is_empty() {
-            for pid in &pids {
-                let _ = run_cmd_any(&["kill", &pid.to_string()], 5).await;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        }
-
-        if let Some(cmd) = &target_start_cmd {
-            let args: Vec<&str> = cmd.split_whitespace().collect();
-            if !args.is_empty() {
-                let child = tokio::process::Command::new("nohup")
-                    .args(&args)
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .spawn();
-                match child {
-                    Ok(c) => {
-                        let pid = c.id().unwrap_or(0);
-                        return Ok(format!("{}: enabled (started, pid {})", name, pid));
-                    }
-                    Err(e) => {
-                        return Ok(format!("{}: enabled (failed to start: {})", name, e));
-                    }
-                }
-            }
-        }
+        // Config-only flip. The main loop is responsible for spawning the
+        // watcher (e.g. via `watcher-restart` or a fresh
+        // `watcher-ctl run <name>` background task). We deliberately do not
+        // spawn it here — see the doc comment above.
         Ok(format!(
-            "{}: enabled (no start command configured -- start manually)",
-            name
+            "{}: enabled (config flipped — main loop must spawn via \
+             `watcher-ctl run {}` or `watcher-restart`)",
+            name, name
         ))
     } else {
         // Kill matching processes
@@ -428,352 +412,30 @@ pub async fn watcher_toggle(config_path: &str, name: &str, enable: bool) -> Resu
     }
 }
 
-/// Stable transient-unit name for the daemon-supervised watcher.
-///
-/// Format: `claude-watch-watcher-<name>.service`. Stable so we can detect
-/// already-running instances (idempotent restart) and verify liveness via
-/// `systemctl --user is-active`.
-fn supervised_unit_name(watcher_name: &str) -> String {
-    format!("claude-watch-watcher-{}.service", watcher_name)
-}
-
-/// Look up the systemd MainPID of a transient user unit.
-///
-/// Returns `Some(pid)` if the unit is loaded and has a non-zero MainPID.
-/// Returns `None` on any failure (unit not loaded, parse error, etc.) —
-/// callers should treat that as "not currently supervised".
-async fn supervised_unit_main_pid(unit: &str) -> Option<u32> {
-    let (out, _) = run_systemctl_user(
-        &[
-            "systemctl",
-            "--user",
-            "show",
-            "-p",
-            "MainPID",
-            "--value",
-            unit,
-        ],
-        5,
-    )
-    .await;
-    let trimmed = out.trim();
-    let pid: u32 = trimmed.parse().ok()?;
-    if pid == 0 {
-        None
-    } else {
-        Some(pid)
-    }
-}
-
-/// Verify a transient user unit is in a healthy state. Accepts both
-/// `active` (steady state) and `activating` (briefly during a respawn
-/// cycle for `Restart=on-success` units). Used as the post-spawn liveness
-/// gate so we never report "spawn fired" without the unit actually being
-/// alive somewhere in its lifecycle.
-///
-/// Rejects: `inactive`, `failed`, `deactivating`. Default-closed on any
-/// error (caller treats that as "spawn unverified").
-///
-/// Why `activating` counts as healthy: `claude-event-watch` is a
-/// wait-and-exit watcher — it blocks on inotify until an event arrives,
-/// drains the queue, and exits cleanly. Our supervised unit uses
-/// `Restart=on-success` + `RestartSec=1`, so during the ~1s gap between
-/// exit and respawn `systemctl is-active` reports `activating`. That's
-/// the desired behaviour, not a failure. Restricting to just `active`
-/// caused the q-2026-04-28-6602 spurious "spawn failed" reports — the
-/// daemon's polling window happened to land in the restart gap.
-async fn supervised_unit_is_active(unit: &str) -> bool {
-    let (out, _ok) = run_systemctl_user(&["systemctl", "--user", "is-active", unit], 5).await;
-    let state = out.trim();
-    state == "active" || state == "activating" || state == "reloading"
-}
-
-/// Stricter steady-state check used only by the idempotency short-circuit
-/// (where `activating` is ambiguous between "healthy mid-respawn" and
-/// "a previous attempt that's still trying"). We only short-circuit when
-/// the unit is fully `active` AND its last `Result` was `success`.
-///
-/// Returns false on any error or any non-`active` state — caller falls
-/// through to the normal spawn path, which is idempotent at the
-/// `systemd-run --unit=<stable-name>` layer (systemd will refuse a duplicate
-/// active unit, surfacing it as a clear error).
-async fn supervised_unit_is_healthy_steady(unit: &str) -> bool {
-    let (out, _ok) = run_systemctl_user(
-        &[
-            "systemctl",
-            "--user",
-            "show",
-            "-p",
-            "ActiveState",
-            "-p",
-            "Result",
-            unit,
-        ],
-        5,
-    )
-    .await;
-    let mut active_state = "";
-    let mut result = "";
-    for line in out.lines() {
-        if let Some(rest) = line.strip_prefix("ActiveState=") {
-            active_state = rest.trim();
-        } else if let Some(rest) = line.strip_prefix("Result=") {
-            result = rest.trim();
-        }
-    }
-    active_state == "active" && result == "success"
-}
-
-/// Build the `XDG_RUNTIME_DIR` / `DBUS_SESSION_BUS_ADDRESS` env pair we
-/// need to talk to the user-instance systemd from a `system.slice` parent
-/// (claude-watch.service runs in the system slice but as `User=hndrewaall`,
-/// so the user systemd socket exists at `/run/user/<uid>/bus`).
-///
-/// CRITICAL: every `systemctl --user` and `systemd-run --user` call from
-/// the daemon needs these env vars or it fails with "Failed to connect to
-/// bus: No medium found". The daemon's environment lacks them by default
-/// (systemd doesn't propagate session vars into system.slice units).
-fn user_bus_env() -> Vec<(String, String)> {
-    let uid = unsafe { libc::getuid() };
-    let runtime_dir = std::env::var("XDG_RUNTIME_DIR")
-        .unwrap_or_else(|_| format!("/run/user/{}", uid));
-    let bus = std::env::var("DBUS_SESSION_BUS_ADDRESS")
-        .unwrap_or_else(|_| format!("unix:path={}/bus", runtime_dir));
-    vec![
-        ("XDG_RUNTIME_DIR".to_string(), runtime_dir),
-        ("DBUS_SESSION_BUS_ADDRESS".to_string(), bus),
-    ]
-}
-
-/// Run `systemctl --user`-style commands with the user-bus env vars
-/// applied. Returns (stdout, success). Mirrors `cmd::run_cmd_any` but
-/// guarantees the dbus session bus address is set so the call reaches
-/// the user-instance systemd from `system.slice`.
-async fn run_systemctl_user(args: &[&str], timeout_secs: u64) -> (String, bool) {
-    use std::process::Stdio;
-    let env_pairs = user_bus_env();
-    let result = tokio::time::timeout(
-        std::time::Duration::from_secs(timeout_secs),
-        {
-            let mut cmd = tokio::process::Command::new(args[0]);
-            cmd.args(&args[1..])
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped());
-            for (k, v) in &env_pairs {
-                cmd.env(k, v);
-            }
-            cmd.output()
-        },
-    )
-    .await;
-    match result {
-        Ok(Ok(output)) => {
-            let out = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            (out, output.status.success())
-        }
-        _ => (String::new(), false),
-    }
-}
-
-/// Auto-restart a single watcher by name as a SUPERVISED transient
-/// user-unit. Returns `(pid, name)` on success.
-///
-/// # Why supervised
-///
-/// The 2026-04-28 incident: claude-event-watch was DOWN and the daemon's
-/// `auto_restart_watcher` "fired" but the spawned process disappeared
-/// within milliseconds. Two compounding bugs:
-///
-/// 1. **Spawn-pattern drift.** The daemon spawned watchers via
-///    `tokio::process::Command::new("nohup")` directly into
-///    claude-watch.service's cgroup. When claude-watch.service stops
-///    (e.g. `make deploy`), KillMode=control-group reaps every descendant
-///    — so a daemon restart between auto-restart and verification looks
-///    indistinguishable from a spawn that never lived.
-///
-/// 2. **Event-amplification race.** When the daemon's inject path emits a
-///    `watcher-down` claude-event, that JSON file lands in the same queue
-///    `claude-event-watch` blocks on. The watcher we just spawned hits
-///    its own fast-path on startup, drains the watcher-down event, and
-///    exits cleanly within ~50ms — which from `ps -p <PID>` looks like
-///    "the process never lived". Wait-and-exit watchers REQUIRE a
-///    supervisor that re-invokes them after each event delivery; the
-///    main-loop's `watcher-ctl run` does this, but a one-shot daemon
-///    spawn does not.
-///
-/// # Fix
-///
-/// Spawn `watcher-ctl run <name>` as a transient user-instance unit:
-/// - **Cgroup escape.** The unit lives in `user@1000.service` slice, not
-///   `claude-watch.service`, so it survives daemon restarts.
-/// - **Auto-respawn.** `Restart=on-success` + `RestartSec=1` means when
-///   `claude-event-watch` exits cleanly after draining an event, systemd
-///   re-runs `watcher-ctl run claude-event-watch` ~1s later. The
-///   wait-and-exit pattern works correctly without a separate supervisor
-///   loop in the daemon.
-/// - **No spawn-pattern drift.** We exec `watcher-ctl run` — the exact
-///   same binary the main loop runs by hand — instead of reimplementing
-///   the spawn semantics.
-/// - **Idempotency.** The unit name `claude-watch-watcher-<name>.service`
-///   is stable, so a second `auto_restart_watcher` call while the unit is
-///   already `active (running)` short-circuits with the existing MainPID
-///   instead of conflicting.
-/// - **External verification.** `systemctl --user is-active <unit>` plus
-///   the recorded MainPID give us a real liveness check that does not
-///   depend on the daemon's own log lines (which Andrew correctly flagged
-///   as "evidence of nothing" when the spawned process is already dead).
-///
-/// # Verification
-///
-/// After invoking `systemd-run`, we:
-/// 1. Confirm the unit reaches `active (running)` (default-closed: treat
-///    timeout as failure).
-/// 2. Read the MainPID via `systemctl show -p MainPID`.
-/// 3. Return that PID — it's the `watcher-ctl run` supervisor PID, which
-///    is the one external observers (`pgrep -f`, `watcher-status`) see.
-///
-/// Returns `Err` with a human-readable reason on any failure.
-pub async fn auto_restart_watcher(config_path: &str, name: &str) -> Result<(u32, String), String> {
-    let entries = parse_watchers_config(config_path);
-    let entry = entries
-        .iter()
-        .find(|e| e.name == name)
-        .ok_or_else(|| format!("watcher '{}' not found in config", name))?;
-
-    if !entry.enabled {
-        return Err(format!("watcher '{}' is disabled", name));
-    }
-
-    // We rely on `start_cmd` only to validate the entry has one configured;
-    // the actual command we run is `watcher-ctl run <name>`, which is the
-    // existing working supervisor and dispatches to the start_cmd internally.
-    if entry.start_cmd.as_deref().map(|s| s.trim().is_empty()).unwrap_or(true) {
-        return Err(format!("no start command configured for '{}'", name));
-    }
-
-    // Ensure PID directory exists (best-effort).
-    let _ = std::fs::create_dir_all(PID_DIR);
-
-    let unit = supervised_unit_name(name);
-
-    // Idempotency: if the supervised unit is already in steady-state
-    // active+success, just return its MainPID. This makes repeated calls
-    // (e.g. policy.rs cooldown misfires) safe and lets
-    // `auto_restart_watcher` double as a "make sure this watcher is
-    // supervised" assertion. We use the strict steady-state check
-    // (active + Result=success) here because `activating` is ambiguous —
-    // it could be healthy-mid-respawn or a previous failed attempt.
-    if supervised_unit_is_healthy_steady(&unit).await {
-        if let Some(pid) = supervised_unit_main_pid(&unit).await {
-            let pid_file = format!("{}/{}.pid", PID_DIR, name);
-            let _ = std::fs::write(&pid_file, pid.to_string());
-            return Ok((pid, name.to_string()));
-        }
-    }
-
-    // If the unit name is already loaded — failed, inactive-but-cached,
-    // or even mid-restart — `systemd-run --unit=<name>` will refuse with
-    // "Unit X was already loaded or has a fragment file." Always clear
-    // the unit first. `systemctl stop` is a no-op for inactive units;
-    // `reset-failed` clears the failed-state cache; both are no-ops for
-    // unknown units. Best-effort — any real issue will surface as a
-    // clear `systemd-run` error below.
-    let _ = run_systemctl_user(&["systemctl", "--user", "stop", &unit], 5).await;
-    let _ = run_systemctl_user(&["systemctl", "--user", "reset-failed", &unit], 5).await;
-
-    // Spawn the supervisor as a transient user-instance unit. We pass
-    // PATH explicitly via `--setenv` so `watcher-ctl` resolves regardless
-    // of the daemon's environment.
-    let path_env = std::env::var("PATH").unwrap_or_else(|_| {
-        "/home/hndrewaall/bin:/usr/local/bin:/usr/bin:/bin".to_string()
-    });
-    let setenv_path = format!("PATH={}", path_env);
-    let unit_arg = format!("--unit={}", unit);
-    let systemd_args: Vec<&str> = vec![
-        "systemd-run",
-        "--user",
-        "--quiet",
-        &unit_arg,
-        "--property=Restart=on-success",
-        "--property=RestartSec=1",
-        // KillMode=mixed: send SIGTERM to MainPID, SIGKILL to remaining
-        // group. Keeps `systemctl stop` working without orphaning
-        // inotifywait children of `watcher-ctl run`.
-        "--property=KillMode=mixed",
-        "--property=TimeoutStopSec=5",
-        "--setenv",
-        &setenv_path,
-        "--",
-        "watcher-ctl",
-        "run",
-        name,
-    ];
-
-    // Build and run `systemd-run` synchronously — it returns immediately
-    // after starting the transient unit. We need the user-bus env vars
-    // set so the user systemd instance is reachable from system.slice.
-    let env_pairs = user_bus_env();
-    let mut cmd = tokio::process::Command::new("systemd-run");
-    cmd.args(&systemd_args[1..])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped());
-    for (k, v) in &env_pairs {
-        cmd.env(k, v);
-    }
-    let output = cmd
-        .output()
-        .await
-        .map_err(|e| format!("failed to exec systemd-run for '{}': {}", name, e))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!(
-            "systemd-run failed for '{}' (exit {:?}): {}",
-            name,
-            output.status.code(),
-            stderr.trim()
-        ));
-    }
-
-    // Verify the unit actually became active. We poll briefly because
-    // `systemd-run` returns as soon as systemd has accepted the unit,
-    // which can be a few hundred ms before ExecStart actually runs.
-    // Default-closed: if we never see `active (running)` within ~3s,
-    // treat the spawn as failed and surface the reason.
-    let mut last_active = false;
-    for _ in 0..15 {
-        if supervised_unit_is_active(&unit).await {
-            last_active = true;
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-    }
-    if !last_active {
-        // Try to capture the unit's failure detail for the error message.
-        let (status_out, _) = run_systemctl_user(
-            &["systemctl", "--user", "status", "--no-pager", &unit],
-            5,
-        )
-        .await;
-        return Err(format!(
-            "supervised unit '{}' did not reach active state for '{}': {}",
-            unit,
-            name,
-            status_out.lines().take(8).collect::<Vec<_>>().join(" | ")
-        ));
-    }
-
-    let pid = supervised_unit_main_pid(&unit)
-        .await
-        .ok_or_else(|| format!("supervised unit '{}' active but MainPID unknown", unit))?;
-
-    // Write the PID file so external watcher-status / fire handlers see
-    // a canonical PID for the watcher-ctl supervisor wrapper.
-    let pid_file = format!("{}/{}.pid", PID_DIR, name);
-    let _ = std::fs::write(&pid_file, pid.to_string());
-
-    Ok((pid, name.to_string()))
-}
+// ---------------------------------------------------------------------------
+// REMOVED 2026-05-01: daemon-side watcher auto-restart.
+//
+// Previous shape: `auto_restart_watcher` + a stack of `systemd-run --user`
+// helpers (`supervised_unit_name`, `supervised_unit_main_pid`,
+// `supervised_unit_is_active`, `supervised_unit_is_healthy_steady`,
+// `user_bus_env`, `run_systemctl_user`) that the daemon's check loop called
+// to spawn `watcher-ctl run <name>` as a transient user systemd unit.
+//
+// Why it was removed: it violated the cardinal rule that watchers can ONLY
+// be started by Claude Code's main loop, in the main loop's process tree.
+// A watcher inside a `claude-watch-watcher-<name>.service` user unit lives
+// in `user@1000.service` slice, NOT as a descendant of Claude Code — which
+// makes it invisible to the obligation gate, orphaned from the main loop's
+// process model, and a surprise to the next session ("ghost watcher: alive
+// but no one in claude-code spawned it"). See
+// `feedback_watcher-architecture-cardinal.md` in claude-config.
+//
+// What replaces it: nothing in this file. The daemon's only emergency
+// recovery action is now the existing tmux-inject path in `policy.rs`,
+// which types `watcher-ctl run <name>` into the Claude Code pane so the
+// MAIN LOOP spawns the watcher in its own process tree. claude-watch
+// (the daemon) never touches the watcher process directly.
+// ---------------------------------------------------------------------------
 
 /// Kill all enabled watcher processes and clean PID files.
 pub async fn watcher_restart(config_path: &str) -> String {
@@ -1523,165 +1185,90 @@ mod tests {
         assert!(!is_supervisor_comm(0));
     }
 
-    // --- auto_restart_watcher tests (q-2026-04-28-5481) -----------------
+    // --- watcher_toggle::enable: config-only flip (cardinal-rule guard) ---
     //
-    // The 2026-04-28 incident: claude-event-watch was DOWN for 30+ minutes
-    // and claude-watch never restarted it. Root cause: the watcher_monitor
-    // suppression branch (when main loop is "actively turning") emitted the
-    // watcher-down alert but skipped any restart action. These tests cover
-    // the new daemon-side restart helper that fires REGARDLESS of
-    // active-turn suppression.
+    // Andrew's cardinal rule (2026-05-01): watchers can ONLY be started by
+    // Claude Code's main loop. `watcher_toggle(_, _, true)` therefore must
+    // NOT spawn the start_cmd via `nohup` (or any other mechanism). It only
+    // flips the config bit — a subsequent `watcher-ctl run <name>` from the
+    // main loop is what actually starts the process.
 
     #[tokio::test]
-    async fn test_auto_restart_watcher_unknown_name() {
-        // Use a tempfile-style path that contains a single dummy entry —
-        // an unknown watcher name should yield an Err that names the
-        // missing entry verbatim.
+    async fn test_watcher_toggle_enable_is_config_only() {
+        // The watcher's pattern is a unique sentinel. After enabling we must
+        // NOT see any process matching that pattern: enable is config-only.
         let dir = tempfile::tempdir().unwrap();
         let cfg = dir.path().join("watchers.conf");
-        std::fs::write(&cfg, "real|real-pat|1|true|true\n").unwrap();
-
-        let result = auto_restart_watcher(cfg.to_str().unwrap(), "ghost").await;
-        assert!(result.is_err(), "unknown watcher must error");
-        let msg = result.unwrap_err();
-        assert!(
-            msg.contains("ghost") && msg.contains("not found"),
-            "error should mention 'ghost' and 'not found', got: {}",
-            msg
-        );
-    }
-
-    #[tokio::test]
-    async fn test_auto_restart_watcher_disabled() {
-        // A watcher whose `enabled` field is `false` must NOT be restarted —
-        // we don't want the daemon resurrecting watchers Andrew explicitly
-        // turned off.
-        let dir = tempfile::tempdir().unwrap();
-        let cfg = dir.path().join("watchers.conf");
-        std::fs::write(&cfg, "off-watcher|pat|1|false|true\n").unwrap();
-
-        let result = auto_restart_watcher(cfg.to_str().unwrap(), "off-watcher").await;
-        assert!(result.is_err(), "disabled watcher must error");
-        assert!(
-            result.unwrap_err().contains("disabled"),
-            "error must mention 'disabled'"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_auto_restart_watcher_no_start_cmd() {
-        // No start_cmd configured → can't restart, must error cleanly.
-        let dir = tempfile::tempdir().unwrap();
-        let cfg = dir.path().join("watchers.conf");
-        // Only 4 fields, no start_cmd
-        std::fs::write(&cfg, "x|pat|1|true\n").unwrap();
-
-        let result = auto_restart_watcher(cfg.to_str().unwrap(), "x").await;
-        assert!(result.is_err(), "missing start_cmd must error");
-        let msg = result.unwrap_err();
-        assert!(
-            msg.contains("no start command") || msg.contains("empty start"),
-            "error must mention missing start_cmd, got: {}",
-            msg
-        );
-    }
-
-    #[test]
-    fn test_supervised_unit_name_format() {
-        // The transient unit name has to be stable so duplicate
-        // `auto_restart_watcher` calls land on the same unit (idempotency
-        // / dup-supervisor avoidance). Lock the format.
-        assert_eq!(
-            supervised_unit_name("claude-event-watch"),
-            "claude-watch-watcher-claude-event-watch.service"
-        );
-        assert_eq!(
-            supervised_unit_name("signal-wait-dm"),
-            "claude-watch-watcher-signal-wait-dm.service"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_supervised_unit_main_pid_unknown_unit() {
-        // An unknown unit must yield None — never a panic, never a stale
-        // PID. Default-closed semantics for the liveness gate.
-        let pid = supervised_unit_main_pid(
-            "claude-watch-watcher-this-unit-does-not-exist-9999.service",
-        )
-        .await;
-        assert!(pid.is_none(), "unknown unit must return None, got {:?}", pid);
-    }
-
-    #[tokio::test]
-    async fn test_supervised_unit_is_active_unknown_unit() {
-        // Same default-closed semantics for is_active: an unknown unit
-        // must return false, not panic.
-        let active = supervised_unit_is_active(
-            "claude-watch-watcher-this-unit-does-not-exist-9999.service",
-        )
-        .await;
-        assert!(!active, "unknown unit must report inactive");
-    }
-
-    /// Live integration test: spawn a real watcher via the systemd-run
-    /// supervisor flow, verify the unit is active, then tear it down.
-    ///
-    /// `#[ignore]` by default because it (a) requires a working user
-    /// systemd instance with a reachable bus, (b) creates a transient
-    /// unit on the host, and (c) leaves PID-file side effects in
-    /// `/var/run/claude/`. Run explicitly with:
-    ///
-    /// ```text
-    /// cargo test -- --ignored test_auto_restart_watcher_spawns_supervised
-    /// ```
-    ///
-    /// The 3-cycle reproducibility check that proves the q-2026-04-28-6602
-    /// fix lives in `tests/e2e_auto_restart_watcher.rs` (also `#[ignore]`)
-    /// and runs against the real `claude-event-watch` watcher.
-    #[tokio::test]
-    #[ignore = "requires user systemd bus + writable /var/run/claude"]
-    async fn test_auto_restart_watcher_spawns_supervised() {
-        let dir = tempfile::tempdir().unwrap();
-        let cfg = dir.path().join("watchers.conf");
-        // Use a watcher name that doesn't collide with anything else,
-        // and a start_cmd that's guaranteed to exist (`sleep`).
-        let watcher_name = format!("autorestart-test-{}", std::process::id());
+        let sentinel = format!("cw-test-enable-sentinel-{}", std::process::id());
+        // start_cmd is a no-op `true` invocation; even if we accidentally
+        // spawned it, no `pgrep -f` for the sentinel would match. We use the
+        // sentinel as the *pattern* so a buggy spawn (which would have used
+        // the start_cmd) wouldn't show up here either — what we're actually
+        // asserting is the success-message text and the absence of a
+        // `started, pid` substring that the old nohup path emitted.
         std::fs::write(
             &cfg,
-            format!("{}|sleep 60|1|true|sleep 60\n", watcher_name),
+            format!("toggle-test|{}|1|false|true\n", sentinel),
         )
         .unwrap();
 
-        let result = auto_restart_watcher(cfg.to_str().unwrap(), &watcher_name).await;
+        let msg = watcher_toggle(cfg.to_str().unwrap(), "toggle-test", true)
+            .await
+            .expect("enable should succeed for a known watcher");
+        // Config-only flip — no `started, pid` substring, which was the
+        // signature of the old nohup spawn path.
+        assert!(
+            !msg.contains("started, pid"),
+            "enable must NOT report a spawn pid (cardinal rule), got: {}",
+            msg
+        );
+        // Confirm the new config-only message structure.
+        assert!(
+            msg.contains("config flipped") && msg.contains("main loop must spawn"),
+            "enable must clearly indicate config-only behavior, got: {}",
+            msg
+        );
 
-        // Best-effort cleanup, even on assertion failure below.
-        let cleanup = || {
-            let unit = supervised_unit_name(&watcher_name);
-            let _ = std::process::Command::new("systemctl")
-                .args(["--user", "stop", &unit])
-                .status();
-            let _ = std::process::Command::new("systemctl")
-                .args(["--user", "reset-failed", &unit])
-                .status();
-        };
+        // Verify the file actually got the enabled flag flipped.
+        let content = std::fs::read_to_string(&cfg).unwrap();
+        assert!(
+            content.contains("toggle-test|") && content.contains("|true|"),
+            "config file should have enabled=true, got: {}",
+            content
+        );
+    }
 
-        match result {
-            Ok((pid, name)) => {
-                assert_eq!(name, watcher_name);
-                assert!(pid > 1, "supervisor PID must be real, got {}", pid);
-                let proc_path = format!("/proc/{}", pid);
-                assert!(
-                    std::path::Path::new(&proc_path).exists(),
-                    "supervisor PID {} must be alive after spawn",
-                    pid
-                );
-                cleanup();
-            }
-            Err(e) => {
-                cleanup();
-                panic!("auto_restart_watcher failed: {}", e);
-            }
-        }
+    #[tokio::test]
+    async fn test_watcher_toggle_enable_does_not_spawn_process() {
+        // Stronger guard: after `enable`, there must be no descendant
+        // process matching the watcher's pattern. This is the test that
+        // would catch a regression where someone re-introduces the nohup
+        // spawn path.
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("watchers.conf");
+        let sentinel = format!("cw-test-no-spawn-{}-{}", std::process::id(), std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0));
+        // start_cmd that, IF spawned, would be visible to pgrep.
+        let start = format!("sleep 30 # {}", sentinel);
+        std::fs::write(
+            &cfg,
+            format!("toggle-test|{}|1|false|{}\n", sentinel, start),
+        )
+        .unwrap();
+
+        let _ = watcher_toggle(cfg.to_str().unwrap(), "toggle-test", true)
+            .await
+            .expect("enable should succeed");
+
+        // Give any rogue spawn a chance to actually fire.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let pids = process_pids(&sentinel).await;
+        assert!(
+            pids.is_empty(),
+            "watcher_toggle enable must NOT spawn the start_cmd (cardinal \
+             rule). Found PIDs: {:?}",
+            pids
+        );
     }
 
     // --- exit_code_from_status tests ---
