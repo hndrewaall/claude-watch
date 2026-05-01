@@ -1,4 +1,4 @@
-.PHONY: test test-verbose test-unit test-e2e test-live test-session-task build deploy install install-hooks clean
+.PHONY: test test-verbose test-unit test-e2e test-live test-session-task test-hooks build deploy install install-hooks clean
 
 # Default: run all tests in parallel via nextest (preferred) or cargo test
 test:
@@ -36,6 +36,15 @@ test-live:
 test-session-task:
 	uv run --python 3.11 --with pytest pytest tools/session-task/tests/ -v
 
+# Run the obligations / hooks Python tests. These are self-contained
+# scripts (not pytest), so we just exec them directly. Each runs against
+# an isolated $HOME tmpdir so the live obligations.json is never touched.
+# The pre-agent-queue-gate-hook test exercises the real `session-task`
+# binary; it must be on PATH (or installed via `make install`).
+test-hooks:
+	tools/hooks/tests/pre-tool-obligations-gate-hook.test
+	tools/hooks/tests/pre-agent-queue-gate-hook.test
+
 # Release build
 build:
 	cargo build --release
@@ -46,20 +55,35 @@ deploy: build
 
 # Install built binaries + scripts onto $PATH ($BIN_DIR, default ~/bin).
 # Targets:
-#   - claude-watch  : the Rust daemon
-#   - session-task  : Python CLI (cross-session queue + resume action)
+#   - claude-watch                          : the Rust daemon
+#   - session-task                          : Python CLI (queue + resume action)
+#   - obligations                           : obligations gate CLI
+#   - pre-agent-queue-gate-hook             : PreToolUse hook (Agent matcher)
+#   - pre-tool-obligations-gate-hook        : PreToolUse hook (* matcher)
+#   - post-tool-obligations-update-hook     : PostToolUse hook (* matcher)
+#   - post-tool-mark-attachment-read-hook   : PostToolUse hook (Read matcher)
 #
-# session-task ships as the script itself (no compile step). The Rust binary
-# depends on `make build` having been run first.
+# All Python scripts ship as the source itself (no compile step). The Rust
+# binary depends on `make build` having been run first.
 BIN_DIR ?= $(HOME)/bin
 
 install: build
 	@mkdir -p $(BIN_DIR)
 	@install -m 0755 target/release/claude-watch $(BIN_DIR)/claude-watch
 	@install -m 0755 tools/session-task/session-task $(BIN_DIR)/session-task
+	@install -m 0755 tools/obligations/obligations $(BIN_DIR)/obligations
+	@install -m 0755 tools/hooks/pre-agent-queue-gate-hook $(BIN_DIR)/pre-agent-queue-gate-hook
+	@install -m 0755 tools/hooks/pre-tool-obligations-gate-hook $(BIN_DIR)/pre-tool-obligations-gate-hook
+	@install -m 0755 tools/hooks/post-tool-obligations-update-hook $(BIN_DIR)/post-tool-obligations-update-hook
+	@install -m 0755 tools/hooks/post-tool-mark-attachment-read-hook $(BIN_DIR)/post-tool-mark-attachment-read-hook
 	@echo "Installed to $(BIN_DIR):"
 	@echo "  - claude-watch"
 	@echo "  - session-task"
+	@echo "  - obligations"
+	@echo "  - pre-agent-queue-gate-hook"
+	@echo "  - pre-tool-obligations-gate-hook"
+	@echo "  - post-tool-obligations-update-hook"
+	@echo "  - post-tool-mark-attachment-read-hook"
 
 # Install git pre-commit hook (warning-free build + unit/fixture tests).
 # Symlinks scripts/git-hooks/pre-commit into .git/hooks so script edits
