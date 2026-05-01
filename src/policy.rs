@@ -235,6 +235,54 @@ pub(crate) fn reset_suppression(state: &mut State) {
     state.first_suppression_at = None;
 }
 
+/// Pure helper: filter the missing-watchers list before emitting a
+/// `watcher-down` claude-event, suppressing the event entirely when the
+/// only thing down is the event-consumer watcher.
+///
+/// **Why this exists**: when the event-consumer watcher (typically
+/// `claude-event-watch`) goes down, dropping a `watcher-down` JSON file
+/// into `~/claude-events/` creates a self-reinforcing feedback loop:
+///
+///   1. consumer-watcher reads the next event, prints it, exits (one-shot).
+///   2. main loop restarts the consumer.
+///   3. claude-watch sees the consumer briefly DOWN, emits a
+///      `watcher-down` event ABOUT THE CONSUMER into `~/claude-events/`.
+///   4. consumer fires immediately on its own self-referential alert,
+///      exits. Goto 3.
+///
+/// We observed 6+ buffered self-alerts pile up after a fresh restart and
+/// take down the watcher for 30+ minutes. The fix: never write a
+/// `watcher-down` event whose only payload IS the consumer watcher — the
+/// consumer can't deliver an event about itself, so the file is
+/// pure self-feedback. The tmux-inject path (`watcher-ctl run <name>`
+/// typed into the Claude Code pane) is unaffected and remains the
+/// recovery channel for a down consumer.
+///
+/// Behaviour:
+/// - `affected = [consumer]`  → returns `None` (suppress emit entirely).
+/// - `affected = [a, consumer, b]` → returns `Some([a, b])` (filter
+///   the consumer out so the event is still useful for the other
+///   watchers without dragging the consumer's name back into the
+///   self-feedback path).
+/// - `affected = [a, b]` (consumer not present) → returns
+///   `Some([a, b])` unchanged.
+/// - `affected = []` → returns `None` (nothing to emit).
+pub(crate) fn filter_consumer_for_event_emit(
+    affected: &[String],
+    consumer_name: &str,
+) -> Option<Vec<String>> {
+    let filtered: Vec<String> = affected
+        .iter()
+        .filter(|name| name.as_str() != consumer_name)
+        .cloned()
+        .collect();
+    if filtered.is_empty() {
+        None
+    } else {
+        Some(filtered)
+    }
+}
+
 /// Quiet-path decision for watcher-down events.
 ///
 /// Pure helper: given the configured thresholds plus a watcher's current
@@ -3003,18 +3051,44 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                     // Out-of-band sink still fires — message reflects
                     // suppression so downstream consumers can tell
                     // this fire did not preempt the pane.
-                    let suppressed_msg = format!(
-                        "[CLAUDE-WATCH] watcher-down (inject suppressed: main loop active): {}",
-                        missing_list,
+                    //
+                    // Self-feedback guard: if the only down watcher is
+                    // the event consumer itself, suppress the JSON file
+                    // emit (it would just feed the consumer's own
+                    // restart loop). The tmux-inject path stays intact
+                    // and is the actual recovery channel here.
+                    let emit_targets = filter_consumer_for_event_emit(
+                        &missing_names,
+                        &event_consumer_name,
                     );
-                    alert::emit_event(crate::event_bus::ClaudeWatchAlert {
-                        alert_type: "watcher-down",
-                        stuck_reason: &watcher_reason,
-                        stale_minutes: None,
-                        affected_watchers: missing_names.clone(),
-                        severity: crate::event_bus::Severity::Medium,
-                        message: &suppressed_msg,
-                    });
+                    if let Some(targets) = emit_targets {
+                        let suppressed_msg = format!(
+                            "[CLAUDE-WATCH] watcher-down (inject suppressed: main loop active): {}",
+                            missing_list,
+                        );
+                        alert::emit_event(crate::event_bus::ClaudeWatchAlert {
+                            alert_type: "watcher-down",
+                            stuck_reason: &watcher_reason,
+                            stale_minutes: None,
+                            affected_watchers: targets,
+                            severity: crate::event_bus::Severity::Medium,
+                            message: &suppressed_msg,
+                        });
+                    } else {
+                        info!(
+                            consumer = %event_consumer_name,
+                            "watcher-down event emit suppressed: only the event consumer is down (self-feedback guard)"
+                        );
+                        write_jsonl_log(
+                            &config.general.log_file,
+                            "watcher_down_event_self_feedback_suppressed",
+                            serde_json::json!({
+                                "consumer": event_consumer_name,
+                                "missing": missing_names,
+                                "site": "actively_turning_path",
+                            }),
+                        );
+                    }
                     // NOTE (2026-04-28 q-2026-04-28-2449): we used to
                     // bump `last_watcher_inject` here so the cooldown
                     // clock advanced even on suppressed fires. That was
@@ -3080,14 +3154,40 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                     // missing-watchers list as structured data and can
                     // decide which restart command(s) to actually run,
                     // rather than reflexively reading the prompt string.
-                    alert::emit_event(crate::event_bus::ClaudeWatchAlert {
-                        alert_type: "watcher-down",
-                        stuck_reason: &watcher_reason,
-                        stale_minutes: None,
-                        affected_watchers: missing_names.clone(),
-                        severity: crate::event_bus::Severity::Medium,
-                        message: &prompt,
-                    });
+                    //
+                    // Self-feedback guard: if the only down watcher is
+                    // the event consumer itself, suppress the JSON file
+                    // emit (it would just feed the consumer's own
+                    // restart loop). The tmux-inject above remains the
+                    // actual recovery channel here.
+                    let emit_targets = filter_consumer_for_event_emit(
+                        &missing_names,
+                        &event_consumer_name,
+                    );
+                    if let Some(targets) = emit_targets {
+                        alert::emit_event(crate::event_bus::ClaudeWatchAlert {
+                            alert_type: "watcher-down",
+                            stuck_reason: &watcher_reason,
+                            stale_minutes: None,
+                            affected_watchers: targets,
+                            severity: crate::event_bus::Severity::Medium,
+                            message: &prompt,
+                        });
+                    } else {
+                        info!(
+                            consumer = %event_consumer_name,
+                            "watcher-down event emit suppressed: only the event consumer is down (self-feedback guard)"
+                        );
+                        write_jsonl_log(
+                            &config.general.log_file,
+                            "watcher_down_event_self_feedback_suppressed",
+                            serde_json::json!({
+                                "consumer": event_consumer_name,
+                                "missing": missing_names,
+                                "site": "inject_path",
+                            }),
+                        );
+                    }
                     state.last_watcher_inject = Some(now.clone());
                     state.last_interrupt_at = Some(now.clone());
                     state.watcher_inject_count += 1;
@@ -4876,6 +4976,71 @@ max_stuck_secs = {max_stuck}
         // No event was ever emitted (None) — the chicken-and-egg case.
         let action = evaluate_watcher_down_action(true, 6, None, 3, 6, 60);
         assert_eq!(action, WatcherDownAction::InjectFallback);
+    }
+
+    #[test]
+    fn test_filter_consumer_for_event_emit_only_consumer_returns_none() {
+        // Self-feedback guard: if the only down watcher is the event
+        // consumer itself, the helper returns None (suppress emit).
+        let affected = vec!["claude-event-watch".to_string()];
+        assert_eq!(
+            filter_consumer_for_event_emit(&affected, "claude-event-watch"),
+            None,
+            "consumer-only down list must suppress the emit"
+        );
+    }
+
+    #[test]
+    fn test_filter_consumer_for_event_emit_consumer_among_others_filtered_out() {
+        // Consumer mixed with other watchers: filter the consumer out
+        // (still emit, but without the consumer's name) so the event
+        // can't be the seed of its own self-feedback loop.
+        let affected = vec![
+            "signal-wait-dm".to_string(),
+            "claude-event-watch".to_string(),
+            "torrent-wait".to_string(),
+        ];
+        let result = filter_consumer_for_event_emit(&affected, "claude-event-watch");
+        assert_eq!(
+            result,
+            Some(vec![
+                "signal-wait-dm".to_string(),
+                "torrent-wait".to_string(),
+            ]),
+            "non-consumer watchers must still emit; consumer must be filtered out"
+        );
+    }
+
+    #[test]
+    fn test_filter_consumer_for_event_emit_consumer_absent_returns_unchanged() {
+        // Consumer not in the list: pass through unchanged.
+        let affected = vec![
+            "signal-wait-dm".to_string(),
+            "torrent-wait".to_string(),
+        ];
+        let result = filter_consumer_for_event_emit(&affected, "claude-event-watch");
+        assert_eq!(result, Some(affected.clone()));
+    }
+
+    #[test]
+    fn test_filter_consumer_for_event_emit_empty_returns_none() {
+        // Empty list: nothing to emit.
+        let affected: Vec<String> = vec![];
+        assert_eq!(
+            filter_consumer_for_event_emit(&affected, "claude-event-watch"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_filter_consumer_for_event_emit_custom_consumer_name() {
+        // Consumer name is configurable — make sure the helper honours
+        // whatever name is passed in (no hardcoded "claude-event-watch").
+        let affected = vec!["my-custom-consumer".to_string()];
+        assert_eq!(
+            filter_consumer_for_event_emit(&affected, "my-custom-consumer"),
+            None
+        );
     }
 
     #[test]
