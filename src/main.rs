@@ -19,6 +19,7 @@
 //!   claude-watch          # run the daemon (default)
 //!   claude-watch status   # show Claude Code status and exit
 
+mod active_agents;
 mod agent;
 mod alert;
 mod cmd;
@@ -91,6 +92,19 @@ enum Commands {
     Agent {
         #[command(subcommand)]
         action: AgentAction,
+    },
+    /// Enumerate live agents (subagent PIDs + running workload labels)
+    ///
+    /// Read-only, fact-only output for downstream tools that want to
+    /// cross-reference live processes against their own task queues. The
+    /// JSON shape is `{"subagents": [pid, ...], "workloads": [label, ...]}`.
+    /// claude-watch does NOT consume queue.json, scope tokens, or any
+    /// caller-side schema; consumers join the data on their side.
+    #[command(name = "active-agents")]
+    ActiveAgents {
+        /// Output as JSON (default: human-readable)
+        #[arg(long)]
+        json: bool,
     },
     /// Manage task-watch (background task tmux panes)
     Task {
@@ -975,6 +989,12 @@ async fn main() {
         }
         Some(Commands::Agent { action }) => {
             run_agent(action);
+        }
+        Some(Commands::ActiveAgents { json }) => {
+            let code = active_agents::cmd_active_agents(json);
+            if code != 0 {
+                std::process::exit(code);
+            }
         }
         Some(Commands::Task { action }) => {
             let code = run_task(action).await;
