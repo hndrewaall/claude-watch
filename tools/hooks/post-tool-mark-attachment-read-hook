@@ -1,0 +1,97 @@
+#!/usr/bin/env python3
+"""PostToolUse hook for the Read tool.
+
+Auto-marks Signal attachment files as read via `signal-mark-read` when
+Claude opens an image / file under ~/signal-queue/attachments/. This
+closes the attachment-ignore gap exposed by signal-ack's attachment-read
+guardrail (added 2026-04-24): the human had to remember to call
+signal-mark-read after every Read of an attachment; now the harness
+does it for them.
+
+Wiring (in ~/.claude/settings.json): point ``command`` at the installed
+hook script (``$BIN_DIR/post-tool-mark-attachment-read-hook``, default
+``~/bin/post-tool-mark-attachment-read-hook``)::
+
+    {
+      "hooks": {
+        "PostToolUse": [
+          {
+            "matcher": "Read",
+            "hooks": [
+              {
+                "type": "command",
+                "command": "/path/to/post-tool-mark-attachment-read-hook",
+                "timeout": 5
+              }
+            ]
+          }
+        ]
+      }
+    }
+
+Input: JSON on stdin with the standard Claude Code hook payload, e.g.
+    {"tool_name": "Read", "tool_input": {"file_path": "/abs/path"}, ...}
+
+Behavior:
+- Silent no-op for any non-Signal-attachment Read (the common case).
+- For paths under ~/signal-queue/attachments/, invoke
+  `signal-mark-read --opener claude-code-hook <path>` and exit 0.
+- Never propagates failures: the Read tool already succeeded; whatever
+  happens here must not block / confuse the user. Errors are swallowed.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+
+SIGNAL_ATTACHMENT_DIR = os.path.expanduser("~/signal-queue/attachments/")
+
+
+def main() -> int:
+    try:
+        payload = json.load(sys.stdin)
+    except (json.JSONDecodeError, ValueError):
+        # No input or malformed input -> no-op.
+        return 0
+
+    if not isinstance(payload, dict):
+        return 0
+
+    tool_name = payload.get("tool_name", "")
+    if tool_name != "Read":
+        return 0
+
+    tool_input = payload.get("tool_input", {})
+    if not isinstance(tool_input, dict):
+        return 0
+
+    file_path = tool_input.get("file_path", "")
+    if not isinstance(file_path, str) or not file_path:
+        return 0
+
+    # Resolve ~ if Claude Code ever passes a tilde-containing path.
+    abs_path = os.path.expanduser(file_path)
+
+    # Guard: only fire for Signal attachments. Everything else is a no-op.
+    if not abs_path.startswith(SIGNAL_ATTACHMENT_DIR):
+        return 0
+
+    # Don't fail the hook on errors -- best-effort.
+    try:
+        subprocess.run(
+            ["signal-mark-read", "--opener", "claude-code-hook", abs_path],
+            check=False,
+            capture_output=True,
+            timeout=4,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        pass
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
