@@ -22,7 +22,7 @@
 //! `~/.config/claude-watch/config.toml`. The cooldown gate prevents
 //! respawn loops if the new dashboard also hangs immediately.
 
-use chrono::{Local, Utc};
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use tracing::{info, warn};
@@ -250,14 +250,11 @@ pub fn should_respawn(
 ///
 /// Cheap: one /proc scan + one `ps --ppid` invocation. Called at most once
 /// per check_auto_respawn cycle (default ~5s).
-pub fn count_active_subagents() -> u32 {
-    count_active_subagents_with_versions_dir(None)
-}
-
-/// Test-friendly variant that lets tests force `find_claude_pid` to return
-/// None (by passing a non-existent versions dir), giving the fail-open
-/// path. Production must pass `None`, which uses the real
-/// `~/.local/share/claude/versions` dir.
+///
+/// Production callers pass `None` for `versions_dir_override`, which uses
+/// the real `~/.local/share/claude/versions` dir. Tests pass
+/// `Some("/nonexistent/path")` to force the fail-open (no-PID) branch
+/// without touching real /proc PIDs.
 pub fn count_active_subagents_with_versions_dir(versions_dir_override: Option<&str>) -> u32 {
     let claude_pid_opt = match versions_dir_override {
         Some(dir) => crate::agent::find_claude_pid_with_versions_dir(dir),
@@ -273,11 +270,6 @@ pub fn count_active_subagents_with_versions_dir(versions_dir_override: Option<&s
         .filter(|c| !crate::agent::is_watcher(&c.cmd) && !crate::agent::is_own_command(&c.cmd))
         .count();
     u32::try_from(agent_children).unwrap_or(u32::MAX)
-}
-
-/// Get the current local time as RFC3339, for testing seam.
-pub fn now_iso() -> String {
-    Local::now().to_rfc3339()
 }
 
 /// Result of an attempted respawn.
@@ -327,25 +319,13 @@ pub fn hash_pane_content(s: &str) -> u64 {
 ///
 /// Logs every step via tracing + (if `claude-event` is on PATH) emits a
 /// structured event so Andrew sees a notification.
-pub async fn execute_respawn(
-    config: &AutoRespawnConfig,
-    dashboard_session: &str,
-) -> RespawnOutcome {
-    execute_respawn_with_versions_dir(config, dashboard_session, None).await
-}
-
-/// Test-friendly variant of `execute_respawn` that accepts an explicit
-/// `versions_dir` override. When `Some(dir)` is passed, `find_claude_pid`
-/// is called with that directory instead of the production path under
-/// `~/.local/share/claude/versions`. This lets unit tests force the
-/// "no claude PID found" abort path without ever scanning /proc for a
-/// real Claude process — which is critical safety: the previous
-/// uninstrumented test fired SIGTERM at the live Claude PID running
-/// the dev session.
 ///
-/// Production callers MUST pass `None`. Tests MUST pass
-/// `Some("/nonexistent/path")` (or any directory that no /proc/PID/exe
-/// will ever resolve into).
+/// Production callers pass `None` for `versions_dir_override`, which uses
+/// the real `~/.local/share/claude/versions` dir. Tests pass
+/// `Some("/nonexistent/path")` to force the "no claude PID found" abort
+/// path without ever scanning /proc for a real Claude process — critical
+/// safety: an uninstrumented test would otherwise fire SIGTERM at the
+/// live Claude PID running the dev session.
 pub async fn execute_respawn_with_versions_dir(
     config: &AutoRespawnConfig,
     dashboard_session: &str,
