@@ -382,6 +382,226 @@ enum WatcherAction {
     Restart,
 }
 
+/// Aggregated facts rendered by `claude-watch status`.
+///
+/// Two clearly-labeled sections:
+///   * `Claude Code:` — pane + tokens + active agents/tasks/watchers/bashes
+///   * `claude-watch:` — self version + daemon service state
+///
+/// All fields are pure data; rendering is the responsibility of
+/// [`format_status_human`] / [`status_json_value`] so the I/O entry point
+/// (`run_status`) stays thin.
+#[derive(Debug, Default)]
+struct StatusReport {
+    /// tmux pane id Claude Code is running in (`""` if pane discovery failed).
+    pane: String,
+    /// Token usage (0 when pane discovery failed).
+    tokens: u64,
+    /// Token budget from claude.max_context_tokens.
+    max_tokens: u64,
+    /// Open-bash count from the status bar (0 when discovery failed).
+    bashes: u64,
+    /// Auto-compact percentage remaining, when the status bar reported it.
+    compact_remaining: Option<u32>,
+    /// Claude Code version actually running (from /proc/PID/exe).
+    cc_version_running: Option<String>,
+    /// Claude Code version installed (from ~/.local/bin/claude symlink).
+    cc_version_installed: Option<String>,
+    /// Live subagent PIDs (children of the Claude PID, watchers/own-cmds excluded).
+    active_agents: usize,
+    /// Currently-running workload labels (tmux pane alive in `tasks` session).
+    running_workloads: usize,
+    /// Number of enabled watchers that are healthy (`status == "ok"`).
+    healthy_watchers: u32,
+    /// Number of enabled watchers (`status != "off"`). Equal to total minus
+    /// disabled rows.
+    enabled_watchers: u32,
+    /// claude-watch's own crate version (compile-time CARGO_PKG_VERSION).
+    claude_watch_version: &'static str,
+    /// `Some(true)` if `claude-watch.service` reports `active`, `Some(false)`
+    /// for any other state, `None` if `systemctl` is not available or the
+    /// query failed.
+    daemon_active: Option<bool>,
+}
+
+/// Pure: render a `StatusReport` as the human-readable two-section block.
+///
+/// Output shape (illustrative — exact whitespace tested below):
+///
+/// ```text
+/// Claude Code:
+///   Pane:           dashboard:0.0
+///   Tokens:         467,176 / 1,000,000 (47%)
+///   Compact:        42% remaining
+///   Active agents:  1
+///   Running tasks:  0
+///   Live watchers:  4/4
+///   Open bashes:    2
+///
+/// claude-watch:
+///   Version:        0.1.0
+///   Service:        active
+/// ```
+///
+/// Fields are omitted when not applicable (e.g. `Compact:` only renders when
+/// the status bar surfaced a percentage; `Pane:` is dropped if pane discovery
+/// failed). The two-section split makes it impossible to confuse Claude Code's
+/// version with claude-watch's own — the previous output mixed both into a
+/// single `Version:` line.
+fn format_status_human(r: &StatusReport) -> String {
+    let mut out = String::new();
+    out.push_str("Claude Code:\n");
+    if !r.pane.is_empty() {
+        out.push_str(&format!("  Pane:           {}\n", r.pane));
+    }
+    if r.tokens > 0 || !r.pane.is_empty() {
+        let pct = if r.max_tokens > 0 {
+            r.tokens as f64 / r.max_tokens as f64 * 100.0
+        } else {
+            0.0
+        };
+        out.push_str(&format!(
+            "  Tokens:         {} / {} ({:.0}%)\n",
+            format_number(r.tokens),
+            format_number(r.max_tokens),
+            pct
+        ));
+    }
+    if let Some(cr) = r.compact_remaining {
+        out.push_str(&format!("  Compact:        {}% remaining\n", cr));
+    }
+    out.push_str(&format!("  Active agents:  {}\n", r.active_agents));
+    out.push_str(&format!("  Running tasks:  {}\n", r.running_workloads));
+    out.push_str(&format!(
+        "  Live watchers:  {}/{}\n",
+        r.healthy_watchers, r.enabled_watchers
+    ));
+    out.push_str(&format!("  Open bashes:    {}\n", r.bashes));
+
+    out.push_str("\nclaude-watch:\n");
+    let cw_ver = r.claude_watch_version;
+    let cc_running = r.cc_version_running.as_deref().unwrap_or("?");
+    let cc_installed = r.cc_version_installed.as_deref().unwrap_or("?");
+    // claude-watch self-version line stands alone (no "up to date" check —
+    // we have no remote version source for ourselves).
+    out.push_str(&format!("  Version:        {}\n", cw_ver));
+    if let Some(active) = r.daemon_active {
+        out.push_str(&format!(
+            "  Service:        {}\n",
+            if active { "active" } else { "inactive" }
+        ));
+    }
+    // Claude Code version goes in the Claude Code section as a separate line
+    // — but we put it here at the bottom of the bookkeeping so the visual
+    // priority (tokens / agents / watchers / bashes) stays at the top.
+    out.push_str(&format!(
+        "\nClaude Code version: {} (installed: {})\n",
+        cc_running, cc_installed
+    ));
+    if cc_running != "?" && cc_installed != "?" && cc_running != cc_installed {
+        out.push_str(&format!(
+            "  (running != installed — restart Claude Code to pick up {})\n",
+            cc_installed
+        ));
+    }
+    out
+}
+
+/// Build the JSON object for `claude-watch status --json`.
+///
+/// Backward-compat: every key from the pre-refactor shape (`pane`, `tokens`,
+/// `bashes`, `compact_remaining`, `version`, `latest`) is preserved with the
+/// same semantics. New keys are additive:
+///   * `claude_watch_version` — claude-watch's own crate version
+///   * `daemon_active` — bool when known, otherwise field is omitted
+///   * `active_agents` — count of live subagent PIDs
+///   * `running_workloads` — count of running workload labels
+///   * `live_watchers`, `enabled_watchers` — healthy / total counts
+///
+/// A consumer that grepped for the old keys keeps working.
+fn status_json_value(r: &StatusReport) -> serde_json::Value {
+    let mut map = serde_json::Map::new();
+    if !r.pane.is_empty() {
+        map.insert(
+            "pane".to_string(),
+            serde_json::Value::String(r.pane.clone()),
+        );
+    }
+    if r.tokens > 0 || !r.pane.is_empty() {
+        map.insert(
+            "tokens".to_string(),
+            serde_json::Value::Number(r.tokens.into()),
+        );
+    }
+    if r.bashes > 0 || !r.pane.is_empty() {
+        map.insert(
+            "bashes".to_string(),
+            serde_json::Value::Number(r.bashes.into()),
+        );
+    }
+    if let Some(cr) = r.compact_remaining {
+        map.insert(
+            "compact_remaining".to_string(),
+            serde_json::Value::Number(cr.into()),
+        );
+    }
+    if let Some(ref v) = r.cc_version_running {
+        map.insert("version".to_string(), serde_json::Value::String(v.clone()));
+    }
+    if let Some(ref v) = r.cc_version_installed {
+        map.insert("latest".to_string(), serde_json::Value::String(v.clone()));
+    }
+    map.insert(
+        "claude_watch_version".to_string(),
+        serde_json::Value::String(r.claude_watch_version.to_string()),
+    );
+    if let Some(active) = r.daemon_active {
+        map.insert(
+            "daemon_active".to_string(),
+            serde_json::Value::Bool(active),
+        );
+    }
+    map.insert(
+        "active_agents".to_string(),
+        serde_json::Value::Number(r.active_agents.into()),
+    );
+    map.insert(
+        "running_workloads".to_string(),
+        serde_json::Value::Number(r.running_workloads.into()),
+    );
+    map.insert(
+        "live_watchers".to_string(),
+        serde_json::Value::Number(r.healthy_watchers.into()),
+    );
+    map.insert(
+        "enabled_watchers".to_string(),
+        serde_json::Value::Number(r.enabled_watchers.into()),
+    );
+    serde_json::Value::Object(map)
+}
+
+/// Query `systemctl is-active claude-watch.service`. Returns:
+///   * `Some(true)` when the service is `active`
+///   * `Some(false)` when systemctl ran but reported anything else
+///     (`inactive`, `failed`, `activating`, ...)
+///   * `None` when systemctl is not available or the call timed out
+///
+/// We deliberately don't surface the granular state: the status output is
+/// for human eyeballs + the JSON consumer only cares about active/not-active.
+async fn check_daemon_active() -> Option<bool> {
+    let (out, _) = cmd::run_cmd_any(
+        &["systemctl", "is-active", "claude-watch.service"],
+        5,
+    )
+    .await;
+    let trimmed = out.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed == "active")
+    }
+}
+
 async fn run_status(json: bool, tokens_only: bool, bashes_only: bool) {
     let config = load_config();
     let max_tokens = config.claude.max_context_tokens;
@@ -412,44 +632,8 @@ async fn run_status(json: bool, tokens_only: bool, bashes_only: bool) {
         }
     };
 
-    if json {
-        let mut map = serde_json::Map::new();
-        if !cs.pane.is_empty() {
-            map.insert(
-                "pane".to_string(),
-                serde_json::Value::String(cs.pane.clone()),
-            );
-        }
-        if cs.tokens > 0 || !cs.pane.is_empty() {
-            map.insert(
-                "tokens".to_string(),
-                serde_json::Value::Number(cs.tokens.into()),
-            );
-        }
-        if cs.bashes > 0 || !cs.pane.is_empty() {
-            map.insert(
-                "bashes".to_string(),
-                serde_json::Value::Number(cs.bashes.into()),
-            );
-        }
-        if let Some(cr) = cs.compact_remaining {
-            map.insert(
-                "compact_remaining".to_string(),
-                serde_json::Value::Number(cr.into()),
-            );
-        }
-        if let Some(ref v) = cs.version {
-            map.insert("version".to_string(), serde_json::Value::String(v.clone()));
-        }
-        if let Some(ref v) = cs.latest {
-            map.insert("latest".to_string(), serde_json::Value::String(v.clone()));
-        }
-        let json_obj = serde_json::Value::Object(map);
-        println!("{}", serde_json::to_string_pretty(&json_obj).unwrap());
-        return;
-    }
-
-    if tokens_only {
+    // Short-mode shortcuts: skip the agent/watcher fan-out (cheap-path).
+    if tokens_only && !json {
         if cs.tokens > 0 || !cs.pane.is_empty() {
             println!("{}", cs.tokens);
         } else {
@@ -458,7 +642,7 @@ async fn run_status(json: bool, tokens_only: bool, bashes_only: bool) {
         return;
     }
 
-    if bashes_only {
+    if bashes_only && !json {
         if cs.bashes > 0 || !cs.pane.is_empty() {
             println!("{}", cs.bashes);
         } else {
@@ -467,34 +651,46 @@ async fn run_status(json: bool, tokens_only: bool, bashes_only: bool) {
         return;
     }
 
-    // Human-readable output
-    if cs.tokens > 0 || !cs.pane.is_empty() {
-        let pct = cs.tokens as f64 / max_tokens as f64 * 100.0;
-        println!(
-            "Tokens:   {:>7} / {} ({:.0}%)",
-            format_number(cs.tokens),
-            format_number(max_tokens),
-            pct
-        );
-    }
-    if let Some(cr) = cs.compact_remaining {
-        println!("Compact:  {}% remaining", cr);
-    }
-    if cs.bashes > 0 || !cs.pane.is_empty() {
-        println!("Bashes:   {}", cs.bashes);
+    // Fan out the three I/O calls in parallel — all are independent and
+    // each is bounded by its own pgrep/tmux/systemctl call. Total wall
+    // clock stays close to the slowest single call instead of summing.
+    let watcher_cfg = watcher::config_path();
+    let (agents, watchers, daemon_active) = tokio::join!(
+        tokio::task::spawn_blocking(active_agents::collect),
+        watcher::watcher_status(&watcher_cfg),
+        check_daemon_active(),
+    );
+    let agents = agents.unwrap_or(active_agents::ActiveAgents {
+        subagents: Vec::new(),
+        workloads: Vec::new(),
+    });
+
+    let healthy_watchers = watchers.iter().filter(|w| w.status == "ok").count() as u32;
+    let enabled_watchers = watchers.iter().filter(|w| w.enabled).count() as u32;
+
+    let report = StatusReport {
+        pane: cs.pane.clone(),
+        tokens: cs.tokens,
+        max_tokens,
+        bashes: cs.bashes,
+        compact_remaining: cs.compact_remaining,
+        cc_version_running: cs.version.clone(),
+        cc_version_installed: cs.latest.clone(),
+        active_agents: agents.subagents.len(),
+        running_workloads: agents.workloads.len(),
+        healthy_watchers,
+        enabled_watchers,
+        claude_watch_version: env!("CARGO_PKG_VERSION"),
+        daemon_active,
+    };
+
+    if json {
+        let value = status_json_value(&report);
+        println!("{}", serde_json::to_string_pretty(&value).unwrap());
+        return;
     }
 
-    let version = cs.version.as_deref().unwrap_or("?");
-    let latest = cs.latest.as_deref().unwrap_or("?");
-    if version == latest {
-        println!("Version:  {} (up to date)", version);
-    } else {
-        println!("Version:  {} (latest: {})", version, latest);
-    }
-
-    if !cs.pane.is_empty() {
-        println!("Pane:     {}", cs.pane);
-    }
+    print!("{}", format_status_human(&report));
 }
 
 /// Format a number with comma separators.
@@ -1032,5 +1228,190 @@ async fn main() {
         None => {
             run_daemon().await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn base_report() -> StatusReport {
+        StatusReport {
+            pane: "dashboard:0.0".to_string(),
+            tokens: 467_176,
+            max_tokens: 1_000_000,
+            bashes: 2,
+            compact_remaining: None,
+            cc_version_running: Some("2.1.126".to_string()),
+            cc_version_installed: Some("2.1.126".to_string()),
+            active_agents: 1,
+            running_workloads: 0,
+            healthy_watchers: 4,
+            enabled_watchers: 4,
+            claude_watch_version: "0.1.0",
+            daemon_active: Some(true),
+        }
+    }
+
+    #[test]
+    fn format_status_human_two_section_headers() {
+        let out = format_status_human(&base_report());
+        // The whole point of the refactor: two clearly-labeled sections.
+        // If either header disappears, the output collapses back into the
+        // ambiguous pre-refactor form.
+        assert!(out.starts_with("Claude Code:\n"), "out:\n{}", out);
+        assert!(out.contains("\nclaude-watch:\n"), "out:\n{}", out);
+    }
+
+    #[test]
+    fn format_status_human_includes_all_runtime_counts() {
+        let out = format_status_human(&base_report());
+        // Each labeled count must be present and attributed to Claude Code.
+        // These four lines are the new active-agents-derived data the
+        // pre-refactor output completely lacked.
+        assert!(out.contains("Active agents:  1"), "out:\n{}", out);
+        assert!(out.contains("Running tasks:  0"), "out:\n{}", out);
+        assert!(out.contains("Live watchers:  4/4"), "out:\n{}", out);
+        assert!(out.contains("Open bashes:    2"), "out:\n{}", out);
+    }
+
+    #[test]
+    fn format_status_human_separates_versions() {
+        // The bug we're fixing: pre-refactor output had a single `Version:`
+        // line that mixed Claude Code's version with no marker for the
+        // claude-watch version. Now the claude-watch section gets its own
+        // `Version:` and Claude Code gets a dedicated line elsewhere.
+        let out = format_status_human(&base_report());
+        // claude-watch version under its section header.
+        let cw_idx = out.find("claude-watch:\n").expect("claude-watch section");
+        let after_cw = &out[cw_idx..];
+        assert!(
+            after_cw.contains("Version:        0.1.0"),
+            "claude-watch section must show 0.1.0; out:\n{}",
+            out
+        );
+        // Claude Code version is on its own line, clearly attributed.
+        assert!(
+            out.contains("Claude Code version: 2.1.126"),
+            "Claude Code version must be attributed; out:\n{}",
+            out
+        );
+    }
+
+    #[test]
+    fn format_status_human_service_active_inactive() {
+        let mut r = base_report();
+        r.daemon_active = Some(true);
+        assert!(format_status_human(&r).contains("Service:        active"));
+        r.daemon_active = Some(false);
+        assert!(format_status_human(&r).contains("Service:        inactive"));
+        // None means systemctl wasn't queryable — drop the line entirely
+        // rather than print a misleading "unknown".
+        r.daemon_active = None;
+        assert!(!format_status_human(&r).contains("Service:"));
+    }
+
+    #[test]
+    fn format_status_human_omits_pane_when_empty() {
+        let mut r = base_report();
+        r.pane = String::new();
+        let out = format_status_human(&r);
+        assert!(!out.contains("Pane:"), "pane line should be omitted; out:\n{}", out);
+    }
+
+    #[test]
+    fn format_status_human_compact_only_when_present() {
+        let mut r = base_report();
+        assert!(!format_status_human(&r).contains("Compact:"));
+        r.compact_remaining = Some(42);
+        assert!(format_status_human(&r).contains("Compact:        42% remaining"));
+    }
+
+    #[test]
+    fn format_status_human_tokens_pct_calculation() {
+        let r = base_report();
+        // 467176 / 1000000 = 46.7176%, rounds to 47%.
+        let out = format_status_human(&r);
+        assert!(out.contains("Tokens:         467,176 / 1,000,000 (47%)"), "out:\n{}", out);
+    }
+
+    #[test]
+    fn format_status_human_running_vs_installed_mismatch() {
+        let mut r = base_report();
+        r.cc_version_running = Some("2.1.125".to_string());
+        r.cc_version_installed = Some("2.1.126".to_string());
+        let out = format_status_human(&r);
+        assert!(out.contains("Claude Code version: 2.1.125 (installed: 2.1.126)"));
+        // The mismatch hint nudges the user to restart Claude Code.
+        assert!(out.contains("running != installed"), "out:\n{}", out);
+    }
+
+    #[test]
+    fn format_status_human_versions_match_no_warning() {
+        let r = base_report();
+        let out = format_status_human(&r);
+        assert!(!out.contains("running != installed"));
+    }
+
+    #[test]
+    fn status_json_value_preserves_pre_refactor_keys() {
+        // Backward compat: every key the old shape produced must still be
+        // present with the same name. Adding new keys is fine; renaming or
+        // dropping any of these breaks downstream cron shims that grep for
+        // specific fields.
+        let r = base_report();
+        let v = status_json_value(&r);
+        assert_eq!(v["pane"], serde_json::json!("dashboard:0.0"));
+        assert_eq!(v["tokens"], serde_json::json!(467_176));
+        assert_eq!(v["bashes"], serde_json::json!(2));
+        assert_eq!(v["version"], serde_json::json!("2.1.126"));
+        assert_eq!(v["latest"], serde_json::json!("2.1.126"));
+    }
+
+    #[test]
+    fn status_json_value_adds_new_count_keys() {
+        let r = base_report();
+        let v = status_json_value(&r);
+        assert_eq!(v["claude_watch_version"], serde_json::json!("0.1.0"));
+        assert_eq!(v["daemon_active"], serde_json::json!(true));
+        assert_eq!(v["active_agents"], serde_json::json!(1));
+        assert_eq!(v["running_workloads"], serde_json::json!(0));
+        assert_eq!(v["live_watchers"], serde_json::json!(4));
+        assert_eq!(v["enabled_watchers"], serde_json::json!(4));
+    }
+
+    #[test]
+    fn status_json_value_omits_daemon_active_when_unknown() {
+        let mut r = base_report();
+        r.daemon_active = None;
+        let v = status_json_value(&r);
+        assert!(
+            !v.as_object().unwrap().contains_key("daemon_active"),
+            "daemon_active must be omitted (not null) when systemctl is unavailable"
+        );
+    }
+
+    #[test]
+    fn status_json_value_omits_pane_when_empty() {
+        let mut r = base_report();
+        r.pane = String::new();
+        r.tokens = 0;
+        r.bashes = 0;
+        let v = status_json_value(&r);
+        let obj = v.as_object().unwrap();
+        // pane / tokens / bashes all skipped when there's no Claude pane
+        // and no positive count — matches the pre-refactor behavior.
+        assert!(!obj.contains_key("pane"));
+        assert!(!obj.contains_key("tokens"));
+        assert!(!obj.contains_key("bashes"));
+    }
+
+    #[test]
+    fn format_status_human_unhealthy_watchers_visible_in_count() {
+        let mut r = base_report();
+        r.healthy_watchers = 3;
+        r.enabled_watchers = 4;
+        let out = format_status_human(&r);
+        assert!(out.contains("Live watchers:  3/4"), "out:\n{}", out);
     }
 }
