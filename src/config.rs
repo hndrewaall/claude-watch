@@ -239,17 +239,6 @@ pub struct WatcherMonitorConfig {
     /// watcher-down INJECT is suppressed. Default: 30.
     #[serde(default = "default_active_window_secs")]
     pub active_window_secs: u64,
-    /// Per-watcher cooldown (seconds) between daemon-side auto-restart
-    /// attempts (q-2026-04-28-5481). Distinct from `inject_cooldown`,
-    /// which gates the tmux-pane prompt inject — auto-restart spawns the
-    /// start_cmd as a detached child and doesn't disrupt the loop, so it
-    /// can fire much more aggressively. Default: 30 — ~3 check cycles at
-    /// the default 10s `general.check_interval`, which lets a wait-and-exit
-    /// watcher (claude-event-watch) get re-spawned quickly between event
-    /// deliveries while still bounding the spawn rate if a start_cmd is
-    /// crashing on launch.
-    #[serde(default = "default_auto_restart_cooldown_secs")]
-    pub auto_restart_cooldown_secs: u64,
     /// Grace period (seconds) after `last_seen_running` during which a
     /// missing watcher is NOT counted toward `consecutive_missing`. Short-
     /// lived watchers (e.g. signal-wait that exits when a message arrives)
@@ -300,10 +289,6 @@ fn default_suppress_inject_when_active() -> bool {
 }
 
 fn default_active_window_secs() -> u64 {
-    30
-}
-
-fn default_auto_restart_cooldown_secs() -> u64 {
     30
 }
 
