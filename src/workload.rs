@@ -343,7 +343,11 @@ pub fn cmd_run(label: &str, cmd_args: &[String]) -> i32 {
 
     println!("Started workload '{label}' in pane {pane_id}");
     println!("Output: {}", out_path.display());
-    println!("Wait with: claude-watch workload wait {label}");
+    println!(
+        "Watch for the `workload-done` claude-event in the next \
+         UserPromptSubmit context (fire-and-forget). Do NOT spawn \
+         `workload wait` as a background task."
+    );
     0
 }
 
@@ -373,8 +377,37 @@ pub fn cmd_list() -> i32 {
     0
 }
 
-/// CLI: `workload wait <label>`
-pub fn cmd_wait(label: &str, lines: usize) -> i32 {
+/// CLI: `workload wait <label> [--force-i-acknowledge-events-are-better]`
+///
+/// Disabled by default. Workloads emit a `workload-done` claude-event when
+/// they exit; that event arrives in the main loop's next UserPromptSubmit
+/// context via the claude-event hook chain, so blocking polling via
+/// `workload wait` is fully redundant and ties up a Claude Code background
+/// task slot. Returns exit code 2 with an explanatory error unless the
+/// user has explicitly opted in via the long flag.
+pub fn cmd_wait(label: &str, lines: usize, force_acknowledged: bool) -> i32 {
+    if !force_acknowledged {
+        eprintln!(
+            "ERROR: `workload wait` is disabled by default.\n\
+             \n\
+             Workloads emit a `workload-done` claude-event when they exit.\n\
+             That event surfaces in the main loop's next UserPromptSubmit\n\
+             context, so blocking polling via `workload wait` is redundant\n\
+             and only clutters the Claude Code background task list.\n\
+             \n\
+             Recommended pattern: fire-and-forget the workload\n\
+             (`workload run <label> -- <cmd>`) and watch for the\n\
+             `workload-done` claude-event on the next turn.\n\
+             \n\
+             If you genuinely need the blocking-poll behavior, opt in:\n\
+             \n\
+             \tworkload wait {label} --force-i-acknowledge-events-are-better\n\
+             \n\
+             See feedback_no-explicit-task-watchers.md for the full rule."
+        );
+        return 2;
+    }
+
     let state = load_state();
     let info = match state.get(label) {
         Some(i) => i.clone(),
@@ -543,6 +576,33 @@ mod tests {
         let s = load_state();
         // Just verify no panic and is a BTreeMap
         let _ = s.len();
+    }
+
+    #[test]
+    fn cmd_wait_without_force_flag_exits_with_code_2() {
+        // Bare `workload wait <label>` must short-circuit BEFORE touching
+        // any state — Andrew's rule (2026-05-01): the `workload-done`
+        // claude-event is the canonical completion signal, polling is
+        // redundant. The flag has to be hard to type accidentally.
+        let rc = cmd_wait("nonexistent-label", 20, false);
+        assert_eq!(
+            rc, 2,
+            "bare `workload wait` must exit 2 (opt-in required), got {rc}"
+        );
+    }
+
+    #[test]
+    fn cmd_wait_with_force_flag_proceeds_to_state_lookup() {
+        // With the opt-in flag set, the gate is bypassed and we fall
+        // through to the existing state-lookup code path. For a missing
+        // label that yields exit code 1 ("No workload 'X'"), proving the
+        // flag actually unblocked the function (versus the gate's exit 2).
+        let rc = cmd_wait("definitely-not-a-real-workload-xyz", 20, true);
+        assert_eq!(
+            rc, 1,
+            "opt-in `workload wait` should reach state lookup and exit 1 \
+             for missing label, got {rc}"
+        );
     }
 
     #[test]
