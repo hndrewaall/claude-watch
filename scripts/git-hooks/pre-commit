@@ -1,0 +1,30 @@
+#!/bin/sh
+# claude-watch pre-commit hook
+#
+# Runs two gates before allowing a commit:
+#   1. Warning-free release build (RUSTFLAGS="-D warnings"). Catches new
+#      dead code, unused imports, etc. on the way in instead of letting
+#      them accumulate.
+#   2. Unit + fixture test suite via cargo-nextest. ~0.1s in parallel.
+#      Skips e2e tests (which do real sleeps and add ~10s+).
+#
+# Install via `make install-hooks` (which symlinks this file into
+# .git/hooks/pre-commit). Bypass for RED-phase TDD commits with
+# `git commit --no-verify`.
+#
+# Exits non-zero on any warning or test failure, blocking the commit.
+
+set -e
+
+repo_root="$(git rev-parse --show-toplevel)"
+cd "$repo_root"
+
+echo "==> pre-commit: warning-free release build (RUSTFLAGS=\"-D warnings\")"
+RUSTFLAGS="-D warnings" cargo build --release --tests
+
+echo "==> pre-commit: unit + fixture tests"
+if command -v cargo-nextest >/dev/null 2>&1; then
+    cargo nextest run -E 'not binary(~e2e_)'
+else
+    cargo test --lib
+fi

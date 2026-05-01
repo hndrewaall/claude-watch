@@ -131,10 +131,22 @@ Without something like this, claude-watch can inject "resume" into a fresh sessi
 ## Build & run
 
 ```bash
-make test       # run all tests (~300 tests, <1s unit, ~10s e2e)
-make build      # release build
-make deploy     # build + systemctl restart
+make test           # run all tests (~960 tests, <1s unit, ~16s e2e)
+make build          # release build
+make deploy         # build + systemctl restart
+make install-hooks  # install the git pre-commit hook (warnings + tests)
 ```
+
+### Pre-commit hook
+
+`make install-hooks` symlinks
+[`scripts/git-hooks/pre-commit`](scripts/git-hooks/pre-commit) into
+`.git/hooks/pre-commit`. The hook runs two gates before each commit:
+
+1. **Warning-free release build** — `RUSTFLAGS="-D warnings" cargo build --release --tests`. Any rustc warning (dead code, unused imports, etc.) blocks the commit.
+2. **Unit + fixture tests** via `cargo nextest run -E 'not binary(~e2e_)'` (~0.5s in parallel).
+
+Bypass with `git commit --no-verify` for RED-phase TDD commits. CI runs the same warning-free build gate (`Warning-Free Build` job in [`.github/workflows/ci.yml`](.github/workflows/ci.yml)) on every PR + push to main.
 
 ## Configuration
 

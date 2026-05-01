@@ -498,6 +498,7 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    #[test]
     fn test_suppression_counters_cleared_on_load() {
         // consecutive_suppressions and first_suppression_at are
         // transient — daemon downtime breaks the "consecutive" semantics
