@@ -22,10 +22,29 @@ pub const WATCHER_PATTERNS: &[&str] = &[
     "task-watch",
 ];
 
-/// Claude tasks base directory.
-/// NOTE: The project slug (e.g. "-home-user") is derived from your working directory.
-/// Adjust to match your Claude Code project path.
-const CLAUDE_TASKS_BASE: &str = "/tmp/claude-1000/-home-user";
+/// Claude tasks base directory PARENT (per-uid).
+///
+/// Claude Code writes per-session task output files under
+/// `/tmp/claude-<uid>/<project-slug>/<session-uuid>/tasks/`. The
+/// project slug is derived from the cwd at session start, with `/`
+/// replaced by `-` (e.g. `/home/alice` -> `-home-alice`). We compute
+/// the slug at runtime from `$HOME` so the same binary works on any
+/// account without a hardcoded path.
+const CLAUDE_TASKS_PARENT: &str = "/tmp/claude-1000";
+
+/// Compute the project-slug-derived tasks base for the current user.
+///
+/// Returns e.g. `/tmp/claude-1000/-home-alice` for `$HOME=/home/alice`.
+/// Defaults to `/tmp/claude-1000/-home-user` if `$HOME` is unset (which
+/// keeps prior behavior in test environments).
+pub fn claude_tasks_base() -> String {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/home/user".to_string());
+    let slug: String = home
+        .chars()
+        .map(|c| if c == '/' { '-' } else { c })
+        .collect();
+    format!("{}/{}", CLAUDE_TASKS_PARENT, slug)
+}
 
 /// A child process of Claude Code.
 #[derive(Debug, Clone)]
@@ -160,7 +179,7 @@ pub fn parse_ps_output(output: &str) -> Vec<ChildProcess> {
 
 /// Find the active Claude Code session directory (most recently modified .output file).
 pub fn find_session_dir() -> Option<PathBuf> {
-    find_session_dir_in(CLAUDE_TASKS_BASE)
+    find_session_dir_in(&claude_tasks_base())
 }
 
 /// Testable version with configurable base path.
