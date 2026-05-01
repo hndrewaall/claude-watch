@@ -1,0 +1,2424 @@
+#!/usr/bin/env python3
+"""Manage resume actions, completed-task history, and the session-task queue.
+
+Three distinct layers of task coordination:
+
+  1. session-task set/clear -- single "top-of-mind" slot for the NEXT resume
+     action. There is only one at a time. Lives in resume-action.json.
+
+  2. session-task queue ... -- a cross-session work queue with scope-based
+     serialization groups. Any number of items. Items in the same scope group
+     run one-at-a-time (priority + FIFO). Items in disjoint groups run in
+     parallel. Lives in queue.json (with fcntl.flock on every RMW).
+
+  3. TaskCreate / TaskList / TaskUpdate (harness primitive, not in this tool)
+     -- tracks background PROCESSES (unix agents/watchers/scans).
+
+Completed items from both layers 1 and 2 are logged to completed-tasks.jsonl.
+
+Usage:
+    session-task set "description"
+    session-task get | show | clear | append "..."
+    session-task complete "description"
+    session-task history [-n N]
+
+    session-task queue add "desc" --scope file:~/foo --scope repo:bar \\
+        [--summary "~10 word headline"] [--priority N] [--context JSON] \\
+        [--created-by WHO]
+    session-task queue list [--ready] [--all] [--group g-X] [--json]
+    session-task queue show <id>
+    session-task queue scope <id>
+    session-task queue groups [--json]
+    session-task queue ready [--json]
+    session-task queue done <id>
+    session-task queue abandon <id> [--reason TEXT]
+    session-task queue pop [--id ID]
+    session-task queue register <id> [--pid N]   # claim item for spawn (gated)
+    session-task queue heartbeat <id> [--pid N]  # refresh liveness on running item
+    session-task queue spawn-check <id> [--json] # "am I clear to spawn?" check
+    session-task queue promote <id>
+    session-task queue set-summary <id> "text"   # edit one-line summary
+    session-task queue prune [--older-than DURATION] [-n/--dry-run]
+    session-task queue banner
+    session-task queue migrate --from FILE [--yes]
+
+Spawn gating (2026-04-17):
+    Before spawning an agent, the main loop MUST go through the queue:
+        1. `session-task queue add "desc" --scope <toks>` -> get id + ready_now
+        2. If ready_now=false, DO NOT spawn. Wait for blockers to clear.
+        3. `session-task queue spawn-check <id>` -> ok|conflict
+        4. `session-task queue register <id>` -> atomically claim (running)
+        5. Spawn the agent.
+        6. On completion: `session-task queue done <id>` (or abandon).
+    `queue register` refuses if the item isn't pending+ready, or if any
+    other running item has overlapping scope (cross-group conflict).
+    This is the one enforcement point. Bypassing it == operating outside
+    the queue, which Andrew has flagged as a rule violation.
+"""
+
+import argparse
+import fcntl
+import json
+import os
+import re
+import secrets
+import shutil
+import subprocess
+import sys
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+TASK_FILE = Path.home() / ".config" / "session" / "resume-action.json"
+COMPLETED_FILE = Path.home() / ".config" / "session" / "completed-tasks.jsonl"
+QUEUE_FILE = Path.home() / ".config" / "session" / "queue.json"
+QUEUE_SCHEMA_VERSION = 2
+
+# Placeholder used when a queue item is added without --summary (soft-required
+# as of 2026-04-19). Pingme notifications display this verbatim so the operator
+# immediately notices the missing headline.
+DEFAULT_SUMMARY = "(no summary)"
+
+
+# ---------------------------------------------------------------------------
+# Layer 1: resume-action.json (single "top-of-mind" slot)
+# ---------------------------------------------------------------------------
+
+
+def load():
+    """Load current resume action, or None."""
+    if not TASK_FILE.exists():
+        return None
+    try:
+        data = json.loads(TASK_FILE.read_text())
+        if not data:
+            return None
+        return data
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def save(data):
+    """Save resume action."""
+    TASK_FILE.parent.mkdir(parents=True, exist_ok=True)
+    TASK_FILE.write_text(json.dumps(data, indent=2) + "\n")
+
+
+def cmd_set(args):
+    data = {
+        "task": args.description,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    if args.context:
+        try:
+            data["context"] = json.loads(args.context)
+        except json.JSONDecodeError:
+            print(f"ERROR: --context must be valid JSON: {args.context}", file=sys.stderr)
+            sys.exit(1)
+    save(data)
+    print(f"Resume action set: {args.description}")
+
+
+def cmd_append(args):
+    current = load()
+    if not current:
+        print("No current resume action. Use 'set' first.", file=sys.stderr)
+        sys.exit(1)
+    current["task"] += "\n" + args.text
+    current["updated_at"] = datetime.now(timezone.utc).isoformat()
+    save(current)
+    print("Appended to resume action.")
+
+
+def cmd_get(args):
+    current = load()
+    if not current:
+        sys.exit(1)  # silent for scripting
+    print(json.dumps(current, indent=2))
+
+
+def cmd_show(args):
+    current = load()
+    if not current:
+        print("No pending resume action.")
+        return
+    print("=" * 60)
+    print("PENDING RESUME ACTION")
+    print("=" * 60)
+    print(f"Task: {current['task']}")
+    if current.get("context"):
+        print(f"Context: {json.dumps(current['context'], indent=2)}")
+    print(f"Set at: {current['created_at']}")
+    if current.get("updated_at"):
+        print(f"Updated: {current['updated_at']}")
+    print("=" * 60)
+
+
+def log_completed(description, extra=None):
+    COMPLETED_FILE.parent.mkdir(parents=True, exist_ok=True)
+    entry = {
+        "task": description,
+        "completed_at": datetime.now(timezone.utc).isoformat(),
+    }
+    if extra:
+        entry.update(extra)
+    with open(COMPLETED_FILE, "a") as f:
+        f.write(json.dumps(entry) + "\n")
+
+
+def cmd_complete(args):
+    log_completed(args.description)
+    print(f"Logged completed task: {args.description}")
+
+
+def _classify_entry(entry):
+    """Return ('resume' | 'queue-done' | 'queue-abandoned' | 'queue-merge' | 'other', tag_str).
+
+    Uses structured fields (source, event) when present, and falls back to
+    parsing the task-string prefix for legacy rows written before the queue
+    layer was added.
+    """
+    source = entry.get("source")
+    event = entry.get("event")
+    task = entry.get("task", "") or ""
+    if source == "queue":
+        if event == "merge":
+            qid = entry.get("new_group_id") or entry.get("group_id") or "?"
+            return "queue-merge", f"[queue MERGE {qid}]"
+        if event == "abandon" or "abandoned" in task[:40]:
+            qid = entry.get("id") or "?"
+            gid = entry.get("group_id") or "?"
+            return "queue-abandoned", f"[queue {qid} {gid} ABANDONED]"
+        qid = entry.get("id") or "?"
+        gid = entry.get("group_id") or "?"
+        return "queue-done", f"[queue {qid} {gid}]"
+    # Legacy: inspect task prefix
+    if task.startswith("[queue "):
+        # Best-effort: pull id if present (format: "[queue q-YYYY-MM-DD-xxxx] ...")
+        m = re.match(r"^\[queue (q-\S+?)(?:\s+abandoned)?\]", task)
+        if m and "abandoned" in task[: 60]:
+            return "queue-abandoned", f"[queue {m.group(1)} ABANDONED]"
+        if m:
+            return "queue-done", f"[queue {m.group(1)}]"
+        return "queue-done", "[queue]"
+    if task.startswith("[resume action]"):
+        return "resume", "[resume-action]"
+    return "other", "[other]"
+
+
+def _entry_display_task(entry, kind):
+    """Strip the layer-prefix from the task string (we render our own tag)."""
+    task = entry.get("task", "?") or "?"
+    for prefix in ("[resume action] ", "[resume action]"):
+        if task.startswith(prefix):
+            return task[len(prefix):]
+    m = re.match(r"^\[queue [^\]]+\]\s*", task)
+    if m:
+        return task[m.end():]
+    return task
+
+
+def _entry_timestamp(entry):
+    """Return the most authoritative timestamp for an entry as a datetime, or None."""
+    ts_str = entry.get("completed_at") or entry.get("abandoned_at") or entry.get("created_at")
+    if not ts_str:
+        return None
+    try:
+        return datetime.fromisoformat(ts_str)
+    except ValueError:
+        return None
+
+
+def _load_queue_items_silent():
+    """Load queue.json items without taking a write lock, for scope lookup.
+
+    Returns dict id -> item, or empty dict on any failure.
+    """
+    try:
+        if not QUEUE_FILE.exists():
+            return {}
+        raw = QUEUE_FILE.read_text()
+        if not raw.strip():
+            return {}
+        data = json.loads(raw)
+        out = {}
+        for it in data.get("items", []):
+            if isinstance(it, dict) and "id" in it:
+                out[it["id"]] = it
+        return out
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def _scope_for_queue_entry(entry, queue_items):
+    """Best-effort scope lookup for a queue history entry.
+
+    Uses the queue.json file if the item is still present, else returns None.
+    """
+    qid = entry.get("id")
+    if not qid:
+        return None
+    it = queue_items.get(qid)
+    if not it:
+        return None
+    return it.get("scope") or None
+
+
+def _render_history_entries(entries, include_scope=True, width_total=None):
+    """Pretty-print a list of entries with source tags. Returns list of lines."""
+    if not entries:
+        return ["(no entries)"]
+    queue_items = _load_queue_items_silent() if include_scope else {}
+    lines = []
+    for entry in entries:
+        try:
+            kind, tag = _classify_entry(entry)
+        except Exception:
+            lines.append("  (corrupt entry)")
+            continue
+        ts = entry.get("completed_at") or entry.get("abandoned_at") or "?"
+        if "T" in ts:
+            ts = ts.split("T")[0] + " " + ts.split("T")[1][:8]
+        desc = _entry_display_task(entry, kind)
+        # Truncate description for one-line display
+        if len(desc) > 140:
+            desc = desc[:137] + "..."
+        lines.append(f"  [{ts}] {tag} {desc}")
+        if include_scope and kind.startswith("queue") and kind != "queue-merge":
+            scope = _scope_for_queue_entry(entry, queue_items)
+            if scope:
+                scope_str = ",".join(scope)
+                if len(scope_str) > 80:
+                    scope_str = scope_str[:77] + "..."
+                lines.append(f"        scope: {scope_str}")
+    return lines
+
+
+def _filter_entries(entries, since=None, layer=None):
+    """Filter a list of parsed history entries by time window and/or layer."""
+    cutoff = None
+    if since:
+        cutoff = datetime.now(timezone.utc) - _parse_duration(since)
+    out = []
+    for entry in entries:
+        if cutoff is not None:
+            ts = _entry_timestamp(entry)
+            if ts is None or ts < cutoff:
+                continue
+        if layer and layer != "all":
+            kind, _ = _classify_entry(entry)
+            if layer == "resume" and kind != "resume":
+                continue
+            if layer == "queue" and not kind.startswith("queue"):
+                continue
+        out.append(entry)
+    return out
+
+
+def _load_all_history_entries():
+    """Load and parse completed-tasks.jsonl. Returns list of dicts (oldest first)."""
+    if not COMPLETED_FILE.exists():
+        return []
+    out = []
+    for line in COMPLETED_FILE.read_text().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            out.append(json.loads(line))
+        except json.JSONDecodeError:
+            out.append({"_corrupt": True, "task": "(corrupt)"})
+    return out
+
+
+def cmd_history(args):
+    n = args.count
+    entries = _load_all_history_entries()
+    if not entries:
+        print("No completed tasks.")
+        return
+
+    # Apply --since / --layer filters BEFORE tail limit
+    entries = _filter_entries(entries, since=getattr(args, "since", None),
+                              layer=getattr(args, "layer", None))
+    if not entries:
+        print("No completed tasks (after filters).")
+        return
+
+    # Tail last N
+    recent = entries[-n:] if len(entries) > n else entries
+
+    # Header describes what filters were in effect so the user knows what
+    # they're looking at.
+    filter_bits = []
+    if getattr(args, "since", None):
+        filter_bits.append(f"since={args.since}")
+    if getattr(args, "layer", None) and args.layer != "all":
+        filter_bits.append(f"layer={args.layer}")
+    filter_suffix = f" ({', '.join(filter_bits)})" if filter_bits else ""
+
+    print(f"Last {len(recent)} completed tasks{filter_suffix}:")
+    include_scope = not getattr(args, "no_scope", False)
+    for line in _render_history_entries(recent, include_scope=include_scope):
+        print(line)
+
+
+def cmd_clear(args):
+    if TASK_FILE.exists():
+        current = load()
+        if current:
+            log_completed(f"[resume action] {current['task'][:200]}")
+        TASK_FILE.unlink()
+        print("Resume action cleared and logged as completed.")
+    else:
+        print("No resume action to clear.")
+
+
+def for_session_resume():
+    current = load()
+    if not current:
+        return ""
+    lines = [
+        "",
+        "!" * 60,
+        "!! RESUME ACTION — DO THIS IMMEDIATELY AFTER WATCHERS ARE UP",
+        "!" * 60,
+        "",
+        f"Task: {current['task']}",
+    ]
+    if current.get("context"):
+        lines.append(f"Context: {json.dumps(current['context'])}")
+    lines.append(f"(set at {current['created_at']})")
+    lines.append("")
+    lines.append("After completing this, run: session-task clear")
+    lines.append("!" * 60)
+    lines.append("")
+    return "\n".join(lines)
+
+
+def for_session_resume_history(n_resume=5, n_queue=5, since="7d"):
+    """Task-history block for session-resume, split into two panels.
+
+    - Resume-action completions (the narrative thread)  : last n_resume in window
+    - Queue completions (what finished since last review): last n_queue in window
+
+    Everything older than `since` is excluded. This prevents a flurry of
+    queue sweeps from drowning out the last few resume-action narratives.
+    """
+    entries = _load_all_history_entries()
+    if not entries:
+        return "No completed tasks recorded yet."
+
+    try:
+        windowed = _filter_entries(entries, since=since, layer="all")
+    except ValueError:
+        windowed = entries
+
+    resume_entries = [e for e in windowed if _classify_entry(e)[0] == "resume"]
+    queue_entries = [e for e in windowed if _classify_entry(e)[0].startswith("queue")]
+
+    resume_tail = resume_entries[-n_resume:]
+    queue_tail = queue_entries[-n_queue:]
+
+    parts = []
+    parts.append(f"### Resume-action trail (last {len(resume_tail)} in {since})")
+    if resume_tail:
+        parts.extend(_render_history_entries(resume_tail, include_scope=False))
+    else:
+        parts.append("  (none)")
+    parts.append("")
+    parts.append(f"### Queue completions (last {len(queue_tail)} in {since})")
+    if queue_tail:
+        parts.extend(_render_history_entries(queue_tail, include_scope=True))
+    else:
+        parts.append("  (none)")
+
+    return "\n".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Layer 2: queue.json (scope-based serialization groups)
+# ---------------------------------------------------------------------------
+
+
+def _queue_empty():
+    return {"schema_version": QUEUE_SCHEMA_VERSION, "items": []}
+
+
+def _queue_open_locked(mode):
+    """Open queue.json with fcntl.LOCK_EX. Caller must close the file when done.
+
+    Returns (file_handle, data). File is opened r+ (or created empty).
+    mode is informational -- we always take LOCK_EX for safety.
+    """
+    QUEUE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    # Use os.open so we can get a writable fd even for new files.
+    fd = os.open(str(QUEUE_FILE), os.O_RDWR | os.O_CREAT, 0o600)
+    fh = os.fdopen(fd, "r+")
+    fcntl.flock(fh, fcntl.LOCK_EX)
+    fh.seek(0)
+    raw = fh.read()
+    if not raw.strip():
+        data = _queue_empty()
+    else:
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            # Corrupt queue -- back up and start fresh so we don't lose more data.
+            backup = QUEUE_FILE.with_suffix(".json.corrupt")
+            backup.write_text(raw)
+            data = _queue_empty()
+    # Normalize
+    if not isinstance(data, dict) or "items" not in data:
+        data = _queue_empty()
+    data.setdefault("schema_version", QUEUE_SCHEMA_VERSION)
+    data.setdefault("items", [])
+    return fh, data
+
+
+def _queue_write_and_unlock(fh, data):
+    data["schema_version"] = QUEUE_SCHEMA_VERSION
+    fh.seek(0)
+    fh.truncate()
+    fh.write(json.dumps(data, indent=2) + "\n")
+    fh.flush()
+    os.fsync(fh.fileno())
+    fcntl.flock(fh, fcntl.LOCK_UN)
+    fh.close()
+
+
+def _queue_unlock_readonly(fh):
+    fcntl.flock(fh, fcntl.LOCK_UN)
+    fh.close()
+
+
+def _new_id():
+    day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    return f"q-{day}-{secrets.token_hex(2)}"
+
+
+def _new_group_id():
+    return f"g-{secrets.token_hex(4)}"
+
+
+# --- scope tokens --------------------------------------------------------
+
+_TYPED_TOKEN_RE = re.compile(r"^(repo|resource|book|agent-proto):")
+
+
+def _normalize_token(tok):
+    """Normalize a single scope token.
+
+    - Expand leading ~ in file: tokens.
+    - Strip a trailing /** on file: tokens (it's redundant with prefix match,
+      kept purely as readability sugar in prompts).
+    - Leave '*' alone.
+    - Typed tokens (repo:/resource:/book:/agent-proto:) are exact-match.
+    """
+    if not tok or not isinstance(tok, str):
+        raise ValueError(f"Scope token must be non-empty string: {tok!r}")
+    if tok == "*":
+        return "*"
+    if tok.startswith("file:"):
+        path = tok[len("file:"):]
+        # Strip trailing /** or ** (explicit recursive intent -- same semantic)
+        if path.endswith("/**"):
+            path = path[:-3]
+        elif path.endswith("**"):
+            path = path[:-2]
+        # Expand ~
+        if path.startswith("~"):
+            path = os.path.expanduser(path)
+        # Keep trailing slash intent: directories prefix-match like file:/foo/
+        # matches file:/foo/bar. We do NOT force or strip trailing slash --
+        # prefix match handles both file:/foo and file:/foo/.
+        return f"file:{path}"
+    if _TYPED_TOKEN_RE.match(tok):
+        return tok
+    # Unknown / untyped token: accept as-is (exact match).
+    return tok
+
+
+def _tokens_overlap(a, b):
+    """Return True if two normalized scope tokens overlap.
+
+    - '*' overlaps everything.
+    - Two file: tokens overlap if one is a prefix of the other.
+    - Typed/other tokens overlap only if equal.
+    """
+    if a == "*" or b == "*":
+        return True
+    a_is_file = a.startswith("file:")
+    b_is_file = b.startswith("file:")
+    if a_is_file and b_is_file:
+        pa = a[len("file:"):]
+        pb = b[len("file:"):]
+        # Directory-style prefix: we treat file:/foo and file:/foo/ as the same.
+        # Add trailing slash for correct prefix match so file:/foo doesn't
+        # accidentally match file:/foobar.
+        def with_sep(p):
+            return p if p.endswith("/") else p + "/"
+        if pa == pb:
+            return True
+        wa = with_sep(pa)
+        wb = with_sep(pb)
+        # Either is a directory-prefix of the other, OR one is an exact file
+        # that lives under the other's directory.
+        return wa.startswith(wb) or wb.startswith(wa)
+    # Mixed types or two non-file tokens: exact match only.
+    return a == b
+
+
+def _scope_sets_overlap(set_a, set_b):
+    """True if any token from set_a overlaps any token from set_b."""
+    for ta in set_a:
+        for tb in set_b:
+            if _tokens_overlap(ta, tb):
+                return True
+    return False
+
+
+def _union_scopes(*sets):
+    """Union of token sets, with simple dedupe."""
+    merged = []
+    seen = set()
+    for s in sets:
+        for t in s:
+            if t not in seen:
+                seen.add(t)
+                merged.append(t)
+    return merged
+
+
+def _active_items(items):
+    return [it for it in items if it.get("status") in ("pending", "running")]
+
+
+def _group_members(items, group_id):
+    return [it for it in items if it.get("group_id") == group_id]
+
+
+def _group_scope(items, group_id):
+    members = _group_members(items, group_id)
+    return _union_scopes(*(m.get("scope", []) for m in members))
+
+
+def _group_ids_overlapping(items, new_scope):
+    """Return list of group_ids whose aggregated scope overlaps new_scope.
+
+    Only considers groups with at least one pending/running member.
+    """
+    active = _active_items(items)
+    by_group = {}
+    for it in active:
+        by_group.setdefault(it["group_id"], []).append(it)
+    overlapping = []
+    for gid, members in by_group.items():
+        gscope = _union_scopes(*(m.get("scope", []) for m in members))
+        if _scope_sets_overlap(gscope, new_scope):
+            overlapping.append(gid)
+    return overlapping
+
+
+def _running_scope_conflicts(items, candidate_scope, *, exclude_id=None,
+                             exclude_group=None):
+    """Return list of running items whose scope overlaps candidate_scope.
+
+    Used for spawn-gating: if ANY running item overlaps the candidate's
+    scope (even across groups -- which should be rare given the merge
+    semantics but can happen for untracked/unregistered in-flight work),
+    spawning is a conflict.
+
+    `exclude_id` skips a specific item (e.g. the candidate itself once
+    it's been marked running). `exclude_group` skips an entire group (used
+    when the caller already knows group-level invariant holds).
+    """
+    out = []
+    for it in items:
+        if it.get("status") != "running":
+            continue
+        if exclude_id and it.get("id") == exclude_id:
+            continue
+        if exclude_group and it.get("group_id") == exclude_group:
+            continue
+        if _scope_sets_overlap(it.get("scope", []), candidate_scope):
+            out.append(it)
+    return out
+
+
+def _sort_key(item):
+    # Priority descending (higher priority = earlier), FIFO tiebreak.
+    return (-int(item.get("priority", 5)), item.get("created_at", ""))
+
+
+def _group_head(items, group_id):
+    """Return the current head (running if any, else next pending)."""
+    members = [it for it in _group_members(items, group_id) if it.get("status") in ("pending", "running")]
+    if not members:
+        return None
+    running = [it for it in members if it.get("status") == "running"]
+    if running:
+        return sorted(running, key=_sort_key)[0]
+    return sorted(members, key=_sort_key)[0]
+
+
+def _item_is_ready(items, item):
+    if item.get("status") != "pending":
+        return False
+    head = _group_head(items, item["group_id"])
+    if head is None:
+        return False
+    if head["id"] != item["id"]:
+        return False
+    # Head must not be running (if something is running in the group, not ready).
+    members = _group_members(items, item["group_id"])
+    if any(m.get("status") == "running" for m in members):
+        return False
+    return True
+
+
+def _gc_groups(items):
+    """Remove any reference to groups that have no pending/running members.
+
+    (Groups are derived from group_id on items, so nothing to remove except
+    logging completed done/abandoned members as they age out. Items with
+    status done/abandoned older than the prune threshold can be kicked by
+    `queue prune`.)
+    """
+    return items
+
+
+def _recompute_group_heads(items):
+    """Ensure invariant: at most one running per group, head flag is accurate."""
+    by_group = {}
+    for it in items:
+        by_group.setdefault(it.get("group_id"), []).append(it)
+    for gid, members in by_group.items():
+        head = _group_head(items, gid)
+        for m in members:
+            m["group_head"] = (head is not None and m["id"] == head["id"])
+
+
+# --- queue subcommands ---------------------------------------------------
+
+
+def _fmt_ts():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _pingme_notify(title, message, priority="normal", silent=False):
+    """Fire a Pushover notification via the ``pingme`` CLI.
+
+    Called from queue lifecycle hooks (register / done / abandon). Failures
+    MUST NOT block the underlying queue state transition, so every error
+    path here is swallowed to stderr and returns None.
+
+    Suppression:
+        * ``silent=True`` (from ``--silent`` on the CLI) skips the call.
+        * ``PINGME_SESSION_TASK=0`` env var skips all session-task pingmes
+          (useful for batch scripts / noisy flows).
+        * ``pingme`` not on PATH -> silent no-op (not an error).
+    """
+    if silent:
+        return None
+    if os.environ.get("PINGME_SESSION_TASK") == "0":
+        return None
+    pingme = shutil.which("pingme")
+    if not pingme:
+        return None
+    if priority not in ("low", "normal", "high", "emergency"):
+        priority = "normal"
+    cmd = [pingme, "-p", priority, message, title]
+    try:
+        subprocess.run(
+            cmd,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except Exception as exc:  # noqa: BLE001 -- never block the queue op
+        print(f"[pingme] notification failed ({exc.__class__.__name__}): {exc}",
+              file=sys.stderr)
+        return None
+    return cmd
+
+
+def _claude_event_notify(tag, message, data, priority="low", silent=False):
+    """Emit a claude-event for a queue lifecycle transition.
+
+    Wraps the ``claude-event`` CLI. Events land in ``~/claude-events/`` and
+    are picked up by ``claude-event-watch``, letting the main loop react to
+    queue transitions (e.g. spawn the next-in-group item when a blocker
+    clears).
+
+    MUST NEVER block or fail the underlying queue op. All errors are caught
+    and logged to stderr as a warning. A broken ``claude-event`` is a
+    warning, not a crash.
+
+    Suppression mirrors pingme:
+        * ``silent=True`` (from ``--silent`` on the CLI) skips the call.
+        * ``CLAUDE_EVENT_SESSION_TASK=0`` env var skips all emits
+          (useful for batch scripts / test harnesses).
+        * ``claude-event`` not on PATH -> silent no-op (not an error).
+    """
+    if silent:
+        return None
+    if os.environ.get("CLAUDE_EVENT_SESSION_TASK") == "0":
+        return None
+    emitter = shutil.which("claude-event")
+    if not emitter:
+        return None
+    if priority not in ("low", "normal", "high", "urgent"):
+        priority = "low"
+    cmd = [
+        emitter,
+        message,
+        "--source", "queue",
+        "--tag", tag,
+        "--priority", priority,
+    ]
+    # Flatten data dict into repeated --data KEY=VAL args. Nested structures
+    # (scope list) get JSON-serialised so the consumer can round-trip them.
+    for k, v in (data or {}).items():
+        if isinstance(v, (list, dict)):
+            v = json.dumps(v, separators=(",", ":"))
+        cmd.extend(["--data", f"{k}={v}"])
+    try:
+        subprocess.run(
+            cmd,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except Exception as exc:  # noqa: BLE001 -- never block the queue op
+        print(
+            f"[claude-event] emit failed ({exc.__class__.__name__}): {exc}",
+            file=sys.stderr,
+        )
+        return None
+    return cmd
+
+
+def _item_summary(item):
+    """Read the one-line summary of a queue item, defaulting to placeholder.
+
+    Legacy items (written before 2026-04-19) have no ``summary`` field; they
+    surface as ``DEFAULT_SUMMARY`` until edited via ``queue set-summary``.
+    """
+    s = (item.get("summary") or "").strip()
+    return s if s else DEFAULT_SUMMARY
+
+
+def _elapsed_minutes(started_at_iso):
+    """Return integer minutes elapsed since an ISO-8601 timestamp, or None."""
+    sec = _elapsed_seconds(started_at_iso)
+    if sec is None:
+        return None
+    return sec // 60
+
+
+def _elapsed_seconds(started_at_iso):
+    """Return integer seconds elapsed since an ISO-8601 timestamp, or None.
+
+    Used by the claude-event emitter so the consumer can render minute-level
+    precision for short tasks (<60s) that would otherwise log as "0m".
+    """
+    if not started_at_iso:
+        return None
+    try:
+        started = datetime.fromisoformat(started_at_iso)
+    except (TypeError, ValueError):
+        return None
+    now = datetime.now(timezone.utc)
+    if started.tzinfo is None:
+        # Treat naive as UTC rather than crashing -- queue writes utc iso.
+        started = started.replace(tzinfo=timezone.utc)
+    delta = now - started
+    return max(0, int(delta.total_seconds()))
+
+
+def cmd_queue_add(args):
+    scope_raw = args.scope or []
+    if not scope_raw:
+        print("ERROR: at least one --scope required (e.g. --scope '*')", file=sys.stderr)
+        sys.exit(1)
+    # Split each --scope value on commas so callers can pass either
+    #   --scope foo --scope bar
+    # or
+    #   --scope foo,bar
+    # interchangeably. Whitespace around tokens is stripped (in case anyone
+    # writes `--scope foo, bar`). Empty fragments (e.g. trailing comma) are
+    # dropped. Andrew flagged 2026-04-27 after q-3dfa silently failed to
+    # serialize behind q-8106 because the comma-joined scope was stored as a
+    # single opaque token, making exact-match conflict detection miss it.
+    scope_split = []
+    seen_split = set()
+    for raw in scope_raw:
+        for piece in raw.split(","):
+            piece = piece.strip()
+            if not piece:
+                continue
+            if piece in seen_split:
+                continue
+            seen_split.add(piece)
+            scope_split.append(piece)
+    if not scope_split:
+        print("ERROR: at least one --scope required (e.g. --scope '*')", file=sys.stderr)
+        sys.exit(1)
+    try:
+        scope = [_normalize_token(t) for t in scope_split]
+    except ValueError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        sys.exit(1)
+    context = None
+    if args.context:
+        try:
+            context = json.loads(args.context)
+        except json.JSONDecodeError:
+            print(f"ERROR: --context must be valid JSON: {args.context}", file=sys.stderr)
+            sys.exit(1)
+
+    # Soft-required one-line summary. Andrew 2026-04-19: "update queue
+    # notifications to include one line summary. might have to require one
+    # as input for task enqueuing ... like 10ish words long". We still accept
+    # items without --summary (to avoid breaking legacy scripts / migration),
+    # but we warn loudly to stderr so the caller notices. Pingme notifications
+    # for items without a summary will read "(no summary)".
+    summary = (args.summary or "").strip() or DEFAULT_SUMMARY
+    if summary == DEFAULT_SUMMARY:
+        print(
+            "warning: no --summary provided; pingme notifications will say "
+            "'(no summary)'. Pass --summary \"~10 word headline\" next time.",
+            file=sys.stderr,
+        )
+
+    # ------------------------------------------------------------------
+    # HARD-FAIL spawn-gate: if any currently-running item has overlapping
+    # scope, refuse to even enqueue the item. Andrew 2026-04-17:
+    #   "make sure it's not just a warning, but a loud failure with all
+    #    caps and explicit instructions not to run"
+    # This is intentional: adding without running-conflict check lets the
+    # main loop queue up scope-overlapping work and then race to spawn it
+    # before the running item finishes. Hard-fail on add forces the caller
+    # to handle the conflict consciously (wait, or use --force-enqueue).
+    # ------------------------------------------------------------------
+    fh, data = _queue_open_locked("rw")
+    try:
+        items = data["items"]
+        running_conflicts = _running_scope_conflicts(items, scope)
+
+        if running_conflicts and not args.force_enqueue:
+            # Release lock before exiting so concurrent callers aren't blocked.
+            fcntl.flock(fh, fcntl.LOCK_UN)
+            fh.close()
+            _print_add_conflict_banner(scope, running_conflicts)
+            sys.exit(3)
+
+        overlapping = _group_ids_overlapping(items, scope)
+
+        if len(overlapping) == 0:
+            group_id = _new_group_id()
+        elif len(overlapping) == 1:
+            group_id = overlapping[0]
+        else:
+            # Merge all overlapping groups into a brand-new group.
+            group_id = _new_group_id()
+            for it in items:
+                if it.get("group_id") in overlapping:
+                    it["group_id"] = group_id
+            log_completed(
+                f"[queue merge] {len(overlapping)} groups merged into {group_id}",
+                extra={
+                    "source": "queue",
+                    "event": "merge",
+                    "merged_groups": overlapping,
+                    "new_group_id": group_id,
+                },
+            )
+
+        new_id = _new_id()
+        # Ensure unique id even if secrets collides (vanishingly rare).
+        existing_ids = {it["id"] for it in items}
+        while new_id in existing_ids:
+            new_id = _new_id()
+
+        item = {
+            "id": new_id,
+            "description": args.description,
+            "summary": summary,
+            "scope": scope,
+            "group_id": group_id,
+            "group_head": False,
+            "status": "pending",
+            "priority": int(args.priority),
+            "created_at": _fmt_ts(),
+            "created_by": args.created_by or "main-loop",
+        }
+        if context is not None:
+            item["context"] = context
+        items.append(item)
+
+        _recompute_group_heads(items)
+
+        # Determine ready_now + serialized_after
+        group_members_sorted = sorted(
+            [it for it in _group_members(items, group_id) if it.get("status") == "pending"],
+            key=_sort_key,
+        )
+        position = next((i + 1 for i, it in enumerate(group_members_sorted) if it["id"] == new_id), -1)
+        ready_now = _item_is_ready(items, item)
+        serialized_after = [it["id"] for it in group_members_sorted if it["id"] != new_id and _sort_key(it) < _sort_key(item)]
+        # Also consider running items in same group
+        running_in_group = [it["id"] for it in _group_members(items, group_id) if it.get("status") == "running"]
+        serialized_after = running_in_group + serialized_after
+
+        _queue_write_and_unlock(fh, data)
+    except Exception:
+        try:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+            fh.close()
+        except Exception:
+            pass
+        raise
+
+    # Build spawn_instruction string for the main loop to read literally.
+    if ready_now:
+        spawn_instruction = f"READY: register-and-spawn (session-task queue register {new_id})"
+    else:
+        blockers = serialized_after or []
+        spawn_instruction = (
+            "BLOCKED: do not spawn, wait for " + ",".join(blockers)
+            if blockers
+            else "BLOCKED: do not spawn (no head visible)"
+        )
+
+    # Print result. running_conflicts is only populated via --force-enqueue
+    # now, since without it we would have already exited above.
+    running_conflict_info = [
+        {"id": c["id"], "group_id": c.get("group_id"), "scope": c.get("scope", [])}
+        for c in running_conflicts
+    ]
+
+    if args.json:
+        print(json.dumps({
+            "id": new_id,
+            "group_id": group_id,
+            "position": position,
+            "ready_now": ready_now,
+            "serialized_after": serialized_after,
+            "scope": scope,
+            "running_scope_conflicts": running_conflict_info,
+            "spawn_instruction": spawn_instruction,
+        }, indent=2))
+    else:
+        print(f"added: {new_id}")
+        print(f"assigned: group={group_id}, position={position}, ready_now={'true' if ready_now else 'false'}, serialized_after={serialized_after}")
+        print(f"spawn_instruction: {spawn_instruction}")
+        if running_conflicts:
+            # Only reachable via --force-enqueue. Still scream.
+            print("", file=sys.stderr)
+            print("!" * 70, file=sys.stderr)
+            print("!! FORCE-ENQUEUED OVER RUNNING SCOPE CONFLICT. DO NOT SPAWN THIS AGENT.",
+                  file=sys.stderr)
+            for c in running_conflicts:
+                print(f"!!   running {c['id']} (group {c.get('group_id')}): "
+                      f"{','.join(c.get('scope', []))}", file=sys.stderr)
+            print("!! RUN THE CONFLICTING WORK FIRST OR WAIT FOR IT TO FINISH.",
+                  file=sys.stderr)
+            print("!" * 70, file=sys.stderr)
+
+    # NOTE: queue-added claude-event emit removed 2026-04-27 (Andrew DM:
+    # "Remove queue added event, too noisy"). queue add is task creation,
+    # not a state transition. The main loop already holds the return value
+    # from queue add — surfacing it again as an event was double-handling.
+    # State-transition emits (queue-running, queue-done, queue-abandoned)
+    # remain in their respective code paths.
+
+
+def _print_add_conflict_banner(new_scope, running_conflicts):
+    """Scream-worthy ALL CAPS stderr banner for queue-add hard-fail.
+
+    Used when a queue add attempts to enqueue scope that overlaps a
+    currently-running item. The caller is expected to read this banner,
+    abort the spawn attempt, and either (a) wait for the running item to
+    finish, or (b) surface the conflict to a human.
+    """
+    print("", file=sys.stderr)
+    bar = "!" * 72
+    print(bar, file=sys.stderr)
+    print("!! QUEUE ADD REFUSED: SCOPE CONFLICT WITH RUNNING ITEM(S).",
+          file=sys.stderr)
+    print("!! DO NOT SPAWN ANY AGENT FOR THIS WORK.", file=sys.stderr)
+    print("!! RUN THE CONFLICTING WORK FIRST OR WAIT FOR IT TO FINISH.",
+          file=sys.stderr)
+    print("!!", file=sys.stderr)
+    print(f"!! NEW SCOPE: {','.join(new_scope)}", file=sys.stderr)
+    print("!! CONFLICTING RUNNING ITEM(S):", file=sys.stderr)
+    for c in running_conflicts:
+        print(
+            f"!!   - {c['id']} (group {c.get('group_id')}): "
+            f"{','.join(c.get('scope', []))}",
+            file=sys.stderr,
+        )
+    print("!!", file=sys.stderr)
+    print("!! IF YOU ABSOLUTELY MUST ENQUEUE OVER THIS CONFLICT (RARE):",
+          file=sys.stderr)
+    print("!!   session-task queue add ... --force-enqueue",
+          file=sys.stderr)
+    print("!! BUT YOU STILL MUST NOT SPAWN AN AGENT FOR IT UNTIL THE",
+          file=sys.stderr)
+    print("!! RUNNING ITEM(S) ABOVE REACH A DONE/ABANDONED STATE.",
+          file=sys.stderr)
+    print(bar, file=sys.stderr)
+
+
+def cmd_queue_list(args):
+    fh, data = _queue_open_locked("r")
+    items = list(data["items"])
+    _queue_unlock_readonly(fh)
+
+    # Filter
+    if args.group:
+        items = [it for it in items if it.get("group_id") == args.group]
+    if args.ready:
+        items = [it for it in items if _item_is_ready(data["items"], it)]
+    elif not args.all:
+        items = [it for it in items if it.get("status") in ("pending", "running")]
+
+    items.sort(key=lambda it: (it.get("group_id", ""), _sort_key(it)))
+
+    if args.json:
+        print(json.dumps(items, indent=2))
+        return
+
+    if not items:
+        print("(no items)")
+        return
+
+    # Tabular
+    print(f"{'ID':22} {'GROUP':14} {'ST':8} {'PR':3} {'H':1} {'SCOPE'}")
+    for it in items:
+        head_mark = "*" if it.get("group_head") else " "
+        scope_str = ",".join(it.get("scope", []))
+        if len(scope_str) > 48:
+            scope_str = scope_str[:45] + "..."
+        summary = _item_summary(it)
+        if len(summary) > 90:
+            summary = summary[:87] + "..."
+        desc = it.get("description", "")
+        if len(desc) > 80:
+            desc = desc[:77] + "..."
+        print(
+            f"{it['id']:22} {it.get('group_id',''):14} "
+            f"{it.get('status',''):8} {it.get('priority',5):<3} {head_mark} "
+            f"{scope_str}"
+        )
+        print(f"  summary: {summary}")
+        print(f"  desc   : {desc}")
+
+
+def cmd_queue_show(args):
+    fh, data = _queue_open_locked("r")
+    items = list(data["items"])
+    _queue_unlock_readonly(fh)
+    for it in items:
+        if it["id"] == args.id:
+            ready = _item_is_ready(items, it)
+            out = dict(it)
+            out["ready_now"] = ready
+            out["group_scope"] = _group_scope(items, it["group_id"])
+            print(json.dumps(out, indent=2))
+            return
+    print(f"not found: {args.id}", file=sys.stderr)
+    sys.exit(1)
+
+
+def cmd_queue_scope(args):
+    fh, data = _queue_open_locked("r")
+    items = list(data["items"])
+    _queue_unlock_readonly(fh)
+    for it in items:
+        if it["id"] == args.id:
+            for t in it.get("scope", []):
+                print(t)
+            return
+    print(f"not found: {args.id}", file=sys.stderr)
+    sys.exit(1)
+
+
+def cmd_queue_groups(args):
+    fh, data = _queue_open_locked("r")
+    items = list(data["items"])
+    _queue_unlock_readonly(fh)
+
+    by_group = {}
+    for it in items:
+        if it.get("status") not in ("pending", "running"):
+            continue
+        by_group.setdefault(it["group_id"], []).append(it)
+
+    out = []
+    for gid, members in sorted(by_group.items()):
+        gscope = _union_scopes(*(m.get("scope", []) for m in members))
+        running = [m for m in members if m.get("status") == "running"]
+        pending = [m for m in members if m.get("status") == "pending"]
+        head = _group_head(items, gid)
+        out.append({
+            "group_id": gid,
+            "scope": gscope,
+            "running_count": len(running),
+            "pending_count": len(pending),
+            "head_id": head["id"] if head else None,
+            "members": [m["id"] for m in sorted(members, key=_sort_key)],
+        })
+
+    if args.json:
+        print(json.dumps(out, indent=2))
+        return
+
+    if not out:
+        print("(no active groups)")
+        return
+    for g in out:
+        print(f"{g['group_id']}  running={g['running_count']}  pending={g['pending_count']}  head={g['head_id']}")
+        print(f"  scope: {','.join(g['scope'])}")
+        print(f"  members: {','.join(g['members'])}")
+
+
+def cmd_queue_ready(args):
+    fh, data = _queue_open_locked("r")
+    items = list(data["items"])
+    _queue_unlock_readonly(fh)
+    ready = [it for it in items if _item_is_ready(items, it)]
+    ready.sort(key=_sort_key)
+    if args.json:
+        print(json.dumps(ready, indent=2))
+        return
+    if not ready:
+        print("(nothing ready)")
+        return
+    for it in ready:
+        print(f"{it['id']}  pr={it.get('priority',5)}  {it['description']}")
+
+
+def cmd_queue_done(args):
+    fh, data = _queue_open_locked("rw")
+    try:
+        items = data["items"]
+        target = next((it for it in items if it["id"] == args.id), None)
+        if target is None:
+            print(f"not found: {args.id}", file=sys.stderr)
+            fcntl.flock(fh, fcntl.LOCK_UN)
+            fh.close()
+            sys.exit(1)
+        if target["status"] == "done":
+            print(f"already done: {args.id}")
+            fcntl.flock(fh, fcntl.LOCK_UN)
+            fh.close()
+            return
+        started_at = target.get("started_at")
+        target["status"] = "done"
+        target["completed_at"] = _fmt_ts()
+        target["group_head"] = False
+        _recompute_group_heads(items)
+        next_head = _group_head(items, target["group_id"])
+        _queue_write_and_unlock(fh, data)
+    except Exception:
+        fcntl.flock(fh, fcntl.LOCK_UN)
+        fh.close()
+        raise
+
+    log_completed(
+        f"[queue {target['id']}] {target['description']}",
+        extra={
+            "source": "queue",
+            "id": target["id"],
+            "group_id": target["group_id"],
+        },
+    )
+
+    # Lifecycle notification: task completion (success). Never blocks.
+    # Summary on line 1 (Pushover preview), elapsed/scope on line 2.
+    elapsed = _elapsed_minutes(started_at)
+    elapsed_sec = _elapsed_seconds(started_at)
+    elapsed_str = f"{elapsed}m" if elapsed is not None else "unknown"
+    _pingme_notify(
+        title=f"queue done: {target['id']}",
+        message=(
+            f"{_item_summary(target)}\n"
+            f"elapsed: {elapsed_str} "
+            f"| scope: {','.join(target.get('scope', []))}"
+        ),
+        priority="normal",
+        silent=getattr(args, "silent", False),
+    )
+
+    # Claude-event lifecycle emit: queue-done. Main loop handler checks the
+    # group for newly-unblocked next-in-group items and may spawn them.
+    _claude_event_notify(
+        tag="queue-done",
+        message=f"queue done: {target['id']} ({_item_summary(target)})",
+        data={
+            "queue_id": target["id"],
+            "group_id": target["group_id"],
+            "scope": target.get("scope", []),
+            "summary": _item_summary(target),
+            "elapsed_sec": elapsed_sec,
+            "created_by": target.get("created_by", ""),
+        },
+        priority="low",
+        silent=getattr(args, "silent", False),
+    )
+
+    print(f"done: {args.id}")
+    if next_head:
+        print(f"next in group {target['group_id']}: {next_head['id']} ({next_head['description'][:60]})")
+    else:
+        print(f"group {target['group_id']} is now empty")
+
+
+def cmd_queue_abandon(args):
+    fh, data = _queue_open_locked("rw")
+    try:
+        items = data["items"]
+        target = next((it for it in items if it["id"] == args.id), None)
+        if target is None:
+            print(f"not found: {args.id}", file=sys.stderr)
+            fcntl.flock(fh, fcntl.LOCK_UN)
+            fh.close()
+            sys.exit(1)
+        started_at = target.get("started_at")
+        target["status"] = "abandoned"
+        target["abandoned_at"] = _fmt_ts()
+        if args.reason:
+            target["abandon_reason"] = args.reason
+        target["group_head"] = False
+        _recompute_group_heads(items)
+        _queue_write_and_unlock(fh, data)
+    except Exception:
+        fcntl.flock(fh, fcntl.LOCK_UN)
+        fh.close()
+        raise
+
+    log_completed(
+        f"[queue {target['id']} abandoned] {target['description']}"
+        + (f" (reason: {args.reason})" if args.reason else ""),
+        extra={
+            "source": "queue",
+            "event": "abandon",
+            "id": target["id"],
+            "group_id": target["group_id"],
+            "reason": args.reason,
+        },
+    )
+
+    # Lifecycle notification: task completion (failure). Never blocks.
+    # Summary on line 1 (Pushover preview), elapsed/reason/scope on line 2.
+    elapsed = _elapsed_minutes(started_at)
+    elapsed_sec = _elapsed_seconds(started_at)
+    elapsed_str = f"{elapsed}m" if elapsed is not None else "unknown"
+    reason_str = args.reason if args.reason else "no reason given"
+    _pingme_notify(
+        title=f"queue abandoned: {target['id']}",
+        message=(
+            f"{_item_summary(target)}\n"
+            f"elapsed: {elapsed_str} "
+            f"| reason: {reason_str} "
+            f"| scope: {','.join(target.get('scope', []))}"
+        ),
+        priority="normal",
+        silent=getattr(args, "silent", False),
+    )
+
+    # Claude-event lifecycle emit: queue-abandoned. Main loop handler logs
+    # to failures and checks the group for downstream-blocked peers.
+    _claude_event_notify(
+        tag="queue-abandoned",
+        message=f"queue abandoned: {target['id']} ({_item_summary(target)})",
+        data={
+            "queue_id": target["id"],
+            "group_id": target["group_id"],
+            "scope": target.get("scope", []),
+            "summary": _item_summary(target),
+            "elapsed_sec": elapsed_sec,
+            "reason": args.reason or "",
+            "created_by": target.get("created_by", ""),
+        },
+        priority="low",
+        silent=getattr(args, "silent", False),
+    )
+
+    print(f"abandoned: {args.id}")
+
+
+def cmd_queue_pop(args):
+    fh, data = _queue_open_locked("rw")
+    try:
+        items = data["items"]
+        target = None
+        if args.id:
+            target = next((it for it in items if it["id"] == args.id), None)
+            if target is None:
+                print(f"not found: {args.id}", file=sys.stderr)
+                fcntl.flock(fh, fcntl.LOCK_UN)
+                fh.close()
+                sys.exit(1)
+            if not _item_is_ready(items, target):
+                print(f"not ready: {args.id}", file=sys.stderr)
+                fcntl.flock(fh, fcntl.LOCK_UN)
+                fh.close()
+                sys.exit(1)
+        else:
+            ready = [it for it in items if _item_is_ready(items, it)]
+            ready.sort(key=_sort_key)
+            if not ready:
+                print("(nothing ready)")
+                fcntl.flock(fh, fcntl.LOCK_UN)
+                fh.close()
+                sys.exit(1)
+            target = ready[0]
+
+        # Belt-and-suspenders spawn-gating: even though _item_is_ready has
+        # already checked group-head status, also refuse to pop if any OTHER
+        # running item has overlapping scope. This catches the case where an
+        # item got registered through a raced add, or there's an untracked
+        # in-flight agent on the same scope (rare but possible). Mirrors the
+        # `queue register` invariant so `pop` and `register` behave the same.
+        ok, reasons, conflicts = _spawn_check(items, target)
+        if not ok:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+            fh.close()
+            print("", file=sys.stderr)
+            bar = "!" * 72
+            print(bar, file=sys.stderr)
+            print(f"!! POP REFUSED: {target['id']} IS NOT CLEAR TO SPAWN.",
+                  file=sys.stderr)
+            print("!! DO NOT SPAWN ANY AGENT FOR THIS WORK.", file=sys.stderr)
+            print("!! RUN THE CONFLICTING WORK FIRST OR WAIT FOR IT TO FINISH.",
+                  file=sys.stderr)
+            print("!! REASONS:", file=sys.stderr)
+            for r in reasons:
+                print(f"!!   - {r}", file=sys.stderr)
+            if conflicts:
+                print("!! RUNNING SCOPE OVERLAPS:", file=sys.stderr)
+                for c in conflicts:
+                    print(
+                        f"!!   - {c['id']} (group {c.get('group_id')}): "
+                        f"{','.join(c.get('scope', []))}",
+                        file=sys.stderr,
+                    )
+            print(bar, file=sys.stderr)
+            sys.exit(2)
+
+        target["status"] = "running"
+        target["started_at"] = _fmt_ts()
+        _recompute_group_heads(items)
+        popped = dict(target)
+        _queue_write_and_unlock(fh, data)
+    except Exception:
+        fcntl.flock(fh, fcntl.LOCK_UN)
+        fh.close()
+        raise
+    print(json.dumps(popped, indent=2))
+
+
+def _spawn_check(items, item):
+    """Return (ok, reasons, conflicts) tuple for spawn-gating.
+
+    ok (bool):
+        True iff it is safe to spawn an agent for this queue item right now.
+
+    reasons (list[str]):
+        Human-readable rejection reasons if not ok.
+
+    conflicts (list[dict]):
+        Running items whose scope overlaps this item's scope (excluding
+        the item itself if it's already running).
+    """
+    reasons = []
+    conflicts = _running_scope_conflicts(
+        items, item.get("scope", []), exclude_id=item.get("id"),
+    )
+
+    status = item.get("status")
+    if status not in ("pending", "running"):
+        reasons.append(f"item status is {status!r} (must be pending or running)")
+    elif status == "pending":
+        if not _item_is_ready(items, item):
+            reasons.append(
+                "item is not ready (blocked behind another item in its group "
+                f"{item.get('group_id')!r})"
+            )
+
+    # Any cross-group running conflict is a hard reject. Same-group conflicts
+    # would be a group-invariant violation (only one running per group).
+    cross = [c for c in conflicts if c.get("group_id") != item.get("group_id")]
+    if cross:
+        reasons.append(
+            "scope overlaps {n} running item(s) in other group(s): {ids}".format(
+                n=len(cross),
+                ids=", ".join(f"{c['id']}({c.get('group_id')})" for c in cross),
+            )
+        )
+
+    same_group_running = [
+        c for c in conflicts if c.get("group_id") == item.get("group_id")
+    ]
+    if same_group_running and item.get("status") == "pending":
+        # Should be caught by _item_is_ready above, but be explicit.
+        reasons.append(
+            "same-group running peer(s) exist: "
+            + ", ".join(c["id"] for c in same_group_running)
+        )
+
+    return (len(reasons) == 0, reasons, conflicts)
+
+
+def cmd_queue_spawn_check(args):
+    fh, data = _queue_open_locked("r")
+    items = list(data["items"])
+    _queue_unlock_readonly(fh)
+
+    target = next((it for it in items if it["id"] == args.id), None)
+    if target is None:
+        print("", file=sys.stderr)
+        bar = "!" * 72
+        print(bar, file=sys.stderr)
+        print(f"!! SPAWN-CHECK REFUSED: QUEUE ITEM {args.id!r} NOT FOUND.",
+              file=sys.stderr)
+        print("!! DO NOT SPAWN ANY AGENT. THE QUEUE HAS NO RECORD OF THIS WORK.",
+              file=sys.stderr)
+        print(bar, file=sys.stderr)
+        sys.exit(2)
+
+    ok, reasons, conflicts = _spawn_check(items, target)
+    conflict_info = [
+        {"id": c["id"], "group_id": c.get("group_id"),
+         "status": c.get("status"), "scope": c.get("scope", [])}
+        for c in conflicts
+    ]
+
+    if args.json:
+        print(json.dumps({
+            "id": target["id"],
+            "status": target.get("status"),
+            "group_id": target.get("group_id"),
+            "scope": target.get("scope", []),
+            "ok": ok,
+            "reasons": reasons,
+            "conflicts": conflict_info,
+            "spawn_instruction": (
+                f"READY: register-and-spawn (session-task queue register {target['id']})"
+                if ok
+                else "BLOCKED: do not spawn, resolve the conflicts listed above"
+            ),
+        }, indent=2))
+        sys.exit(0 if ok else 2)
+
+    if ok:
+        print(f"ok: {target['id']}")
+        print(f"  status: {target.get('status')}")
+        print(f"  group : {target.get('group_id')}")
+        print(f"  scope : {','.join(target.get('scope', []))}")
+        print(f"  next  : session-task queue register {target['id']}")
+        sys.exit(0)
+
+    # HARD-FAIL path: ALL CAPS stderr so the main loop cannot miss it.
+    print("", file=sys.stderr)
+    bar = "!" * 72
+    print(bar, file=sys.stderr)
+    print(f"!! SPAWN-CHECK FAILED: {target['id']} IS NOT CLEAR TO SPAWN.",
+          file=sys.stderr)
+    print("!! DO NOT SPAWN ANY AGENT FOR THIS WORK.", file=sys.stderr)
+    print("!! RUN THE CONFLICTING WORK FIRST OR WAIT FOR IT TO FINISH.",
+          file=sys.stderr)
+    print("!!", file=sys.stderr)
+    print(f"!! ITEM  : {target['id']} (status={target.get('status')}, "
+          f"group={target.get('group_id')})", file=sys.stderr)
+    print(f"!! SCOPE : {','.join(target.get('scope', []))}", file=sys.stderr)
+    print("!! REASONS:", file=sys.stderr)
+    for r in reasons:
+        print(f"!!   - {r}", file=sys.stderr)
+    if conflicts:
+        print("!! RUNNING SCOPE OVERLAPS:", file=sys.stderr)
+        for c in conflicts:
+            print(
+                f"!!   - {c['id']} (group {c.get('group_id')}, "
+                f"status {c.get('status')}): {','.join(c.get('scope', []))}",
+                file=sys.stderr,
+            )
+    print(bar, file=sys.stderr)
+
+    sys.exit(2)
+
+
+def cmd_queue_register(args):
+    """Atomically claim a pending item as running (spawn-gating entry point).
+
+    Refuses if:
+      * item does not exist
+      * item is not pending (already running/done/abandoned)
+      * item is not the ready head of its group (blocked on a peer)
+      * any OTHER running item's scope overlaps this item's scope
+        (cross-group conflict -- indicates an unregistered in-flight agent
+        the main loop is responsible for)
+
+    This is the single source of truth for "is this agent allowed to spawn
+    right now". The main loop MUST call register before invoking the Agent
+    tool; an unregistered spawn is an operating-rules violation.
+    """
+    fh, data = _queue_open_locked("rw")
+    try:
+        items = data["items"]
+        target = next((it for it in items if it["id"] == args.id), None)
+        if target is None:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+            fh.close()
+            print("", file=sys.stderr)
+            bar = "!" * 72
+            print(bar, file=sys.stderr)
+            print(f"!! REGISTER REFUSED: QUEUE ITEM {args.id!r} NOT FOUND.",
+                  file=sys.stderr)
+            print("!! DO NOT SPAWN ANY AGENT. THE QUEUE HAS NO RECORD OF THIS WORK.",
+                  file=sys.stderr)
+            print(bar, file=sys.stderr)
+            sys.exit(2)
+
+        if target.get("status") == "running":
+            # Idempotent-ish: re-registering something that's already running
+            # is fine if --if-absent, but default refuses so the caller
+            # notices double-register.
+            if args.if_absent:
+                print(f"already running: {args.id}")
+                fcntl.flock(fh, fcntl.LOCK_UN)
+                fh.close()
+                return
+            fcntl.flock(fh, fcntl.LOCK_UN)
+            fh.close()
+            print("", file=sys.stderr)
+            bar = "!" * 72
+            print(bar, file=sys.stderr)
+            print(f"!! REGISTER REFUSED: {args.id} IS ALREADY RUNNING.",
+                  file=sys.stderr)
+            print("!! DOUBLE-SPAWN DETECTED. DO NOT SPAWN ANOTHER AGENT.",
+                  file=sys.stderr)
+            print("!! IF THE ORIGINAL AGENT DIED, MARK IT ABANDONED FIRST:",
+                  file=sys.stderr)
+            print(f"!!   session-task queue abandon {args.id} --reason '...'",
+                  file=sys.stderr)
+            print("!! OR USE --if-absent TO NO-OP WHEN THE ITEM IS ALREADY RUNNING.",
+                  file=sys.stderr)
+            print(bar, file=sys.stderr)
+            sys.exit(2)
+
+        ok, reasons, conflicts = _spawn_check(items, target)
+        if not ok:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+            fh.close()
+            print("", file=sys.stderr)
+            bar = "!" * 72
+            print(bar, file=sys.stderr)
+            print(f"!! REGISTER REFUSED: {args.id} IS NOT CLEAR TO SPAWN.",
+                  file=sys.stderr)
+            print("!! DO NOT SPAWN ANY AGENT FOR THIS WORK.", file=sys.stderr)
+            print("!! RUN THE CONFLICTING WORK FIRST OR WAIT FOR IT TO FINISH.",
+                  file=sys.stderr)
+            print("!!", file=sys.stderr)
+            print(f"!! ITEM  : {args.id} (status={target.get('status')}, "
+                  f"group={target.get('group_id')})", file=sys.stderr)
+            print(f"!! SCOPE : {','.join(target.get('scope', []))}",
+                  file=sys.stderr)
+            print("!! REASONS:", file=sys.stderr)
+            for r in reasons:
+                print(f"!!   - {r}", file=sys.stderr)
+            if conflicts:
+                print("!! RUNNING SCOPE OVERLAPS:", file=sys.stderr)
+                for c in conflicts:
+                    print(
+                        f"!!   - {c['id']} (group {c.get('group_id')}): "
+                        f"{','.join(c.get('scope', []))}",
+                        file=sys.stderr,
+                    )
+            print(bar, file=sys.stderr)
+            sys.exit(2)
+
+        target["status"] = "running"
+        target["started_at"] = _fmt_ts()
+        target["registered_at"] = target["started_at"]
+        # Liveness telemetry (added 2026-05-01, revised same day).
+        #
+        # `pid` is OPTIONAL and defaults to None (deferred PID stamping). Why:
+        # `register` is overwhelmingly invoked from a shell wrapper inside the
+        # main loop, and that shell is ephemeral — `os.getpid()` returns the
+        # bash subshell PID, which exits within seconds, so any /proc-based
+        # liveness check immediately sees a dead PID and fires a false-
+        # positive WorkQueueOrphaned alert (the bug fixed here). Pass
+        # `--pid N` explicitly when the caller actually has a long-lived PID
+        # to stamp (e.g. a wrapper that fork+execs the agent and knows the
+        # child PID). Subagents typically don't either — they live inside an
+        # LLM context, not a single OS process — so they should heartbeat
+        # against `last_heartbeat_at` instead of trying to claim a PID.
+        #
+        # `last_heartbeat_at` is initialized to started_at. The exporter
+        # treats pid=None items as "trusted alive" while their heartbeat age
+        # is within HEARTBEAT_GRACE_SECONDS (default 300s); subagents call
+        # `queue heartbeat <id>` periodically to refresh that timestamp.
+        # Once heartbeat age exceeds the grace window, the exporter flips
+        # has_live_owner to 0 and WorkQueueOrphaned fires.
+        if args.pid is not None:
+            try:
+                target["pid"] = int(args.pid)
+            except (TypeError, ValueError):
+                # Bad explicit --pid value — leave unstamped rather than
+                # silently fall back to the caller's ephemeral PID.
+                target["pid"] = None
+        else:
+            target["pid"] = None
+        target["last_heartbeat_at"] = target["started_at"]
+        if args.note:
+            target.setdefault("register_notes", []).append({
+                "at": target["started_at"],
+                "note": args.note,
+            })
+        _recompute_group_heads(items)
+        registered = dict(target)
+        _queue_write_and_unlock(fh, data)
+    except Exception:
+        fcntl.flock(fh, fcntl.LOCK_UN)
+        fh.close()
+        raise
+
+    # Lifecycle notification: task start. Never blocks the register op.
+    # Summary goes on the first line so it's the Pushover preview text;
+    # scope/priority follow as secondary context.
+    _pingme_notify(
+        title=f"queue started: {registered['id']}",
+        message=(
+            f"{_item_summary(registered)}\n"
+            f"scope: {','.join(registered.get('scope', []))} "
+            f"| priority: {registered.get('priority', 5)}"
+        ),
+        priority="normal",
+        silent=getattr(args, "silent", False),
+    )
+
+    # Claude-event lifecycle emit: queue-running. Informational — lets the
+    # main loop see transitions without having to poll queue.json.
+    _claude_event_notify(
+        tag="queue-running",
+        message=f"queue running: {registered['id']} ({_item_summary(registered)})",
+        data={
+            "queue_id": registered["id"],
+            "group_id": registered.get("group_id"),
+            "scope": registered.get("scope", []),
+            "summary": _item_summary(registered),
+            "created_by": registered.get("created_by", ""),
+        },
+        priority="low",
+        silent=getattr(args, "silent", False),
+    )
+
+    if args.json:
+        print(json.dumps(registered, indent=2))
+    else:
+        print(f"registered: {args.id} (now running)")
+        print(f"  group : {registered.get('group_id')}")
+        print(f"  scope : {','.join(registered.get('scope', []))}")
+        print("  next  : spawn the agent. call `queue done` when it finishes.")
+
+
+def cmd_queue_heartbeat(args):
+    """Refresh the liveness timestamp (and optionally PID) on a running item.
+
+    Counterpart to the `last_heartbeat_at` field stamped by `register`.
+    Designed to be called periodically by long-running subagents so the
+    work-queue-exporter can distinguish "still active" from "abandoned"
+    without false-positive orphan alerts.
+
+    Behavior:
+      * Item must exist and be in status=running. Anything else exits 1.
+      * Default: bumps `last_heartbeat_at` to now and DOES NOT touch `pid`.
+        This is the safe path for subagents calling from an ephemeral shell
+        — `os.getpid()` would just stamp a soon-dead bash PID and trigger
+        the very false-positive this CLI exists to prevent.
+      * `--pid <N>` to stamp an explicit owning PID (caller asserts they
+        have a real long-lived PID to point at). Bad values are rejected
+        rather than falling back to the caller's PID.
+      * `--keep-pid` is retained as a no-op alias for backward compatibility
+        with the previous default (which DID stamp the caller PID); new
+        callers can omit it.
+
+    No pingme / claude-event emissions -- heartbeats are high-frequency by
+    design and we don't want to spam the lifecycle bus. The exporter polls
+    queue.json every scrape and surfaces both fields as gauges.
+    """
+    fh, data = _queue_open_locked("rw")
+    try:
+        items = data["items"]
+        target = next((it for it in items if it["id"] == args.id), None)
+        if target is None:
+            print(f"not found: {args.id}", file=sys.stderr)
+            fcntl.flock(fh, fcntl.LOCK_UN)
+            fh.close()
+            sys.exit(1)
+        if target.get("status") != "running":
+            print(
+                f"heartbeat refused: {args.id} status={target.get('status')!r} "
+                f"(must be running)",
+                file=sys.stderr,
+            )
+            fcntl.flock(fh, fcntl.LOCK_UN)
+            fh.close()
+            sys.exit(1)
+        now = _fmt_ts()
+        target["last_heartbeat_at"] = now
+        # Only update `pid` when the caller has explicitly asserted a value.
+        # Default (and `--keep-pid`) leave the existing pid alone — never
+        # stamp the ephemeral caller-shell PID, which would defeat the
+        # purpose of the CLI. Sentinel `--pid 0` CLEARS the pid (back to
+        # null) — useful for migrating existing items that were stamped
+        # with the now-known-bad ephemeral-shell-PID default before the
+        # 2026-05-01 fix.
+        if args.pid is not None and not args.keep_pid:
+            try:
+                pid_int = int(args.pid)
+                if pid_int == 0:
+                    target["pid"] = None
+                else:
+                    target["pid"] = pid_int
+            except (TypeError, ValueError):
+                # Leave existing pid untouched on bad input rather than
+                # silently corrupting it.
+                pass
+        updated = dict(target)
+        _queue_write_and_unlock(fh, data)
+    except Exception:
+        fcntl.flock(fh, fcntl.LOCK_UN)
+        fh.close()
+        raise
+
+    if args.json:
+        print(json.dumps(updated, indent=2))
+    else:
+        print(
+            f"heartbeat: {args.id} pid={updated.get('pid')} "
+            f"last_heartbeat_at={updated.get('last_heartbeat_at')}"
+        )
+
+
+def cmd_queue_set_summary(args):
+    """Add / replace the one-line summary on an existing queue item.
+
+    Useful for:
+      * legacy items added before 2026-04-19 (no summary field)
+      * typo fixes on items already running
+      * clarifying a summary after a scope widening
+
+    Does NOT fire a pingme notification -- this is a pure metadata edit.
+    The updated summary WILL appear in the next register/done/abandon pingme
+    for this item.
+    """
+    new_summary = (args.summary or "").strip()
+    if not new_summary:
+        print("ERROR: summary must be non-empty", file=sys.stderr)
+        sys.exit(1)
+    fh, data = _queue_open_locked("rw")
+    try:
+        items = data["items"]
+        target = next((it for it in items if it["id"] == args.id), None)
+        if target is None:
+            print(f"not found: {args.id}", file=sys.stderr)
+            fcntl.flock(fh, fcntl.LOCK_UN)
+            fh.close()
+            sys.exit(1)
+        old_summary = target.get("summary") or DEFAULT_SUMMARY
+        target["summary"] = new_summary
+        target["summary_updated_at"] = _fmt_ts()
+        _queue_write_and_unlock(fh, data)
+    except Exception:
+        fcntl.flock(fh, fcntl.LOCK_UN)
+        fh.close()
+        raise
+    print(f"summary updated: {args.id}")
+    print(f"  old: {old_summary}")
+    print(f"  new: {new_summary}")
+
+
+def cmd_queue_promote(args):
+    fh, data = _queue_open_locked("rw")
+    try:
+        items = data["items"]
+        target = next((it for it in items if it["id"] == args.id), None)
+        if target is None:
+            print(f"not found: {args.id}", file=sys.stderr)
+            fcntl.flock(fh, fcntl.LOCK_UN)
+            fh.close()
+            sys.exit(1)
+        if target.get("status") != "pending":
+            print(f"can only promote pending items (status={target.get('status')})", file=sys.stderr)
+            fcntl.flock(fh, fcntl.LOCK_UN)
+            fh.close()
+            sys.exit(1)
+        # Bump priority high enough to be above everyone else in the group.
+        members = _group_members(items, target["group_id"])
+        max_p = max((int(m.get("priority", 5)) for m in members), default=5)
+        target["priority"] = max(max_p + 1, int(target.get("priority", 5)) + 1)
+        target["promoted_at"] = _fmt_ts()
+        # Rewrite created_at to "now" so FIFO places this FIRST among equal priorities.
+        # Actually safer: leave created_at alone and trust the priority bump.
+        _recompute_group_heads(items)
+        _queue_write_and_unlock(fh, data)
+    except Exception:
+        fcntl.flock(fh, fcntl.LOCK_UN)
+        fh.close()
+        raise
+    print(f"promoted: {args.id} (priority={target['priority']})")
+
+
+_DURATION_RE = re.compile(r"^(\d+)([dhm])$")
+
+
+def _parse_duration(s):
+    m = _DURATION_RE.match(s)
+    if not m:
+        raise ValueError(f"bad duration: {s} (use Nd/Nh/Nm)")
+    n, unit = int(m.group(1)), m.group(2)
+    if unit == "d":
+        return timedelta(days=n)
+    if unit == "h":
+        return timedelta(hours=n)
+    return timedelta(minutes=n)
+
+
+def cmd_queue_prune(args):
+    cutoff = None
+    if args.older_than:
+        try:
+            cutoff = datetime.now(timezone.utc) - _parse_duration(args.older_than)
+        except ValueError as e:
+            print(f"ERROR: {e}", file=sys.stderr)
+            sys.exit(1)
+
+    fh, data = _queue_open_locked("rw")
+    try:
+        items = data["items"]
+        to_remove = []
+        for it in items:
+            if it.get("status") not in ("done", "abandoned"):
+                continue
+            if cutoff is None:
+                to_remove.append(it)
+                continue
+            ts_str = it.get("completed_at") or it.get("abandoned_at")
+            if not ts_str:
+                continue
+            try:
+                ts = datetime.fromisoformat(ts_str)
+            except ValueError:
+                continue
+            if ts < cutoff:
+                to_remove.append(it)
+        if args.dry_run:
+            print(f"would prune {len(to_remove)} items")
+            for it in to_remove:
+                print(f"  {it['id']}  {it.get('status')}  {it.get('description','')[:60]}")
+            fcntl.flock(fh, fcntl.LOCK_UN)
+            fh.close()
+            return
+        keep = [it for it in items if it not in to_remove]
+        data["items"] = keep
+        _queue_write_and_unlock(fh, data)
+    except Exception:
+        fcntl.flock(fh, fcntl.LOCK_UN)
+        fh.close()
+        raise
+    print(f"pruned {len(to_remove)} items")
+
+
+def cmd_queue_banner(args):
+    fh, data = _queue_open_locked("r")
+    items = list(data["items"])
+    _queue_unlock_readonly(fh)
+    ready = [it for it in items if _item_is_ready(items, it)]
+    ready.sort(key=_sort_key)
+    pending = [it for it in items if it.get("status") == "pending"]
+    running = [it for it in items if it.get("status") == "running"]
+
+    if not ready and not pending and not running:
+        return  # silent when empty -- banner only when something to show
+
+    lines = [
+        "",
+        "#" * 60,
+        "## SESSION-TASK QUEUE — TOP READY ITEMS",
+        "#" * 60,
+    ]
+    if ready:
+        for it in ready[:5]:
+            lines.append(
+                f"  * [{it['id']}] pr={it.get('priority',5)} {it['description'][:80]}"
+            )
+            lines.append(
+                f"        scope: {','.join(it.get('scope', []))[:90]}"
+            )
+    else:
+        lines.append("  (no items are READY -- everything is blocked on a running peer or unblocked below)")
+
+    waiting = [it for it in pending if not _item_is_ready(items, it)]
+    if waiting:
+        lines.append("")
+        lines.append(f"  Waiting behind a group peer: {len(waiting)} item(s)")
+    if running:
+        lines.append(f"  In progress (running): {len(running)} item(s)")
+
+    lines.append("#" * 60)
+    lines.append("")
+    print("\n".join(lines))
+
+
+# --- migration -----------------------------------------------------------
+
+
+def _infer_scope_from_text(text):
+    """Heuristic scope inference for legacy /tmp/claude-queued-tasks.txt."""
+    t = text.lower()
+    scope = []
+
+    # agent-proto: mentions
+    proto_map = {
+        "ebook-convert-pdf": "agent-proto:ebook-convert-pdf",
+        "em-dash": "agent-proto:ebook-convert-pdf",
+        "chapter-breaks": "agent-proto:ebook-convert-pdf",
+        "epub-check-breaks": "agent-proto:ebook-convert-pdf",
+        "line-break": "agent-proto:ebook-convert-pdf",
+        "toc": "agent-proto:ebook-convert-pdf",
+        "security-patcher": "agent-proto:security-patcher",
+        "security-scanner": "agent-proto:security-scanner",
+    }
+    for needle, tok in proto_map.items():
+        if needle in t and tok not in scope:
+            scope.append(tok)
+
+    # repo: mentions
+    if "~/repos/docker-gomorrah" in t or "docker-gomorrah" in t or "monitoring/docker-compose" in t:
+        scope.append("repo:docker-gomorrah")
+    if "~/repos/media-tools" in t or "media-tools" in t or "ebook-convert-pdf" in t:
+        scope.append("repo:media-tools")
+    if ".claude/agents" in t or "agents/security-" in t:
+        scope.append("repo:claude-config")
+
+    # book: mentions
+    if "fadr" in t or "first and rare" in t:
+        scope.append("book:fadr")
+    if "laws of trading" in t or "calibre id 342" in t:
+        scope.append("book:laws-of-trading")
+
+    # Dedupe
+    seen = set()
+    out = []
+    for s in scope:
+        if s not in seen:
+            seen.add(s)
+            out.append(s)
+
+    if not out:
+        out = ["*"]
+    return out
+
+
+def _parse_legacy_queue(text):
+    """Parse /tmp/claude-queued-tasks.txt into a list of (description, scope)."""
+    # Items start with "QUEUED" or "QUEUED N" (possibly with trailing punctuation)
+    blocks = re.split(r"(?m)^QUEUED[^\n]*\n", text)
+    headers = re.findall(r"(?m)^QUEUED[^\n]*", text)
+    # Re-zip header + body
+    items = []
+    for header, body in zip(headers, blocks[1:]):
+        # Trim body
+        body = body.strip()
+        # Use first line after header (or header itself if body is empty) as short desc
+        first_line = body.splitlines()[0].strip() if body else header.strip()
+        desc = f"{header.strip()} -- {first_line[:160]}"
+        full = header + "\n" + body
+        scope = _infer_scope_from_text(full)
+        items.append((desc, scope, body))
+    return items
+
+
+def cmd_queue_migrate(args):
+    src = Path(args.from_file).expanduser()
+    if not src.exists():
+        print(f"ERROR: source does not exist: {src}", file=sys.stderr)
+        sys.exit(1)
+    text = src.read_text()
+    parsed = _parse_legacy_queue(text)
+    if not parsed:
+        print("No items parsed. Nothing to migrate.")
+        return
+    print(f"Parsed {len(parsed)} items from {src}")
+    for i, (desc, scope, body) in enumerate(parsed, 1):
+        print(f"  {i}. scope={scope}")
+        print(f"      {desc[:100]}")
+    if not args.yes:
+        print("Re-run with --yes to commit.")
+        return
+
+    # Actually add each as a queue item.
+    # Use moderate priority 5 and --created-by migrate
+    added = []
+    for desc, scope, body in parsed:
+        ns = argparse.Namespace(
+            description=desc,
+            scope=scope,
+            priority=5,
+            context=json.dumps({"legacy_body": body}),
+            created_by="migrate",
+            json=True,
+        )
+        # Inline version of cmd_queue_add so we can collect IDs.
+        try:
+            norm_scope = [_normalize_token(t) for t in scope]
+        except ValueError as e:
+            print(f"ERROR on item: {e}", file=sys.stderr)
+            continue
+        try:
+            context = json.loads(ns.context) if ns.context else None
+        except json.JSONDecodeError:
+            context = None
+
+        fh, data = _queue_open_locked("rw")
+        try:
+            items = data["items"]
+            overlapping = _group_ids_overlapping(items, norm_scope)
+            if len(overlapping) == 0:
+                group_id = _new_group_id()
+            elif len(overlapping) == 1:
+                group_id = overlapping[0]
+            else:
+                group_id = _new_group_id()
+                for it in items:
+                    if it.get("group_id") in overlapping:
+                        it["group_id"] = group_id
+                log_completed(
+                    f"[queue merge] {len(overlapping)} groups merged into {group_id}",
+                    extra={"source": "queue", "event": "merge",
+                           "merged_groups": overlapping, "new_group_id": group_id},
+                )
+            new_id = _new_id()
+            existing_ids = {it["id"] for it in items}
+            while new_id in existing_ids:
+                new_id = _new_id()
+            item = {
+                "id": new_id,
+                "description": desc,
+                "summary": DEFAULT_SUMMARY,
+                "scope": norm_scope,
+                "group_id": group_id,
+                "group_head": False,
+                "status": "pending",
+                "priority": 5,
+                "created_at": _fmt_ts(),
+                "created_by": "migrate",
+            }
+            if context is not None:
+                item["context"] = context
+            items.append(item)
+            _recompute_group_heads(items)
+            _queue_write_and_unlock(fh, data)
+            added.append(new_id)
+        except Exception:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+            fh.close()
+            raise
+
+    print(f"Migrated {len(added)} items: {added}")
+
+
+# ---------------------------------------------------------------------------
+# Arg parsing + dispatch
+# ---------------------------------------------------------------------------
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    sub = parser.add_subparsers(dest="command")
+
+    # Layer 1 (single-slot resume action)
+    p_set = sub.add_parser("set", help="Set a resume action")
+    p_set.add_argument("description", help="What to do on resume")
+    p_set.add_argument("--context", "-c", help="JSON context/state")
+
+    p_append = sub.add_parser("append", help="Append to existing action")
+    p_append.add_argument("text", help="Text to append")
+
+    sub.add_parser("get", help="Print as JSON (silent if empty)")
+    sub.add_parser("show", help="Pretty-print current action")
+    sub.add_parser("clear", help="Mark done and remove")
+    sub.add_parser("banner", help="Output for session-resume (internal)")
+
+    p_complete = sub.add_parser("complete", help="Log a completed task")
+    p_complete.add_argument("description", help="What was completed")
+
+    p_history = sub.add_parser("history", help="Show last N completed tasks")
+    p_history.add_argument("-n", "--count", type=int, default=10)
+    p_history.add_argument(
+        "--since",
+        help="Filter to entries newer than this duration (e.g. 1h, 24h, 7d)",
+    )
+    p_history.add_argument(
+        "--layer",
+        choices=["resume", "queue", "all"],
+        default="all",
+        help="Filter by layer (resume=single-slot, queue=queue items, all=both)",
+    )
+    p_history.add_argument(
+        "--no-scope", action="store_true",
+        help="Do not append scope line under queue entries",
+    )
+    p_history_raw = sub.add_parser(
+        "history-raw", help="Raw output for session-resume (internal)"
+    )
+    p_history_raw.add_argument(
+        "--since", default="7d",
+        help="Time window for history-raw (default: 7d)",
+    )
+    p_history_raw.add_argument(
+        "--n-resume", type=int, default=5,
+        help="Max resume-action entries to show (default: 5)",
+    )
+    p_history_raw.add_argument(
+        "--n-queue", type=int, default=5,
+        help="Max queue completion entries to show (default: 5)",
+    )
+
+    # Layer 2 (queue)
+    p_queue = sub.add_parser("queue", help="Task queue with scope-based groups")
+    qsub = p_queue.add_subparsers(dest="qcmd")
+
+    q_add = qsub.add_parser("add", help="Add item")
+    q_add.add_argument("description")
+    q_add.add_argument("--scope", action="append", required=True)
+    q_add.add_argument(
+        "--summary",
+        help=(
+            "One-line (~10 word) human-readable headline. Surfaces verbatim "
+            "in pingme queue-started/done/abandoned notifications. "
+            "Soft-required: omitting it prints a stderr warning and the "
+            "pingme message reads '(no summary)'. Use `queue set-summary "
+            "<id> \"text\"` to add one after the fact."
+        ),
+    )
+    q_add.add_argument("--priority", type=int, default=5)
+    q_add.add_argument("--context")
+    q_add.add_argument("--created-by")
+    q_add.add_argument("--json", action="store_true")
+    q_add.add_argument(
+        "--force-enqueue",
+        action="store_true",
+        help=(
+            "Bypass the hard-fail scope-conflict check and enqueue anyway. "
+            "The new item is still blocked behind the running item(s) for "
+            "spawn purposes (register/spawn-check will refuse), but it will "
+            "be recorded in the queue. Use ONLY when intentionally queueing "
+            "follow-up work that must serialize after running work."
+        ),
+    )
+
+    q_list = qsub.add_parser("list", help="List items (default: pending+running)")
+    q_list.add_argument("--ready", action="store_true")
+    q_list.add_argument("--all", action="store_true")
+    q_list.add_argument("--group")
+    q_list.add_argument("--json", action="store_true")
+
+    q_show = qsub.add_parser("show", help="Show item details")
+    q_show.add_argument("id")
+
+    q_scope = qsub.add_parser("scope", help="Print an item's scope")
+    q_scope.add_argument("id")
+
+    q_groups = qsub.add_parser("groups", help="List active groups")
+    q_groups.add_argument("--json", action="store_true")
+
+    q_ready = qsub.add_parser("ready", help="Items ready to start")
+    q_ready.add_argument("--json", action="store_true")
+
+    q_done = qsub.add_parser("done", help="Mark item done")
+    q_done.add_argument("id")
+    q_done.add_argument(
+        "--silent", action="store_true",
+        help="Suppress the pingme lifecycle notification for this operation.",
+    )
+
+    q_abandon = qsub.add_parser("abandon", help="Mark item abandoned")
+    q_abandon.add_argument("id")
+    q_abandon.add_argument("--reason")
+    q_abandon.add_argument(
+        "--silent", action="store_true",
+        help="Suppress the pingme lifecycle notification for this operation.",
+    )
+
+    q_pop = qsub.add_parser("pop", help="Atomically take next ready item")
+    q_pop.add_argument("--id")
+
+    q_register = qsub.add_parser(
+        "register",
+        help=("Atomically claim an item as running before spawning an agent. "
+              "Refuses if another running item has overlapping scope."),
+    )
+    q_register.add_argument("id")
+    q_register.add_argument("--if-absent", action="store_true",
+                            help="Do not fail if the item is already running.")
+    q_register.add_argument("--note",
+                            help="Freeform note (e.g. spawned agent id) recorded on the item.")
+    q_register.add_argument("--json", action="store_true")
+    q_register.add_argument(
+        "--pid",
+        type=int,
+        default=None,
+        help=(
+            "Owning process PID to stamp on the item. DEFAULT: unset — pid is "
+            "deferred and the work-queue-exporter trusts the item alive while "
+            "its `last_heartbeat_at` is within HEARTBEAT_GRACE_SECONDS (5min). "
+            "Pass an explicit PID only when you have a long-lived process to "
+            "point at; the caller's own PID is usually an ephemeral shell and "
+            "stamping it triggers a false-positive WorkQueueOrphaned alert "
+            "(the bug fixed 2026-05-01)."
+        ),
+    )
+    q_register.add_argument(
+        "--silent", action="store_true",
+        help="Suppress the pingme lifecycle notification for this operation.",
+    )
+
+    q_heartbeat = qsub.add_parser(
+        "heartbeat",
+        help=(
+            "Refresh last_heartbeat_at on a running item; optionally update the "
+            "owning PID. Subagents call this periodically so a wedged-but-alive "
+            "owner is distinguishable from a healthy long-runner."
+        ),
+    )
+    q_heartbeat.add_argument("id")
+    q_heartbeat.add_argument(
+        "--pid",
+        type=int,
+        default=None,
+        help=(
+            "Stamp an explicit owning PID. OMIT to leave pid unchanged "
+            "(the safe default — the caller's own PID is usually an "
+            "ephemeral shell and stamping it triggers false-positive "
+            "WorkQueueOrphaned alerts). Sentinel `--pid 0` CLEARS the "
+            "pid (back to null) so the exporter falls through to "
+            "heartbeat-grace evaluation — useful for migrating items "
+            "stamped with a now-known-bad ephemeral PID."
+        ),
+    )
+    q_heartbeat.add_argument(
+        "--keep-pid",
+        action="store_true",
+        help=(
+            "Backward-compat no-op: leave pid untouched. As of 2026-05-01 "
+            "this is the default; flag retained so existing scripts keep "
+            "working without semantic change."
+        ),
+    )
+    q_heartbeat.add_argument("--json", action="store_true")
+
+    q_spawn = qsub.add_parser(
+        "spawn-check",
+        help=("Check whether it is safe to spawn an agent for this item. "
+              "Exit 0 = ok, 1 = conflict, 2 = not found."),
+    )
+    q_spawn.add_argument("id")
+    q_spawn.add_argument("--json", action="store_true")
+
+    q_promote = qsub.add_parser("promote", help="Bump item priority to group head")
+    q_promote.add_argument("id")
+
+    q_setsum = qsub.add_parser(
+        "set-summary",
+        help=("Add / replace the one-line summary on an existing item. "
+              "Useful for legacy items missing a summary or for typo fixes."),
+    )
+    q_setsum.add_argument("id")
+    q_setsum.add_argument("summary", help="New summary text (~10 words)")
+
+    q_prune = qsub.add_parser("prune", help="Remove done/abandoned items")
+    q_prune.add_argument("--older-than", help="e.g. 7d, 24h, 30m")
+    q_prune.add_argument("-n", "--dry-run", action="store_true")
+
+    qsub.add_parser("banner", help="Top-5 ready items banner")
+
+    q_mig = qsub.add_parser("migrate", help="Parse legacy /tmp/claude-queued-tasks.txt")
+    q_mig.add_argument("--from", dest="from_file", required=True)
+    q_mig.add_argument("--yes", action="store_true")
+
+    return parser
+
+
+def main():
+    parser = build_parser()
+    args = parser.parse_args()
+
+    if args.command == "set":
+        return cmd_set(args)
+    if args.command == "append":
+        return cmd_append(args)
+    if args.command == "get":
+        return cmd_get(args)
+    if args.command == "show":
+        return cmd_show(args)
+    if args.command == "clear":
+        return cmd_clear(args)
+    if args.command == "banner":
+        banner = for_session_resume()
+        if banner:
+            print(banner)
+        return
+    if args.command == "complete":
+        return cmd_complete(args)
+    if args.command == "history":
+        return cmd_history(args)
+    if args.command == "history-raw":
+        print(for_session_resume_history(
+            n_resume=args.n_resume,
+            n_queue=args.n_queue,
+            since=args.since,
+        ))
+        return
+    if args.command == "queue":
+        qmap = {
+            "add": cmd_queue_add,
+            "list": cmd_queue_list,
+            "show": cmd_queue_show,
+            "scope": cmd_queue_scope,
+            "groups": cmd_queue_groups,
+            "ready": cmd_queue_ready,
+            "done": cmd_queue_done,
+            "abandon": cmd_queue_abandon,
+            "pop": cmd_queue_pop,
+            "register": cmd_queue_register,
+            "heartbeat": cmd_queue_heartbeat,
+            "spawn-check": cmd_queue_spawn_check,
+            "promote": cmd_queue_promote,
+            "set-summary": cmd_queue_set_summary,
+            "prune": cmd_queue_prune,
+            "banner": cmd_queue_banner,
+            "migrate": cmd_queue_migrate,
+        }
+        fn = qmap.get(args.qcmd)
+        if fn is None:
+            parser.parse_args(["queue", "--help"])
+            sys.exit(1)
+        return fn(args)
+
+    parser.print_help()
+    sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
