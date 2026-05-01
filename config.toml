@@ -105,8 +105,10 @@ enabled = true
 watchers_config = "~/.config/watchmen/watchers.conf"
 # Expected watchmen supervisor count
 expected_watchmen = 0
-# Consecutive missing checks before injecting restart (6 = ~60s at 10s interval)
-inject_threshold = 6
+# Consecutive missing checks before injecting restart (3 = ~30s at 10s interval).
+# Bumped from 6 → 3 — tighter detection latency, matches event_threshold so quiet-path
+# event + loud tmux-inject fire on the same cycle.
+inject_threshold = 3
 # Cooldown between watcher-missing injections (seconds).
 # 2026-04-28: Tightened 300 -> 60 (PR #44). A down watcher is a hard
 # liveness failure (no signal, no events, no torrents getting through),
