@@ -76,8 +76,9 @@ Two test scripts live under `tests/`:
     live queue. ~8 cases.
   - `tests/pre-tool-obligations-gate-hook.test` — exercises the
     obligations gate (PreToolUse + PostToolUse) end-to-end against an
-    isolated `HOME=$tmpdir` sandbox. 70+ cases covering every predicate,
-    enforcement mode, exempt-patterns, overrides, and the watcher-ctl
-    cardinal-rule gate.
+    isolated `HOME=$tmpdir` sandbox. 100 cases covering every predicate
+    (including `stale_ready_queue_present`), enforcement mode,
+    exempt-patterns, overrides (including the pingme Pushover hook),
+    and the watcher-ctl cardinal-rule gate.
 
 Run from the repo root with `make test-hooks`.
