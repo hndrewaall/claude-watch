@@ -1,4 +1,4 @@
-.PHONY: test test-verbose test-unit test-e2e test-live build deploy install-hooks clean
+.PHONY: test test-verbose test-unit test-e2e test-live test-session-task build deploy install install-hooks clean
 
 # Default: run all tests in parallel via nextest (preferred) or cargo test
 test:
@@ -30,6 +30,12 @@ test-live:
 		cargo nextest run --run-ignored=only || \
 		cargo test -- --ignored
 
+# Run the session-task Python tests (cross-session queue CLI under tools/).
+# Pre-existing 5 failures in test_queue_claude_event.py are tracked in
+# tools/session-task/README.md and are unrelated to this migration.
+test-session-task:
+	uv run --python 3.11 --with pytest pytest tools/session-task/tests/ -v
+
 # Release build
 build:
 	cargo build --release
@@ -37,6 +43,23 @@ build:
 # Build + restart systemd service
 deploy: build
 	sudo systemctl restart claude-watch
+
+# Install built binaries + scripts onto $PATH ($BIN_DIR, default ~/bin).
+# Targets:
+#   - claude-watch  : the Rust daemon
+#   - session-task  : Python CLI (cross-session queue + resume action)
+#
+# session-task ships as the script itself (no compile step). The Rust binary
+# depends on `make build` having been run first.
+BIN_DIR ?= $(HOME)/bin
+
+install: build
+	@mkdir -p $(BIN_DIR)
+	@install -m 0755 target/release/claude-watch $(BIN_DIR)/claude-watch
+	@install -m 0755 tools/session-task/session-task $(BIN_DIR)/session-task
+	@echo "Installed to $(BIN_DIR):"
+	@echo "  - claude-watch"
+	@echo "  - session-task"
 
 # Install git pre-commit hook (warning-free build + unit/fixture tests).
 # Symlinks scripts/git-hooks/pre-commit into .git/hooks so script edits
