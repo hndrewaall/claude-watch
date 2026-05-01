@@ -117,13 +117,11 @@ inject_threshold = 6
 # path (src/policy.rs check_once); the prior cascade-suppression
 # rationale from the 2026-04-21 raise no longer applies.
 inject_cooldown = 60
-# Per-watcher cooldown (seconds) between daemon-side auto-restart attempts
-# (q-2026-04-28-5481, PR #43). Distinct from inject_cooldown —
-# auto-restart spawns the start_cmd as a detached child without touching
-# the tmux pane, so it can fire much faster. 30s = ~3 check cycles at the
-# default 10s general interval, which keeps wait-and-exit watchers
-# (claude-event-watch) reliably re-spawned between event deliveries.
-auto_restart_cooldown_secs = 30
+# NOTE (2026-05-01): `auto_restart_cooldown_secs` was removed along with the
+# daemon-side auto-restart path. Watchers can ONLY be spawned by Claude
+# Code's main loop (cardinal rule); claude-watch's only emergency action
+# is the tmux-inject above, which types `watcher-ctl run <name>` into the
+# pane and lets the main loop spawn the watcher in its own process tree.
 # Quiet path (PR #48): emit a `watcher-down` claude-event
 # (source=claude-watch, tag=watcher-down) when consecutive_missing hits
 # this threshold. Set below inject_threshold so the quiet path runs first

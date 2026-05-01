@@ -273,13 +273,6 @@ pub struct WatcherState {
     pub last_seen_running: Option<String>,
     pub consecutive_missing: u32,
     pub enabled: bool,
-    /// Timestamp of the last daemon-side auto-restart for this watcher
-    /// (q-2026-04-28-5481). Per-watcher so a wait-and-exit watcher (like
-    /// claude-event-watch, which exits after delivering each event) can
-    /// be re-spawned quickly without sharing the much longer global
-    /// `inject_cooldown` clock used for tmux-pane injects.
-    #[serde(default)]
-    pub last_auto_restart_at: Option<String>,
     /// RFC3339 timestamp of the last `watcher-down` claude-event emission for
     /// this watcher (the "quiet path", PR #48). When set, subsequent
     /// watcher-monitor cycles suppress re-emission within the configured
@@ -288,6 +281,10 @@ pub struct WatcherState {
     /// inject as a fallback). Cleared on recovery (count >= min_count).
     #[serde(default)]
     pub event_emitted_at: Option<String>,
+    // NOTE: `last_auto_restart_at` was removed 2026-05-01 along with the
+    // daemon-side auto-restart path (cardinal rule: watchers must be
+    // spawned by the main loop). Older state files containing the field
+    // still deserialize cleanly — serde ignores unknown fields by default.
 }
 
 pub fn load_state(path: &str) -> State {
@@ -380,7 +377,6 @@ mod tests {
                 last_seen_running: Some("2026-03-16T12:00:00-05:00".to_string()),
                 consecutive_missing: 0,
                 enabled: true,
-                last_auto_restart_at: None,
                 event_emitted_at: None,
             },
         );
