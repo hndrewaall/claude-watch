@@ -153,13 +153,23 @@ enum WorkloadAction {
     /// Show running workloads
     #[command(alias = "ls")]
     List,
-    /// Block until workload completes, print final output
+    /// Block until workload completes, print final output.
+    ///
+    /// DISABLED BY DEFAULT — workloads emit a `workload-done` claude-event
+    /// on exit which surfaces in the next UserPromptSubmit context, so
+    /// blocking polling is redundant. Pass
+    /// `--force-i-acknowledge-events-are-better` to override.
     Wait {
         /// Workload label
         label: String,
         /// Number of output lines to show (default: 20)
         #[arg(short = 'n', long, default_value_t = 20)]
         lines: usize,
+        /// Acknowledge that the `workload-done` claude-event is the
+        /// preferred completion signal and you specifically want to block
+        /// anyway. Required — without this flag `wait` exits non-zero.
+        #[arg(long = "force-i-acknowledge-events-are-better")]
+        force_i_acknowledge_events_are_better: bool,
     },
     /// Show/tail workload output
     Log {
@@ -1051,7 +1061,11 @@ fn run_workload(action: WorkloadAction) -> i32 {
             workload::cmd_run(&label, &cmd)
         }
         WorkloadAction::List => workload::cmd_list(),
-        WorkloadAction::Wait { label, lines } => workload::cmd_wait(&label, lines),
+        WorkloadAction::Wait {
+            label,
+            lines,
+            force_i_acknowledge_events_are_better,
+        } => workload::cmd_wait(&label, lines, force_i_acknowledge_events_are_better),
         WorkloadAction::Log {
             label,
             follow,
