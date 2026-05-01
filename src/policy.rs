@@ -1584,6 +1584,224 @@ pub(crate) fn should_self_heal(
     dead_checks >= checks_required && (retry_tokens > 0 || retry_bashes > 0)
 }
 
+/// Pure helper: walk the current `State` + heartbeat-stuck flag and return
+/// the set of HangSignals that should be observed THIS cycle from
+/// non-pane-capture sources (everything except PaneCaptureUnchanged,
+/// which needs an async tmux capture).
+///
+/// Split out so we can unit-test the signal-collection logic without
+/// mocking tmux. Caller is responsible for adding PaneCaptureUnchanged
+/// based on a separate `evaluate_pane_unchanged` call.
+pub(crate) fn collect_non_pane_signals(
+    state: &State,
+    config: &Config,
+    heartbeat_stuck: bool,
+) -> Vec<crate::respawn::HangSignal> {
+    use crate::respawn::HangSignal;
+    let mut out = Vec::new();
+    if heartbeat_stuck {
+        out.push(HangSignal::HeartbeatStale);
+    }
+    let watcher_critical = state
+        .watcher_health
+        .values()
+        .any(|wh| wh.enabled && wh.consecutive_missing >= config.watcher_monitor.inject_threshold);
+    let recent_watcher_inject = state
+        .last_watcher_inject
+        .as_deref()
+        .and_then(elapsed_since)
+        .is_some_and(|e| e <= config.auto_respawn_on_hang.signal_window_secs as f64);
+    if watcher_critical && recent_watcher_inject {
+        out.push(HangSignal::WatcherDownPersistent);
+    }
+    if state.thinking_interrupt_count >= 2 {
+        out.push(HangSignal::ProlongedThinkingNoProgress);
+    }
+    let recent_wedged = state
+        .last_wedged_clear
+        .as_deref()
+        .and_then(elapsed_since)
+        .is_some_and(|e| e <= config.auto_respawn_on_hang.signal_window_secs as f64);
+    if recent_wedged && state.wedged_consecutive >= 2 {
+        out.push(HangSignal::WedgedClearNoProgress);
+    }
+    out
+}
+
+/// Per-cycle signal collection + multi-signal hang evaluation. Side-effects:
+///
+///   - Records new HangSignals into `state.hang_signal_history`.
+///   - Updates `pane_content_hash` / `pane_content_unchanged_since`.
+///   - Prunes the history to `signal_window_secs`.
+///   - If the threshold + cooldown are satisfied, calls
+///     `respawn::execute_respawn`, then updates `last_respawn_at` / counters.
+///
+/// Idempotent within a single cycle. Each signal can fire only once per
+/// invocation (HashMap dedup in `HangSignalHistory.observe`).
+pub(crate) async fn check_auto_respawn(
+    config: &Config,
+    state: &mut State,
+    pane: &str,
+    now: &str,
+    heartbeat_stuck: bool,
+) {
+    check_auto_respawn_with_versions_dir(config, state, pane, now, heartbeat_stuck, None).await
+}
+
+/// Test-friendly variant. `versions_dir_override` is forwarded to
+/// `execute_respawn_with_versions_dir`. Production code MUST call
+/// `check_auto_respawn` (which passes None). Tests MUST pass
+/// `Some("/nonexistent")` so the destructive kill path can never find
+/// a real Claude PID. See the safety note on
+/// `respawn::execute_respawn_with_versions_dir`.
+pub(crate) async fn check_auto_respawn_with_versions_dir(
+    config: &Config,
+    state: &mut State,
+    pane: &str,
+    now: &str,
+    heartbeat_stuck: bool,
+    versions_dir_override: Option<&str>,
+) {
+    use crate::respawn::{
+        evaluate_pane_unchanged, execute_respawn_with_versions_dir, hash_pane_content,
+        should_respawn, HangSignal, RespawnOutcome,
+    };
+
+    if !config.auto_respawn_on_hang.enabled {
+        return;
+    }
+
+    // ---- Signals 1, 2, 3, 5: pure-state-derived ----
+    for sig in collect_non_pane_signals(state, config, heartbeat_stuck) {
+        state.hang_signal_history.observe(&sig, now);
+    }
+
+    // ---- Signal 4: pane capture unchanged (needs tmux I/O) ----
+    if !pane.is_empty() {
+        if let Some(capture) = tmux::capture_pane(pane).await {
+            let h = hash_pane_content(&capture);
+            let (new_hash, new_first_seen, fire) = evaluate_pane_unchanged(
+                h,
+                state.pane_content_hash,
+                state.pane_content_unchanged_since.as_deref(),
+                now,
+                config.auto_respawn_on_hang.pane_unchanged_secs,
+            );
+            state.pane_content_hash = new_hash;
+            state.pane_content_unchanged_since = new_first_seen;
+            if fire {
+                state
+                    .hang_signal_history
+                    .observe(&HangSignal::PaneCaptureUnchanged, now);
+            }
+        }
+    }
+
+    // Prune anything outside the window.
+    state
+        .hang_signal_history
+        .prune_window(now, config.auto_respawn_on_hang.signal_window_secs);
+
+    let active_count = state.hang_signal_history.distinct_active().len();
+    debug!(
+        active_count,
+        signals_required = config.auto_respawn_on_hang.signals_required,
+        "auto-respawn: signal evaluation"
+    );
+
+    if !should_respawn(
+        &state.hang_signal_history,
+        state.last_respawn_at.as_deref(),
+        now,
+        config.auto_respawn_on_hang.signals_required,
+        config.auto_respawn_on_hang.cooldown_secs,
+    ) {
+        return;
+    }
+
+    // Threshold + cooldown satisfied — fire.
+    let active_signals: Vec<String> = state
+        .hang_signal_history
+        .distinct_active()
+        .into_iter()
+        .collect();
+    warn!(
+        signals = ?active_signals,
+        "auto-respawn: multi-signal hang detected — killing + respawning dashboard"
+    );
+    write_jsonl_log(
+        &config.general.log_file,
+        "auto_respawn_fire",
+        serde_json::json!({
+            "signals": active_signals,
+            "signals_required": config.auto_respawn_on_hang.signals_required,
+            "window_secs": config.auto_respawn_on_hang.signal_window_secs,
+        }),
+    );
+    write_legacy_log(
+        &config.general.legacy_log_file,
+        &format!(
+            "AUTO-RESPAWN: multi-signal hang detected (signals={:?}) -- killing + respawning",
+            active_signals
+        ),
+    );
+
+    let outcome = execute_respawn_with_versions_dir(
+        &config.auto_respawn_on_hang,
+        &config.tmux.dashboard_session,
+        versions_dir_override,
+    )
+    .await;
+
+    state.last_respawn_at = Some(now.to_string());
+    state.auto_respawn_count = state.auto_respawn_count.saturating_add(1);
+    state.auto_respawn_interrupts_total =
+        state.auto_respawn_interrupts_total.saturating_add(1);
+    state.last_interrupt_at = Some(now.to_string());
+    // Clear the history so the next cycle starts from a clean slate.
+    state.hang_signal_history = crate::respawn::HangSignalHistory::default();
+    state.pane_content_hash = None;
+    state.pane_content_unchanged_since = None;
+
+    match &outcome {
+        RespawnOutcome::Success { new_pid } => {
+            info!(?new_pid, "auto-respawn: success");
+            write_jsonl_log(
+                &config.general.log_file,
+                "auto_respawn_success",
+                serde_json::json!({ "new_pid": new_pid }),
+            );
+            alert::send_pingme(
+                "claude-watch: auto-respawned dashboard after multi-signal hang detection",
+            )
+            .await;
+        }
+        RespawnOutcome::LaunchFailed => {
+            warn!("auto-respawn: launch failed");
+            write_jsonl_log(
+                &config.general.log_file,
+                "auto_respawn_launch_failed",
+                serde_json::json!({}),
+            );
+            alert::send_pingme_with_priority(
+                "claude-watch: AUTO-RESPAWN failed — dashboard launch did not produce a new claude PID",
+                "high",
+            )
+            .await;
+        }
+        RespawnOutcome::Aborted { reason } => {
+            warn!(reason = %reason, "auto-respawn: aborted");
+            write_jsonl_log(
+                &config.general.log_file,
+                "auto_respawn_aborted",
+                serde_json::json!({ "reason": reason }),
+            );
+        }
+    }
+
+    crate::state::save_state(&config.general.state_file, state);
+}
+
 /// Run a single check cycle.
 pub async fn check_cycle(config: &Config, state: &mut State) {
     let now = Local::now().to_rfc3339();
@@ -2957,6 +3175,19 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                 }
             }
         }
+    }
+
+    // --- Auto-respawn-on-hang: multi-signal hang detection ---
+    //
+    // Independent of the individual interrupt sites above. Each fire path
+    // (heartbeat-stale, watcher-down, prolonged-thinking, wedged-pane,
+    // pane-capture-unchanged) records a HangSignal here. If `signals_required`
+    // distinct signal kinds are observed within `signal_window_secs`, we
+    // kill + relaunch the dashboard. Default OFF — Andrew opts in via
+    // `[auto_respawn_on_hang] enabled = true`. Default cooldown 30 min so
+    // a hung freshly-launched dashboard cannot get respawned in a tight loop.
+    if config.auto_respawn_on_hang.enabled {
+        check_auto_respawn(config, state, &effective_pane, &now, stuck).await;
     }
 
     // --- tmux healthcheck brief ---
@@ -4788,5 +5019,352 @@ max_stuck_secs = {max_stuck}
         assert_eq!(health.consecutive_missing, 0);
         assert!(health.event_emitted_at.is_none());
         assert!(health.last_seen_running.is_some());
+    }
+
+    // --- auto-respawn-on-hang signal-collection tests (2026-05-01) ---
+
+    fn config_with_auto_respawn(enabled: bool, signals_required: u32, window_secs: u64) -> Config {
+        let toml_str = format!(
+            r#"
+[general]
+check_interval = 10
+state_file = "/tmp/s.json"
+log_file = "/tmp/s.jsonl"
+legacy_log_file = "/tmp/s.log"
+
+[claude]
+max_context_tokens = 200000
+heartbeat_file = "/tmp/hb"
+relaunch_script = "/tmp/rel.sh"
+
+[dead_process]
+checks_required = 3
+restart_cooldown = 60
+
+[fresh_clear]
+min_tokens = 1000
+max_tokens = 5000
+detections_required = 2
+cooldown = 60
+
+[heartbeat]
+stale_minutes = 10
+
+[alerts]
+initial_cooldown = 60
+escalation_tiers = [60]
+max_pingme_alerts = 1
+resume_prompt = "x"
+
+[foreground_monitor]
+enabled = true
+threshold_seconds = 60
+check_interval = 3
+
+[watcher_monitor]
+enabled = true
+watchers_config = "/tmp/w.conf"
+expected_watchmen = 0
+inject_threshold = 6
+
+[context_monitor]
+enabled = true
+threshold_percent = 75
+compact_trigger_percent = 5
+grace_period = 60
+cooldown = 60
+
+[auto_respawn_on_hang]
+enabled = {enabled}
+signals_required = {signals_required}
+signal_window_secs = {window_secs}
+cooldown_secs = 1800
+kill_grace_secs = 5
+respawn_verify_secs = 30
+pane_unchanged_secs = 600
+"#,
+            enabled = enabled,
+            signals_required = signals_required,
+            window_secs = window_secs,
+        );
+        crate::config::parse_config(&toml_str).expect("parse")
+    }
+
+    #[test]
+    fn test_auto_respawn_default_off() {
+        // No [auto_respawn_on_hang] section -> default disabled.
+        let config = config_with_api_retry(true, 1, 1800);
+        assert!(
+            !config.auto_respawn_on_hang.enabled,
+            "auto-respawn must default OFF — destructive feature, opt-in only"
+        );
+    }
+
+    #[test]
+    fn test_collect_no_signals_when_clean_state() {
+        let config = config_with_auto_respawn(true, 2, 300);
+        let state = State::default();
+        let signals = collect_non_pane_signals(&state, &config, false);
+        assert!(signals.is_empty());
+    }
+
+    #[test]
+    fn test_collect_heartbeat_stuck_emits_signal() {
+        let config = config_with_auto_respawn(true, 2, 300);
+        let state = State::default();
+        let signals = collect_non_pane_signals(&state, &config, true);
+        assert_eq!(signals, vec![crate::respawn::HangSignal::HeartbeatStale]);
+    }
+
+    #[test]
+    fn test_collect_watcher_signal_requires_recent_inject() {
+        let config = config_with_auto_respawn(true, 2, 300);
+        let mut state = State::default();
+        // Watcher critically missing
+        state.watcher_health.insert(
+            "memory-remind".to_string(),
+            crate::state::WatcherState {
+                last_seen_running: None,
+                consecutive_missing: 10,
+                enabled: true,
+                ..Default::default()
+            },
+        );
+        // No recent watcher inject — should NOT emit (we haven't poked the loop yet)
+        let signals = collect_non_pane_signals(&state, &config, false);
+        assert!(
+            signals.is_empty(),
+            "watcher critical without recent inject must NOT signal"
+        );
+
+        // Add a recent watcher inject -> signal fires
+        state.last_watcher_inject = Some(Utc::now().to_rfc3339());
+        let signals = collect_non_pane_signals(&state, &config, false);
+        assert_eq!(
+            signals,
+            vec![crate::respawn::HangSignal::WatcherDownPersistent]
+        );
+    }
+
+    #[test]
+    fn test_collect_watcher_signal_ignores_stale_inject() {
+        // Watcher inject 10 min ago, window 300s -> outside window, no signal.
+        let config = config_with_auto_respawn(true, 2, 300);
+        let mut state = State::default();
+        state.watcher_health.insert(
+            "memory-remind".to_string(),
+            crate::state::WatcherState {
+                last_seen_running: None,
+                consecutive_missing: 10,
+                enabled: true,
+                ..Default::default()
+            },
+        );
+        state.last_watcher_inject =
+            Some((Utc::now() - chrono::Duration::seconds(600)).to_rfc3339());
+        let signals = collect_non_pane_signals(&state, &config, false);
+        assert!(signals.is_empty());
+    }
+
+    #[test]
+    fn test_collect_thinking_signal_requires_two_interrupts() {
+        let config = config_with_auto_respawn(true, 2, 300);
+        let mut state = State::default();
+        state.thinking_interrupt_count = 1;
+        let signals = collect_non_pane_signals(&state, &config, false);
+        assert!(signals.is_empty(), "1 interrupt below threshold");
+
+        state.thinking_interrupt_count = 2;
+        let signals = collect_non_pane_signals(&state, &config, false);
+        assert_eq!(
+            signals,
+            vec![crate::respawn::HangSignal::ProlongedThinkingNoProgress]
+        );
+    }
+
+    #[test]
+    fn test_collect_wedged_signal_requires_recent_clear_and_climbing() {
+        let config = config_with_auto_respawn(true, 2, 300);
+        let mut state = State::default();
+        state.last_wedged_clear = Some(Utc::now().to_rfc3339());
+        state.wedged_consecutive = 1;
+        let signals = collect_non_pane_signals(&state, &config, false);
+        assert!(
+            signals.is_empty(),
+            "wedged consecutive=1 below threshold of 2"
+        );
+
+        state.wedged_consecutive = 2;
+        let signals = collect_non_pane_signals(&state, &config, false);
+        assert_eq!(
+            signals,
+            vec![crate::respawn::HangSignal::WedgedClearNoProgress]
+        );
+    }
+
+    #[test]
+    fn test_collect_multiple_signals_combine() {
+        let config = config_with_auto_respawn(true, 2, 300);
+        let mut state = State::default();
+        state.thinking_interrupt_count = 3;
+        state.watcher_health.insert(
+            "memory-remind".to_string(),
+            crate::state::WatcherState {
+                last_seen_running: None,
+                consecutive_missing: 10,
+                enabled: true,
+                ..Default::default()
+            },
+        );
+        state.last_watcher_inject = Some(Utc::now().to_rfc3339());
+        let signals = collect_non_pane_signals(&state, &config, true);
+        assert_eq!(signals.len(), 3);
+        assert!(signals.contains(&crate::respawn::HangSignal::HeartbeatStale));
+        assert!(signals.contains(&crate::respawn::HangSignal::WatcherDownPersistent));
+        assert!(signals.contains(&crate::respawn::HangSignal::ProlongedThinkingNoProgress));
+    }
+
+    /// End-to-end-ish: when the feature is disabled (default), check_auto_respawn
+    /// is a no-op even with all signals firing.
+    #[tokio::test]
+    async fn test_check_auto_respawn_is_noop_when_disabled() {
+        let config = config_with_auto_respawn(false, 2, 300);
+        let mut state = State::default();
+        state.thinking_interrupt_count = 5;
+        state.watcher_health.insert(
+            "memory-remind".to_string(),
+            crate::state::WatcherState {
+                last_seen_running: None,
+                consecutive_missing: 10,
+                enabled: true,
+                ..Default::default()
+            },
+        );
+        state.last_watcher_inject = Some(Utc::now().to_rfc3339());
+
+        let now = Utc::now().to_rfc3339();
+        check_auto_respawn(&config, &mut state, "", &now, true).await;
+
+        // No signals recorded, no respawn fired.
+        assert!(
+            state.hang_signal_history.distinct_active().is_empty(),
+            "disabled feature must not record signals"
+        );
+        assert!(state.last_respawn_at.is_none());
+        assert_eq!(state.auto_respawn_count, 0);
+    }
+
+    /// When the feature is enabled and signals fire below threshold, no respawn.
+    #[tokio::test]
+    async fn test_check_auto_respawn_records_but_does_not_fire_below_threshold() {
+        let config = config_with_auto_respawn(true, 3, 300);
+        let mut state = State::default();
+        state.thinking_interrupt_count = 5;
+
+        let now = Utc::now().to_rfc3339();
+        check_auto_respawn(&config, &mut state, "", &now, false).await;
+
+        // Recorded the thinking signal.
+        assert_eq!(
+            state.hang_signal_history.distinct_active().len(),
+            1,
+            "exactly 1 distinct signal recorded"
+        );
+        // But threshold is 3, not 1 -> no fire.
+        assert_eq!(
+            state.auto_respawn_count, 0,
+            "below threshold must not respawn"
+        );
+        assert!(state.last_respawn_at.is_none());
+    }
+
+    /// When two distinct signals fire AND the feature is enabled, the respawn
+    /// path runs but (because we pass a mocked `versions_dir` that doesn't
+    /// match any /proc/PID/exe) `find_claude_pid_with_versions_dir` returns
+    /// None and `execute_respawn` aborts cleanly. The state-mutation
+    /// bookkeeping must run regardless of the abort. CRITICAL SAFETY: this
+    /// test must never find a real Claude PID — the override is the
+    /// guard. See `respawn::execute_respawn_with_versions_dir`.
+    #[tokio::test]
+    async fn test_check_auto_respawn_aborts_when_no_claude_via_mock() {
+        let config = config_with_auto_respawn(true, 2, 300);
+        let mut state = State::default();
+        state.thinking_interrupt_count = 5;
+        state.watcher_health.insert(
+            "memory-remind".to_string(),
+            crate::state::WatcherState {
+                last_seen_running: None,
+                consecutive_missing: 10,
+                enabled: true,
+                ..Default::default()
+            },
+        );
+        state.last_watcher_inject = Some(Utc::now().to_rfc3339());
+
+        let now = Utc::now().to_rfc3339();
+        // Use the *_with_versions_dir variant with a path that no /proc
+        // entry will ever match; this forces the abort branch and never
+        // touches the real Claude PID running the test session.
+        check_auto_respawn_with_versions_dir(
+            &config,
+            &mut state,
+            "",
+            &now,
+            true,
+            Some("/nonexistent/claude/versions/path"),
+        )
+        .await;
+
+        // 3 signals collected, but execute_respawn aborted / launched.
+        // The state-mutation-on-fire bookkeeping must run regardless.
+        assert_eq!(
+            state.auto_respawn_count, 1,
+            "counter must increment even on abort/launch-failure"
+        );
+        assert!(
+            state.last_respawn_at.is_some(),
+            "cooldown timestamp must be stamped"
+        );
+        // History cleared after fire so the next cycle starts fresh.
+        assert!(
+            state.hang_signal_history.distinct_active().is_empty(),
+            "history clears after fire"
+        );
+    }
+
+    /// Cooldown: a recent respawn blocks re-fire even if signals are firing.
+    #[tokio::test]
+    async fn test_check_auto_respawn_cooldown_blocks_re_fire() {
+        let config = config_with_auto_respawn(true, 2, 300);
+        let mut state = State::default();
+        state.thinking_interrupt_count = 5;
+        state.watcher_health.insert(
+            "memory-remind".to_string(),
+            crate::state::WatcherState {
+                last_seen_running: None,
+                consecutive_missing: 10,
+                enabled: true,
+                ..Default::default()
+            },
+        );
+        state.last_watcher_inject = Some(Utc::now().to_rfc3339());
+        // Pretend a respawn happened 5 minutes ago — well within the 30 min
+        // cooldown.
+        state.last_respawn_at =
+            Some((Utc::now() - chrono::Duration::seconds(300)).to_rfc3339());
+
+        let now = Utc::now().to_rfc3339();
+        check_auto_respawn(&config, &mut state, "", &now, true).await;
+
+        // Signals were recorded but no NEW fire happened.
+        assert_eq!(
+            state.auto_respawn_count, 0,
+            "cooldown must block re-fire, counter unchanged"
+        );
+        // History should NOT be cleared (no fire to trigger the cleanup).
+        assert!(
+            !state.hang_signal_history.distinct_active().is_empty(),
+            "no fire => history retained"
+        );
     }
 }
