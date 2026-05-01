@@ -10,6 +10,34 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  no-warnings:
+    name: Warning-Free Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Build release with -D warnings
+        run: RUSTFLAGS="-D warnings" cargo build --release --tests
+        env:
+          # Promote any rustc warning to an error. Keeps dead code,
+          # unused imports, etc. out of main. Mirrors the local
+          # scripts/git-hooks/pre-commit gate.
+          RUSTFLAGS: "-D warnings"
+
   unit-tests:
     name: Unit + Fixture Tests
     runs-on: ubuntu-latest
