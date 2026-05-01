@@ -44,10 +44,28 @@ pub struct WatcherEntry {
 /// Pure function: parse status bar fields from pane capture text.
 ///
 /// Looks at the last 10 lines for:
-/// - Token count: `(\d[\d,]*)\s+tokens`
-/// - Bash/background task count: `(\d+)\s+(?:bashes|background\s+tasks)`
+/// - Token count: `(\d[\d,]*)\s+tokens` (also handles k/M suffix in thinking
+///   indicator: `↑ 2.3k tokens`, `↓ 1.4M tokens`).
+/// - Bash/background task count: `(\d+)\s+(?:bashes|background\s+tasks|shells?)`
+///   — singular `shell`/`bash`/`task` accepted (status bar emits "1 shell",
+///   not "1 shells"); also tolerates an "active" qualifier from the overlay
+///   panel ("4 active shells").
 /// - Compact remaining: `Context left until auto-compact:\s*(\d+)%`
+///
+/// Returns `(parsed, saw_status_bar)`. `saw_status_bar` indicates we found
+/// a status-bar indicator anywhere in the tail — used by the parse-miss
+/// detector to distinguish "real status bar with no counts" (legitimate
+/// idle state, e.g. ⏵⏵ bar with 0 shells and 0 tokens) from "no status
+/// bar visible at all" (overlay panel etc.).
 pub(crate) fn parse_status_bar(pane_text: &str) -> ParsedStatusBar {
+    parse_status_bar_with_diag(pane_text).0
+}
+
+/// Like `parse_status_bar` but also returns whether a status-bar marker was
+/// detected in the tail. The marker flag lets `is_parse_miss` suppress
+/// warnings for legitimately-idle status bars (which carry neither tokens
+/// nor a shell count).
+pub(crate) fn parse_status_bar_with_diag(pane_text: &str) -> (ParsedStatusBar, bool) {
     let mut result = ParsedStatusBar::default();
 
     let lines: Vec<&str> = pane_text.lines().collect();
@@ -68,12 +86,30 @@ pub(crate) fn parse_status_bar(pane_text: &str) -> ParsedStatusBar {
     // false positives like "took" / "token" in prose while still catching
     // both the truncated and full forms.
     let token_re = Regex::new(r"(\d[\d,]*)\s+tok").unwrap();
+    // Thinking-indicator format: `↑ 2.3k tokens`, `↓ 1.4M tokens`, `↑ 286 tokens`.
+    // The arrow + suffix combination is unique to Claude Code's
+    // thinking/streaming line and never appears in chat prose. Match it
+    // explicitly so we still get a token count when the status bar itself
+    // has been clobbered by an overlay panel or extreme wrap.
+    let token_thinking_re =
+        Regex::new(r"[\u{2191}\u{2193}]\s*([\d]+(?:\.[\d]+)?)\s*([kKmM]?)\s*tok").unwrap();
     // Claude Code has used multiple names for the concurrent-task counter:
     // `bashes` (old), `background tasks` (mid), and `shells` (2.1.94+). Match
-    // all of them. The `\b` word boundary prevents e.g. "5 shellscript" from
-    // matching.
-    let bash_re =
-        Regex::new(r"(\d+)\s+(?:bashes|background\s+tasks|shells)\b").unwrap();
+    // all of them — including the singular forms (status bar shows
+    // "1 shell" / "1 bash", not "1 shells"). Also tolerate an optional
+    // "active" qualifier inserted by the Background-tasks overlay panel
+    // ("4 active shells", "1 active agent"). The negative lookahead-equivalent
+    // here is the trailing whitespace/end check: `\b` after `(?:s)?` keeps
+    // "5 shellscript" from matching.
+    // NOTE: regex_lite quirk — `bashes?` does NOT match `bash` (only matches
+    // `bashes`). We have to spell out the optional plural suffix as `(?:es)?`
+    // / `(?:s)?` for it to behave correctly. Same trap applies to `tasks?`
+    // and `shells?` — write them as `task(?:s)?` and `shell(?:s)?` to be
+    // safe.
+    let bash_re = Regex::new(
+        r"(\d+)\s+(?:active\s+)?(?:bash(?:es)?|background\s+task(?:s)?|shell(?:s)?)\b",
+    )
+    .unwrap();
     let compact_re = Regex::new(r"Context left until auto-compact:\s*(\d+)%").unwrap();
 
     // Check if ANY line in the bottom section is a status bar line.
@@ -93,15 +129,22 @@ pub(crate) fn parse_status_bar(pane_text: &str) -> ParsedStatusBar {
     //
     // If we see a status bar indicator anywhere, enable token parsing for all
     // lines in the tail.
-    let has_status_bar = lines[start..].iter().any(|line| {
+    let is_status_bar_marker = |line: &str| -> bool {
         line.contains('\u{23f5}') // ⏵ — permission mode icon (bypass / accept edits)
             || line.contains("bypass permissi")
             || line.contains("-- INSERT --")
             || line.contains("background tasks")
+            || line.contains("background task")
             || line.contains("bashes")
             || line.contains(" shells")
+            || line.contains(" shell ")
+            || line.contains("active shells")
+            || line.contains("active agents")
+            || line.contains("active agent")
             || line.contains("auto-compact")
-    });
+    };
+
+    let has_status_bar = lines[start..].iter().any(|l| is_status_bar_marker(l));
 
     for line in &lines[start..] {
         if has_status_bar {
@@ -109,6 +152,23 @@ pub(crate) fn parse_status_bar(pane_text: &str) -> ParsedStatusBar {
                 if let Some(m) = caps.get(1) {
                     let cleaned = m.as_str().replace(',', "");
                     if let Ok(v) = cleaned.parse::<u64>() {
+                        result.tokens = Some(v);
+                    }
+                }
+            }
+        }
+        // Thinking-indicator tokens (with k/M suffix) — match regardless of
+        // status_bar flag. The arrow prefix is itself a strong anchor.
+        if result.tokens.is_none() {
+            if let Some(caps) = token_thinking_re.captures(line) {
+                if let (Some(num), Some(suffix)) = (caps.get(1), caps.get(2)) {
+                    if let Ok(base) = num.as_str().parse::<f64>() {
+                        let mult: f64 = match suffix.as_str() {
+                            "k" | "K" => 1_000.0,
+                            "m" | "M" => 1_000_000.0,
+                            _ => 1.0,
+                        };
+                        let v = (base * mult).round() as u64;
                         result.tokens = Some(v);
                     }
                 }
@@ -130,19 +190,114 @@ pub(crate) fn parse_status_bar(pane_text: &str) -> ParsedStatusBar {
         }
     }
 
-    result
+    // Overlay-fallback pass: when the inline status-bar pass fails to
+    // extract counts but the FULL pane (not just the bottom 10 lines)
+    // contains overlay markers OR a thinking-indicator token line, scan
+    // the entire pane. This handles the "Background tasks" overlay
+    // (2026-04-27 incident) where:
+    //   - The overlay is taller than 10 lines (header + count + "Shells (N)"
+    //     section + per-shell rows + "Local agents (N)" section + per-agent
+    //     rows + nav-hint row), AND
+    //   - tmux capture preserves blank lines that the parse_miss_tail
+    //     diagnostic strips, so the WARN tail looks like the count line
+    //     should have been visible — but the parser's bottom-10-line
+    //     window had been pushed past it by intervening blanks.
+    //
+    // The thinking-indicator regex (↑/↓ N tokens) and the overlay's
+    // "N active shells" / "N active agent" pattern are both unique enough
+    // that scanning the whole pane is safe (no risk of matching prose).
+    let overlay_visible = lines.iter().any(|line| {
+        line.contains("Background tasks")
+            || line.contains("active shells")
+            || line.contains("active shell")
+            || line.contains("active agents")
+            || line.contains("active agent")
+            || line.contains("Local agents")
+            || line.starts_with("  Shells (")
+            || line.contains(" Shells (")
+    });
+
+    if overlay_visible {
+        // Whole-pane scan for bashes (overlay layout), but only if not
+        // already found.
+        if result.bashes.is_none() {
+            for line in &lines {
+                if let Some(caps) = bash_re.captures(line) {
+                    if let Some(m) = caps.get(1) {
+                        if let Ok(v) = m.as_str().parse::<u64>() {
+                            result.bashes = Some(v);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Whole-pane scan for thinking-indicator tokens (always safe because
+    // the ↑/↓ + tok anchor never appears in chat prose). Catches cases
+    // where a thinking line is more than 10 lines above the bottom.
+    if result.tokens.is_none() {
+        for line in &lines {
+            if let Some(caps) = token_thinking_re.captures(line) {
+                if let (Some(num), Some(suffix)) = (caps.get(1), caps.get(2)) {
+                    if let Ok(base) = num.as_str().parse::<f64>() {
+                        let mult: f64 = match suffix.as_str() {
+                            "k" | "K" => 1_000.0,
+                            "m" | "M" => 1_000_000.0,
+                            _ => 1.0,
+                        };
+                        let v = (base * mult).round() as u64;
+                        result.tokens = Some(v);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    // Treat the overlay as a status-bar marker: even though it visually
+    // replaces the bar, it's a known UI state with a count present, and
+    // we don't want is_parse_miss to flag it.
+    let saw_status_bar = has_status_bar || overlay_visible;
+
+    (result, saw_status_bar)
 }
 
 /// Pure function: determine whether a parse-bar result + pane capture
 /// represents a suspicious "parse miss" — i.e. the pane had non-whitespace
-/// content but we extracted neither tokens nor bashes. This is the case we
-/// want to log loudly so we can diagnose stale-latch bugs where the daemon
-/// repeatedly reads 0 from a pane that clearly has a status bar.
+/// content, NO status-bar marker, and we extracted neither tokens nor
+/// bashes. This is the case we want to log loudly so we can diagnose
+/// stale-latch bugs where the daemon repeatedly reads 0 from a pane that
+/// clearly has a status bar.
 ///
-/// A capture that is empty or all-whitespace is *not* a parse miss — that's
-/// "process is actually gone" and shouldn't spam logs.
-pub(crate) fn is_parse_miss(pane_text: &str, parsed: &ParsedStatusBar) -> bool {
+/// Cases that are NOT parse misses:
+///   1. Empty / all-whitespace capture → "process is actually gone"
+///   2. Either tokens OR bashes successfully parsed
+///   3. A status-bar marker (⏵⏵, INSERT, etc.) was visible AND a count
+///      was extracted — handled by case 2.
+///
+/// Cases that ARE parse misses (warn so the parser can be hardened):
+///   - Pane has content, no status-bar markers visible, no counts parsed.
+///     This usually means an overlay panel obscured the bar AND the
+///     thinking indicator token-count form is also unrecognised, OR a
+///     new Claude Code UI variant has shipped that we don't recognise.
+///
+/// A status bar that IS visible but legitimately has no shell/token
+/// counts (e.g. idle: `⏵⏵ bypass permissions on (shift+tab to cycle) ·
+/// esc to interrupt` — 0 shells, 0 tokens because nothing's happening)
+/// is NOT a parse miss. We saw the bar, the counts truly aren't present,
+/// nothing to harden.
+pub(crate) fn is_parse_miss(
+    pane_text: &str,
+    parsed: &ParsedStatusBar,
+    saw_status_bar: bool,
+) -> bool {
     if parsed.tokens.is_some() || parsed.bashes.is_some() {
+        return false;
+    }
+    // Status bar visible but no counts — legitimately idle, not a miss.
+    if saw_status_bar {
         return false;
     }
     pane_text.chars().any(|c| !c.is_whitespace())
@@ -307,13 +462,15 @@ pub async fn get_claude_status() -> Option<ClaudeStatus> {
 
         // Use joined capture (-J) for status bar parsing to avoid truncation
         if let Some(capture) = crate::tmux::capture_pane_joined(&pane).await {
-            let parsed = parse_status_bar(&capture);
+            let (parsed, saw_status_bar) = parse_status_bar_with_diag(&capture);
 
             // Diagnostic: if we got nothing out of the parser but the pane
-            // clearly has content, log the tail so we can debug stale-latch
-            // bugs where the daemon reads tokens=0 forever while the CLI
-            // parses the same pane correctly.
-            if is_parse_miss(&capture, &parsed) {
+            // clearly has content AND no status bar was visible at all, log
+            // the tail so we can debug stale-latch bugs where the daemon
+            // reads tokens=0 forever while the CLI parses the same pane
+            // correctly. A status bar that IS visible but has no counts
+            // (legitimately idle) is not a miss.
+            if is_parse_miss(&capture, &parsed, saw_status_bar) {
                 warn!(
                     pane = %pane,
                     tail = %parse_miss_tail(&capture, 10, 200),
@@ -643,6 +800,284 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_status_bar_singular_shell() {
+        // Real status bar from 2026-04-27 00:16Z parse miss: status bar emits
+        // "1 shell" (singular), not "1 shells". Previously the bash_re was
+        // anchored on `(?:bashes|background\s+tasks|shells)\b` (plural-only),
+        // so the count was lost AND `has_status_bar` failed to detect the
+        // bar via the " shells" substring → tokens were also unparseable on
+        // a normal status-bar-suffix line.
+        let input = "some output\n\
+                     -- INSERT -- \u{23f5}\u{23f5} bypass permissions on \u{00b7} 1 shell \u{00b7} 50000 tokens";
+        let parsed = parse_status_bar(input);
+        assert_eq!(parsed.bashes, Some(1));
+        assert_eq!(parsed.tokens, Some(50000));
+    }
+
+    #[test]
+    fn test_parse_status_bar_singular_background_task() {
+        let input = "-- INSERT -- 1 background task";
+        let parsed = parse_status_bar(input);
+        assert_eq!(parsed.bashes, Some(1));
+    }
+
+    #[test]
+    fn test_parse_status_bar_singular_bash() {
+        let input = "-- INSERT -- 1 bash";
+        let parsed = parse_status_bar(input);
+        assert_eq!(parsed.bashes, Some(1));
+    }
+
+    #[test]
+    fn test_parse_status_bar_overlay_active_shells() {
+        // Real overlay panel from 2026-04-27 01:57Z parse miss: when the
+        // user presses ctrl+b to view the Background-tasks panel, the
+        // status bar is replaced with a panel that reads:
+        //     Background tasks
+        //     4 active shells
+        //     watcher-ctl run signal-wait-dm (running)
+        //     ...
+        // Previously bash_re didn't tolerate the "active" qualifier, so the
+        // count was lost AND has_status_bar didn't detect the panel, so
+        // even the thinking-indicator token form was suppressed.
+        let input = "\
+                     \u{25cf} Newspapering\u{2026} (21s \u{00b7} \u{2191} 286 tokens \u{00b7} thought for 1s)\n\
+                     \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n\
+                       Background tasks\n\
+                       4 active shells\n\
+                         watcher-ctl run signal-wait-dm (running)\n\
+                         watcher-ctl run claude-event-watch (running)\n\
+                         watcher-ctl run memory-remind (running)\n\
+                       \u{276f} watcher-ctl run signal-wait-group (running)\n\
+                       \u{2191}/\u{2193} to select \u{00b7} Enter to view \u{00b7} x to stop \u{00b7} \u{2190}/Esc to close";
+        let parsed = parse_status_bar(input);
+        assert_eq!(parsed.bashes, Some(4));
+        // Thinking-indicator token recovery: "↑ 286 tokens".
+        assert_eq!(parsed.tokens, Some(286));
+    }
+
+    #[test]
+    fn test_parse_status_bar_overlay_with_shells_and_agents_section_2026_04_27() {
+        // 2026-04-27T03:20:43Z parse-miss reproduction. The Background-tasks
+        // overlay introduced a new two-section layout:
+        //     Background tasks
+        //     3 active shells · 1 active agent
+        //       Shells (3)
+        //         watcher-ctl run signal-wait-dm (running)
+        //         watcher-ctl run memory-remind (running)
+        //         watcher-ctl run signal-wait-group (running)
+        //       Local agents (1)
+        //         Execute startup-context-trim (running)
+        //       ↑/↓ to select · Enter to view · ...
+        //
+        // The overlay is taller than 10 lines AND tmux capture preserves
+        // blank lines that parse_miss_tail's diagnostic strips, so the WARN
+        // looked like the parser saw the count line — but the parser's
+        // bottom-10 window had been pushed past it by intervening blanks.
+        // Padding with blanks here reproduces the exact failure mode
+        // observed in production.
+        let input = "previous chat output\n\
+\n\
+\u{25cf} Some action\n\
+\n\
+  \u{2500}\u{2500}\u{2500}\u{2500}\n\
+\n\
+  Background tasks\n\
+\n\
+   3 active shells \u{00b7} 1 active agent\n\
+\n\
+     Shells (3)\n\
+\n\
+   \u{276f} watcher-ctl run signal-wait-dm (running)\n\
+     watcher-ctl run memory-remind (running)\n\
+     watcher-ctl run signal-wait-group (running)\n\
+     Local agents (1)\n\
+     Execute startup-context-trim (running)\n\
+   \u{2191}/\u{2193} to select \u{00b7} Enter to view \u{00b7} x to stop \u{00b7} ctrl+x ctrl+k to stop all agents \u{00b7} \u{2190}/Esc\n\
+   to close";
+        let (parsed, saw_bar) = parse_status_bar_with_diag(input);
+        assert_eq!(
+            parsed.bashes,
+            Some(3),
+            "overlay layout: 3 active shells must be extracted from full pane scan"
+        );
+        assert!(
+            saw_bar,
+            "overlay markers (Background tasks / active shells / Local agents) \
+             must register as status-bar visible to suppress is_parse_miss"
+        );
+    }
+
+    #[test]
+    fn test_parse_status_bar_overlay_thinking_token_pushed_above_window() {
+        // 2026-04-27T01:59:17Z parse-miss reproduction. An idle status bar
+        // (no counts) is at the bottom of the pane, but a thinking line
+        // (`↓ 1.3k tokens`) is more than 10 lines above. Previously the
+        // parser only scanned the bottom 10 lines for token_thinking_re
+        // and missed it.
+        let input = "\u{25cf} Background command \"Restart memory-remind\" failed with exit code 1\n\
+\u{25cf} Background command \"Restart claude-event-watch\" failed with exit code 1\n\
+\u{25cf} Read(/home/hndrewaall/.claude/projects/-home-hndrewaall/e34f3a78-8c8e-4b5b-b2c6-7cd0a32684a2/tool-results/bgvq1ijn1.txt)\n\
+  \u{239d}  Read 244 lines\n\
+\u{25cf} Zigzagging\u{2026} (37s \u{00b7} \u{2193} 1.3k tokens \u{00b7} thought for 13s)\n\
+\n\
+\n\
+\n\
+\n\
+\n\
+\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n\
+\u{276f}\n\
+\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n\
+  \u{23f5}\u{23f5} bypass permissions on (shift+tab to cycle) \u{00b7} esc to interrupt";
+        let (parsed, saw_bar) = parse_status_bar_with_diag(input);
+        assert_eq!(
+            parsed.tokens,
+            Some(1300),
+            "thinking-indicator above the 10-line window must be recovered \
+             by the whole-pane fallback scan"
+        );
+        assert!(
+            saw_bar,
+            "⏵⏵ icon at bottom must register as status bar"
+        );
+    }
+
+    #[test]
+    fn test_parse_status_bar_overlay_active_shell_singular() {
+        // Defensive: overlay with "1 active shell" (singular) should also
+        // parse correctly via the whole-pane scan.
+        let input = "previous output\n\
+\n\
+\n\
+\n\
+\n\
+\n\
+  Background tasks\n\
+\n\
+   1 active shell\n\
+\n\
+     Shells (1)\n\
+\n\
+     watcher-ctl run signal-wait-dm (running)\n\
+   \u{2191}/\u{2193} to select \u{00b7} Enter to view \u{00b7} x to stop \u{00b7} \u{2190}/Esc to close";
+        let parsed = parse_status_bar(input);
+        assert_eq!(parsed.bashes, Some(1));
+    }
+
+    #[test]
+    fn test_parse_status_bar_overlay_does_not_overshadow_inline_bar() {
+        // When BOTH an overlay-looking line AND an inline status bar are
+        // present (defensive — shouldn't really happen), the inline bar's
+        // shell count (the bottom-10 hit) takes precedence: bash_re's
+        // first-match-wins via assigning to result.bashes inside the loop,
+        // and the overlay-fallback only runs if result.bashes is None.
+        let input = "  Background tasks\n\
+   3 active shells \u{00b7} 1 active agent\n\
+\n\
+\n\
+\n\
+\n\
+\n\
+\n\
+\n\
+\n\
+\n\
+\u{2500}\u{2500}\u{2500}\u{2500}\n\
+\u{276f}\n\
+\u{2500}\u{2500}\u{2500}\u{2500}\n\
+\u{23f5}\u{23f5} bypass permissions on \u{00b7} 7 shells \u{00b7} 999 tokens";
+        let parsed = parse_status_bar(input);
+        // Inline bar wins.
+        assert_eq!(parsed.bashes, Some(7));
+        assert_eq!(parsed.tokens, Some(999));
+    }
+
+    #[test]
+    fn test_parse_status_bar_thinking_indicator_k_suffix() {
+        // Real thinking line from 2026-04-27 00:16Z parse miss: when the
+        // status bar is partly obscured but a thinking line is visible, we
+        // can still extract a token count from "↑ 2.3k tokens".
+        let input = "\u{25cf} Honking\u{2026} (1m 9s \u{00b7} \u{2191} 2.3k tokens)";
+        let parsed = parse_status_bar(input);
+        assert_eq!(parsed.tokens, Some(2300));
+    }
+
+    #[test]
+    fn test_parse_status_bar_thinking_indicator_down_arrow() {
+        // Some thinking lines use ↓ instead of ↑.
+        let input = "\u{25cf} Zigzagging\u{2026} (37s \u{00b7} \u{2193} 1.3k tokens \u{00b7} thought for 13s)";
+        let parsed = parse_status_bar(input);
+        assert_eq!(parsed.tokens, Some(1300));
+    }
+
+    #[test]
+    fn test_parse_status_bar_thinking_indicator_no_suffix() {
+        // ↑ N tokens (no suffix) — N is a literal integer.
+        let input = "\u{25cf} Newspapering\u{2026} (21s \u{00b7} \u{2191} 286 tokens \u{00b7} thought for 1s)";
+        let parsed = parse_status_bar(input);
+        assert_eq!(parsed.tokens, Some(286));
+    }
+
+    #[test]
+    fn test_parse_status_bar_thinking_indicator_m_suffix() {
+        // Defensive: M-suffix support for huge contexts (1.4M tokens).
+        let input = "\u{25cf} Cooking\u{2026} (5m \u{00b7} \u{2191} 1.4M tokens)";
+        let parsed = parse_status_bar(input);
+        assert_eq!(parsed.tokens, Some(1_400_000));
+    }
+
+    #[test]
+    fn test_parse_status_bar_thinking_indicator_does_not_match_prose() {
+        // Thinking-indicator regex is anchored on the ↑/↓ arrow + suffix
+        // combination, so prose mentioning "tokens" without that anchor
+        // must not match (we don't want to read a token count out of chat
+        // text).
+        let input = "Hey, that took about 500 tokens to compute.\n\
+                     \u{276f}";
+        let parsed = parse_status_bar(input);
+        assert_eq!(
+            parsed.tokens, None,
+            "must not match token counts in chat prose"
+        );
+    }
+
+    #[test]
+    fn test_parse_status_bar_idle_no_counts() {
+        // A truly idle status bar — no shells, no tokens. The bar is
+        // visible but neither count is rendered. parse_status_bar returns
+        // Nones for both, but parse_status_bar_with_diag should report
+        // saw_status_bar=true, which suppresses the parse-miss warning.
+        let input = "\u{2500}\u{2500}\u{2500}\u{2500}\n\
+                     \u{276f}\n\
+                     \u{2500}\u{2500}\u{2500}\u{2500}\n\
+                     \u{23f5}\u{23f5} bypass permissions on (shift+tab to cycle) \u{00b7} esc to interrupt";
+        let (parsed, saw_bar) = parse_status_bar_with_diag(input);
+        assert_eq!(parsed.tokens, None);
+        assert_eq!(parsed.bashes, None);
+        assert!(saw_bar, "⏵⏵ icon must register as a status-bar marker");
+    }
+
+    #[test]
+    fn test_parse_status_bar_diag_no_status_bar_visible() {
+        // Pane content with no status-bar markers anywhere — saw_status_bar
+        // must be false so is_parse_miss correctly flags this as suspicious.
+        let input = "hello world\nno status bar here";
+        let (parsed, saw_bar) = parse_status_bar_with_diag(input);
+        assert_eq!(parsed.tokens, None);
+        assert_eq!(parsed.bashes, None);
+        assert!(!saw_bar);
+    }
+
+    #[test]
+    fn test_parse_status_bar_diag_full_bar_returns_true() {
+        let input = "\u{23f5}\u{23f5} bypass permissions on \u{00b7} 5 shells \u{00b7} 100 tokens";
+        let (parsed, saw_bar) = parse_status_bar_with_diag(input);
+        assert_eq!(parsed.tokens, Some(100));
+        assert_eq!(parsed.bashes, Some(5));
+        assert!(saw_bar);
+    }
+
+    #[test]
     fn test_parse_status_bar_single_chevron_not_enough() {
         // A lone `>` or the prompt character `❯` isn't a status-bar marker —
         // Claude's chat output frequently contains chevrons. We do NOT want
@@ -664,15 +1099,31 @@ mod tests {
     fn test_is_parse_miss_empty_capture() {
         // Empty pane capture is "process gone", not a parse miss.
         let parsed = ParsedStatusBar::default();
-        assert!(!is_parse_miss("", &parsed));
-        assert!(!is_parse_miss("   \n\t\n  ", &parsed));
+        assert!(!is_parse_miss("", &parsed, false));
+        assert!(!is_parse_miss("   \n\t\n  ", &parsed, false));
     }
 
     #[test]
     fn test_is_parse_miss_has_content_but_nothing_parsed() {
-        // Non-empty pane with no tokens/bashes is the suspicious case.
+        // Non-empty pane with no tokens/bashes AND no status bar marker is
+        // the suspicious case.
         let parsed = ParsedStatusBar::default();
-        assert!(is_parse_miss("hello world\nno status bar here", &parsed));
+        assert!(is_parse_miss(
+            "hello world\nno status bar here",
+            &parsed,
+            false
+        ));
+    }
+
+    #[test]
+    fn test_is_parse_miss_status_bar_visible_no_counts() {
+        // Status bar IS visible but has no shell/token counts (legitimately
+        // idle: 0 shells, 0 tokens displayed). This must NOT be flagged as
+        // a parse miss — there is nothing for the parser to harden against.
+        let parsed = ParsedStatusBar::default();
+        let pane = "some chat output\n\
+                     \u{23f5}\u{23f5} bypass permissions on (shift+tab to cycle) \u{00b7} esc to interrupt";
+        assert!(!is_parse_miss(pane, &parsed, true));
     }
 
     #[test]
@@ -683,7 +1134,8 @@ mod tests {
             bashes: None,
             compact_remaining: None,
         };
-        assert!(!is_parse_miss("some content", &parsed));
+        assert!(!is_parse_miss("some content", &parsed, false));
+        assert!(!is_parse_miss("some content", &parsed, true));
     }
 
     #[test]
@@ -693,7 +1145,8 @@ mod tests {
             bashes: Some(3),
             compact_remaining: None,
         };
-        assert!(!is_parse_miss("some content", &parsed));
+        assert!(!is_parse_miss("some content", &parsed, false));
+        assert!(!is_parse_miss("some content", &parsed, true));
     }
 
     // --- parse_miss_tail tests ---

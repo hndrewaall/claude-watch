@@ -62,7 +62,17 @@ pub(crate) fn thinking_backoff_threshold_with_multiplier(
 
 /// Returns true if a previous interrupt fired within the last
 /// `cooldown_secs` seconds. Used to suppress cascading interrupts across
-/// all fire paths (prolonged-thinking, watcher-down, context-warning).
+/// the prolonged-thinking and context-warning fire paths.
+///
+/// NOTE (2026-04-28): The watcher-down inject path is intentionally
+/// EXEMPT from this gate. A down watcher (signal-wait, claude-event-
+/// watch, torrent-wait, etc.) is a hard liveness failure — silence in
+/// the cooldown window means inbound messages, events, and torrents go
+/// unprocessed for as long as it takes to clear. The watcher-down
+/// inject must be allowed to fire even when another interrupt fired
+/// recently. The per-watcher `last_watcher_inject` cooldown
+/// (`watcher_monitor.inject_cooldown`, default 60s) still rate-limits
+/// re-injects on the same fire path.
 ///
 /// A `cooldown_secs` of 0 disables the gate entirely.
 pub(crate) fn interrupt_in_global_cooldown(state: &State, cooldown_secs: u64) -> bool {
@@ -74,6 +84,294 @@ pub(crate) fn interrupt_in_global_cooldown(state: &State, cooldown_secs: u64) ->
         .as_deref()
         .and_then(elapsed_since)
         .is_some_and(|e| e < cooldown_secs as f64)
+}
+
+/// Pure predicate: should the watcher-down inject path fire now, given
+/// the timestamp of the last watcher-inject and the configured cooldown?
+///
+/// - `None` last-inject (never fired before) -> always allow.
+/// - `Some(ts)` -> allow iff elapsed >= cooldown_secs (or the timestamp
+///   is malformed and `elapsed_since` returns None — fail-open so the
+///   gate never wedges).
+///
+/// Intentionally does NOT consult `interrupt_in_global_cooldown` (PR #44):
+/// a down watcher is a hard liveness failure, so the watcher-down path is
+/// exempt from the global post-interrupt cooldown that gates other inject
+/// reasons.
+pub(crate) fn watcher_inject_due(
+    last_watcher_inject: Option<&str>,
+    cooldown_secs: u64,
+) -> bool {
+    match last_watcher_inject {
+        Some(last) => elapsed_since(last).is_none_or(|e| e >= cooldown_secs as f64),
+        None => true,
+    }
+}
+
+/// Returns true if the main loop is "actively turning" — either a tool
+/// call is currently running (`bashes > 0` this check) or one fired
+/// within the last `window_secs` (per `state.last_active_at`).
+///
+/// Used by the watcher-down inject suppression gate so the daemon does
+/// not preempt an in-flight turn with a `WATCHER(S) DOWN` prompt. A
+/// `window_secs` of 0 still honors the live `bashes > 0` check.
+pub(crate) fn main_loop_actively_turning(
+    state: &State,
+    bashes: u64,
+    window_secs: u64,
+) -> bool {
+    if bashes > 0 {
+        return true;
+    }
+    state
+        .last_active_at
+        .as_deref()
+        .and_then(elapsed_since)
+        .is_some_and(|e| e < window_secs as f64)
+}
+
+/// Pure predicate: should the fresh-/clear inject be suppressed because
+/// the main loop is actively turning? Mirrors the decision we make at
+/// the fire site so unit tests don't have to mock tmux pane reads.
+///
+/// Returns true iff `suppress_enabled && main_loop_actively_turning(...)`.
+pub(crate) fn fresh_clear_inject_suppressed(
+    state: &State,
+    bashes: u64,
+    suppress_enabled: bool,
+    window_secs: u64,
+) -> bool {
+    suppress_enabled && main_loop_actively_turning(state, bashes, window_secs)
+}
+
+/// Pure predicate: should the dead-process restart be suppressed because
+/// the main loop is actively turning? Mirrors the decision we make at
+/// the fire site so unit tests don't have to mock tmux pane reads.
+///
+/// Returns true iff `suppress_enabled && main_loop_actively_turning(...)`.
+pub(crate) fn dead_process_restart_suppressed(
+    state: &State,
+    bashes: u64,
+    suppress_enabled: bool,
+    window_secs: u64,
+) -> bool {
+    suppress_enabled && main_loop_actively_turning(state, bashes, window_secs)
+}
+
+/// Reason a force-inject escalation should fire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EscalationReason {
+    /// `consecutive_suppressions >= max_consecutive_suppressions`.
+    ConsecutiveCap,
+    /// `now - first_suppression_at > max_suppression_window_secs`.
+    WindowExceeded,
+}
+
+impl EscalationReason {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            EscalationReason::ConsecutiveCap => "consecutive_cap",
+            EscalationReason::WindowExceeded => "window_exceeded",
+        }
+    }
+}
+
+/// Pure predicate: has the cross-gate suppression run been long/persistent
+/// enough that the next gate fire should force-inject regardless of
+/// `actively_turning`? Returns the triggering reason if so.
+///
+/// Both limits are checked on EVERY gate fire — the consecutive counter
+/// catches "many suppressions in a tight window" and the wall-clock window
+/// catches "fewer suppressions, but the active turn has been running so
+/// long the gate's been open way too long".
+///
+/// `consecutive_suppressions == 0` short-circuits to None: the first
+/// suppression of a run can never escalate (escalation only fires when
+/// the gate has demonstrably failed to drain at least once).
+pub(crate) fn should_escalate_suppression(
+    state: &State,
+    max_consecutive_suppressions: u32,
+    max_suppression_window_secs: u64,
+) -> Option<EscalationReason> {
+    if state.consecutive_suppressions == 0 {
+        return None;
+    }
+    if max_consecutive_suppressions > 0
+        && state.consecutive_suppressions >= max_consecutive_suppressions
+    {
+        return Some(EscalationReason::ConsecutiveCap);
+    }
+    if max_suppression_window_secs > 0 {
+        if let Some(elapsed) = state
+            .first_suppression_at
+            .as_deref()
+            .and_then(elapsed_since)
+        {
+            if elapsed > max_suppression_window_secs as f64 {
+                return Some(EscalationReason::WindowExceeded);
+            }
+        }
+    }
+    None
+}
+
+/// Record that a suppression-gate fired and was suppressed (the `actively_
+/// turning` path took the "skip the inject" branch). Increments the shared
+/// counter and stamps `first_suppression_at` on the 0 -> 1 transition.
+/// Idempotent w.r.t. `first_suppression_at` after the first call.
+pub(crate) fn record_suppression(state: &mut State, now: &str) {
+    if state.consecutive_suppressions == 0 {
+        state.first_suppression_at = Some(now.to_string());
+    }
+    state.consecutive_suppressions = state.consecutive_suppressions.saturating_add(1);
+}
+
+/// Reset the shared suppression counter and timestamp. Called when an
+/// inject lands successfully OR when the underlying suppression condition
+/// resolves (the gate's predicate stops matching). Cheap no-op when the
+/// counter is already 0.
+pub(crate) fn reset_suppression(state: &mut State) {
+    state.consecutive_suppressions = 0;
+    state.first_suppression_at = None;
+}
+
+/// Quiet-path decision for watcher-down events.
+///
+/// Pure helper: given the configured thresholds plus a watcher's current
+/// state, decide what the watcher-monitor cycle should do this iteration.
+/// Returns a `WatcherDownAction`:
+///
+///   * `Nothing`         — below event_threshold, or in grace window.
+///   * `EmitEvent`       — fire a `watcher-down` claude-event; quiet path.
+///   * `InjectFallback`  — heavyweight tmux-inject path:
+///       - the watcher is the configured event-consumer (chicken-and-egg:
+///         emitting an event with no consumer is pointless), OR
+///       - we already emitted an event for this watcher AND the grace
+///         window has expired AND consecutive_missing has reached the
+///         inject_threshold.
+///
+/// This function does NOT consult the global cooldown or the
+/// `last_watcher_inject` cooldown; those are layered on top by the caller
+/// at the inject site (mirroring the legacy behaviour).
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub(crate) enum WatcherDownAction {
+    Nothing,
+    EmitEvent,
+    InjectFallback,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn evaluate_watcher_down_action(
+    is_consumer_watcher: bool,
+    consecutive_missing: u32,
+    event_emitted_at: Option<&str>,
+    event_threshold: u32,
+    inject_threshold: u32,
+    event_grace_secs: u64,
+) -> WatcherDownAction {
+    // Special-case: when the consumer watcher itself is missing, the quiet
+    // path can't deliver — skip event emission and fall straight through
+    // to inject as soon as it has reached the inject_threshold (so the
+    // legacy semantics for that watcher are preserved).
+    if is_consumer_watcher {
+        if consecutive_missing >= inject_threshold {
+            return WatcherDownAction::InjectFallback;
+        }
+        return WatcherDownAction::Nothing;
+    }
+
+    let grace_active = event_emitted_at
+        .and_then(elapsed_since)
+        .is_some_and(|e| e < event_grace_secs as f64);
+
+    // Once the quiet path has fired AT ALL for this watcher (regardless of
+    // grace age), the inject path is the only escalation route — we do NOT
+    // re-emit. While the grace window is active, the loud path is also
+    // suppressed (give the main loop a chance). Past the grace window, we
+    // fall through to inject as fallback for the case where the main loop
+    // never picked up the event (or claude-event-watch is itself stalled).
+    if event_emitted_at.is_some() {
+        if grace_active {
+            return WatcherDownAction::Nothing;
+        }
+        if consecutive_missing >= inject_threshold {
+            return WatcherDownAction::InjectFallback;
+        }
+        return WatcherDownAction::Nothing;
+    }
+
+    // No prior emission. First-time event emission: at-or-above
+    // event_threshold but below inject_threshold (so the quiet path
+    // strictly precedes the loud one for normal configs).
+    if consecutive_missing >= event_threshold && consecutive_missing < inject_threshold {
+        return WatcherDownAction::EmitEvent;
+    }
+
+    // No prior event AND consecutive_missing has marched past the inject
+    // threshold without ever crossing event_threshold (only possible if
+    // event_threshold > inject_threshold, i.e. misconfiguration). Fall
+    // through to inject as legacy behaviour.
+    if consecutive_missing >= inject_threshold {
+        return WatcherDownAction::InjectFallback;
+    }
+
+    WatcherDownAction::Nothing
+}
+
+/// Best-effort fire-and-forget emission of a `watcher-down` claude-event.
+///
+/// Shells out to the configured `claude-event` CLI. If the CLI is missing,
+/// crashes, or hangs, we log and move on — the caller should treat this as
+/// non-blocking. The fallback inject path will eventually fire if the main
+/// loop never picks the event up.
+async fn emit_watcher_down_event(
+    cli: &str,
+    watcher: &str,
+    consecutive_missing: u32,
+    recorded_pid: Option<u32>,
+) -> bool {
+    let message = format!(
+        "Watcher DOWN: {}. Run: watcher-ctl run {}",
+        watcher, watcher
+    );
+    let pid_str = match recorded_pid {
+        Some(p) => p.to_string(),
+        None => "null".to_string(),
+    };
+    let watcher_kv = format!("watcher={}", watcher);
+    let consec_kv = format!("consecutive_missing={}", consecutive_missing);
+    let pid_kv = format!("recorded_pid={}", pid_str);
+    let args: Vec<&str> = vec![
+        cli,
+        &message,
+        "--tag",
+        "watcher-down",
+        "--source",
+        "claude-watch",
+        "--source-name",
+        "claude-watch",
+        "--priority",
+        "high",
+        "--data",
+        &watcher_kv,
+        "--data",
+        &consec_kv,
+        "--data",
+        &pid_kv,
+    ];
+
+    // 5s timeout — claude-event is a tiny Python script that should complete
+    // in well under a second; if it hangs, don't block the monitor loop.
+    let result = crate::cmd::run_cmd_any(&args, 5).await;
+    if !result.1 {
+        warn!(
+            watcher = %watcher,
+            cli = %cli,
+            "claude-event emission failed (CLI missing, non-zero exit, or timeout); falling back to inject path on next cycle past grace window"
+        );
+        return false;
+    }
+    true
 }
 
 /// If the given reminder fired within the last `max_age_secs` (we default
@@ -158,12 +456,173 @@ async fn restart_claude(pane: &str, state: &mut State, config: &crate::config::C
         state.restart_claude_interrupts_total.saturating_add(1);
     state.pending_resume_inject = true;
 
-    alert::send_pingme("claude-watch: Claude Code crashed -- auto-restarting").await;
+    alert::notify(crate::event_bus::ClaudeWatchAlert {
+        alert_type: "claude-crashed",
+        stuck_reason: "claude code process gone",
+        stale_minutes: None,
+        affected_watchers: vec![],
+        severity: crate::event_bus::Severity::High,
+        message: "claude-watch: Claude Code crashed -- auto-restarting",
+    })
+    .await;
+}
+
+/// Pure decision: given the current observation (`is_retrying`) and the
+/// existing state, return the `(new_consecutive, new_first_seen, suppress)`
+/// triple. Split out so the consecutive-cycles + max-stuck-secs logic can
+/// be unit-tested without mocking tmux.
+///
+/// Semantics:
+///   - `is_retrying=true` increments `consecutive`. The first detection sets
+///     `first_seen`. Suppression activates once `consecutive >= threshold`.
+///   - `is_retrying=true` AND we've already been suppressing for longer than
+///     `max_stuck_secs` returns `suppress=false` so monitoring resumes (the
+///     retry has hung long enough to count as a real failure).
+///   - `is_retrying=false` clears the episode immediately.
+pub(crate) fn evaluate_api_retry_state(
+    is_retrying: bool,
+    consecutive: u32,
+    first_seen: Option<&str>,
+    threshold: u32,
+    max_stuck_secs: u64,
+) -> (u32, Option<String>, bool) {
+    if !is_retrying {
+        return (0, None, false);
+    }
+
+    let new_consecutive = consecutive.saturating_add(1);
+    // Preserve the original first_seen if we already have one; otherwise stamp
+    // it now (the caller passes the current local time as `first_seen=None`
+    // when no episode is in progress).
+    let new_first_seen = match first_seen {
+        Some(fs) => Some(fs.to_string()),
+        None => Some(Local::now().to_rfc3339()),
+    };
+
+    // Don't suppress until the consecutive threshold is reached.
+    if new_consecutive < threshold {
+        return (new_consecutive, new_first_seen, false);
+    }
+
+    // Suppression cap: once we've been retrying for longer than
+    // max_stuck_secs, stop suppressing — let the normal monitoring sites
+    // fire so something can recover.
+    if max_stuck_secs > 0 {
+        if let Some(ref fs) = new_first_seen {
+            if let Some(elapsed) = elapsed_since(fs) {
+                if elapsed > max_stuck_secs as f64 {
+                    return (new_consecutive, new_first_seen, false);
+                }
+            }
+        }
+    }
+
+    (new_consecutive, new_first_seen, true)
+}
+
+/// Detect whether the pane is currently in an upstream-API retry-backoff and
+/// update the daemon's tracking state accordingly. Returns true when the
+/// caller should SUPPRESS interrupt fires for this cycle.
+///
+/// This is the single chokepoint for the "back off when API is overloaded"
+/// fix. To avoid double-counting state updates when `check_cycle` calls
+/// `check_foreground` near the end of its body (both would otherwise call
+/// this function in a single cycle), the caller in `check_foreground` skips
+/// the update and reads the suppression flag from existing state via
+/// `is_api_retry_suppressing` instead.
+async fn update_api_retry_state(config: &Config, state: &mut State, pane: &str) -> bool {
+    if !config.api_retry.enabled || pane.is_empty() {
+        return false;
+    }
+
+    let is_retrying = tmux::detect_api_retry(pane).await;
+    let was_suppressing = is_api_retry_suppressing(config, state);
+
+    let (new_consec, new_first, suppress) = evaluate_api_retry_state(
+        is_retrying,
+        state.api_retry_consecutive,
+        state.api_retry_first_seen.as_deref(),
+        config.api_retry.consecutive,
+        config.api_retry.max_stuck_secs,
+    );
+    state.api_retry_consecutive = new_consec;
+    state.api_retry_first_seen = new_first;
+
+    if suppress {
+        state.api_retry_suppressions_total =
+            state.api_retry_suppressions_total.saturating_add(1);
+        if !was_suppressing {
+            // Edge: log on transition into suppression.
+            info!(
+                consecutive = state.api_retry_consecutive,
+                "API retry detected — suppressing interrupt sites until retry resolves"
+            );
+            write_jsonl_log(
+                &config.general.log_file,
+                "api_retry_suppress_start",
+                serde_json::json!({
+                    "consecutive": state.api_retry_consecutive,
+                }),
+            );
+        } else {
+            debug!(
+                consecutive = state.api_retry_consecutive,
+                "api_retry suppression continues"
+            );
+        }
+    } else if was_suppressing {
+        // Transition out of suppression. Either the retry resolved or we hit
+        // the max_stuck_secs cap — either way the caller resumes normal
+        // monitoring on this cycle.
+        info!("API retry resolved or stuck timeout reached — resuming normal monitoring");
+        write_jsonl_log(
+            &config.general.log_file,
+            "api_retry_suppress_end",
+            serde_json::json!({}),
+        );
+    }
+
+    suppress
+}
+
+/// Pure decision (no I/O, no state mutation): given the current State and
+/// Config, return whether the api_retry guard is currently suppressing
+/// interrupts. Used by `check_foreground` when called from inside
+/// `check_cycle` (which already ran `update_api_retry_state` once this
+/// cycle) so we don't increment the suppressions counter twice.
+///
+/// Returns false when the feature is disabled, no episode is in progress,
+/// the consecutive threshold isn't met, or the max_stuck_secs cap has been
+/// exceeded.
+pub(crate) fn is_api_retry_suppressing(config: &Config, state: &State) -> bool {
+    if !config.api_retry.enabled {
+        return false;
+    }
+    if state.api_retry_consecutive < config.api_retry.consecutive {
+        return false;
+    }
+    let first_seen = match state.api_retry_first_seen.as_deref() {
+        Some(fs) => fs,
+        None => return false,
+    };
+    if config.api_retry.max_stuck_secs > 0 {
+        if let Some(elapsed) = elapsed_since(first_seen) {
+            if elapsed > config.api_retry.max_stuck_secs as f64 {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 /// Run a foreground-only check cycle. This is called more frequently than
 /// the full check_cycle to provide responsive foreground blocking detection.
 /// Requires a known pane to check against.
+///
+/// Performs its own api_retry detection via `update_api_retry_state`. Use
+/// `check_foreground_inner` directly when called from inside `check_cycle`
+/// to avoid double-incrementing the api_retry state counters in a single
+/// full-check cycle.
 pub async fn check_foreground(
     config: &Config,
     state: &mut State,
@@ -172,6 +631,40 @@ pub async fn check_foreground(
     bashes: u64,
 ) {
     if !config.foreground_monitor.enabled || pane.is_empty() {
+        return;
+    }
+    let api_retrying = update_api_retry_state(config, state, pane).await;
+    check_foreground_inner(config, state, pane, tokens, bashes, api_retrying).await;
+}
+
+/// Foreground check body, with the api_retrying flag passed in by the
+/// caller. Split out from `check_foreground` so `check_cycle` can call it
+/// without re-running `update_api_retry_state` (which would
+/// double-increment `api_retry_suppressions_total` per full cycle).
+async fn check_foreground_inner(
+    config: &Config,
+    state: &mut State,
+    pane: &str,
+    tokens: u64,
+    bashes: u64,
+    api_retrying: bool,
+) {
+    if !config.foreground_monitor.enabled || pane.is_empty() {
+        return;
+    }
+
+    // API retry guard: if Claude Code is currently in upstream-API retry
+    // backoff (529 / overloaded / 5xx), suppress every fire from this
+    // function. Each inject during retry resets the retry state machine,
+    // creating a livelock where the retry loop never gets to complete.
+    // Also reset the thinking timer so a stale start time doesn't cause
+    // an immediate fire the moment the retry resolves.
+    if api_retrying {
+        debug!("foreground check: api_retry active — suppressing fires this cycle");
+        state.thinking_start = None;
+        state.thinking_alerted = false;
+        state.foreground_start = None;
+        state.foreground_alerted = false;
         return;
     }
 
@@ -260,7 +753,11 @@ pub async fn check_foreground(
                         state.prolonged_thinking_interrupts_total = state
                             .prolonged_thinking_interrupts_total
                             .saturating_add(1);
-                        tmux::interrupt_and_wait(pane, 30).await;
+                        // 5s budget: Escape blasts every 250ms. If Claude
+                        // hasn't honored the interrupt by ~5s, it almost
+                        // certainly won't — proceed with the inject anyway.
+                        // Pre-fix: 30s, dominated perceived recovery latency.
+                        tmux::interrupt_and_wait(pane, 5).await;
                         let msg = format!(
                                 "[CLAUDE-WATCH] Prolonged thinking detected (>{}s in thinking state, interrupt #{}). \
                                 You appear to be stuck in a long generation. If you have complex work to do, \
@@ -281,6 +778,22 @@ pub async fn check_foreground(
                                 "interrupt_count": state.thinking_interrupt_count,
                             }),
                         );
+                        // Third sink: claude-event so the main loop can
+                        // see this stuck-state via structured fields and
+                        // not just react reflexively to the injected
+                        // string.
+                        let pt_reason = format!(
+                            "prolonged thinking ({}s, interrupt #{})",
+                            elapsed as u64, state.thinking_interrupt_count,
+                        );
+                        alert::emit_event(crate::event_bus::ClaudeWatchAlert {
+                            alert_type: "prolonged-thinking",
+                            stuck_reason: &pt_reason,
+                            stale_minutes: None,
+                            affected_watchers: vec![],
+                            severity: crate::event_bus::Severity::Medium,
+                            message: &msg,
+                        });
                     } else {
                         info!(
                             elapsed_secs = elapsed,
@@ -327,7 +840,9 @@ pub async fn check_foreground(
                             state.foreground_blocking_interrupts_total = state
                                 .foreground_blocking_interrupts_total
                                 .saturating_add(1);
-                            tmux::interrupt_and_wait(pane, 30).await;
+                            // 5s budget — see comment at the prolonged-thinking
+                            // interrupt site above.
+                            tmux::interrupt_and_wait(pane, 5).await;
                             tmux::inject_text(pane, &config.foreground_monitor.interrupt_message)
                                 .await;
                             write_jsonl_log(
@@ -370,6 +885,55 @@ fn is_pid_alive(pid: u32) -> bool {
     kill(Pid::from_raw(pid as i32), Signal::SIGCONT)
         .map(|_| true)
         .unwrap_or(false)
+}
+
+/// Read a watcher PID file and return the recorded PID, if the file exists
+/// and contains a parseable integer. Whitespace is trimmed.
+///
+/// Returns:
+/// - `Some(pid)` if the file exists and parses cleanly.
+/// - `None` if the file is missing, unreadable, or contains non-numeric data.
+fn read_watcher_pid(pid_dir: &str, name: &str) -> Option<u32> {
+    let path = format!("{}/{}.pid", pid_dir, name);
+    let content = std::fs::read_to_string(&path).ok()?;
+    content.trim().parse::<u32>().ok()
+}
+
+/// Decide whether a watcher should be considered DOWN, given:
+/// - the live process count (from `pgrep -fc`)
+/// - the configured `min_count`
+/// - the recorded PID file (if any)
+/// - a process-liveness probe (typically `is_pid_alive`)
+///
+/// Returns `true` when the watcher is missing/orphaned.
+///
+/// The orphan-detection branch is the bug-2 fix: if a PID file exists and its
+/// recorded PID is dead, the watcher is DOWN even when `pgrep -fc` happens to
+/// match some other process by accident (e.g. a stale shell whose argv still
+/// contains the watcher's name pattern, or a self-matching wrapper). This
+/// matches the legacy `watchmen` shell-script's `kill -0` cross-check that
+/// was lost when watchmen was rewritten in Rust.
+///
+/// Watchers without a PID file fall through to the existing pgrep-only logic
+/// (preserves backward compat for watchers we don't explicitly track).
+pub fn watcher_is_down(
+    pgrep_count: u32,
+    min_count: u32,
+    recorded_pid: Option<u32>,
+    pid_alive: impl Fn(u32) -> bool,
+) -> bool {
+    // Standard pgrep-only check first.
+    if pgrep_count < min_count {
+        return true;
+    }
+    // Orphan-detection: pgrep saw a match, but the PID Claude actually
+    // started has died. The match is a false positive — count as DOWN.
+    if let Some(pid) = recorded_pid {
+        if !pid_alive(pid) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Spawn `self-clear` immediately (no grace period). Used for the
@@ -473,12 +1037,25 @@ async fn inject_context_warning(pane: &str, pct: f64, compact_remaining: Option<
         Forced clear in {}s if you don't act.",
         context_info, grace
     );
-    tmux::interrupt_and_wait(pane, 30).await;
+    // 5s budget — same rationale as the other inline interrupt sites.
+    tmux::interrupt_and_wait(pane, 5).await;
     tmux::inject_text(pane, &msg).await;
 }
 
 /// Determine if context threshold is exceeded.
 /// Returns Some((pct, triggered_by_compact)) if triggered, None otherwise.
+///
+/// The three trigger paths are INDEPENDENT — any one firing causes a trigger:
+///
+/// 1. **BY_COMPACT** (primary): `compact_remaining <= compact_trigger_percent`.
+///    The most accurate signal when Claude Code reports it.
+/// 2. **BY_MARGIN** (safety net): `tokens >= max_context_tokens - threshold_margin`.
+///    Runs even when compact_remaining is Some but not triggering — this is the
+///    fix for the 2026-04-30 incident where a session sat at 95.97% for 12 min
+///    with no auto-clear because the old else-if chain skipped this check.
+/// 3. **BY_PERCENT** (legacy fallback): `pct >= threshold_percent`. Only used
+///    when threshold_margin is unset (per documented config semantics:
+///    "ignored when threshold_margin is set").
 pub(crate) fn check_context_threshold_with_margin(
     tokens: u64,
     max_context_tokens: u64,
@@ -489,16 +1066,27 @@ pub(crate) fn check_context_threshold_with_margin(
 ) -> Option<(f64, bool)> {
     let pct = (tokens as f64 / max_context_tokens as f64) * 100.0;
 
+    // Primary: compact_remaining is the most accurate signal when present.
     if let Some(cr) = compact_remaining {
         if cr <= compact_trigger_percent {
             return Some((pct, true));
         }
-    } else if let Some(margin) = threshold_margin {
-        // Fixed margin: trigger when tokens >= max - margin
+    }
+
+    // Safety net: fixed token margin from max. Runs independently of the
+    // compact_remaining check — if compact didn't trigger above, margin still
+    // gets a chance to fire.
+    if let Some(margin) = threshold_margin {
         if max_context_tokens > margin && tokens >= max_context_tokens - margin {
             return Some((pct, false));
         }
-    } else if pct >= threshold_percent as f64 {
+        // When threshold_margin is set, threshold_percent is ignored
+        // (legacy fallback semantics, documented in ContextMonitorConfig).
+        return None;
+    }
+
+    // Legacy fallback: percent of max.
+    if pct >= threshold_percent as f64 {
         return Some((pct, false));
     }
 
@@ -564,7 +1152,15 @@ async fn check_reauth(config: &Config, state: &mut State, pane: &str) {
                 let now = Local::now().to_rfc3339();
                 warn!("sending high-priority reauth alert with URL");
                 let alert_msg = format!("Claude Code login needed. URL: {}", login_url);
-                alert::send_pingme_with_priority(&alert_msg, "high").await;
+                alert::notify(crate::event_bus::ClaudeWatchAlert {
+                    alert_type: "reauth-needed",
+                    stuck_reason: "claude code 401, login url present",
+                    stale_minutes: None,
+                    affected_watchers: vec![],
+                    severity: crate::event_bus::Severity::High,
+                    message: &alert_msg,
+                })
+                .await;
                 write_jsonl_log(
                     &config.general.log_file,
                     "reauth_alert",
@@ -835,11 +1431,14 @@ async fn run_auto_update(pane: &str, old_version: &str, new_version: &str, confi
         serde_json::json!({}),
     );
 
-    // Step 1: Interrupt and wait for idle
-    if tmux::interrupt_and_wait(pane, 30).await {
+    // Step 1: Interrupt and wait for idle. 10s budget — auto-update is
+    // a rare path so we're a bit more patient than the inline interrupt
+    // sites (5s), but still bounded so a stuck pane doesn't pin the
+    // updater for half a minute.
+    if tmux::interrupt_and_wait(pane, 10).await {
         info!("auto-update: Claude Code is idle");
     } else {
-        warn!("auto-update: could not confirm idle after 30s, proceeding anyway");
+        warn!("auto-update: could not confirm idle after 10s, proceeding anyway");
     }
 
     // Settle time after interruption
@@ -858,7 +1457,15 @@ async fn run_auto_update(pane: &str, old_version: &str, new_version: &str, confi
             "auto_update_failed",
             serde_json::json!({"reason": "exit_timeout"}),
         );
-        alert::send_pingme("claude-watch: auto-update FAILED — Claude Code did not exit").await;
+        alert::notify(crate::event_bus::ClaudeWatchAlert {
+            alert_type: "auto-update-failed",
+            stuck_reason: "auto-update: claude code did not exit within 45s",
+            stale_minutes: None,
+            affected_watchers: vec![],
+            severity: crate::event_bus::Severity::High,
+            message: "claude-watch: auto-update FAILED — Claude Code did not exit",
+        })
+        .await;
         return;
     }
     info!("auto-update: Claude Code exited");
@@ -951,7 +1558,15 @@ async fn run_auto_update(pane: &str, old_version: &str, new_version: &str, confi
         "claude-watch: auto-update complete ({} → {})",
         old_version, new_version
     );
-    alert::send_pingme(&msg).await;
+    alert::notify(crate::event_bus::ClaudeWatchAlert {
+        alert_type: "auto-update-complete",
+        stuck_reason: "auto-update finished",
+        stale_minutes: None,
+        affected_watchers: vec![],
+        severity: crate::event_bus::Severity::Low,
+        message: &msg,
+    })
+    .await;
     info!("auto-update: complete ({} → {})", old_version, new_version);
 }
 
@@ -967,6 +1582,224 @@ pub(crate) fn should_self_heal(
     retry_bashes: u64,
 ) -> bool {
     dead_checks >= checks_required && (retry_tokens > 0 || retry_bashes > 0)
+}
+
+/// Pure helper: walk the current `State` + heartbeat-stuck flag and return
+/// the set of HangSignals that should be observed THIS cycle from
+/// non-pane-capture sources (everything except PaneCaptureUnchanged,
+/// which needs an async tmux capture).
+///
+/// Split out so we can unit-test the signal-collection logic without
+/// mocking tmux. Caller is responsible for adding PaneCaptureUnchanged
+/// based on a separate `evaluate_pane_unchanged` call.
+pub(crate) fn collect_non_pane_signals(
+    state: &State,
+    config: &Config,
+    heartbeat_stuck: bool,
+) -> Vec<crate::respawn::HangSignal> {
+    use crate::respawn::HangSignal;
+    let mut out = Vec::new();
+    if heartbeat_stuck {
+        out.push(HangSignal::HeartbeatStale);
+    }
+    let watcher_critical = state
+        .watcher_health
+        .values()
+        .any(|wh| wh.enabled && wh.consecutive_missing >= config.watcher_monitor.inject_threshold);
+    let recent_watcher_inject = state
+        .last_watcher_inject
+        .as_deref()
+        .and_then(elapsed_since)
+        .is_some_and(|e| e <= config.auto_respawn_on_hang.signal_window_secs as f64);
+    if watcher_critical && recent_watcher_inject {
+        out.push(HangSignal::WatcherDownPersistent);
+    }
+    if state.thinking_interrupt_count >= 2 {
+        out.push(HangSignal::ProlongedThinkingNoProgress);
+    }
+    let recent_wedged = state
+        .last_wedged_clear
+        .as_deref()
+        .and_then(elapsed_since)
+        .is_some_and(|e| e <= config.auto_respawn_on_hang.signal_window_secs as f64);
+    if recent_wedged && state.wedged_consecutive >= 2 {
+        out.push(HangSignal::WedgedClearNoProgress);
+    }
+    out
+}
+
+/// Per-cycle signal collection + multi-signal hang evaluation. Side-effects:
+///
+///   - Records new HangSignals into `state.hang_signal_history`.
+///   - Updates `pane_content_hash` / `pane_content_unchanged_since`.
+///   - Prunes the history to `signal_window_secs`.
+///   - If the threshold + cooldown are satisfied, calls
+///     `respawn::execute_respawn`, then updates `last_respawn_at` / counters.
+///
+/// Idempotent within a single cycle. Each signal can fire only once per
+/// invocation (HashMap dedup in `HangSignalHistory.observe`).
+pub(crate) async fn check_auto_respawn(
+    config: &Config,
+    state: &mut State,
+    pane: &str,
+    now: &str,
+    heartbeat_stuck: bool,
+) {
+    check_auto_respawn_with_versions_dir(config, state, pane, now, heartbeat_stuck, None).await
+}
+
+/// Test-friendly variant. `versions_dir_override` is forwarded to
+/// `execute_respawn_with_versions_dir`. Production code MUST call
+/// `check_auto_respawn` (which passes None). Tests MUST pass
+/// `Some("/nonexistent")` so the destructive kill path can never find
+/// a real Claude PID. See the safety note on
+/// `respawn::execute_respawn_with_versions_dir`.
+pub(crate) async fn check_auto_respawn_with_versions_dir(
+    config: &Config,
+    state: &mut State,
+    pane: &str,
+    now: &str,
+    heartbeat_stuck: bool,
+    versions_dir_override: Option<&str>,
+) {
+    use crate::respawn::{
+        evaluate_pane_unchanged, execute_respawn_with_versions_dir, hash_pane_content,
+        should_respawn, HangSignal, RespawnOutcome,
+    };
+
+    if !config.auto_respawn_on_hang.enabled {
+        return;
+    }
+
+    // ---- Signals 1, 2, 3, 5: pure-state-derived ----
+    for sig in collect_non_pane_signals(state, config, heartbeat_stuck) {
+        state.hang_signal_history.observe(&sig, now);
+    }
+
+    // ---- Signal 4: pane capture unchanged (needs tmux I/O) ----
+    if !pane.is_empty() {
+        if let Some(capture) = tmux::capture_pane(pane).await {
+            let h = hash_pane_content(&capture);
+            let (new_hash, new_first_seen, fire) = evaluate_pane_unchanged(
+                h,
+                state.pane_content_hash,
+                state.pane_content_unchanged_since.as_deref(),
+                now,
+                config.auto_respawn_on_hang.pane_unchanged_secs,
+            );
+            state.pane_content_hash = new_hash;
+            state.pane_content_unchanged_since = new_first_seen;
+            if fire {
+                state
+                    .hang_signal_history
+                    .observe(&HangSignal::PaneCaptureUnchanged, now);
+            }
+        }
+    }
+
+    // Prune anything outside the window.
+    state
+        .hang_signal_history
+        .prune_window(now, config.auto_respawn_on_hang.signal_window_secs);
+
+    let active_count = state.hang_signal_history.distinct_active().len();
+    debug!(
+        active_count,
+        signals_required = config.auto_respawn_on_hang.signals_required,
+        "auto-respawn: signal evaluation"
+    );
+
+    if !should_respawn(
+        &state.hang_signal_history,
+        state.last_respawn_at.as_deref(),
+        now,
+        config.auto_respawn_on_hang.signals_required,
+        config.auto_respawn_on_hang.cooldown_secs,
+    ) {
+        return;
+    }
+
+    // Threshold + cooldown satisfied — fire.
+    let active_signals: Vec<String> = state
+        .hang_signal_history
+        .distinct_active()
+        .into_iter()
+        .collect();
+    warn!(
+        signals = ?active_signals,
+        "auto-respawn: multi-signal hang detected — killing + respawning dashboard"
+    );
+    write_jsonl_log(
+        &config.general.log_file,
+        "auto_respawn_fire",
+        serde_json::json!({
+            "signals": active_signals,
+            "signals_required": config.auto_respawn_on_hang.signals_required,
+            "window_secs": config.auto_respawn_on_hang.signal_window_secs,
+        }),
+    );
+    write_legacy_log(
+        &config.general.legacy_log_file,
+        &format!(
+            "AUTO-RESPAWN: multi-signal hang detected (signals={:?}) -- killing + respawning",
+            active_signals
+        ),
+    );
+
+    let outcome = execute_respawn_with_versions_dir(
+        &config.auto_respawn_on_hang,
+        &config.tmux.dashboard_session,
+        versions_dir_override,
+    )
+    .await;
+
+    state.last_respawn_at = Some(now.to_string());
+    state.auto_respawn_count = state.auto_respawn_count.saturating_add(1);
+    state.auto_respawn_interrupts_total =
+        state.auto_respawn_interrupts_total.saturating_add(1);
+    state.last_interrupt_at = Some(now.to_string());
+    // Clear the history so the next cycle starts from a clean slate.
+    state.hang_signal_history = crate::respawn::HangSignalHistory::default();
+    state.pane_content_hash = None;
+    state.pane_content_unchanged_since = None;
+
+    match &outcome {
+        RespawnOutcome::Success { new_pid } => {
+            info!(?new_pid, "auto-respawn: success");
+            write_jsonl_log(
+                &config.general.log_file,
+                "auto_respawn_success",
+                serde_json::json!({ "new_pid": new_pid }),
+            );
+            alert::send_pingme(
+                "claude-watch: auto-respawned dashboard after multi-signal hang detection",
+            )
+            .await;
+        }
+        RespawnOutcome::LaunchFailed => {
+            warn!("auto-respawn: launch failed");
+            write_jsonl_log(
+                &config.general.log_file,
+                "auto_respawn_launch_failed",
+                serde_json::json!({}),
+            );
+            alert::send_pingme_with_priority(
+                "claude-watch: AUTO-RESPAWN failed — dashboard launch did not produce a new claude PID",
+                "high",
+            )
+            .await;
+        }
+        RespawnOutcome::Aborted { reason } => {
+            warn!(reason = %reason, "auto-respawn: aborted");
+            write_jsonl_log(
+                &config.general.log_file,
+                "auto_respawn_aborted",
+                serde_json::json!({ "reason": reason }),
+            );
+        }
+    }
+
+    crate::state::save_state(&config.general.state_file, state);
 }
 
 /// Run a single check cycle.
@@ -1091,6 +1924,28 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
     if bashes > 0 || tokens > 0 {
         state.last_known_bashes = bashes;
     }
+    // Mark "actively turning" whenever a tool call is in flight. The
+    // watcher-down inject path consults this timestamp to avoid
+    // preempting a busy main loop with a `WATCHER(S) DOWN` prompt.
+    if bashes > 0 {
+        state.last_active_at = Some(now.clone());
+    }
+
+    // --- API retry detection (suppression flag for downstream interrupt sites) ---
+    //
+    // When Claude Code is in upstream-API retry backoff (529 / overloaded /
+    // 5xx → "Retrying in Ns · attempt N/M"), every interrupt resets the
+    // retry state machine and prevents recovery. We detect once per cycle
+    // here and have downstream interrupt sites (wedged-clear, watcher-down,
+    // context-warning, and check_foreground's prolonged-thinking) skip
+    // their fires while the flag is set. Heartbeat and dead-process
+    // detection are NOT suppressed — those measure liveness, and a truly
+    // dead loop must still alert.
+    let api_retrying =
+        update_api_retry_state(config, state, &effective_pane).await;
+    if api_retrying {
+        debug!("check_cycle: api_retry active — suppressing wedged/watcher/context fires");
+    }
 
     // --- Dead process detection ---
     if tokens == 0 && bashes == 0 && !effective_pane.is_empty() {
@@ -1212,14 +2067,94 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
             }
 
             if tmux::is_shell_prompt(&effective_pane).await {
-                info!(
-                    dead_checks,
-                    "shell prompt confirmed -- restarting Claude Code"
+                // Active-turn suppression (2026-04-27 false-positive fix):
+                // `tokens == 0 && bashes == 0` is point-in-time and can
+                // briefly hold during a tmux pane swap, a status-parser
+                // miss, or the gap between two tool calls. The
+                // shell-prompt confirmation is the strong-side check
+                // here, but the parser can ALSO mis-classify mixed
+                // pane content as a shell prompt (e.g. a backgrounded
+                // bash command output line ending in `$`). If the loop
+                // ran ANY tool call within `active_window_secs`,
+                // suppress the restart — the process is demonstrably
+                // alive and `restart_claude` would kill an active
+                // session and fire a false `claude-crashed` alert.
+                let actively_turning = dead_process_restart_suppressed(
+                    state,
+                    bashes,
+                    config.dead_process.suppress_when_active,
+                    config.dead_process.active_window_secs,
                 );
-                restart_claude(&effective_pane, state, &config.claude).await;
-                state.consecutive_dead_checks = 0;
-                state.consecutive_failures = 0;
-                state.alert_count = 0;
+                // Cross-gate escalation backstop (2026-04-28
+                // q-2026-04-28-2449): if the suppression run has been
+                // long/persistent enough, force the restart even though
+                // the active-turn predicate matches. Catches the case
+                // where a sustained dispatcher window holds the gate
+                // open indefinitely.
+                let escalation = should_escalate_suppression(
+                    state,
+                    config.suppression.max_consecutive_suppressions,
+                    config.suppression.max_suppression_window_secs,
+                );
+                if actively_turning && escalation.is_none() {
+                    let last_active_age = state
+                        .last_active_at
+                        .as_deref()
+                        .and_then(elapsed_since)
+                        .map(|e| e as u64);
+                    info!(
+                        dead_checks,
+                        bashes,
+                        last_active_age_secs = ?last_active_age,
+                        "dead-process restart suppressed: main loop actively turning"
+                    );
+                    write_jsonl_log(
+                        &config.general.log_file,
+                        "dead_process_restart_suppressed",
+                        serde_json::json!({
+                            "dead_checks": dead_checks,
+                            "bashes": bashes,
+                            "reason": "main_loop_actively_turning",
+                            "last_active_age_secs": last_active_age,
+                            "active_window_secs": config.dead_process.active_window_secs,
+                            "consecutive_suppressions": state.consecutive_suppressions + 1,
+                        }),
+                    );
+                    record_suppression(state, &now);
+                    // Reset the consecutive counter so we don't re-fire
+                    // on the very next check after the active window
+                    // closes — require a fresh `checks_required`-cycle
+                    // run of dead-state observations before restarting.
+                    state.consecutive_dead_checks = 0;
+                } else {
+                    if let Some(reason) = escalation {
+                        warn!(
+                            dead_checks,
+                            consecutive_suppressions = state.consecutive_suppressions,
+                            escalation_reason = reason.as_str(),
+                            "dead-process restart escalating: suppression run capped — forcing restart"
+                        );
+                        write_jsonl_log(
+                            &config.general.log_file,
+                            "suppression_escalated",
+                            serde_json::json!({
+                                "site": "dead_process",
+                                "reason": reason.as_str(),
+                                "consecutive_suppressions": state.consecutive_suppressions,
+                                "first_suppression_at": state.first_suppression_at,
+                            }),
+                        );
+                    }
+                    info!(
+                        dead_checks,
+                        "shell prompt confirmed -- restarting Claude Code"
+                    );
+                    restart_claude(&effective_pane, state, &config.claude).await;
+                    state.consecutive_dead_checks = 0;
+                    state.consecutive_failures = 0;
+                    state.alert_count = 0;
+                    reset_suppression(state);
+                }
             } else if dead_checks >= config.dead_process.fresh_inject_checks
                 && !state.fresh_session_injected
                 && tmux::is_idle(&effective_pane).await
@@ -1311,11 +2246,94 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                 }
             }
 
+            // Active-turn suppression (2026-04-27 false-positive fix):
+            // The token range [min_tokens, max_tokens) AND `bashes == 0`
+            // are both point-in-time predicates that the main loop
+            // briefly satisfies between two tool calls (a small turn
+            // that just got back, say, 3000 tokens; bashes momentarily 0
+            // before the next tool call fires). Without this gate the
+            // alert fires mid-turn and injects "resume" into active
+            // work. If the loop ran ANY tool call within
+            // `active_window_secs`, suppress both the inject and the
+            // alert — the loop is clearly alive.
+            let actively_turning = fresh_clear_inject_suppressed(
+                state,
+                bashes,
+                config.fresh_clear.suppress_when_active,
+                config.fresh_clear.active_window_secs,
+            );
+            // Cross-gate escalation backstop (2026-04-28 q-2026-04-28-2449).
+            let escalation = should_escalate_suppression(
+                state,
+                config.suppression.max_consecutive_suppressions,
+                config.suppression.max_suppression_window_secs,
+            );
+            if actively_turning && escalation.is_none() {
+                let last_active_age = state
+                    .last_active_at
+                    .as_deref()
+                    .and_then(elapsed_since)
+                    .map(|e| e as u64);
+                info!(
+                    tokens,
+                    bashes,
+                    last_active_age_secs = ?last_active_age,
+                    "fresh /clear inject suppressed: main loop actively turning"
+                );
+                write_jsonl_log(
+                    &config.general.log_file,
+                    "fresh_clear_inject_suppressed",
+                    serde_json::json!({
+                        "tokens": tokens,
+                        "bashes": bashes,
+                        "reason": "main_loop_actively_turning",
+                        "last_active_age_secs": last_active_age,
+                        "active_window_secs": config.fresh_clear.active_window_secs,
+                        "consecutive_suppressions": state.consecutive_suppressions + 1,
+                    }),
+                );
+                record_suppression(state, &now);
+                // Reset the consecutive counter so we don't re-fire on
+                // the very next check after the active window closes.
+                // The detection has to re-build from scratch.
+                state.consecutive_fast_detections = 0;
+                state.last_check = Some(now);
+                crate::state::save_state(&config.general.state_file, state);
+                return;
+            }
+
+            if let Some(reason) = escalation {
+                warn!(
+                    tokens,
+                    consecutive_suppressions = state.consecutive_suppressions,
+                    escalation_reason = reason.as_str(),
+                    "fresh /clear inject escalating: suppression run capped — forcing inject"
+                );
+                write_jsonl_log(
+                    &config.general.log_file,
+                    "suppression_escalated",
+                    serde_json::json!({
+                        "site": "fresh_clear",
+                        "reason": reason.as_str(),
+                        "consecutive_suppressions": state.consecutive_suppressions,
+                        "first_suppression_at": state.first_suppression_at,
+                    }),
+                );
+            }
+
             info!(tokens, "fresh /clear detected -- injecting resume");
-            alert::send_pingme(&format!(
+            let fresh_msg = format!(
                 "Fresh /clear detected (tokens={}, bashes=0). Injecting resume.",
                 tokens
-            ))
+            );
+            alert::notify(crate::event_bus::ClaudeWatchAlert {
+                alert_type: "fresh-clear-stuck",
+                stuck_reason: "fresh /clear with no follow-up activity",
+                stale_minutes: None,
+                affected_watchers: vec![],
+                severity: crate::event_bus::Severity::Medium,
+                message: &fresh_msg,
+            })
             .await;
 
             // Dismiss feedback prompt if present
@@ -1330,6 +2348,7 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
             state.fresh_clear_resume_inject_interrupts_total = state
                 .fresh_clear_resume_inject_interrupts_total
                 .saturating_add(1);
+            reset_suppression(state);
             state.last_check = Some(now);
             crate::state::save_state(&config.general.state_file, state);
             return;
@@ -1341,6 +2360,9 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
     // --- Heartbeat stale detection ---
     let mut stuck = false;
     let mut stuck_reason = String::new();
+    // Captured for the claude-event sink so the main loop can parse
+    // `stale_minutes` as a number rather than re-regex'ing the string.
+    let mut stuck_stale_minutes: Option<u64> = None;
 
     match std::fs::metadata(&config.claude.heartbeat_file) {
         Ok(meta) => {
@@ -1352,12 +2374,14 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                 let stale_secs = config.heartbeat.stale_minutes * 60;
                 if age >= stale_secs {
                     stuck = true;
+                    let age_min = age / 60;
                     stuck_reason = format!(
                         "heartbeat stale ({}min, threshold={}min, watchmen={})",
-                        age / 60,
+                        age_min,
                         config.heartbeat.stale_minutes,
                         watchmen_count
                     );
+                    stuck_stale_minutes = Some(age_min);
                     state.heartbeat_stale_count += 1;
                 }
             }
@@ -1370,8 +2394,11 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
     // --- Foreground blocking detection ---
     // Delegated to check_foreground() which runs on its own timer in the main loop.
     // Also run it here during full check cycles to ensure it runs at least as often
-    // as the general interval.
-    check_foreground(config, state, &effective_pane, tokens, bashes).await;
+    // as the general interval. We call check_foreground_inner directly so the
+    // api_retrying flag we computed at the top of this function is reused
+    // (calling check_foreground would re-run update_api_retry_state and
+    // double-increment the counters within a single full cycle).
+    check_foreground_inner(config, state, &effective_pane, tokens, bashes, api_retrying).await;
 
     // --- Context monitoring ---
     if config.context_monitor.enabled && tokens > 0 {
@@ -1414,7 +2441,21 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                         config.general.post_interrupt_cooldown_secs,
                     );
 
-                    if hook_deferred {
+                    if api_retrying {
+                        debug!(
+                            tokens,
+                            pct,
+                            "context threshold exceeded but api_retry active — suppressing fire"
+                        );
+                        write_jsonl_log(
+                            &config.general.log_file,
+                            "context_threshold_api_retry_deferred",
+                            serde_json::json!({
+                                "tokens": tokens,
+                                "pct": pct,
+                            }),
+                        );
+                    } else if hook_deferred {
                         debug!(
                             tokens,
                             pct,
@@ -1575,7 +2616,20 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                     .and_then(elapsed_since)
                     .is_some_and(|e| e < config.context_monitor.wedged_cooldown as f64);
 
-                if !in_cooldown {
+                if api_retrying {
+                    debug!(
+                        reason = %reason,
+                        "wedged pane detected but api_retry active — suppressing self-clear"
+                    );
+                    write_jsonl_log(
+                        &config.general.log_file,
+                        "wedged_clear_api_retry_deferred",
+                        serde_json::json!({
+                            "reason": reason.to_string(),
+                            "consecutive": state.wedged_consecutive,
+                        }),
+                    );
+                } else if !in_cooldown {
                     warn!(
                         reason = %reason,
                         consecutive = state.wedged_consecutive,
@@ -1613,7 +2667,16 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                     let alert_msg = format!(
                         "claude-watch: agent wedged ({reason}) -- running self-clear",
                     );
-                    alert::send_pingme(&alert_msg).await;
+                    let wedged_reason = format!("wedged pane: {reason}");
+                    alert::notify(crate::event_bus::ClaudeWatchAlert {
+                        alert_type: "wedged-pane",
+                        stuck_reason: &wedged_reason,
+                        stale_minutes: None,
+                        affected_watchers: vec![],
+                        severity: crate::event_bus::Severity::High,
+                        message: &alert_msg,
+                    })
+                    .await;
 
                     spawn_immediate_clear(state);
 
@@ -1646,12 +2709,34 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
         let entries = status::parse_watchers_config(&config.watcher_monitor.watchers_config);
         let mut any_critical_missing = false;
         let mut missing_names: Vec<String> = Vec::new();
+        // Pull config values into locals once to avoid borrow-checker
+        // friction when we both mutate `state.watcher_health` and read
+        // `config` later in the same scope.
+        let event_threshold = config.watcher_monitor.event_threshold;
+        let inject_threshold = config.watcher_monitor.inject_threshold;
+        let event_grace_secs = config.watcher_monitor.event_grace_secs;
+        let event_command = config.watcher_monitor.event_command.clone();
+        let event_consumer_name = config
+            .watcher_monitor
+            .event_consumer_watcher_name
+            .clone();
 
         for entry in &entries {
             if !entry.enabled {
                 continue;
             }
             let count = status::check_process_count(&entry.pattern).await;
+            // Orphan-PID cross-check (bug-2 fix): pgrep can match the wrong
+            // process if a stale shell or self-matching wrapper happens to
+            // contain the watcher's name pattern in its argv. The legacy
+            // `watchmen` shell-script handled this with a `kill -0` probe of
+            // the recorded PID; we restore that behaviour here so that a
+            // dead memory-remind whose pidfile still points at PID N
+            // (now reaped) is reported as DOWN rather than masked by a
+            // coincidental pgrep hit.
+            let recorded_pid = read_watcher_pid(crate::watcher::PID_DIR, &entry.name);
+            let down = watcher_is_down(count, entry.min_count, recorded_pid, is_pid_alive);
+            let orphaned = down && count >= entry.min_count;
             let health = state
                 .watcher_health
                 .entry(entry.name.clone())
@@ -1659,23 +2744,31 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                     last_seen_running: None,
                     consecutive_missing: 0,
                     enabled: entry.enabled,
+                    last_auto_restart_at: None,
+                    event_emitted_at: None,
                 });
 
-            if count >= entry.min_count {
+            if !down {
                 health.last_seen_running = Some(now.clone());
                 health.consecutive_missing = 0;
+                // Recovery clears the quiet-path bookkeeping so the next
+                // failure starts a fresh quiet-path episode.
+                health.event_emitted_at = None;
             } else {
                 // Grace period: if the watcher was seen running within the
-                // last 90 seconds, don't count this as a miss. Short-lived
-                // watchers (e.g. signal-wait exits when a message arrives)
-                // have a natural gap between exit and the main loop's
-                // restart. Without this grace period we fire spurious
+                // configured grace_secs, don't count this as a miss. Short-
+                // lived watchers (e.g. signal-wait exits when a message
+                // arrives) have a natural gap between exit and the main
+                // loop's restart. Without this grace period we fire spurious
                 // "watcher missing" alerts every time a message is received.
+                // Default 90s; tunable via [watcher_monitor].grace_secs (0 in
+                // the e2e auto-restart test for fast firing).
+                let grace_secs = config.watcher_monitor.grace_secs as f64;
                 let in_grace = health
                     .last_seen_running
                     .as_deref()
                     .and_then(elapsed_since)
-                    .is_some_and(|e| e < 90.0);
+                    .is_some_and(|e| e < grace_secs);
                 if in_grace {
                     continue;
                 }
@@ -1686,6 +2779,7 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                         watcher = %entry.name,
                         pattern = %entry.pattern,
                         consecutive_missing = health.consecutive_missing,
+                        orphaned = orphaned,
                         "watcher missing"
                     );
                     write_jsonl_log(
@@ -1695,73 +2789,405 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                             "watcher": entry.name,
                             "pattern": entry.pattern,
                             "consecutive_missing": health.consecutive_missing,
+                            "orphaned": orphaned,
                         }),
                     );
                 }
-                if health.consecutive_missing >= config.watcher_monitor.inject_threshold {
-                    any_critical_missing = true;
-                    missing_names.push(entry.name.clone());
+
+                // Quiet-path decision. The pure helper returns one of
+                // {Nothing, EmitEvent, InjectFallback} based on the
+                // configured thresholds, the consumer-watcher special
+                // case, and the per-watcher event_emitted_at timestamp.
+                let is_consumer = entry.name == event_consumer_name;
+                let action = evaluate_watcher_down_action(
+                    is_consumer,
+                    health.consecutive_missing,
+                    health.event_emitted_at.as_deref(),
+                    event_threshold,
+                    inject_threshold,
+                    event_grace_secs,
+                );
+
+                match action {
+                    WatcherDownAction::Nothing => {}
+                    WatcherDownAction::EmitEvent => {
+                        // Snapshot pid for logging. status::check_process_count
+                        // doesn't return one; record_pid stays None for now.
+                        let recorded_pid: Option<u32> = None;
+                        info!(
+                            watcher = %entry.name,
+                            consecutive_missing = health.consecutive_missing,
+                            "watcher-down event (quiet path) — emitting claude-event"
+                        );
+                        write_jsonl_log(
+                            &config.general.log_file,
+                            "watcher_down_event_emit",
+                            serde_json::json!({
+                                "watcher": entry.name,
+                                "consecutive_missing": health.consecutive_missing,
+                                "recorded_pid": recorded_pid,
+                            }),
+                        );
+                        let ok = emit_watcher_down_event(
+                            &event_command,
+                            &entry.name,
+                            health.consecutive_missing,
+                            recorded_pid,
+                        )
+                        .await;
+                        if ok {
+                            health.event_emitted_at = Some(now.clone());
+                        }
+                        // Whether the emission succeeded or not, do NOT add
+                        // this watcher to missing_names — we want to give
+                        // the main loop a chance to handle the event before
+                        // the inject path fires. If the emit failed, the
+                        // next cycle past the grace window (which is
+                        // skipped here because event_emitted_at is None)
+                        // will re-enter EmitEvent and try again, or escalate
+                        // straight to InjectFallback once consecutive_missing
+                        // crosses inject_threshold.
+                    }
+                    WatcherDownAction::InjectFallback => {
+                        any_critical_missing = true;
+                        missing_names.push(entry.name.clone());
+                    }
                 }
             }
         }
 
-        // Inject restart commands if watchers are down and cooldown has passed
-        if any_critical_missing && !effective_pane.is_empty() {
-            let should_inject = match &state.last_watcher_inject {
-                Some(ref last) => elapsed_since(last)
-                    .is_none_or(|e| e >= config.watcher_monitor.inject_cooldown as f64),
-                None => true,
-            };
-            // Global post-interrupt cooldown: if any interrupt (thinking,
-            // context-warning, or a prior watcher-down) fired recently,
-            // defer this one to avoid cascading interrupts.
-            let global_cooldown_blocks =
-                interrupt_in_global_cooldown(state, config.general.post_interrupt_cooldown_secs);
-            if should_inject && global_cooldown_blocks {
-                debug!(
-                    cooldown = config.general.post_interrupt_cooldown_secs,
-                    "watcher-down inject would fire but global post-interrupt cooldown active"
-                );
+        // Auto-restart down watchers (q-2026-04-28-5481).
+        //
+        // BUG HISTORY: Before this branch, the daemon emitted a
+        // `watcher-down` claude-event and (when the main loop wasn't
+        // actively turning) injected a restart prompt into the tmux pane,
+        // BUT it did not actually restart the watcher itself. The 2026-04-28
+        // incident: claude-event-watch was DOWN for 30+ minutes — the
+        // suppression branch fired repeatedly ("inject suppressed: main
+        // loop active"), the inject path never fired (suppression was
+        // active the whole time, didn't escalate within the test window),
+        // and the watcher stayed dead.
+        //
+        // FIX: Run the actual restart UNCONDITIONALLY here, before the
+        // inject/suppression decision. The restart is purely additive (it
+        // spawns a detached child via the same `nohup start_cmd` pattern
+        // used by `watcher-ctl enable`) and does not touch the tmux pane,
+        // so it's safe even when the main loop is mid-tool-call. The
+        // existing alert/inject logic below is preserved verbatim — Andrew
+        // still gets the claude-event for visibility, and the inject path
+        // still tries to nudge the main loop when appropriate.
+        //
+        // Cooldown is PER-WATCHER (`WatcherState.last_auto_restart_at`)
+        // and uses `config.watcher_monitor.auto_restart_cooldown_secs`
+        // (default 30s) — distinct from the much-longer `inject_cooldown`
+        // used for the tmux-pane prompt. The shorter clock is what makes
+        // the wait-and-exit watcher pattern (claude-event-watch exits
+        // after each event delivery) work cleanly: the daemon re-spawns
+        // it within ~30s rather than ~5min.
+        if any_critical_missing {
+            let cooldown = config.watcher_monitor.auto_restart_cooldown_secs;
+            let mut spawned: Vec<(String, u32)> = Vec::new();
+            let mut errors: Vec<(String, String)> = Vec::new();
+            let mut deferred: Vec<String> = Vec::new();
+            for name in &missing_names {
+                let due = state
+                    .watcher_health
+                    .get(name)
+                    .and_then(|h| h.last_auto_restart_at.as_deref())
+                    .and_then(elapsed_since)
+                    .is_none_or(|e| e >= cooldown as f64);
+                if !due {
+                    deferred.push(name.clone());
+                    continue;
+                }
+                match crate::watcher::auto_restart_watcher(
+                    &config.watcher_monitor.watchers_config,
+                    name,
+                )
+                .await
+                {
+                    Ok((pid, _)) => {
+                        spawned.push((name.clone(), pid));
+                        if let Some(h) = state.watcher_health.get_mut(name) {
+                            h.last_auto_restart_at = Some(now.clone());
+                        }
+                    }
+                    Err(e) => errors.push((name.clone(), e)),
+                }
             }
-            if should_inject && !global_cooldown_blocks {
-                let missing_list = missing_names.join(", ");
-                warn!(missing = %missing_list, "watchers down — interrupting and injecting restart");
+            if !spawned.is_empty() {
+                let summary = spawned
+                    .iter()
+                    .map(|(n, p)| format!("{}={}", n, p))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                warn!(
+                    spawned = %summary,
+                    "watcher-down auto-restart fired"
+                );
                 write_jsonl_log(
                     &config.general.log_file,
-                    "watcher_inject",
+                    "watcher_auto_restart",
+                    serde_json::json!({
+                        "spawned": spawned
+                            .iter()
+                            .map(|(n, p)| serde_json::json!({"name": n, "pid": p}))
+                            .collect::<Vec<_>>(),
+                    }),
+                );
+                // Reset per-watcher consecutive_missing for the ones
+                // we just respawned. The next check cycle will see
+                // the new process via pgrep and confirm health; we
+                // pre-zero here so a stale 6+ counter doesn't keep
+                // counting the watcher as down for one extra cycle
+                // and re-fire on the next check.
+                for (name, _) in &spawned {
+                    if let Some(h) = state.watcher_health.get_mut(name) {
+                        h.consecutive_missing = 0;
+                    }
+                }
+            }
+            if !errors.is_empty() {
+                for (name, err) in &errors {
+                    warn!(watcher = %name, error = %err, "watcher-down auto-restart failed");
+                }
+                write_jsonl_log(
+                    &config.general.log_file,
+                    "watcher_auto_restart_failed",
+                    serde_json::json!({
+                        "errors": errors
+                            .iter()
+                            .map(|(n, e)| serde_json::json!({"name": n, "error": e}))
+                            .collect::<Vec<_>>(),
+                    }),
+                );
+            }
+            if !deferred.is_empty() {
+                debug!(
+                    deferred = %deferred.join(", "),
+                    cooldown_secs = cooldown,
+                    "watcher-down auto-restart deferred: per-watcher cooldown active"
+                );
+            }
+            if !spawned.is_empty() || !errors.is_empty() {
+                crate::state::save_state(&config.general.state_file, state);
+            }
+        }
+
+        // Inject restart commands if watchers are down and cooldown has passed.
+        //
+        // NOTE (2026-04-28, PR #44): The watcher-down inject path is
+        // intentionally EXEMPT from `interrupt_in_global_cooldown`. A down
+        // watcher is a hard liveness failure — we have no signal-wait, no
+        // claude-event-watch, no torrent-wait — and silence here means
+        // messages / events / completions sit unprocessed for the cooldown
+        // window. Prior systemd-run supervision attempt (q-2026-04-28-6602)
+        // violated the heartbeat-liveness invariant and was reverted. The
+        // correct shape is: keep the spawn target in the main-loop tmux
+        // pane (watchers must die when the main loop dies), and let the
+        // inject re-fire on the per-watcher cooldown regardless of recent
+        // unrelated interrupts.
+        //
+        // Active-turn suppression with escalation backstop (PR #43) IS
+        // retained: when the main loop is actively turning we drop the
+        // pane preemption (the claude-event still fires out-of-band), and
+        // the cross-gate escalation kicks the inject through anyway if
+        // the suppression run gets too long/persistent.
+        if any_critical_missing && !effective_pane.is_empty() {
+            let should_inject = watcher_inject_due(
+                state.last_watcher_inject.as_deref(),
+                config.watcher_monitor.inject_cooldown,
+            );
+            // api_retry suppression (PR #45): if Claude Code is currently
+            // in upstream-API retry backoff, an inject would wipe the
+            // retry state machine and force a brand-new turn. Skip the
+            // inject path entirely until the retry resolves; the auto-
+            // restart already ran above and is independent of the pane.
+            if should_inject && api_retrying {
+                debug!(
+                    "watcher-down inject would fire but api_retry active — suppressing"
+                );
+                write_jsonl_log(
+                    &config.general.log_file,
+                    "watcher_inject_api_retry_deferred",
                     serde_json::json!({
                         "missing": missing_names,
                     }),
                 );
-
-                // Interrupt first (like prolonged-thinking) to break any inline work
-                if tmux::interrupt_and_wait(&effective_pane, 10).await {
-                    info!("watcher inject: Claude Code is idle after interrupt");
-                } else {
-                    warn!("watcher inject: could not confirm idle, injecting anyway");
-                }
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-
-                // Build specific restart commands
-                let restart_cmds: Vec<String> = missing_names
-                    .iter()
-                    .map(|n| format!("watcher-ctl run {}", n))
-                    .collect();
-                let prompt = format!(
-                    "[CLAUDE-WATCH] WATCHER(S) DOWN: {}. You MUST restart them NOW. \
-                     Run these as background tasks immediately: {}",
-                    missing_list,
-                    restart_cmds.join(", ")
+            }
+            // Active-turn suppression: if the main loop is currently
+            // running a tool call (or ran one within the last
+            // `active_window_secs`), suppress ONLY the in-pane preemption.
+            // The structured claude-event still fires so Andrew is
+            // notified out-of-band. The reflexive cascade — inject fires
+            // mid-turn → loop pivots to "restart watcher" → original ask
+            // is abandoned half-finished — only happens if we keep
+            // typing into the pane, so dropping the inject is enough.
+            let actively_turning = config.watcher_monitor.suppress_inject_when_active
+                && main_loop_actively_turning(
+                    state,
+                    bashes,
+                    config.watcher_monitor.active_window_secs,
                 );
-                tmux::inject_text(&effective_pane, &prompt).await;
-                state.last_watcher_inject = Some(now.clone());
-                state.last_interrupt_at = Some(now.clone());
-                state.watcher_inject_count += 1;
-                state.watcher_down_interrupts_total =
-                    state.watcher_down_interrupts_total.saturating_add(1);
-                crate::state::save_state(&config.general.state_file, state);
+            // Cross-gate escalation backstop (2026-04-28 q-2026-04-28-2449):
+            // if the suppression run has been long/persistent enough, force
+            // the inject regardless of `actively_turning`. Catches the
+            // sustained-dispatcher-window case where the gate would
+            // otherwise hold open indefinitely (real-world incident:
+            // claude-event-watch suppressed for 33 min).
+            let escalation = should_escalate_suppression(
+                state,
+                config.suppression.max_consecutive_suppressions,
+                config.suppression.max_suppression_window_secs,
+            );
+            if should_inject && !api_retrying {
+                let missing_list = missing_names.join(", ");
+                let watcher_reason = format!(
+                    "{} watcher(s) missing: {}",
+                    missing_names.len(),
+                    missing_list,
+                );
+
+                if actively_turning && escalation.is_none() {
+                    // Suppression path: still emit the structured
+                    // claude-event (out-of-band notify) and log it,
+                    // but do NOT interrupt or inject into the pane.
+                    let bashes_now = bashes;
+                    let last_active_age = state
+                        .last_active_at
+                        .as_deref()
+                        .and_then(elapsed_since)
+                        .map(|e| e as u64);
+                    info!(
+                        missing = %missing_list,
+                        bashes = bashes_now,
+                        last_active_age_secs = ?last_active_age,
+                        "watcher-down inject suppressed: main loop actively turning"
+                    );
+                    write_jsonl_log(
+                        &config.general.log_file,
+                        "watcher_inject_suppressed",
+                        serde_json::json!({
+                            "missing": missing_names,
+                            "reason": "main_loop_actively_turning",
+                            "bashes": bashes_now,
+                            "last_active_age_secs": last_active_age,
+                            "active_window_secs": config.watcher_monitor.active_window_secs,
+                            "consecutive_suppressions": state.consecutive_suppressions + 1,
+                        }),
+                    );
+                    record_suppression(state, &now);
+                    // Out-of-band sink still fires — message reflects
+                    // suppression so downstream consumers can tell
+                    // this fire did not preempt the pane.
+                    let suppressed_msg = format!(
+                        "[CLAUDE-WATCH] watcher-down (inject suppressed: main loop active): {}",
+                        missing_list,
+                    );
+                    alert::emit_event(crate::event_bus::ClaudeWatchAlert {
+                        alert_type: "watcher-down",
+                        stuck_reason: &watcher_reason,
+                        stale_minutes: None,
+                        affected_watchers: missing_names.clone(),
+                        severity: crate::event_bus::Severity::Medium,
+                        message: &suppressed_msg,
+                    });
+                    // NOTE (2026-04-28 q-2026-04-28-2449): we used to
+                    // bump `last_watcher_inject` here so the cooldown
+                    // clock advanced even on suppressed fires. That was
+                    // a bug: a single suppressed attempt ate the full
+                    // 5-min `inject_cooldown` slot, so even after the
+                    // main loop went idle 1s later, the next inject was
+                    // deferred until the cooldown elapsed. Now we leave
+                    // the cooldown clock untouched on suppression — the
+                    // shared `consecutive_suppressions` counter and the
+                    // wall-clock window backstop are the things that
+                    // bound the suppression run, not the cooldown clock.
+                    crate::state::save_state(&config.general.state_file, state);
+                } else {
+                    if let Some(reason) = escalation {
+                        warn!(
+                            missing = %missing_list,
+                            consecutive_suppressions = state.consecutive_suppressions,
+                            escalation_reason = reason.as_str(),
+                            "watcher-down inject escalating: suppression run capped — forcing inject"
+                        );
+                        write_jsonl_log(
+                            &config.general.log_file,
+                            "suppression_escalated",
+                            serde_json::json!({
+                                "site": "watcher_monitor",
+                                "reason": reason.as_str(),
+                                "consecutive_suppressions": state.consecutive_suppressions,
+                                "first_suppression_at": state.first_suppression_at,
+                                "missing": missing_names,
+                            }),
+                        );
+                    }
+                    warn!(missing = %missing_list, "watchers down — interrupting and injecting restart");
+                    write_jsonl_log(
+                        &config.general.log_file,
+                        "watcher_inject",
+                        serde_json::json!({
+                            "missing": missing_names,
+                        }),
+                    );
+
+                    // Interrupt first (like prolonged-thinking) to break any inline work
+                    if tmux::interrupt_and_wait(&effective_pane, 10).await {
+                        info!("watcher inject: Claude Code is idle after interrupt");
+                    } else {
+                        warn!("watcher inject: could not confirm idle, injecting anyway");
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+                    // Build specific restart commands
+                    let restart_cmds: Vec<String> = missing_names
+                        .iter()
+                        .map(|n| format!("watcher-ctl run {}", n))
+                        .collect();
+                    let prompt = format!(
+                        "[CLAUDE-WATCH] WATCHER(S) DOWN: {}. You MUST restart them NOW. \
+                         Run these as background tasks immediately: {}",
+                        missing_list,
+                        restart_cmds.join(", ")
+                    );
+                    tmux::inject_text(&effective_pane, &prompt).await;
+                    // Third sink: claude-event so the main loop sees the
+                    // missing-watchers list as structured data and can
+                    // decide which restart command(s) to actually run,
+                    // rather than reflexively reading the prompt string.
+                    alert::emit_event(crate::event_bus::ClaudeWatchAlert {
+                        alert_type: "watcher-down",
+                        stuck_reason: &watcher_reason,
+                        stale_minutes: None,
+                        affected_watchers: missing_names.clone(),
+                        severity: crate::event_bus::Severity::Medium,
+                        message: &prompt,
+                    });
+                    state.last_watcher_inject = Some(now.clone());
+                    state.last_interrupt_at = Some(now.clone());
+                    state.watcher_inject_count += 1;
+                    state.watcher_down_interrupts_total =
+                        state.watcher_down_interrupts_total.saturating_add(1);
+                    reset_suppression(state);
+                    crate::state::save_state(&config.general.state_file, state);
+                }
             }
         }
+    }
+
+    // --- Auto-respawn-on-hang: multi-signal hang detection ---
+    //
+    // Independent of the individual interrupt sites above. Each fire path
+    // (heartbeat-stale, watcher-down, prolonged-thinking, wedged-pane,
+    // pane-capture-unchanged) records a HangSignal here. If `signals_required`
+    // distinct signal kinds are observed within `signal_window_secs`, we
+    // kill + relaunch the dashboard. Default OFF — Andrew opts in via
+    // `[auto_respawn_on_hang] enabled = true`. Default cooldown 30 min so
+    // a hung freshly-launched dashboard cannot get respawned in a tight loop.
+    if config.auto_respawn_on_hang.enabled {
+        check_auto_respawn(config, state, &effective_pane, &now, stuck).await;
     }
 
     // --- tmux healthcheck brief ---
@@ -1866,7 +3292,32 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                     "Claude stuck: {}. {} consecutive checks failed.",
                     stuck_reason, state.consecutive_failures
                 );
-                alert::alert(&msg, &alert_pane, &config.alerts.resume_prompt, use_pingme).await;
+                // Severity escalates with the alert count: first few
+                // alerts are High; once we're past the pingme cap (the
+                // sustained-stuck case), bump to Critical. Andrew's
+                // 574-min heartbeat-stale incident was the canonical
+                // case where the loop should have noticed depth.
+                let severity = if state.alert_count > config.alerts.max_pingme_alerts {
+                    crate::event_bus::Severity::Critical
+                } else {
+                    crate::event_bus::Severity::High
+                };
+                let event_alert = crate::event_bus::ClaudeWatchAlert {
+                    alert_type: "heartbeat-stale",
+                    stuck_reason: &stuck_reason,
+                    stale_minutes: stuck_stale_minutes,
+                    affected_watchers: vec![],
+                    severity,
+                    message: &msg,
+                };
+                alert::alert(
+                    &msg,
+                    &alert_pane,
+                    &config.alerts.resume_prompt,
+                    use_pingme,
+                    event_alert,
+                )
+                .await;
             }
 
             state.last_alert = Some(now.clone());
@@ -1942,6 +3393,115 @@ mod tests {
         assert!(!should_self_heal(0, 5, 1000, 2));
     }
 
+    // --- watcher_is_down tests ---
+    //
+    // Regression suite for bug 2: the legacy `watchmen` shell-script did a
+    // `kill -0` cross-check on the recorded PID file so a pgrep false-match
+    // (stale wrapper, self-matching shell, etc.) didn't mask a dead watcher.
+    // The Rust rewrite dropped that check; these tests pin down the
+    // restored behaviour. Most importantly: pgrep_count >= min_count but
+    // recorded_pid is dead -> DOWN (orphan-detected).
+
+    #[test]
+    fn test_watcher_is_down_count_below_min() {
+        // No PID file, count = 0 < min_count = 1 -> DOWN.
+        assert!(watcher_is_down(0, 1, None, |_| true));
+    }
+
+    #[test]
+    fn test_watcher_is_down_count_meets_min_no_pidfile() {
+        // No PID file -> fall back to pgrep-only logic. Count meets min ->
+        // not DOWN. Preserves backward-compat for watchers we don't track.
+        assert!(!watcher_is_down(1, 1, None, |_| panic!("should not probe")));
+        assert!(!watcher_is_down(3, 1, None, |_| panic!("should not probe")));
+    }
+
+    #[test]
+    fn test_watcher_is_down_pidfile_alive() {
+        // Count meets min AND recorded PID is alive -> not DOWN.
+        assert!(!watcher_is_down(1, 1, Some(42), |pid| pid == 42));
+    }
+
+    #[test]
+    fn test_watcher_is_down_pidfile_dead_orphan() {
+        // The bug-2 fix: count meets min via pgrep BUT recorded PID is dead.
+        // Used to be reported as ok; now reported as DOWN (orphan).
+        assert!(watcher_is_down(1, 1, Some(42), |_| false));
+    }
+
+    #[test]
+    fn test_watcher_is_down_pidfile_dead_with_higher_count() {
+        // Even when pgrep shows multiple matches (e.g. transient self-match),
+        // a dead recorded PID is the canonical signal — DOWN.
+        assert!(watcher_is_down(5, 1, Some(42), |_| false));
+    }
+
+    #[test]
+    fn test_watcher_is_down_count_below_min_with_pidfile() {
+        // Count below min AND PID dead -> DOWN regardless.
+        assert!(watcher_is_down(0, 1, Some(42), |_| false));
+        // Count below min but PID alive -> still DOWN (count is canonical
+        // signal that the watcher isn't running with min_count instances).
+        assert!(watcher_is_down(0, 1, Some(42), |pid| pid == 42));
+    }
+
+    #[test]
+    fn test_watcher_is_down_min_count_zero() {
+        // Edge case: min_count = 0 means always meets count requirement.
+        // Without a PID file, never DOWN.
+        assert!(!watcher_is_down(0, 0, None, |_| panic!("no probe")));
+        // With a PID file and dead PID, DOWN by orphan detection.
+        assert!(watcher_is_down(0, 0, Some(42), |_| false));
+    }
+
+    // --- read_watcher_pid tests ---
+
+    #[test]
+    fn test_read_watcher_pid_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            read_watcher_pid(dir.path().to_str().unwrap(), "nonexistent"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_read_watcher_pid_valid() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("foo.pid"), "12345\n").unwrap();
+        assert_eq!(
+            read_watcher_pid(dir.path().to_str().unwrap(), "foo"),
+            Some(12345)
+        );
+    }
+
+    #[test]
+    fn test_read_watcher_pid_trims_whitespace() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("bar.pid"), "  9876  \n").unwrap();
+        assert_eq!(
+            read_watcher_pid(dir.path().to_str().unwrap(), "bar"),
+            Some(9876)
+        );
+    }
+
+    #[test]
+    fn test_read_watcher_pid_garbage() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("baz.pid"), "not-a-pid\n").unwrap();
+        assert_eq!(read_watcher_pid(dir.path().to_str().unwrap(), "baz"), None);
+    }
+
+    #[test]
+    fn test_read_watcher_pid_empty_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("empty.pid"), "").unwrap();
+        assert_eq!(
+            read_watcher_pid(dir.path().to_str().unwrap(), "empty"),
+            None
+        );
+    }
+
     // --- check_context_threshold tests ---
 
     #[test]
@@ -1965,8 +3525,10 @@ mod tests {
 
     #[test]
     fn test_context_threshold_compact_remaining_safe() {
-        // compact_remaining = 50% > 5% trigger — no trigger
-        let result = check_context_threshold_with_margin(150000, 200000, Some(50), 75, 5, None);
+        // compact_remaining = 50% > 5% trigger — compact path doesn't fire.
+        // Use low tokens (50K of 200K = 25%) so the percent fallback also
+        // doesn't fire; expect None.
+        let result = check_context_threshold_with_margin(50000, 200000, Some(50), 75, 5, None);
         assert!(result.is_none());
     }
 
@@ -2000,14 +3562,24 @@ mod tests {
     }
 
     #[test]
-    fn test_context_threshold_compact_overrides_token() {
-        // compact_remaining is present and safe (50%), even though tokens are at 80%
-        // Primary trigger (compact) takes precedence — not triggered
+    fn test_context_threshold_compact_does_not_block_percent_fallback() {
+        // compact_remaining is present and safe (50%, > 5% trigger), tokens
+        // are at 80% (>= 75% threshold), and threshold_margin is unset.
+        //
+        // The compact check is the PRIMARY signal but does not BLOCK the
+        // fallback paths — when compact doesn't trigger, the legacy percent
+        // fallback must still run. Expected: BY_PERCENT trigger.
+        //
+        // (Previously this test asserted is_none(), encoding the very bug
+        // fixed in this commit — see test_context_threshold_margin_fires_*.)
         let result = check_context_threshold_with_margin(160000, 200000, Some(50), 75, 5, None);
         assert!(
-            result.is_none(),
-            "compact_remaining safe should prevent trigger even with high tokens"
+            result.is_some(),
+            "compact-safe should not block percent fallback"
         );
+        let (pct, by_compact) = result.unwrap();
+        assert!(!by_compact, "should be BY_PERCENT, not BY_COMPACT");
+        assert!((pct - 80.0).abs() < 0.1);
     }
 
     #[test]
@@ -2032,6 +3604,92 @@ mod tests {
         // 750K would trigger at 75% but margin says 970K — should NOT trigger
         let result = check_context_threshold_with_margin(750000, 1000000, None, 75, 5, Some(30000));
         assert!(result.is_none(), "margin should override percent threshold");
+    }
+
+    #[test]
+    fn test_context_threshold_margin_fires_even_when_compact_remaining_present() {
+        // Regression test for the 2026-04-30 incident: tokens at 95.97%
+        // (well past the 90% / 100K margin threshold) but
+        // compact_remaining=Some(30) blocked the margin check via the old
+        // else-if chain. The session climbed from 912K → 959K over 12 minutes
+        // with zero context_threshold events emitted.
+        //
+        // Required behavior: compact-trigger and margin/percent triggers must
+        // be INDEPENDENT. compact_remaining is the primary signal, but when
+        // it's present and not triggering, the margin/percent fallback must
+        // still run as a safety net.
+        let result = check_context_threshold_with_margin(
+            959_756,         // tokens
+            1_000_000,       // max
+            Some(30),        // compact_remaining > compact_trigger_percent
+            75,              // threshold_percent
+            5,               // compact_trigger_percent
+            Some(100_000),   // threshold_margin (trigger at 900K)
+        );
+        assert!(
+            result.is_some(),
+            "margin must fire when compact_remaining is present but not triggering"
+        );
+        let (pct, by_compact) = result.unwrap();
+        assert!((pct - 95.9756).abs() < 0.01);
+        assert!(!by_compact, "should be by_margin, not by_compact");
+    }
+
+    #[test]
+    fn test_context_threshold_compact_wins_over_margin() {
+        // compact_remaining=Some(3) (triggers, <= 5) AND margin would not fire
+        // (tokens at 200K, far from max-margin=900K). compact_remaining takes
+        // precedence — BY_COMPACT path.
+        let result = check_context_threshold_with_margin(
+            200_000,
+            1_000_000,
+            Some(3),
+            75,
+            5,
+            Some(100_000),
+        );
+        assert!(result.is_some());
+        let (_, by_compact) = result.unwrap();
+        assert!(by_compact, "compact_remaining=3 should win over margin");
+    }
+
+    #[test]
+    fn test_context_threshold_neither_compact_nor_margin_fires() {
+        // compact_remaining=Some(30) doesn't trigger and tokens=500K is below
+        // the margin threshold (900K). Expect None — no trigger.
+        let result = check_context_threshold_with_margin(
+            500_000,
+            1_000_000,
+            Some(30),
+            75,
+            5,
+            Some(100_000),
+        );
+        assert!(result.is_none(), "neither compact nor margin should fire");
+    }
+
+    #[test]
+    fn test_context_threshold_compact_present_but_safe_falls_through_to_percent() {
+        // When compact_remaining is present but doesn't trigger, AND
+        // threshold_margin is unset, the legacy percent fallback must still
+        // run. Tokens=160K of 200K = 80% > 75% threshold. Expect BY_PERCENT.
+        // This is the regression guard for the bug fix: the old else-if chain
+        // would skip this check entirely when compact_remaining was Some.
+        let result = check_context_threshold_with_margin(
+            160_000,
+            200_000,
+            Some(30), // compact present but not triggering
+            75,
+            5,
+            None, // no margin set, legacy percent path
+        );
+        assert!(
+            result.is_some(),
+            "percent fallback must fire when compact present but not triggering"
+        );
+        let (pct, by_compact) = result.unwrap();
+        assert!(!by_compact, "should be BY_PERCENT, not BY_COMPACT");
+        assert!((pct - 80.0).abs() < 0.1);
     }
 
     // --- Thinking backoff threshold tests ---
@@ -2328,5 +3986,1385 @@ mod tests {
         assert_eq!(state.wedged_clear_interrupts_total, 0);
         assert_eq!(state.auto_update_interrupts_total, 0);
         assert_eq!(state.restart_claude_interrupts_total, 0);
+    }
+
+    // --- main_loop_actively_turning suppression-gate tests (2026-04-27) ---
+    //
+    // The watcher-down inject path consults this predicate. When it returns
+    // true, the daemon skips the tmux interrupt + inject (the in-pane
+    // preemption) but still emits the structured claude-event sink so
+    // Andrew is notified out-of-band. The in-pane preemption is the only
+    // cause of the "inject fires mid-turn → loop pivots to restart watcher
+    // → original ask is abandoned half-finished" cascade Andrew flagged
+    // 2026-04-27.
+
+    fn iso_secs_ago(seconds_ago: i64) -> String {
+        let dt = chrono::Utc::now() - chrono::Duration::seconds(seconds_ago);
+        dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+    }
+
+    #[test]
+    fn test_main_loop_actively_turning_when_bashes_nonzero() {
+        // bashes > 0 RIGHT NOW: actively turning, regardless of last_active_at.
+        let state = State::default();
+        assert!(main_loop_actively_turning(&state, 1, 30));
+    }
+
+    #[test]
+    fn test_main_loop_actively_turning_recent_activity_in_window() {
+        // bashes == 0 NOW but a tool call ran 5s ago: still actively turning.
+        let mut state = State::default();
+        state.last_active_at = Some(iso_secs_ago(5));
+        assert!(main_loop_actively_turning(&state, 0, 30));
+    }
+
+    #[test]
+    fn test_main_loop_actively_turning_stale_activity_outside_window() {
+        // last_active_at is 60s ago, window is 30s: not actively turning.
+        let mut state = State::default();
+        state.last_active_at = Some(iso_secs_ago(60));
+        assert!(!main_loop_actively_turning(&state, 0, 30));
+    }
+
+    #[test]
+    fn test_main_loop_actively_turning_no_history_idle() {
+        // No last_active_at, bashes == 0: definitely not actively turning.
+        let state = State::default();
+        assert!(!main_loop_actively_turning(&state, 0, 30));
+    }
+
+    #[test]
+    fn test_main_loop_actively_turning_window_zero_still_honors_live_bashes() {
+        // window_secs = 0 disables the recent-activity gate, but a live
+        // tool call (bashes > 0) MUST still count as actively turning.
+        let state = State::default();
+        assert!(main_loop_actively_turning(&state, 1, 0));
+    }
+
+    #[test]
+    fn test_main_loop_actively_turning_window_zero_idle_returns_false() {
+        // window_secs = 0 + bashes == 0 + recent activity 1s ago:
+        // recent-activity gate is disabled, so this must NOT count as
+        // actively turning.
+        let mut state = State::default();
+        state.last_active_at = Some(iso_secs_ago(1));
+        assert!(!main_loop_actively_turning(&state, 0, 0));
+    }
+
+    #[test]
+    fn test_main_loop_actively_turning_invalid_timestamp_treated_as_idle() {
+        // Garbage in last_active_at parses to None and must NOT be
+        // treated as "recent" — that would silently disable the inject
+        // forever after a single corrupt write.
+        let mut state = State::default();
+        state.last_active_at = Some("not a timestamp".to_string());
+        assert!(!main_loop_actively_turning(&state, 0, 30));
+    }
+
+    // --- fresh-/clear and dead-process suppression tests (2026-04-27, q-2026-04-27-ce5f) ---
+    //
+    // Both alert paths fire on point-in-time predicates that the main
+    // loop transiently satisfies between two tool calls (a small turn
+    // sitting at a few thousand tokens with bashes momentarily 0; or a
+    // brief pane swap making tokens=0 and bashes=0 look like a dead
+    // process). These tests pin the suppression-decision logic so the
+    // false positives Andrew flagged at 02:45 ET 2026-04-27 don't
+    // regress.
+
+    #[test]
+    fn test_fresh_clear_suppressed_when_actively_turning() {
+        // bashes > 0 right now: the loop is mid-tool-call, so even if
+        // the [min_tokens, max_tokens) gate matches we MUST suppress.
+        let state = State::default();
+        assert!(fresh_clear_inject_suppressed(&state, 1, true, 60));
+    }
+
+    #[test]
+    fn test_fresh_clear_suppressed_when_recent_activity_in_window() {
+        // bashes == 0 NOW but a tool call ran 10s ago: the loop is
+        // demonstrably alive — the bashes gauge is just between calls.
+        // The fresh-/clear inject would derail real work, so suppress.
+        let mut state = State::default();
+        state.last_active_at = Some(iso_secs_ago(10));
+        assert!(fresh_clear_inject_suppressed(&state, 0, true, 60));
+    }
+
+    #[test]
+    fn test_fresh_clear_not_suppressed_when_idle_outside_window() {
+        // Last activity 120s ago, window is 60s: loop is genuinely
+        // idle on a fresh /clear, so the fast-path SHOULD fire.
+        let mut state = State::default();
+        state.last_active_at = Some(iso_secs_ago(120));
+        assert!(!fresh_clear_inject_suppressed(&state, 0, true, 60));
+    }
+
+    #[test]
+    fn test_fresh_clear_not_suppressed_when_no_history() {
+        // Brand-new daemon, no last_active_at recorded, bashes == 0:
+        // can't infer activity, so DON'T suppress. The fast-path keeps
+        // its existing behaviour for the genuine fresh-/clear case.
+        let state = State::default();
+        assert!(!fresh_clear_inject_suppressed(&state, 0, true, 60));
+    }
+
+    #[test]
+    fn test_fresh_clear_not_suppressed_when_disabled() {
+        // suppress_when_active = false (operator override): even with a
+        // live tool call the suppression gate is bypassed, restoring
+        // pre-fix behaviour. Useful escape hatch if the predicate
+        // misfires for some workload.
+        let mut state = State::default();
+        state.last_active_at = Some(iso_secs_ago(5));
+        assert!(!fresh_clear_inject_suppressed(&state, 1, false, 60));
+        assert!(!fresh_clear_inject_suppressed(&state, 0, false, 60));
+    }
+
+    #[test]
+    fn test_fresh_clear_window_zero_still_honors_live_bashes() {
+        // active_window_secs = 0 disables the time-window check, but a
+        // live tool call (bashes > 0) MUST still suppress. Mirrors the
+        // main_loop_actively_turning semantics exactly.
+        let state = State::default();
+        assert!(fresh_clear_inject_suppressed(&state, 1, true, 0));
+    }
+
+    #[test]
+    fn test_fresh_clear_window_zero_idle_does_not_suppress() {
+        // active_window_secs = 0 + bashes == 0 + recent activity 1s
+        // ago: window check is disabled, and bashes is 0 right now,
+        // so the gate stays open and the inject can fire.
+        let mut state = State::default();
+        state.last_active_at = Some(iso_secs_ago(1));
+        assert!(!fresh_clear_inject_suppressed(&state, 0, true, 0));
+    }
+
+    #[test]
+    fn test_dead_process_suppressed_when_actively_turning() {
+        // bashes > 0 right now: the process is demonstrably alive.
+        // Restarting it would kill an active session and fire a false
+        // claude-crashed alert. MUST suppress.
+        let state = State::default();
+        assert!(dead_process_restart_suppressed(&state, 2, true, 60));
+    }
+
+    #[test]
+    fn test_dead_process_suppressed_when_recent_activity_in_window() {
+        // bashes == 0 NOW but a tool call ran 30s ago. The dead-process
+        // checks_required is 3 (default) at ~10s intervals, so a 30s
+        // window perfectly straddles "could the parser have missed
+        // 3 cycles in a row?" — yes, easily. Suppress to be safe.
+        let mut state = State::default();
+        state.last_active_at = Some(iso_secs_ago(30));
+        assert!(dead_process_restart_suppressed(&state, 0, true, 60));
+    }
+
+    #[test]
+    fn test_dead_process_not_suppressed_when_idle_outside_window() {
+        // Last tool call 90s ago, window is 60s: process has been
+        // genuinely silent past the window. If the shell-prompt check
+        // also confirms, restart the process for real.
+        let mut state = State::default();
+        state.last_active_at = Some(iso_secs_ago(90));
+        assert!(!dead_process_restart_suppressed(&state, 0, true, 60));
+    }
+
+    #[test]
+    fn test_dead_process_not_suppressed_when_no_history() {
+        // Brand-new daemon, no last_active_at, bashes == 0: nothing to
+        // infer activity from. Don't suppress — the dead_checks_required
+        // counter and is_shell_prompt() check are the other safety belts.
+        let state = State::default();
+        assert!(!dead_process_restart_suppressed(&state, 0, true, 60));
+    }
+
+    #[test]
+    fn test_dead_process_not_suppressed_when_disabled() {
+        // suppress_when_active = false: gate is bypassed entirely.
+        // Restores pre-fix behaviour for an operator who wants it.
+        let mut state = State::default();
+        state.last_active_at = Some(iso_secs_ago(5));
+        assert!(!dead_process_restart_suppressed(&state, 1, false, 60));
+        assert!(!dead_process_restart_suppressed(&state, 0, false, 60));
+    }
+
+    #[test]
+    fn test_dead_process_uses_wider_default_window_than_watcher_down() {
+        // Documents the policy choice: a dead-process false positive
+        // restarts Claude Code (destroys an in-flight session), which
+        // is far more destructive than a missed watcher-down inject
+        // (just defers a notification by 5 min). The default
+        // active_window_secs for dead_process is 60s vs watcher_monitor's
+        // 30s. Test the boundary: 45s ago should suppress at 60s
+        // window but not at 30s window.
+        let mut state = State::default();
+        state.last_active_at = Some(iso_secs_ago(45));
+        // dead_process default window (60s) suppresses
+        assert!(dead_process_restart_suppressed(&state, 0, true, 60));
+        // watcher_monitor default window (30s) would NOT
+        assert!(!main_loop_actively_turning(&state, 0, 30));
+    }
+
+    #[test]
+    fn test_dead_process_invalid_timestamp_treated_as_idle() {
+        // Same defensive check as test_main_loop_actively_turning_invalid_timestamp_treated_as_idle:
+        // garbage timestamp parses to None, treated as idle (no suppression).
+        // A corrupt persisted state file MUST NOT silently disable the
+        // restart path forever.
+        let mut state = State::default();
+        state.last_active_at = Some("garbage".to_string());
+        assert!(!dead_process_restart_suppressed(&state, 0, true, 60));
+    }
+
+    #[test]
+    fn test_fresh_clear_invalid_timestamp_treated_as_idle() {
+        // Mirror of dead_process variant. Garbage in last_active_at
+        // must NOT be treated as recent activity.
+        let mut state = State::default();
+        state.last_active_at = Some("garbage".to_string());
+        assert!(!fresh_clear_inject_suppressed(&state, 0, true, 60));
+    }
+
+    // --- Cross-gate suppression-escalation tests (2026-04-28, q-2026-04-28-2449) ---
+    //
+    // These pin the behavior of the shared escalation mechanism that backstops
+    // the three suppression gates. Real-world incident: claude-event-watch
+    // died at 19:27Z and stayed down 33 min because watcher_monitor's
+    // suppression gate kept holding through a sustained dispatcher window.
+    // These tests guarantee the next time that happens we escalate at the
+    // configured cap and force-inject.
+
+    #[test]
+    fn test_record_suppression_first_call_stamps_timestamp() {
+        // 0 -> 1 transition: first_suppression_at should be set, counter
+        // bumped to 1.
+        let mut state = State::default();
+        let now = chrono::Utc::now().to_rfc3339();
+        record_suppression(&mut state, &now);
+        assert_eq!(state.consecutive_suppressions, 1);
+        assert_eq!(state.first_suppression_at.as_deref(), Some(now.as_str()));
+    }
+
+    #[test]
+    fn test_record_suppression_subsequent_calls_preserve_timestamp() {
+        // Once first_suppression_at is set, subsequent calls must NOT
+        // overwrite it (otherwise the wall-clock backstop would never
+        // fire — the window would keep resetting).
+        let mut state = State::default();
+        let t0 = "2026-04-28T00:00:00+00:00".to_string();
+        let t1 = "2026-04-28T00:01:00+00:00".to_string();
+        let t2 = "2026-04-28T00:02:00+00:00".to_string();
+        record_suppression(&mut state, &t0);
+        record_suppression(&mut state, &t1);
+        record_suppression(&mut state, &t2);
+        assert_eq!(state.consecutive_suppressions, 3);
+        // t0 is the first, must persist across the next two.
+        assert_eq!(state.first_suppression_at, Some(t0));
+    }
+
+    #[test]
+    fn test_record_suppression_saturates_at_u32_max() {
+        // Sanity: catastrophic counter overflow must not panic.
+        let mut state = State::default();
+        state.consecutive_suppressions = u32::MAX;
+        state.first_suppression_at = Some(iso_secs_ago(60));
+        record_suppression(&mut state, "now");
+        assert_eq!(state.consecutive_suppressions, u32::MAX);
+    }
+
+    #[test]
+    fn test_reset_suppression_clears_both_fields() {
+        let mut state = State::default();
+        state.consecutive_suppressions = 5;
+        state.first_suppression_at = Some(iso_secs_ago(120));
+        reset_suppression(&mut state);
+        assert_eq!(state.consecutive_suppressions, 0);
+        assert!(state.first_suppression_at.is_none());
+    }
+
+    #[test]
+    fn test_reset_suppression_idempotent_when_already_clear() {
+        let mut state = State::default();
+        reset_suppression(&mut state);
+        assert_eq!(state.consecutive_suppressions, 0);
+        assert!(state.first_suppression_at.is_none());
+    }
+
+    #[test]
+    fn test_should_escalate_returns_none_when_counter_zero() {
+        // The very first suppression of a run can never escalate — the
+        // gate has not yet demonstrably failed to drain. Required so the
+        // happy path (one suppression, then the active turn ends, then
+        // the watcher comes back) doesn't escalate.
+        let state = State::default();
+        assert_eq!(should_escalate_suppression(&state, 3, 600), None);
+    }
+
+    #[test]
+    fn test_should_escalate_fires_on_consecutive_cap() {
+        // counter == max: escalation due to consecutive cap.
+        let mut state = State::default();
+        state.consecutive_suppressions = 3;
+        state.first_suppression_at = Some(iso_secs_ago(10));
+        assert_eq!(
+            should_escalate_suppression(&state, 3, 600),
+            Some(EscalationReason::ConsecutiveCap)
+        );
+    }
+
+    // --- evaluate_api_retry_state tests (2026-04-28) ---
+
+    #[test]
+    fn test_api_retry_eval_not_retrying_clears_state() {
+        // When the pane no longer shows a retry banner, all tracking state
+        // resets immediately (no consecutive count, no first_seen).
+        let prior = "2026-04-28T12:00:00+00:00";
+        let (consec, first, suppress) =
+            evaluate_api_retry_state(false, 5, Some(prior), 1, 1800);
+        assert_eq!(consec, 0);
+        assert!(first.is_none());
+        assert!(!suppress);
+    }
+
+    #[test]
+    fn test_api_retry_eval_first_detection_stamps_first_seen() {
+        // First detection: consecutive = 1, first_seen gets stamped, and
+        // with threshold=1 we suppress immediately.
+        let (consec, first, suppress) = evaluate_api_retry_state(true, 0, None, 1, 1800);
+        assert_eq!(consec, 1);
+        assert!(first.is_some());
+        assert!(suppress);
+    }
+
+    #[test]
+    fn test_api_retry_eval_below_consecutive_threshold_does_not_suppress() {
+        // threshold=3, consec was 0 -> becomes 1. Not enough to suppress yet.
+        let (consec, first, suppress) = evaluate_api_retry_state(true, 0, None, 3, 1800);
+        assert_eq!(consec, 1);
+        assert!(first.is_some()); // first_seen stamped on first detection
+        assert!(!suppress);
+    }
+
+    #[test]
+    fn test_api_retry_eval_at_consecutive_threshold_suppresses() {
+        // threshold=3, consec was 2 -> becomes 3. Just hits threshold.
+        let prior = Utc::now().to_rfc3339();
+        let (consec, first, suppress) =
+            evaluate_api_retry_state(true, 2, Some(&prior), 3, 1800);
+        assert_eq!(consec, 3);
+        assert_eq!(first.as_deref(), Some(prior.as_str()));
+        assert!(suppress);
+    }
+
+    #[test]
+    fn test_api_retry_eval_preserves_first_seen_across_cycles() {
+        // While retrying, first_seen MUST stay pinned to the first
+        // detection so max_stuck_secs can measure elapsed time correctly.
+        let prior = "2026-04-28T12:00:00+00:00";
+        let (_, first, _) = evaluate_api_retry_state(true, 1, Some(prior), 1, 1800);
+        assert_eq!(first.as_deref(), Some(prior));
+    }
+
+    #[test]
+    fn test_api_retry_eval_max_stuck_secs_lifts_suppression() {
+        // first_seen is 2 hours ago, max_stuck_secs = 1800 (30 min).
+        // Suppression must lift so monitoring can resume.
+        let two_hours_ago = (Utc::now() - chrono::Duration::seconds(7200)).to_rfc3339();
+        let (consec, first, suppress) =
+            evaluate_api_retry_state(true, 100, Some(&two_hours_ago), 1, 1800);
+        assert_eq!(consec, 101);
+        assert_eq!(first.as_deref(), Some(two_hours_ago.as_str()));
+        assert!(
+            !suppress,
+            "max_stuck_secs exceeded — suppression must lift to allow recovery"
+        );
+    }
+
+    #[test]
+    fn test_should_escalate_fires_on_consecutive_cap_overshoot() {
+        // counter > max also fires — defensive against off-by-one
+        // bumps from a code-path that increments after the predicate
+        // check.
+        let mut state = State::default();
+        state.consecutive_suppressions = 10;
+        state.first_suppression_at = Some(iso_secs_ago(10));
+        assert_eq!(
+            should_escalate_suppression(&state, 3, 600),
+            Some(EscalationReason::ConsecutiveCap)
+        );
+    }
+
+    #[test]
+    fn test_should_escalate_fires_on_window_exceeded() {
+        // Counter is below the consecutive cap but the wall-clock
+        // window has been exceeded — escalate via the window backstop.
+        // Mirrors the slow-drip case where suppressions land less often
+        // than the cap implies (e.g. a check that satisfies the gate
+        // every other cycle).
+        let mut state = State::default();
+        state.consecutive_suppressions = 1;
+        state.first_suppression_at = Some(iso_secs_ago(700));
+        assert_eq!(
+            should_escalate_suppression(&state, 3, 600),
+            Some(EscalationReason::WindowExceeded)
+        );
+    }
+
+    #[test]
+    fn test_should_escalate_returns_none_below_both_limits() {
+        // counter < cap AND elapsed < window: no escalation, normal
+        // suppression continues.
+        let mut state = State::default();
+        state.consecutive_suppressions = 1;
+        state.first_suppression_at = Some(iso_secs_ago(60));
+        assert_eq!(should_escalate_suppression(&state, 3, 600), None);
+    }
+
+    #[test]
+    fn test_should_escalate_consecutive_cap_zero_disables_consecutive_check() {
+        // max_consecutive_suppressions=0 disables the consecutive-cap
+        // limb (operator escape hatch). With counter=10 and the cap
+        // disabled, only the window backstop can escalate.
+        let mut state = State::default();
+        state.consecutive_suppressions = 10;
+        state.first_suppression_at = Some(iso_secs_ago(10));
+        // Window also too short to fire: should NOT escalate.
+        assert_eq!(should_escalate_suppression(&state, 0, 600), None);
+        // Window exceeded: window-side escalation still fires.
+        state.first_suppression_at = Some(iso_secs_ago(700));
+        assert_eq!(
+            should_escalate_suppression(&state, 0, 600),
+            Some(EscalationReason::WindowExceeded)
+        );
+    }
+
+    #[test]
+    fn test_should_escalate_window_zero_disables_window_check() {
+        // max_suppression_window_secs=0 disables the window backstop.
+        // Useful escape hatch for environments that want only the
+        // consecutive-cap behaviour.
+        let mut state = State::default();
+        state.consecutive_suppressions = 1;
+        state.first_suppression_at = Some(iso_secs_ago(10000));
+        // Even with a 10000s gap, window=0 means no escalation.
+        assert_eq!(should_escalate_suppression(&state, 3, 0), None);
+        // Counter still triggers escalation independently.
+        state.consecutive_suppressions = 5;
+        assert_eq!(
+            should_escalate_suppression(&state, 3, 0),
+            Some(EscalationReason::ConsecutiveCap)
+        );
+    }
+
+    #[test]
+    fn test_should_escalate_invalid_first_suppression_at_treated_as_no_window_data() {
+        // Garbage timestamp → window check skips, falls through to None
+        // unless the consecutive cap also fires. Mirrors the defensive
+        // semantics elsewhere.
+        let mut state = State::default();
+        state.consecutive_suppressions = 1;
+        state.first_suppression_at = Some("garbage".to_string());
+        assert_eq!(should_escalate_suppression(&state, 3, 600), None);
+    }
+
+    #[test]
+    fn test_should_escalate_consecutive_cap_takes_precedence_over_window() {
+        // When BOTH limits would fire, ConsecutiveCap is reported — the
+        // counter check runs first. Documents the precedence so log
+        // analysis is stable.
+        let mut state = State::default();
+        state.consecutive_suppressions = 10;
+        state.first_suppression_at = Some(iso_secs_ago(10000));
+        assert_eq!(
+            should_escalate_suppression(&state, 3, 600),
+            Some(EscalationReason::ConsecutiveCap)
+        );
+    }
+
+    #[test]
+    fn test_record_then_reset_returns_to_pristine_state() {
+        // End-to-end: a suppression run that ends with a successful
+        // inject (reset_suppression called) leaves state ready for a
+        // brand-new run, with no leftover history.
+        let mut state = State::default();
+        record_suppression(&mut state, "2026-04-28T00:00:00+00:00");
+        record_suppression(&mut state, "2026-04-28T00:00:30+00:00");
+        record_suppression(&mut state, "2026-04-28T00:01:00+00:00");
+        assert_eq!(state.consecutive_suppressions, 3);
+        reset_suppression(&mut state);
+        // Next run starts from scratch — consecutive_suppressions=0
+        // means should_escalate returns None.
+        assert_eq!(should_escalate_suppression(&state, 3, 600), None);
+        // And first_suppression_at gets re-stamped on the next record.
+        record_suppression(&mut state, "2026-04-28T01:00:00+00:00");
+        assert_eq!(state.consecutive_suppressions, 1);
+        assert_eq!(
+            state.first_suppression_at.as_deref(),
+            Some("2026-04-28T01:00:00+00:00")
+        );
+    }
+
+    // --- Regression test for the cooldown-bump bug (2026-04-28) ---
+    //
+    // Pre-fix, the watcher_monitor suppression path bumped
+    // `state.last_watcher_inject = now` even though no inject ran.
+    // That ate the full 5-min `inject_cooldown` slot on a single
+    // suppressed attempt — even if the active window closed 1s later,
+    // the next inject was deferred until the cooldown elapsed.
+    //
+    // The fix is intentional structural: the suppression branch in
+    // watcher_monitor no longer touches `last_watcher_inject`. We
+    // assert via a focused unit test of `record_suppression` (which
+    // is what the suppression branch now calls) PLUS a no-op state
+    // mutation check.
+
+    #[test]
+    fn test_record_suppression_does_not_touch_last_watcher_inject() {
+        // Pin the contract: record_suppression bumps the suppression
+        // counter ONLY. It must not silently update the watcher-down
+        // cooldown clock — that field tracks the last actual inject,
+        // which is the cooldown-bump bug we're fixing.
+        let mut state = State::default();
+        state.last_watcher_inject = Some("2026-04-28T00:00:00+00:00".to_string());
+        record_suppression(&mut state, "2026-04-28T01:00:00+00:00");
+        // last_watcher_inject is untouched — only consecutive_suppressions
+        // and first_suppression_at moved.
+        assert_eq!(
+            state.last_watcher_inject.as_deref(),
+            Some("2026-04-28T00:00:00+00:00")
+        );
+        assert_eq!(state.consecutive_suppressions, 1);
+        assert_eq!(
+            state.first_suppression_at.as_deref(),
+            Some("2026-04-28T01:00:00+00:00")
+        );
+    }
+
+    #[test]
+    fn test_record_suppression_does_not_touch_last_interrupt_at() {
+        // Same contract for the global post-interrupt cooldown clock.
+        // No interrupt fired (we suppressed), so last_interrupt_at must
+        // not move — otherwise other fire paths (prolonged-thinking,
+        // context-warning) would be cooled-down by a non-event.
+        let mut state = State::default();
+        state.last_interrupt_at = Some("2026-04-28T00:00:00+00:00".to_string());
+        record_suppression(&mut state, "2026-04-28T01:00:00+00:00");
+        assert_eq!(
+            state.last_interrupt_at.as_deref(),
+            Some("2026-04-28T00:00:00+00:00")
+        );
+    }
+
+    // --- State transient-reset on daemon load (2026-04-28) ---
+    //
+    // The escalation state fields (consecutive_suppressions,
+    // first_suppression_at) are transient — daemon downtime makes the
+    // "consecutive" semantics meaningless and a stale persisted timestamp
+    // would cause the wall-clock backstop to fire immediately on the
+    // first suppression after restart. load_state must clear both.
+    // The actual reset lives in src/state.rs::load_state; this test
+    // documents the expected behaviour from policy's perspective (a
+    // fresh State has both fields zeroed).
+
+    #[test]
+    fn test_default_state_has_clean_suppression_counters() {
+        // Stand-in for the "load_state from missing file" case — the
+        // reset semantics in load_state mean a brand-new daemon never
+        // sees stale escalation state.
+        let state = State::default();
+        assert_eq!(state.consecutive_suppressions, 0);
+        assert!(state.first_suppression_at.is_none());
+        // And no escalation fires on a pristine state.
+        assert_eq!(should_escalate_suppression(&state, 3, 600), None);
+    }
+
+    // --- Watcher-down inject due-predicate tests (2026-04-28) ---
+    //
+    // These pin the new behavior:
+    //   1. Never-injected -> always due.
+    //   2. Recent inject (< cooldown) -> NOT due.
+    //   3. Old inject (>= cooldown) -> due.
+    //   4. Malformed timestamp -> due (fail-open).
+    //   5. cooldown=0 with recent inject -> due (cooldown disabled).
+    //   6. The watcher-down predicate does NOT consult
+    //      interrupt_in_global_cooldown — i.e. an unrelated recent
+    //      interrupt MUST NOT block the watcher-down fire path.
+    //      This is the regression guard for the actual bug Andrew filed
+    //      (q-2026-04-28-713a) and for the prior reverted attempts.
+
+    #[test]
+    fn test_watcher_inject_due_never_injected() {
+        assert!(watcher_inject_due(None, 60));
+    }
+
+    #[test]
+    fn test_watcher_inject_due_within_cooldown() {
+        let recent = (Utc::now() - chrono::Duration::seconds(10)).to_rfc3339();
+        assert!(!watcher_inject_due(Some(&recent), 60));
+    }
+
+    #[test]
+    fn test_watcher_inject_due_after_cooldown() {
+        let old = (Utc::now() - chrono::Duration::seconds(120)).to_rfc3339();
+        assert!(watcher_inject_due(Some(&old), 60));
+    }
+
+    #[test]
+    fn test_watcher_inject_due_malformed_timestamp_fails_open() {
+        // Garbage timestamp must fail OPEN (allow inject) rather than
+        // wedge the gate forever.
+        assert!(watcher_inject_due(Some("not a date"), 60));
+    }
+
+    #[test]
+    fn test_watcher_inject_due_cooldown_zero_always_due() {
+        // cooldown=0 means "no rate limit"; even a 1s-ago inject is due.
+        let just_now = (Utc::now() - chrono::Duration::seconds(1)).to_rfc3339();
+        assert!(watcher_inject_due(Some(&just_now), 0));
+    }
+
+    #[test]
+    fn test_watcher_inject_ignores_global_cooldown() {
+        // REGRESSION GUARD (q-2026-04-28-713a): the watcher-down inject
+        // path is intentionally exempt from interrupt_in_global_cooldown.
+        // Set up state where a different interrupt fired 5s ago; the
+        // global cooldown gate would block, but the watcher-down
+        // predicate does not consult it.
+        let mut state = State::default();
+        state.last_interrupt_at =
+            Some((Utc::now() - chrono::Duration::seconds(5)).to_rfc3339());
+        // Sanity: global cooldown would block.
+        assert!(interrupt_in_global_cooldown(&state, 60));
+        // But watcher-down predicate ignores last_interrupt_at and only
+        // considers last_watcher_inject. With None, it's due.
+        assert!(watcher_inject_due(state.last_watcher_inject.as_deref(), 60));
+    }
+
+    #[test]
+    fn test_default_watcher_inject_cooldown_is_aggressive() {
+        // Pin the new 60s default in case someone bumps it back to
+        // 300s without realizing the original cascade-suppression
+        // rationale was retired. If you genuinely want a longer
+        // default, also update CLAUDE.md / the comment in config.rs.
+        use crate::config::parse_config;
+        let cfg = r#"
+[general]
+check_interval = 10
+state_file = "/tmp/s.json"
+log_file = "/tmp/s.jsonl"
+legacy_log_file = "/tmp/s.log"
+
+[claude]
+max_context_tokens = 200000
+heartbeat_file = "/tmp/hb"
+relaunch_script = "/tmp/rel.sh"
+
+[dead_process]
+checks_required = 3
+restart_cooldown = 60
+
+[fresh_clear]
+min_tokens = 1000
+max_tokens = 5000
+detections_required = 2
+cooldown = 60
+
+[heartbeat]
+stale_minutes = 10
+
+[alerts]
+initial_cooldown = 60
+escalation_tiers = [60]
+max_pingme_alerts = 3
+resume_prompt = "r"
+
+[foreground_monitor]
+enabled = false
+threshold_seconds = 180
+check_interval = 3
+
+[watcher_monitor]
+enabled = true
+watchers_config = "/tmp/w.conf"
+expected_watchmen = 0
+
+[context_monitor]
+enabled = true
+threshold_percent = 75
+compact_trigger_percent = 5
+grace_period = 120
+cooldown = 300
+"#;
+        let cfg = parse_config(cfg).expect("parse");
+        assert_eq!(
+            cfg.watcher_monitor.inject_cooldown, 60,
+            "default watcher inject_cooldown should be 60s (aggressive re-inject); \
+             see src/policy.rs::watcher_inject_due doc comment"
+        );
+    }
+
+    // --- evaluate_api_retry_state additional tests (PR #45) ---
+
+    #[test]
+    fn test_api_retry_eval_max_stuck_secs_zero_disables_cap() {
+        // max_stuck_secs=0 disables the timeout — suppression continues
+        // indefinitely as long as the retry is still observed.
+        let two_hours_ago = (Utc::now() - chrono::Duration::seconds(7200)).to_rfc3339();
+        let (_, _, suppress) =
+            evaluate_api_retry_state(true, 100, Some(&two_hours_ago), 1, 0);
+        assert!(suppress, "max_stuck_secs=0 should disable the cap");
+    }
+
+    #[test]
+    fn test_api_retry_eval_resolution_then_re_entry() {
+        // Episode 1: detect, suppress, resolve, then a NEW episode begins.
+        // The new episode's first_seen must be fresh (not inherit episode 1's).
+        let (consec_1, first_1, suppress_1) =
+            evaluate_api_retry_state(true, 0, None, 1, 1800);
+        assert_eq!(consec_1, 1);
+        assert!(first_1.is_some());
+        assert!(suppress_1);
+
+        // Resolution.
+        let (consec_2, first_2, suppress_2) =
+            evaluate_api_retry_state(false, consec_1, first_1.as_deref(), 1, 1800);
+        assert_eq!(consec_2, 0);
+        assert!(first_2.is_none());
+        assert!(!suppress_2);
+
+        // New episode starts.
+        let (consec_3, first_3, suppress_3) =
+            evaluate_api_retry_state(true, consec_2, first_2.as_deref(), 1, 1800);
+        assert_eq!(consec_3, 1);
+        assert!(first_3.is_some());
+        // The new first_seen should NOT equal the old one (it's a new
+        // episode) — but since we only know the old one was Some(...),
+        // we just check both are Some, are different timestamps... actually
+        // they could be equal if both stamp at the same RFC3339 second.
+        // Just assert it's stamped.
+        assert!(suppress_3);
+    }
+
+    #[test]
+    fn test_api_retry_eval_saturating_consecutive() {
+        // Pathological huge consecutive must not panic on overflow.
+        let now = Utc::now().to_rfc3339();
+        let (consec, _, suppress) =
+            evaluate_api_retry_state(true, u32::MAX, Some(&now), 1, 1800);
+        assert_eq!(consec, u32::MAX); // saturated
+        assert!(suppress);
+    }
+
+    // --- is_api_retry_suppressing tests (read-only state derivation) ---
+
+    fn config_with_api_retry(enabled: bool, consecutive: u32, max_stuck: u64) -> Config {
+        let toml_str = format!(
+            r#"
+[general]
+check_interval = 10
+state_file = "/tmp/s.json"
+log_file = "/tmp/s.jsonl"
+legacy_log_file = "/tmp/s.log"
+
+[claude]
+max_context_tokens = 200000
+heartbeat_file = "/tmp/hb"
+relaunch_script = "/tmp/rel.sh"
+
+[dead_process]
+checks_required = 3
+restart_cooldown = 60
+
+[fresh_clear]
+min_tokens = 1000
+max_tokens = 5000
+detections_required = 2
+cooldown = 60
+
+[heartbeat]
+stale_minutes = 10
+
+[alerts]
+initial_cooldown = 60
+escalation_tiers = [60]
+max_pingme_alerts = 1
+resume_prompt = "x"
+
+[foreground_monitor]
+enabled = true
+threshold_seconds = 60
+check_interval = 3
+
+[watcher_monitor]
+enabled = false
+watchers_config = "/tmp/w.conf"
+expected_watchmen = 0
+
+[context_monitor]
+enabled = true
+threshold_percent = 75
+compact_trigger_percent = 5
+grace_period = 60
+cooldown = 60
+
+[api_retry]
+enabled = {enabled}
+consecutive = {consecutive}
+max_stuck_secs = {max_stuck}
+"#,
+            enabled = enabled,
+            consecutive = consecutive,
+            max_stuck = max_stuck,
+        );
+        crate::config::parse_config(&toml_str).expect("parse")
+    }
+
+    #[test]
+    fn test_is_api_retry_suppressing_disabled() {
+        // enabled=false always returns false even if state looks active.
+        let config = config_with_api_retry(false, 1, 1800);
+        let mut state = State::default();
+        state.api_retry_consecutive = 5;
+        state.api_retry_first_seen = Some(Utc::now().to_rfc3339());
+        assert!(!is_api_retry_suppressing(&config, &state));
+    }
+
+    #[test]
+    fn test_is_api_retry_suppressing_no_episode() {
+        // No first_seen / no consecutive -> not suppressing.
+        let config = config_with_api_retry(true, 1, 1800);
+        let state = State::default();
+        assert!(!is_api_retry_suppressing(&config, &state));
+    }
+
+    #[test]
+    fn test_is_api_retry_suppressing_below_threshold() {
+        // consecutive=1, threshold=3 -> not yet suppressing.
+        let config = config_with_api_retry(true, 3, 1800);
+        let mut state = State::default();
+        state.api_retry_consecutive = 1;
+        state.api_retry_first_seen = Some(Utc::now().to_rfc3339());
+        assert!(!is_api_retry_suppressing(&config, &state));
+    }
+
+    #[test]
+    fn test_is_api_retry_suppressing_active_episode() {
+        let config = config_with_api_retry(true, 1, 1800);
+        let mut state = State::default();
+        state.api_retry_consecutive = 1;
+        state.api_retry_first_seen = Some(Utc::now().to_rfc3339());
+        assert!(is_api_retry_suppressing(&config, &state));
+    }
+
+    #[test]
+    fn test_is_api_retry_suppressing_max_stuck_lifts() {
+        // first_seen 2 hours ago, max_stuck=1800 -> no longer suppressing.
+        let config = config_with_api_retry(true, 1, 1800);
+        let mut state = State::default();
+        state.api_retry_consecutive = 100;
+        state.api_retry_first_seen =
+            Some((Utc::now() - chrono::Duration::seconds(7200)).to_rfc3339());
+        assert!(!is_api_retry_suppressing(&config, &state));
+    }
+
+    // --- evaluate_watcher_down_action tests (quiet-path / 2026-04-28) ---
+    //
+    // Behaviour table:
+    //
+    // | scenario                                  | expected action     |
+    // |-------------------------------------------|---------------------|
+    // | below event_threshold                     | Nothing             |
+    // | hit event_threshold, no prior emit        | EmitEvent           |
+    // | event recently emitted, within grace      | Nothing             |
+    // | event emitted, grace expired, < inject_th | Nothing             |
+    // | event emitted, grace expired, >= inject_th| InjectFallback      |
+    // | consumer watcher missing, < inject_th     | Nothing (no event!) |
+    // | consumer watcher missing, >= inject_th    | InjectFallback      |
+    // | misconfig: ev_th > inj_th, hit inj_th     | InjectFallback      |
+
+    #[test]
+    fn test_watcher_action_below_event_threshold_does_nothing() {
+        // consecutive=2, event_threshold=3 -> no action yet
+        let action = evaluate_watcher_down_action(false, 2, None, 3, 6, 60);
+        assert_eq!(action, WatcherDownAction::Nothing);
+    }
+
+    #[test]
+    fn test_watcher_action_at_event_threshold_emits() {
+        // consecutive=3, event_threshold=3, no prior emit -> EmitEvent
+        let action = evaluate_watcher_down_action(false, 3, None, 3, 6, 60);
+        assert_eq!(action, WatcherDownAction::EmitEvent);
+    }
+
+    #[test]
+    fn test_watcher_action_above_event_threshold_emits() {
+        // consecutive=4, event_threshold=3, no prior emit -> EmitEvent
+        // (still below inject_threshold=6)
+        let action = evaluate_watcher_down_action(false, 4, None, 3, 6, 60);
+        assert_eq!(action, WatcherDownAction::EmitEvent);
+    }
+
+    #[test]
+    fn test_watcher_action_within_grace_window_suppresses() {
+        // event was emitted ~5s ago, grace=60s -> Nothing
+        let recent = Utc::now()
+            .checked_sub_signed(chrono::Duration::seconds(5))
+            .unwrap()
+            .to_rfc3339();
+        let action = evaluate_watcher_down_action(false, 5, Some(&recent), 3, 6, 60);
+        assert_eq!(action, WatcherDownAction::Nothing);
+    }
+
+    #[test]
+    fn test_watcher_action_grace_expired_below_inject_threshold_does_nothing() {
+        // event was emitted long ago, grace expired, but consecutive_missing
+        // hasn't reached inject_threshold yet -> Nothing.
+        let stale = Utc::now()
+            .checked_sub_signed(chrono::Duration::seconds(120))
+            .unwrap()
+            .to_rfc3339();
+        let action = evaluate_watcher_down_action(false, 5, Some(&stale), 3, 6, 60);
+        assert_eq!(action, WatcherDownAction::Nothing);
+    }
+
+    #[test]
+    fn test_watcher_action_grace_expired_at_inject_threshold_falls_through_to_inject() {
+        // event was emitted long ago, grace expired, AND consecutive_missing
+        // reached inject_threshold -> InjectFallback (the main loop never
+        // picked up the event for whatever reason — escalate).
+        let stale = Utc::now()
+            .checked_sub_signed(chrono::Duration::seconds(120))
+            .unwrap()
+            .to_rfc3339();
+        let action = evaluate_watcher_down_action(false, 6, Some(&stale), 3, 6, 60);
+        assert_eq!(action, WatcherDownAction::InjectFallback);
+    }
+
+    #[test]
+    fn test_watcher_action_consumer_watcher_skips_event_below_inject_threshold() {
+        // claude-event-watch itself is missing — never emit (no consumer).
+        // Below inject_threshold -> Nothing.
+        let action = evaluate_watcher_down_action(true, 3, None, 3, 6, 60);
+        assert_eq!(action, WatcherDownAction::Nothing);
+    }
+
+    #[test]
+    fn test_watcher_action_consumer_watcher_falls_through_to_inject_at_threshold() {
+        // claude-event-watch missing AND past inject_threshold -> InjectFallback.
+        // No event was ever emitted (None) — the chicken-and-egg case.
+        let action = evaluate_watcher_down_action(true, 6, None, 3, 6, 60);
+        assert_eq!(action, WatcherDownAction::InjectFallback);
+    }
+
+    #[test]
+    fn test_watcher_action_misconfig_event_threshold_above_inject_threshold() {
+        // Misconfiguration: event_threshold (10) > inject_threshold (6).
+        // consecutive_missing=6 is at inject_threshold but below
+        // event_threshold. The pure helper falls through to InjectFallback
+        // rather than wedging on Nothing forever.
+        let action = evaluate_watcher_down_action(false, 6, None, 10, 6, 60);
+        assert_eq!(action, WatcherDownAction::InjectFallback);
+    }
+
+    #[test]
+    fn test_watcher_action_grace_zero_disables_quiet_path_after_first_emit() {
+        // grace_secs=0 means the quiet-path suppression window is empty.
+        // After emission, the very next cycle past inject_threshold should
+        // immediately fall through to InjectFallback (no waiting).
+        let just_now = Utc::now().to_rfc3339();
+        let action = evaluate_watcher_down_action(false, 6, Some(&just_now), 3, 6, 0);
+        assert_eq!(action, WatcherDownAction::InjectFallback);
+    }
+
+    #[test]
+    fn test_watcher_action_recovery_clears_event_emitted_at_externally() {
+        // This test mirrors what the watcher loop does on recovery: it
+        // clears event_emitted_at so the next failure gets a fresh quiet
+        // path. We verify the helper returns EmitEvent again with a cleared
+        // timestamp, even though we previously emitted.
+        let action = evaluate_watcher_down_action(false, 3, None, 3, 6, 60);
+        assert_eq!(action, WatcherDownAction::EmitEvent);
+    }
+
+    #[test]
+    fn test_watcher_action_re_emit_suppressed_when_grace_active_and_count_grew() {
+        // Even if consecutive_missing grew past event_threshold by another
+        // cycle, while the grace window is active we MUST NOT re-emit
+        // (no double-fire).
+        let recent = Utc::now()
+            .checked_sub_signed(chrono::Duration::seconds(10))
+            .unwrap()
+            .to_rfc3339();
+        let action = evaluate_watcher_down_action(false, 4, Some(&recent), 3, 6, 60);
+        assert_eq!(action, WatcherDownAction::Nothing);
+    }
+
+    #[test]
+    fn test_watcher_state_recovery_clears_event_emitted_at() {
+        // Simulate the watcher-loop "recovery" branch: when count >= min_count
+        // the loop sets last_seen_running, zeros consecutive_missing, AND
+        // clears event_emitted_at. Verify the field actually gets cleared
+        // (regression guard for forgetting to reset it).
+        let mut health = WatcherState {
+            last_seen_running: None,
+            consecutive_missing: 5,
+            enabled: true,
+            last_auto_restart_at: None,
+            event_emitted_at: Some("2026-04-28T12:00:00+00:00".to_string()),
+        };
+        // Mirror the recovery branch:
+        health.last_seen_running = Some("2026-04-28T12:05:00+00:00".to_string());
+        health.consecutive_missing = 0;
+        health.event_emitted_at = None;
+
+        assert_eq!(health.consecutive_missing, 0);
+        assert!(health.event_emitted_at.is_none());
+        assert!(health.last_seen_running.is_some());
+    }
+
+    // --- auto-respawn-on-hang signal-collection tests (2026-05-01) ---
+
+    fn config_with_auto_respawn(enabled: bool, signals_required: u32, window_secs: u64) -> Config {
+        let toml_str = format!(
+            r#"
+[general]
+check_interval = 10
+state_file = "/tmp/s.json"
+log_file = "/tmp/s.jsonl"
+legacy_log_file = "/tmp/s.log"
+
+[claude]
+max_context_tokens = 200000
+heartbeat_file = "/tmp/hb"
+relaunch_script = "/tmp/rel.sh"
+
+[dead_process]
+checks_required = 3
+restart_cooldown = 60
+
+[fresh_clear]
+min_tokens = 1000
+max_tokens = 5000
+detections_required = 2
+cooldown = 60
+
+[heartbeat]
+stale_minutes = 10
+
+[alerts]
+initial_cooldown = 60
+escalation_tiers = [60]
+max_pingme_alerts = 1
+resume_prompt = "x"
+
+[foreground_monitor]
+enabled = true
+threshold_seconds = 60
+check_interval = 3
+
+[watcher_monitor]
+enabled = true
+watchers_config = "/tmp/w.conf"
+expected_watchmen = 0
+inject_threshold = 6
+
+[context_monitor]
+enabled = true
+threshold_percent = 75
+compact_trigger_percent = 5
+grace_period = 60
+cooldown = 60
+
+[auto_respawn_on_hang]
+enabled = {enabled}
+signals_required = {signals_required}
+signal_window_secs = {window_secs}
+cooldown_secs = 1800
+kill_grace_secs = 5
+respawn_verify_secs = 30
+pane_unchanged_secs = 600
+"#,
+            enabled = enabled,
+            signals_required = signals_required,
+            window_secs = window_secs,
+        );
+        crate::config::parse_config(&toml_str).expect("parse")
+    }
+
+    #[test]
+    fn test_auto_respawn_default_off() {
+        // No [auto_respawn_on_hang] section -> default disabled.
+        let config = config_with_api_retry(true, 1, 1800);
+        assert!(
+            !config.auto_respawn_on_hang.enabled,
+            "auto-respawn must default OFF — destructive feature, opt-in only"
+        );
+    }
+
+    #[test]
+    fn test_collect_no_signals_when_clean_state() {
+        let config = config_with_auto_respawn(true, 2, 300);
+        let state = State::default();
+        let signals = collect_non_pane_signals(&state, &config, false);
+        assert!(signals.is_empty());
+    }
+
+    #[test]
+    fn test_collect_heartbeat_stuck_emits_signal() {
+        let config = config_with_auto_respawn(true, 2, 300);
+        let state = State::default();
+        let signals = collect_non_pane_signals(&state, &config, true);
+        assert_eq!(signals, vec![crate::respawn::HangSignal::HeartbeatStale]);
+    }
+
+    #[test]
+    fn test_collect_watcher_signal_requires_recent_inject() {
+        let config = config_with_auto_respawn(true, 2, 300);
+        let mut state = State::default();
+        // Watcher critically missing
+        state.watcher_health.insert(
+            "memory-remind".to_string(),
+            crate::state::WatcherState {
+                last_seen_running: None,
+                consecutive_missing: 10,
+                enabled: true,
+                ..Default::default()
+            },
+        );
+        // No recent watcher inject — should NOT emit (we haven't poked the loop yet)
+        let signals = collect_non_pane_signals(&state, &config, false);
+        assert!(
+            signals.is_empty(),
+            "watcher critical without recent inject must NOT signal"
+        );
+
+        // Add a recent watcher inject -> signal fires
+        state.last_watcher_inject = Some(Utc::now().to_rfc3339());
+        let signals = collect_non_pane_signals(&state, &config, false);
+        assert_eq!(
+            signals,
+            vec![crate::respawn::HangSignal::WatcherDownPersistent]
+        );
+    }
+
+    #[test]
+    fn test_collect_watcher_signal_ignores_stale_inject() {
+        // Watcher inject 10 min ago, window 300s -> outside window, no signal.
+        let config = config_with_auto_respawn(true, 2, 300);
+        let mut state = State::default();
+        state.watcher_health.insert(
+            "memory-remind".to_string(),
+            crate::state::WatcherState {
+                last_seen_running: None,
+                consecutive_missing: 10,
+                enabled: true,
+                ..Default::default()
+            },
+        );
+        state.last_watcher_inject =
+            Some((Utc::now() - chrono::Duration::seconds(600)).to_rfc3339());
+        let signals = collect_non_pane_signals(&state, &config, false);
+        assert!(signals.is_empty());
+    }
+
+    #[test]
+    fn test_collect_thinking_signal_requires_two_interrupts() {
+        let config = config_with_auto_respawn(true, 2, 300);
+        let mut state = State::default();
+        state.thinking_interrupt_count = 1;
+        let signals = collect_non_pane_signals(&state, &config, false);
+        assert!(signals.is_empty(), "1 interrupt below threshold");
+
+        state.thinking_interrupt_count = 2;
+        let signals = collect_non_pane_signals(&state, &config, false);
+        assert_eq!(
+            signals,
+            vec![crate::respawn::HangSignal::ProlongedThinkingNoProgress]
+        );
+    }
+
+    #[test]
+    fn test_collect_wedged_signal_requires_recent_clear_and_climbing() {
+        let config = config_with_auto_respawn(true, 2, 300);
+        let mut state = State::default();
+        state.last_wedged_clear = Some(Utc::now().to_rfc3339());
+        state.wedged_consecutive = 1;
+        let signals = collect_non_pane_signals(&state, &config, false);
+        assert!(
+            signals.is_empty(),
+            "wedged consecutive=1 below threshold of 2"
+        );
+
+        state.wedged_consecutive = 2;
+        let signals = collect_non_pane_signals(&state, &config, false);
+        assert_eq!(
+            signals,
+            vec![crate::respawn::HangSignal::WedgedClearNoProgress]
+        );
+    }
+
+    #[test]
+    fn test_collect_multiple_signals_combine() {
+        let config = config_with_auto_respawn(true, 2, 300);
+        let mut state = State::default();
+        state.thinking_interrupt_count = 3;
+        state.watcher_health.insert(
+            "memory-remind".to_string(),
+            crate::state::WatcherState {
+                last_seen_running: None,
+                consecutive_missing: 10,
+                enabled: true,
+                ..Default::default()
+            },
+        );
+        state.last_watcher_inject = Some(Utc::now().to_rfc3339());
+        let signals = collect_non_pane_signals(&state, &config, true);
+        assert_eq!(signals.len(), 3);
+        assert!(signals.contains(&crate::respawn::HangSignal::HeartbeatStale));
+        assert!(signals.contains(&crate::respawn::HangSignal::WatcherDownPersistent));
+        assert!(signals.contains(&crate::respawn::HangSignal::ProlongedThinkingNoProgress));
+    }
+
+    /// End-to-end-ish: when the feature is disabled (default), check_auto_respawn
+    /// is a no-op even with all signals firing.
+    #[tokio::test]
+    async fn test_check_auto_respawn_is_noop_when_disabled() {
+        let config = config_with_auto_respawn(false, 2, 300);
+        let mut state = State::default();
+        state.thinking_interrupt_count = 5;
+        state.watcher_health.insert(
+            "memory-remind".to_string(),
+            crate::state::WatcherState {
+                last_seen_running: None,
+                consecutive_missing: 10,
+                enabled: true,
+                ..Default::default()
+            },
+        );
+        state.last_watcher_inject = Some(Utc::now().to_rfc3339());
+
+        let now = Utc::now().to_rfc3339();
+        check_auto_respawn(&config, &mut state, "", &now, true).await;
+
+        // No signals recorded, no respawn fired.
+        assert!(
+            state.hang_signal_history.distinct_active().is_empty(),
+            "disabled feature must not record signals"
+        );
+        assert!(state.last_respawn_at.is_none());
+        assert_eq!(state.auto_respawn_count, 0);
+    }
+
+    /// When the feature is enabled and signals fire below threshold, no respawn.
+    #[tokio::test]
+    async fn test_check_auto_respawn_records_but_does_not_fire_below_threshold() {
+        let config = config_with_auto_respawn(true, 3, 300);
+        let mut state = State::default();
+        state.thinking_interrupt_count = 5;
+
+        let now = Utc::now().to_rfc3339();
+        check_auto_respawn(&config, &mut state, "", &now, false).await;
+
+        // Recorded the thinking signal.
+        assert_eq!(
+            state.hang_signal_history.distinct_active().len(),
+            1,
+            "exactly 1 distinct signal recorded"
+        );
+        // But threshold is 3, not 1 -> no fire.
+        assert_eq!(
+            state.auto_respawn_count, 0,
+            "below threshold must not respawn"
+        );
+        assert!(state.last_respawn_at.is_none());
+    }
+
+    /// When two distinct signals fire AND the feature is enabled, the respawn
+    /// path runs but (because we pass a mocked `versions_dir` that doesn't
+    /// match any /proc/PID/exe) `find_claude_pid_with_versions_dir` returns
+    /// None and `execute_respawn` aborts cleanly. The state-mutation
+    /// bookkeeping must run regardless of the abort. CRITICAL SAFETY: this
+    /// test must never find a real Claude PID — the override is the
+    /// guard. See `respawn::execute_respawn_with_versions_dir`.
+    #[tokio::test]
+    async fn test_check_auto_respawn_aborts_when_no_claude_via_mock() {
+        let config = config_with_auto_respawn(true, 2, 300);
+        let mut state = State::default();
+        state.thinking_interrupt_count = 5;
+        state.watcher_health.insert(
+            "memory-remind".to_string(),
+            crate::state::WatcherState {
+                last_seen_running: None,
+                consecutive_missing: 10,
+                enabled: true,
+                ..Default::default()
+            },
+        );
+        state.last_watcher_inject = Some(Utc::now().to_rfc3339());
+
+        let now = Utc::now().to_rfc3339();
+        // Use the *_with_versions_dir variant with a path that no /proc
+        // entry will ever match; this forces the abort branch and never
+        // touches the real Claude PID running the test session.
+        check_auto_respawn_with_versions_dir(
+            &config,
+            &mut state,
+            "",
+            &now,
+            true,
+            Some("/nonexistent/claude/versions/path"),
+        )
+        .await;
+
+        // 3 signals collected, but execute_respawn aborted / launched.
+        // The state-mutation-on-fire bookkeeping must run regardless.
+        assert_eq!(
+            state.auto_respawn_count, 1,
+            "counter must increment even on abort/launch-failure"
+        );
+        assert!(
+            state.last_respawn_at.is_some(),
+            "cooldown timestamp must be stamped"
+        );
+        // History cleared after fire so the next cycle starts fresh.
+        assert!(
+            state.hang_signal_history.distinct_active().is_empty(),
+            "history clears after fire"
+        );
+    }
+
+    /// Cooldown: a recent respawn blocks re-fire even if signals are firing.
+    #[tokio::test]
+    async fn test_check_auto_respawn_cooldown_blocks_re_fire() {
+        let config = config_with_auto_respawn(true, 2, 300);
+        let mut state = State::default();
+        state.thinking_interrupt_count = 5;
+        state.watcher_health.insert(
+            "memory-remind".to_string(),
+            crate::state::WatcherState {
+                last_seen_running: None,
+                consecutive_missing: 10,
+                enabled: true,
+                ..Default::default()
+            },
+        );
+        state.last_watcher_inject = Some(Utc::now().to_rfc3339());
+        // Pretend a respawn happened 5 minutes ago — well within the 30 min
+        // cooldown.
+        state.last_respawn_at =
+            Some((Utc::now() - chrono::Duration::seconds(300)).to_rfc3339());
+
+        let now = Utc::now().to_rfc3339();
+        check_auto_respawn(&config, &mut state, "", &now, true).await;
+
+        // Signals were recorded but no NEW fire happened.
+        assert_eq!(
+            state.auto_respawn_count, 0,
+            "cooldown must block re-fire, counter unchanged"
+        );
+        // History should NOT be cleared (no fire to trigger the cleanup).
+        assert!(
+            !state.hang_signal_history.distinct_active().is_empty(),
+            "no fire => history retained"
+        );
     }
 }

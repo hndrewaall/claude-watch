@@ -23,6 +23,16 @@ pub struct Config {
     pub task_watch: TaskWatchConfig,
     #[serde(default)]
     pub hybrid: HybridConfig,
+    #[serde(default)]
+    pub suppression: SuppressionConfig,
+    #[serde(default)]
+    pub api_retry: ApiRetryConfig,
+    /// Auto-respawn-on-hang. Default off; opt in via config to allow
+    /// claude-watch to kill + relaunch the dashboard when multiple
+    /// independent signals indicate Claude Code is wedged. See
+    /// `crate::respawn` for the design.
+    #[serde(default)]
+    pub auto_respawn_on_hang: crate::respawn::AutoRespawnConfig,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -45,7 +55,7 @@ fn default_post_interrupt_cooldown_secs() -> u64 {
     60
 }
 
-#[derive(Debug, Deserialize, Clone, Default)]
+#[derive(Debug, Default, Deserialize, Clone)]
 pub struct TmuxConfig {
     /// Known dashboard pane for Claude Code (e.g. "dashboard:0.2").
     /// Empty string = auto-detect via find_claude_pane().
@@ -55,6 +65,17 @@ pub struct TmuxConfig {
     /// Empty string = auto-detect via find_claude_pane().
     #[serde(default)]
     pub dashboard_session: String,
+    /// Settle delay (milliseconds) inserted between the ESC -> NORMAL-mode
+    /// transition and the dd/i/text sequence inside `inject_text`. Default:
+    /// 0 (disabled — fast path). Tune up only if a particular environment
+    /// shows follow-up keystrokes being garbled or eaten because Claude
+    /// Code's pane hasn't finished processing the Escape before the next
+    /// keys arrive. Most setups don't need this — the ESC loop's
+    /// per-iteration `is_insert_mode()` check already confirms each
+    /// Escape was processed before the next is sent (and PR #46 adds
+    /// explicit INSERT-mode verification after the `i` keystroke).
+    #[serde(default)]
+    pub post_escape_settle_ms: u64,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -74,10 +95,33 @@ pub struct DeadProcessConfig {
     /// (not via claude-watch restart), so pending_resume_inject is never set.
     #[serde(default = "default_fresh_inject_checks")]
     pub fresh_inject_checks: u32,
+    /// When true, suppress the `restart_claude` action (and the
+    /// `claude-crashed` alert it fires) when the main loop is actively
+    /// turning — a tool call ran within `active_window_secs`. The
+    /// `tokens == 0 && bashes == 0` predicate is point-in-time and can
+    /// briefly satisfy during a tmux pane swap, status-parser miss, or
+    /// the gap between two tool calls; restarting Claude in those moments
+    /// kills an active session. The shell-prompt confirmation is the
+    /// other safety belt and remains required, but a recent tool call is
+    /// equally strong evidence the process is alive. Default: true.
+    #[serde(default = "default_suppress_when_active")]
+    pub suppress_when_active: bool,
+    /// Window (seconds) of recent tool-call activity that counts as
+    /// "actively turning" for `suppress_when_active`. If `bashes > 0` was
+    /// last observed within this many seconds, the restart is suppressed.
+    /// Default: 60 — wider than the watcher-down window because a
+    /// dead-process false positive is more destructive (kills a live
+    /// Claude Code session) than a missed inject.
+    #[serde(default = "default_dead_process_active_window_secs")]
+    pub active_window_secs: u64,
 }
 
 fn default_fresh_inject_checks() -> u32 {
     5 // ~60s at 12s intervals
+}
+
+fn default_dead_process_active_window_secs() -> u64 {
+    60
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -86,6 +130,32 @@ pub struct FreshClearConfig {
     pub max_tokens: u64,
     pub detections_required: u32,
     pub cooldown: u64,
+    /// When true, suppress the `fresh-clear-stuck` alert and inject when
+    /// the main loop is actively turning. The token range
+    /// `[min_tokens, max_tokens)` overlaps with normal mid-turn token
+    /// counts (a small turn that has just received a few thousand tokens
+    /// from a tool call), and `bashes == 0` is point-in-time and can be
+    /// transiently true between two tool calls. Without this gate the
+    /// alert fires while Claude is mid-turn and injects "resume" into
+    /// active work. Default: true.
+    #[serde(default = "default_suppress_when_active")]
+    pub suppress_when_active: bool,
+    /// Window (seconds) of recent tool-call activity that counts as
+    /// "actively turning" for `suppress_when_active`. If `bashes > 0`
+    /// was last observed within this many seconds, the inject is
+    /// suppressed. Default: 60 — wider than the watcher-down window
+    /// because a fresh-clear false positive injects "resume" mid-turn,
+    /// which derails the active task.
+    #[serde(default = "default_fresh_clear_active_window_secs")]
+    pub active_window_secs: u64,
+}
+
+fn default_suppress_when_active() -> bool {
+    true
+}
+
+fn default_fresh_clear_active_window_secs() -> u64 {
+    60
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -148,9 +218,69 @@ pub struct WatcherMonitorConfig {
     /// Consecutive missing checks before injecting a restart prompt (default: 6 = ~60s)
     #[serde(default = "default_watcher_inject_threshold")]
     pub inject_threshold: u32,
-    /// Cooldown in seconds between watcher-missing injections (default: 300)
+    /// Cooldown in seconds between watcher-missing injections (default: 60).
+    /// Tightened 300 -> 60 on 2026-04-28: a down watcher is a hard liveness
+    /// failure (no signal, no events, no torrents getting through), so when
+    /// the previous inject didn't land we want to re-inject quickly rather
+    /// than wait 5 minutes while the user is silent.
     #[serde(default = "default_watcher_inject_cooldown")]
     pub inject_cooldown: u64,
+    /// When true, suppress the tmux-INJECT (interrupt + prompt) part of
+    /// the watcher-down alert when the main loop is actively turning
+    /// (a tool call is running, or one ran within `active_window_secs`).
+    /// The structured claude-event STILL fires so Andrew is notified
+    /// out-of-band — only the in-pane preemption is skipped. Heartbeat-
+    /// stale and other alert paths are unaffected. Default: true.
+    #[serde(default = "default_suppress_inject_when_active")]
+    pub suppress_inject_when_active: bool,
+    /// Window (seconds) of recent tool-call activity that counts as
+    /// "actively turning" for the purposes of `suppress_inject_when_active`.
+    /// If `bashes > 0` was last observed within this many seconds, the
+    /// watcher-down INJECT is suppressed. Default: 30.
+    #[serde(default = "default_active_window_secs")]
+    pub active_window_secs: u64,
+    /// Per-watcher cooldown (seconds) between daemon-side auto-restart
+    /// attempts (q-2026-04-28-5481). Distinct from `inject_cooldown`,
+    /// which gates the tmux-pane prompt inject — auto-restart spawns the
+    /// start_cmd as a detached child and doesn't disrupt the loop, so it
+    /// can fire much more aggressively. Default: 30 — ~3 check cycles at
+    /// the default 10s `general.check_interval`, which lets a wait-and-exit
+    /// watcher (claude-event-watch) get re-spawned quickly between event
+    /// deliveries while still bounding the spawn rate if a start_cmd is
+    /// crashing on launch.
+    #[serde(default = "default_auto_restart_cooldown_secs")]
+    pub auto_restart_cooldown_secs: u64,
+    /// Grace period (seconds) after `last_seen_running` during which a
+    /// missing watcher is NOT counted toward `consecutive_missing`. Short-
+    /// lived watchers (e.g. signal-wait that exits when a message arrives)
+    /// have a natural gap between exit and the main loop's restart, so we
+    /// avoid firing spurious "watcher missing" alerts every time a message
+    /// arrives. Default: 90 seconds. Lowered to 0 in e2e tests so a freshly
+    /// killed watcher fires within the inject_threshold window.
+    #[serde(default = "default_watcher_grace_secs")]
+    pub grace_secs: u64,
+    /// Quiet path (PR #48): emit a `watcher-down` claude-event after this
+    /// many consecutive missing checks. Set lower than `inject_threshold`
+    /// so the quiet path runs first; the heavyweight tmux-inject is the
+    /// fallback. Default: 3 (~30s at 10s interval).
+    #[serde(default = "default_watcher_event_threshold")]
+    pub event_threshold: u32,
+    /// Grace period (seconds) after a `watcher-down` event has been emitted
+    /// during which the tmux-inject path is suppressed. If the watcher is
+    /// still down after this many seconds, fall through to the inject path
+    /// as a fallback. Default: 60.
+    #[serde(default = "default_watcher_event_grace_secs")]
+    pub event_grace_secs: u64,
+    /// Path to the `claude-event` CLI used by the quiet path. Defaults to
+    /// `claude-event` (resolved via $PATH). Override for tests or non-standard
+    /// installs.
+    #[serde(default = "default_watcher_event_command")]
+    pub event_command: String,
+    /// The watcher name that consumes claude-events. If THIS watcher goes
+    /// down, the quiet path is useless (no consumer) and we fall straight
+    /// through to the tmux-inject path. Default: "claude-event-watch".
+    #[serde(default = "default_watcher_event_consumer_name")]
+    pub event_consumer_watcher_name: String,
 }
 
 fn default_watcher_inject_threshold() -> u32 {
@@ -158,7 +288,39 @@ fn default_watcher_inject_threshold() -> u32 {
 }
 
 fn default_watcher_inject_cooldown() -> u64 {
-    300
+    60
+}
+
+fn default_watcher_grace_secs() -> u64 {
+    90
+}
+
+fn default_suppress_inject_when_active() -> bool {
+    true
+}
+
+fn default_active_window_secs() -> u64 {
+    30
+}
+
+fn default_auto_restart_cooldown_secs() -> u64 {
+    30
+}
+
+fn default_watcher_event_threshold() -> u32 {
+    3
+}
+
+fn default_watcher_event_grace_secs() -> u64 {
+    60
+}
+
+fn default_watcher_event_command() -> String {
+    "claude-event".to_string()
+}
+
+fn default_watcher_event_consumer_name() -> String {
+    "claude-event-watch".to_string()
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -377,6 +539,117 @@ fn default_context_fallback_secs() -> u64 {
 }
 fn default_version_fallback_secs() -> u64 {
     900
+}
+
+/// Cross-gate suppression-escalation tuning. The watcher-down, fresh-/clear,
+/// and dead-process suppression gates each defer their inject when the main
+/// loop is "actively turning". That's correct in the common case but creates
+/// a starvation hazard: a long-running dispatcher window (e.g. 30+ minutes
+/// of back-to-back agents) can hold the gate open indefinitely, swallowing
+/// genuine watcher-down / context-clear / dead-process conditions for the
+/// duration. The two knobs here cap the suppression run.
+///
+/// When EITHER limit is reached on the next gate-fire, the fire force-injects
+/// regardless of `actively_turning`. Counters are shared across all three
+/// gates (a single counter on `State`) so a busy mix of fires across paths
+/// still hits the cap.
+///
+/// This was added 2026-04-28 (q-2026-04-28-2449) after `claude-event-watch`
+/// was suppressed for 33 minutes during a sustained dispatcher window;
+/// alertmanager fired ClaudeEventStale before the gate ever reopened.
+#[derive(Debug, Deserialize, Clone)]
+pub struct SuppressionConfig {
+    /// After this many consecutive suppressed fires (across all three
+    /// gates), the next fire force-injects regardless of `actively_turning`.
+    /// Default: 3 — three suppressed fires at the watcher-down 30s window
+    /// is ~3 minutes of confirmed-busy + already-failed-to-inject before
+    /// we override.
+    #[serde(default = "default_max_consecutive_suppressions")]
+    pub max_consecutive_suppressions: u32,
+    /// Wall-clock backstop (seconds) since the FIRST suppression in the
+    /// current run. If `now - first_suppression_at` exceeds this, the
+    /// next gate fire force-injects. Catches the slow-drip case where
+    /// suppressions land less often than the consecutive-counter cap
+    /// would suggest (e.g. a check that satisfies the gate every other
+    /// cycle).
+    /// Default: 600 (10 min). The 33-min real-world incident this is
+    /// designed to fix would have triggered at the 10-min mark.
+    #[serde(default = "default_max_suppression_window_secs")]
+    pub max_suppression_window_secs: u64,
+}
+
+impl Default for SuppressionConfig {
+    fn default() -> Self {
+        Self {
+            max_consecutive_suppressions: default_max_consecutive_suppressions(),
+            max_suppression_window_secs: default_max_suppression_window_secs(),
+        }
+    }
+}
+
+fn default_max_consecutive_suppressions() -> u32 {
+    3
+}
+
+fn default_max_suppression_window_secs() -> u64 {
+    600
+}
+
+/// Upstream-API retry detection.
+///
+/// When Anthropic's API returns 529 (overloaded) or transient 5xx errors,
+/// Claude Code retries with exponential backoff and prints lines like
+/// "Retrying in 24s · attempt 3/10". During the retry window the daemon's
+/// normal interrupt sites (prolonged-thinking, watcher-down, context-warning,
+/// wedged-clear) MUST suppress fires — every inject during retry resets the
+/// retry state machine and the loop never recovers.
+///
+/// Detection in `tmux::check_lines_for_api_retry()` requires both a retry
+/// marker ("Retrying in Ns" / "attempt N/M") AND an upstream-API error cue
+/// ("API Error: 5xx", "Overloaded", etc.) in the LAST ~25 pane lines, so
+/// chat-history references to the strings don't trip it.
+#[derive(Debug, Deserialize, Clone)]
+pub struct ApiRetryConfig {
+    /// Master switch. Default: true (the feature is opt-out).
+    #[serde(default = "default_api_retry_enabled")]
+    pub enabled: bool,
+    /// Number of consecutive check cycles a retry pattern must be observed
+    /// before suppression activates. Single-cycle blips would otherwise
+    /// suppress legitimate interrupts on a flicker. Default: 1 (suppress
+    /// immediately on first detection — the cost of a missed interrupt is
+    /// negligible compared to the cost of resetting the retry loop).
+    #[serde(default = "default_api_retry_consecutive")]
+    pub consecutive: u32,
+    /// Maximum seconds api_retrying state may persist before claude-watch
+    /// stops suppressing and resumes normal monitoring. Guards against
+    /// "stuck retry" where Claude Code hangs in the retry banner forever
+    /// (e.g. a network split kills outgoing requests so the retry loop
+    /// can't make progress and we still need to alert/recover). Default:
+    /// 1800 (30 min).
+    #[serde(default = "default_api_retry_max_stuck_secs")]
+    pub max_stuck_secs: u64,
+}
+
+impl Default for ApiRetryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_api_retry_enabled(),
+            consecutive: default_api_retry_consecutive(),
+            max_stuck_secs: default_api_retry_max_stuck_secs(),
+        }
+    }
+}
+
+fn default_api_retry_enabled() -> bool {
+    true
+}
+
+fn default_api_retry_consecutive() -> u32 {
+    1
+}
+
+fn default_api_retry_max_stuck_secs() -> u64 {
+    1800 // 30 minutes
 }
 
 /// Load config from well-known paths or CLAUDE_WATCH_CONFIG env var.
@@ -688,6 +961,127 @@ cooldown = 300
             parse_config(config_empty_tmux).expect("should parse with empty [tmux] section");
         assert_eq!(config.tmux.dashboard_pane, "");
         assert_eq!(config.tmux.dashboard_session, "");
+        // New knob (added 2026-04-25; combined-PR default lowered 500 -> 0,
+        // 2026-04-28 PR #43+#46): should default to 0ms (fast-path) when
+        // omitted. PR #46 adds explicit INSERT-mode verification after the
+        // `i` keystroke, so the prior 500ms cushion is no longer needed.
+        assert_eq!(config.tmux.post_escape_settle_ms, 0);
+    }
+
+    #[test]
+    fn test_post_escape_settle_ms_default_when_tmux_section_missing() {
+        // No [tmux] section at all -> TmuxConfig::default() -> 0ms (fast-path).
+        let cfg = r#"
+[general]
+check_interval = 10
+state_file = "/tmp/s.json"
+log_file = "/tmp/s.jsonl"
+legacy_log_file = "/tmp/s.log"
+
+[claude]
+max_context_tokens = 200000
+heartbeat_file = "/tmp/hb"
+relaunch_script = "/tmp/rel.sh"
+
+[dead_process]
+checks_required = 3
+restart_cooldown = 60
+
+[fresh_clear]
+min_tokens = 1000
+max_tokens = 5000
+detections_required = 2
+cooldown = 60
+
+[heartbeat]
+stale_minutes = 10
+
+[alerts]
+initial_cooldown = 60
+escalation_tiers = [60]
+max_pingme_alerts = 3
+resume_prompt = "r"
+
+[foreground_monitor]
+enabled = false
+threshold_seconds = 180
+check_interval = 3
+
+[watcher_monitor]
+enabled = false
+watchers_config = "/tmp/w.conf"
+expected_watchmen = 0
+
+[context_monitor]
+enabled = true
+threshold_percent = 75
+compact_trigger_percent = 5
+grace_period = 120
+cooldown = 300
+"#;
+        let config = parse_config(cfg).expect("should parse without [tmux] section");
+        assert_eq!(config.tmux.post_escape_settle_ms, 0);
+    }
+
+    #[test]
+    fn test_post_escape_settle_ms_explicit_override() {
+        // Explicit override in [tmux] should win over the 500ms default.
+        let cfg = r#"
+[general]
+check_interval = 10
+state_file = "/tmp/s.json"
+log_file = "/tmp/s.jsonl"
+legacy_log_file = "/tmp/s.log"
+
+[tmux]
+post_escape_settle_ms = 1500
+
+[claude]
+max_context_tokens = 200000
+heartbeat_file = "/tmp/hb"
+relaunch_script = "/tmp/rel.sh"
+
+[dead_process]
+checks_required = 3
+restart_cooldown = 60
+
+[fresh_clear]
+min_tokens = 1000
+max_tokens = 5000
+detections_required = 2
+cooldown = 60
+
+[heartbeat]
+stale_minutes = 10
+
+[alerts]
+initial_cooldown = 60
+escalation_tiers = [60]
+max_pingme_alerts = 3
+resume_prompt = "r"
+
+[foreground_monitor]
+enabled = false
+threshold_seconds = 180
+check_interval = 3
+
+[watcher_monitor]
+enabled = false
+watchers_config = "/tmp/w.conf"
+expected_watchmen = 0
+
+[context_monitor]
+enabled = true
+threshold_percent = 75
+compact_trigger_percent = 5
+grace_period = 120
+cooldown = 300
+"#;
+        let config = parse_config(cfg).expect("should parse with override");
+        assert_eq!(config.tmux.post_escape_settle_ms, 1500);
+        // Other tmux defaults should still apply (untouched in the override).
+        assert_eq!(config.tmux.dashboard_pane, "");
+        assert_eq!(config.tmux.dashboard_session, "");
     }
 
     #[test]
@@ -706,6 +1100,14 @@ cooldown = 300
         assert_eq!(config.alerts.escalation_tiers.len(), 5);
         assert!(config.foreground_monitor.enabled);
         assert!(config.watcher_monitor.enabled);
+        // Quiet-path defaults (no event_* keys in SAMPLE_CONFIG -> defaults).
+        assert_eq!(config.watcher_monitor.event_threshold, 3);
+        assert_eq!(config.watcher_monitor.event_grace_secs, 60);
+        assert_eq!(config.watcher_monitor.event_command, "claude-event");
+        assert_eq!(
+            config.watcher_monitor.event_consumer_watcher_name,
+            "claude-event-watch"
+        );
         assert!(config.reauth.enabled);
         assert_eq!(config.reauth.alert_interval_seconds, 10800);
         assert!(config.task_watch.enabled);
@@ -860,6 +1262,133 @@ cooldown = 300
         // reauth defaults should also be applied
         assert!(config.reauth.enabled);
         assert_eq!(config.reauth.alert_interval_seconds, 10800);
+    }
+
+    #[test]
+    fn test_parse_config_suppression_defaults() {
+        // [suppression] section is optional; defaults must apply when
+        // it's absent. Pin the documented defaults so future drift
+        // requires updating tests + docs together.
+        let config_no_suppression = r#"
+[general]
+check_interval = 10
+state_file = "/tmp/test-state.json"
+log_file = "/tmp/test.jsonl"
+legacy_log_file = "/tmp/test.log"
+
+[tmux]
+dashboard_pane = "dashboard:0.0"
+dashboard_session = "dashboard"
+
+[claude]
+max_context_tokens = 200000
+heartbeat_file = "/tmp/heartbeat"
+relaunch_script = "/tmp/relaunch.sh"
+
+[dead_process]
+checks_required = 3
+restart_cooldown = 300
+
+[fresh_clear]
+min_tokens = 1000
+max_tokens = 50000
+detections_required = 2
+cooldown = 120
+
+[heartbeat]
+stale_minutes = 15
+
+[alerts]
+initial_cooldown = 60
+escalation_tiers = [60, 120, 300, 600, 3600]
+max_pingme_alerts = 3
+resume_prompt = "Resume your work."
+
+[foreground_monitor]
+enabled = true
+threshold_seconds = 120
+check_interval = 10
+
+[watcher_monitor]
+enabled = true
+watchers_config = "/tmp/watchers.conf"
+expected_watchmen = 3
+
+[context_monitor]
+enabled = true
+threshold_percent = 75
+compact_trigger_percent = 5
+grace_period = 120
+cooldown = 300
+"#;
+        let config = parse_config(config_no_suppression)
+            .expect("should parse without [suppression] section");
+        assert_eq!(config.suppression.max_consecutive_suppressions, 3);
+        assert_eq!(config.suppression.max_suppression_window_secs, 600);
+    }
+
+    #[test]
+    fn test_parse_config_suppression_overrides() {
+        // Explicit [suppression] values must override the defaults.
+        let config_custom = r#"
+[general]
+check_interval = 10
+state_file = "/tmp/test-state.json"
+log_file = "/tmp/test.jsonl"
+legacy_log_file = "/tmp/test.log"
+
+[tmux]
+dashboard_pane = "dashboard:0.0"
+dashboard_session = "dashboard"
+
+[claude]
+max_context_tokens = 200000
+heartbeat_file = "/tmp/heartbeat"
+relaunch_script = "/tmp/relaunch.sh"
+
+[dead_process]
+checks_required = 3
+restart_cooldown = 300
+
+[fresh_clear]
+min_tokens = 1000
+max_tokens = 50000
+detections_required = 2
+cooldown = 120
+
+[heartbeat]
+stale_minutes = 15
+
+[alerts]
+initial_cooldown = 60
+escalation_tiers = [60, 120, 300, 600, 3600]
+max_pingme_alerts = 3
+resume_prompt = "Resume your work."
+
+[foreground_monitor]
+enabled = true
+threshold_seconds = 120
+check_interval = 10
+
+[watcher_monitor]
+enabled = true
+watchers_config = "/tmp/watchers.conf"
+expected_watchmen = 3
+
+[context_monitor]
+enabled = true
+threshold_percent = 75
+compact_trigger_percent = 5
+grace_period = 120
+cooldown = 300
+
+[suppression]
+max_consecutive_suppressions = 5
+max_suppression_window_secs = 1200
+"#;
+        let config = parse_config(config_custom).expect("should parse with [suppression] section");
+        assert_eq!(config.suppression.max_consecutive_suppressions, 5);
+        assert_eq!(config.suppression.max_suppression_window_secs, 1200);
     }
 
     #[test]
