@@ -1,4 +1,4 @@
-.PHONY: test test-verbose test-unit test-e2e test-live test-session-task test-hooks build deploy install install-hooks clean
+.PHONY: test test-verbose test-unit test-e2e test-live test-session-task test-hooks test-agent-msg test-claude-event test-self-clear test-watchers build deploy install install-hooks clean
 
 # Default: run all tests in parallel via nextest (preferred) or cargo test
 test:
@@ -45,6 +45,26 @@ test-hooks:
 	tools/hooks/tests/pre-tool-obligations-gate-hook.test
 	tools/hooks/tests/pre-agent-queue-gate-hook.test
 
+# Run the agent-msg embedded test suite (CLI for delivering async
+# messages to running Claude Code agents via the obligations gate).
+# The script's `--test` flag runs all 38 cases in-process against
+# isolated tmpdirs, no obligations side effects.
+test-agent-msg:
+	python3 tools/agent-msg/agent-msg --test
+
+# Run the claude-event + claude-event-tail unit tests.
+test-claude-event:
+	python3 tools/claude-event/tests/test_claude_event.py
+
+# Run the self-clear config-only smoke tests (the full inject flow needs
+# a live Claude Code tmux pane, which can't be reproduced in unit tests).
+test-self-clear:
+	python3 tools/watchers/tests/test_self_clear_config.py
+
+# Run the claude-event-watch fast-path smoke test.
+test-watchers: test-self-clear
+	tools/watchers/tests/test_claude_event_watch.sh
+
 # Release build
 build:
 	cargo build --release
@@ -76,6 +96,11 @@ install: build
 	@install -m 0755 tools/hooks/pre-tool-obligations-gate-hook $(BIN_DIR)/pre-tool-obligations-gate-hook
 	@install -m 0755 tools/hooks/post-tool-obligations-update-hook $(BIN_DIR)/post-tool-obligations-update-hook
 	@install -m 0755 tools/hooks/post-tool-mark-attachment-read-hook $(BIN_DIR)/post-tool-mark-attachment-read-hook
+	@install -m 0755 tools/agent-msg/agent-msg $(BIN_DIR)/agent-msg
+	@install -m 0755 tools/claude-event/claude-event $(BIN_DIR)/claude-event
+	@install -m 0755 tools/claude-event/claude-event-tail $(BIN_DIR)/claude-event-tail
+	@install -m 0755 tools/watchers/claude-event-watch $(BIN_DIR)/claude-event-watch
+	@install -m 0755 tools/watchers/self-clear $(BIN_DIR)/self-clear
 	@echo "Installed to $(BIN_DIR):"
 	@echo "  - claude-watch"
 	@echo "  - session-task"
@@ -84,6 +109,11 @@ install: build
 	@echo "  - pre-tool-obligations-gate-hook"
 	@echo "  - post-tool-obligations-update-hook"
 	@echo "  - post-tool-mark-attachment-read-hook"
+	@echo "  - agent-msg"
+	@echo "  - claude-event"
+	@echo "  - claude-event-tail"
+	@echo "  - claude-event-watch"
+	@echo "  - self-clear"
 
 # Install git pre-commit hook (warning-free build + unit/fixture tests).
 # Symlinks scripts/git-hooks/pre-commit into .git/hooks so script edits
