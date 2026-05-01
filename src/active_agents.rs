@@ -1,41 +1,147 @@
 //! `claude-watch active-agents` — read-only enumeration of live agents.
 //!
-//! Emits a minimal fact set about who is running RIGHT NOW:
+//! Emits a fact set about who is running RIGHT NOW:
 //!
 //!   - `subagents`: live child PIDs of the Claude Code main process that
 //!     are NOT watchers and NOT our own introspection commands. Reuses the
 //!     same heuristic as `agent::cmd_list` and `respawn::count_active_subagents`.
 //!     We emit raw PIDs (not agent IDs) deliberately — agent IDs would
 //!     require reading the per-session subagents JSONL directory, which is
-//!     a path-leak we explicitly want to avoid in the public-repo source.
+//!     a path-leak we explicitly want to avoid in the public-repo source
+//!     for the BARE pid set. See `agents` below for the richer mapping.
 //!
 //!   - `workloads`: labels of currently-running workloads, read from
 //!     claude-watch's own internal workload state. `running` here means the
 //!     tmux pane is still alive; we exclude completed/dead workloads.
 //!
-//! Design intent: claude-watch emits FACTS about live processes. Whoever
-//! consumes this output (e.g. a private cron shim that cross-references
-//! against `session-task queue list --json`) decides what is "expected"
-//! vs "orphaned" on its own side. claude-watch deliberately does NOT
-//! consume the queue.json schema, scope semantics, or any local-path
-//! convention. This is the abstraction line the repo failed to hold in
-//! the first iteration of #53.
+//!   - `agents` (`--with-meta` / via `agent-state`): per-agent records
+//!     {agent_id, queue_id, alive, jsonl_age_seconds}. Built by scanning
+//!     the active session's `subagents/` JSONL directory and parsing the
+//!     first user message of each transcript for a `Queue item: q-XXXX`
+//!     marker. Liveness is JSONL-mtime-based (subagents share the parent
+//!     Claude Code PID, so per-subagent /proc liveness is impossible —
+//!     we infer "still working" from the transcript being actively
+//!     appended). The default max-age is 120s, matching the typical
+//!     time between agent tool calls.
+//!
+//! Design intent: claude-watch emits FACTS about live processes + agents.
+//! Whoever consumes this output (e.g. work-queue-exporter) decides what is
+//! "expected" vs "orphaned" on its own side. claude-watch deliberately
+//! does NOT consume the queue.json schema, scope semantics, or any
+//! local-path convention. This is the abstraction line the repo failed to
+//! hold in the first iteration of #53.
 
 use serde::Serialize;
+use std::path::Path;
+use std::time::SystemTime;
 
-use crate::agent::{find_claude_pid, get_children, is_own_command, is_watcher, ChildProcess};
+use crate::agent::{
+    find_claude_pid, get_children, is_own_command, is_watcher, ChildProcess,
+};
 use crate::workload::{load_state, WorkloadState};
+
+/// Find the most-recently-modified `subagents/` directory under
+/// `~/.claude/projects/<project-slug>/<session-uuid>/subagents/`.
+///
+/// We walk the projects tree directly rather than going through
+/// `find_session_dir` (which keys off `/tmp/claude-<uid>/<slug>/<uuid>/tasks/`
+/// — those UUIDs DO NOT match the projects/ UUIDs, so the prior
+/// path-join-by-session-id was broken on real installs and silently
+/// returned nothing).
+///
+/// "Most recent" = directory with the most-recently-modified file
+/// inside (typically an agent-*.jsonl or .meta.json). Stable across
+/// new sessions; immune to project-slug renames.
+pub fn find_active_subagents_dir() -> Option<std::path::PathBuf> {
+    let home = std::env::var("HOME").ok()?;
+    let projects = std::path::PathBuf::from(home).join(".claude/projects");
+    let mut best: Option<(std::time::SystemTime, std::path::PathBuf)> = None;
+    let project_dirs = std::fs::read_dir(&projects).ok()?;
+    for project_entry in project_dirs.flatten() {
+        let session_dirs = match std::fs::read_dir(project_entry.path()) {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+        for session_entry in session_dirs.flatten() {
+            let subagents = session_entry.path().join("subagents");
+            if !subagents.is_dir() {
+                continue;
+            }
+            // Score this subagents dir by the most-recent mtime of any
+            // file in it. Empty dirs (no agents yet) get the dir's own
+            // mtime so they still register as "this session".
+            let mut newest = match std::fs::metadata(&subagents)
+                .ok()
+                .and_then(|m| m.modified().ok())
+            {
+                Some(t) => t,
+                None => continue,
+            };
+            if let Ok(children) = std::fs::read_dir(&subagents) {
+                for child in children.flatten() {
+                    if let Ok(meta) = child.metadata() {
+                        if let Ok(mt) = meta.modified() {
+                            if mt > newest {
+                                newest = mt;
+                            }
+                        }
+                    }
+                }
+            }
+            best = match best {
+                Some((t, _)) if t >= newest => best,
+                _ => Some((newest, subagents)),
+            };
+        }
+    }
+    best.map(|(_, p)| p)
+}
+
+/// Default JSONL-mtime "alive" window. An agent transcript that hasn't
+/// been touched in this many seconds is considered no-longer-running.
+/// Subagents typically write to JSONL on every tool call AND on every
+/// model turn — 120s is comfortable headroom for a long thinking pass
+/// without false-positive death.
+pub const DEFAULT_AGENT_ALIVE_MAX_AGE_SECS: u64 = 120;
 
 /// Output shape for `claude-watch active-agents [--json]`.
 #[derive(Debug, Serialize, PartialEq, Eq)]
 pub struct ActiveAgents {
     /// Live PIDs of Claude Code subagent processes (children of the main
     /// Claude PID, minus watchers + own commands). Sorted ascending for a
-    /// stable diff.
+    /// stable diff. Note: a subagent ONLY shows up here while it has an
+    /// active child tool process (Bash, etc.); during pure model thinking
+    /// it has no PID. Use `agents` for the full population.
     pub subagents: Vec<u32>,
 
     /// Labels of currently-running workloads. Sorted ascending.
     pub workloads: Vec<String>,
+
+    /// Per-agent records, one per JSONL in the active session's
+    /// `subagents/` dir. Empty when no session is detected. Always
+    /// included; consumers join on `queue_id` to map queue items to
+    /// agent liveness. Sorted by agent_id for stable diff.
+    #[serde(default)]
+    pub agents: Vec<AgentRecord>,
+}
+
+/// One agent's liveness record.
+#[derive(Debug, Serialize, PartialEq, Eq, Clone)]
+pub struct AgentRecord {
+    /// Agent ID (the `agent-XXXX` filename stem in the subagents dir).
+    pub agent_id: String,
+    /// Queue item ID parsed from the agent's first user message
+    /// (`Queue item: q-XXXX` marker), if present. None for agents
+    /// spawned without queue tracking (rare — agents from the spawn
+    /// gate always include the marker).
+    pub queue_id: Option<String>,
+    /// True iff JSONL was modified within the configured max-age window.
+    /// Subagents lack stable PIDs (they share the parent Claude PID),
+    /// so transcript-mtime is the canonical liveness signal.
+    pub alive: bool,
+    /// Seconds since JSONL was last modified. None if metadata was
+    /// unreadable (treated as `alive=false`).
+    pub jsonl_age_seconds: Option<u64>,
 }
 
 /// Pure: filter `children` down to subagent PIDs and sort.
@@ -70,6 +176,121 @@ where
     labels
 }
 
+/// Pure: extract the queue item ID from a JSONL transcript content.
+///
+/// Looks for the literal marker `Queue item: q-XXXX` anywhere in the
+/// content. The first match wins (the marker is always on the first
+/// user message — the spawn prompt — but we don't enforce position so
+/// the parser stays trivial and robust).
+///
+/// Queue id format: `q-` followed by alphanumerics or hyphens, terminated
+/// by whitespace, end-of-line, or a non-allowed char. Examples:
+///   q-2026-05-01-6087   q-bd3a   q-a50a
+pub fn extract_queue_id(content: &str) -> Option<String> {
+    let needle = "Queue item:";
+    let mut start = 0usize;
+    while let Some(pos) = content[start..].find(needle) {
+        let abs = start + pos + needle.len();
+        let rest = &content[abs..];
+        // Skip any whitespace after the colon.
+        let rest = rest.trim_start();
+        // Must start with `q-` to be a queue id.
+        if let Some(after_q) = rest.strip_prefix("q-") {
+            // Take chars until non-allowed.
+            let mut end = 0usize;
+            for (i, c) in after_q.char_indices() {
+                if c.is_ascii_alphanumeric() || c == '-' {
+                    end = i + c.len_utf8();
+                } else {
+                    break;
+                }
+            }
+            if end > 0 {
+                return Some(format!("q-{}", &after_q[..end]));
+            }
+        }
+        // Advance past this needle to look for further occurrences.
+        start = abs;
+    }
+    None
+}
+
+/// Read a JSONL file and extract the queue id from its FIRST user message.
+///
+/// We only read the first line for performance — the spawn prompt is
+/// always the first user message and contains the marker. Falls back
+/// to scanning the whole file if the first line doesn't match (cheap
+/// for the small JSONLs; rare path).
+fn extract_queue_id_from_jsonl(jsonl_path: &Path) -> Option<String> {
+    let content = std::fs::read_to_string(jsonl_path).ok()?;
+    // Fast path: just check the first line (the spawn prompt).
+    if let Some(first_line) = content.lines().next() {
+        if let Some(qid) = extract_queue_id(first_line) {
+            return Some(qid);
+        }
+    }
+    // Fallback: scan everything (handles edge cases — e.g. agents
+    // continued after a follow-up prompt that re-cites the queue id).
+    extract_queue_id(&content)
+}
+
+/// Compute alive flag + age from a JSONL mtime and `now`.
+pub fn agent_alive_from_mtime(
+    jsonl_mtime: Option<SystemTime>,
+    now: SystemTime,
+    max_age_secs: u64,
+) -> (bool, Option<u64>) {
+    match jsonl_mtime {
+        Some(mt) => match now.duration_since(mt) {
+            Ok(age) => {
+                let age_s = age.as_secs();
+                (age_s <= max_age_secs, Some(age_s))
+            }
+            // mtime in the future (clock skew, etc.) — treat as just-modified.
+            Err(_) => (true, Some(0)),
+        },
+        None => (false, None),
+    }
+}
+
+/// Scan a `subagents/` directory and build per-agent records.
+///
+/// `now` is injected so tests are deterministic.
+pub fn collect_agent_records(
+    subagents_dir: &Path,
+    now: SystemTime,
+    max_age_secs: u64,
+) -> Vec<AgentRecord> {
+    let mut out: Vec<AgentRecord> = Vec::new();
+    let entries = match std::fs::read_dir(subagents_dir) {
+        Ok(e) => e,
+        Err(_) => return out,
+    };
+    for entry in entries.flatten() {
+        let fname = entry.file_name().to_string_lossy().to_string();
+        // Match `agent-<id>.jsonl` (NOT meta.json, NOT anything else).
+        let agent_id = match fname
+            .strip_prefix("agent-")
+            .and_then(|s| s.strip_suffix(".jsonl"))
+        {
+            Some(id) => id.to_string(),
+            None => continue,
+        };
+        let path = entry.path();
+        let mtime = std::fs::metadata(&path).ok().and_then(|m| m.modified().ok());
+        let (alive, age) = agent_alive_from_mtime(mtime, now, max_age_secs);
+        let queue_id = extract_queue_id_from_jsonl(&path);
+        out.push(AgentRecord {
+            agent_id,
+            queue_id,
+            alive,
+            jsonl_age_seconds: age,
+        });
+    }
+    out.sort_by(|a, b| a.agent_id.cmp(&b.agent_id));
+    out
+}
+
 /// Production helper: ask tmux whether a pane id is alive.
 ///
 /// Mirrors the private `pane_alive` in `workload.rs` — duplicating here
@@ -96,30 +317,67 @@ fn pane_alive(pane_id: &str) -> bool {
 ///
 /// Fail-open: if no Claude PID is detected (`find_claude_pid` returns None),
 /// `subagents` is an empty Vec. Workloads still report normally — they
-/// don't depend on the Claude PID. This matches the semantics of
-/// `respawn::count_active_subagents`: when /proc isn't readable, we can't
-/// see subagents, but we also can't auto-respawn, so emitting an empty
-/// list is the safe default.
+/// don't depend on the Claude PID. `agents` is also empty when no session
+/// dir is detected.
 pub fn collect() -> ActiveAgents {
+    collect_with_max_age(DEFAULT_AGENT_ALIVE_MAX_AGE_SECS)
+}
+
+/// Collect with caller-specified max-age window for agent liveness.
+pub fn collect_with_max_age(max_age_secs: u64) -> ActiveAgents {
     let subagents = match find_claude_pid() {
         Some(pid) => filter_subagent_pids(&get_children(pid)),
         None => Vec::new(),
     };
     let workloads = running_workload_labels(&load_state(), pane_alive);
+    let agents = match find_active_subagents_dir() {
+        Some(dir) => collect_agent_records(&dir, SystemTime::now(), max_age_secs),
+        None => Vec::new(),
+    };
     ActiveAgents {
         subagents,
         workloads,
+        agents,
     }
 }
 
+/// Atomic write a string to `path` via `<path>.tmp` + rename.
+fn atomic_write(path: &Path, content: &str) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, content)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
 /// CLI entry point. Returns exit code.
-pub fn cmd_active_agents(json: bool) -> i32 {
-    let agents = collect();
+///
+/// Prints to stdout (always) and OPTIONALLY also writes to
+/// `--write-state <path>` (atomic). The writeable mode is meant for cron
+/// (e.g. `* * * * * claude-watch active-agents --json --write-state
+/// /var/lib/claude-watch/active-agents.json`) so other consumers
+/// (work-queue-exporter container) can read the JSON via a bind-mount
+/// without shelling out to claude-watch.
+pub fn cmd_active_agents(json: bool, max_age_secs: u64, write_state: Option<&str>) -> i32 {
+    let agents = collect_with_max_age(max_age_secs);
+
+    // Always render JSON for the state file (machine-readable contract).
+    let json_str =
+        serde_json::to_string_pretty(&agents).unwrap_or_else(|_| "{}".to_string());
+
+    if let Some(path) = write_state {
+        if let Err(e) = atomic_write(Path::new(path), &(json_str.clone() + "\n")) {
+            eprintln!("error: failed to write state file {}: {}", path, e);
+            return 2;
+        }
+    }
+
     if json {
-        // Pretty-print so it composes cleanly with `jq` and is readable
-        // when invoked manually for debugging.
-        let s = serde_json::to_string_pretty(&agents).unwrap_or_else(|_| "{}".to_string());
-        println!("{}", s);
+        println!("{}", json_str);
     } else {
         // Human-readable, scannable in a terminal.
         if agents.subagents.is_empty() {
@@ -133,6 +391,23 @@ pub fn cmd_active_agents(json: bool) -> i32 {
         } else {
             println!("Workloads: {}", agents.workloads.join(", "));
         }
+        if agents.agents.is_empty() {
+            println!("Agents:    (none)");
+        } else {
+            println!("Agents:");
+            for a in &agents.agents {
+                let qid = a.queue_id.as_deref().unwrap_or("-");
+                let age = a
+                    .jsonl_age_seconds
+                    .map(|s| format!("{}s", s))
+                    .unwrap_or_else(|| "?".to_string());
+                let alive = if a.alive { "alive" } else { "stale" };
+                println!(
+                    "  {}  queue={}  {}  age={}",
+                    a.agent_id, qid, alive, age
+                );
+            }
+        }
     }
     0
 }
@@ -141,6 +416,7 @@ pub fn cmd_active_agents(json: bool) -> i32 {
 mod tests {
     use super::*;
     use crate::workload::WorkloadEntry;
+    use std::time::Duration;
 
     fn cp(pid: u32, cmd: &str) -> ChildProcess {
         ChildProcess {
@@ -268,6 +544,12 @@ mod tests {
         let agents = ActiveAgents {
             subagents: vec![1234, 5678],
             workloads: vec!["promote-foo".to_string(), "scan-bar".to_string()],
+            agents: vec![AgentRecord {
+                agent_id: "abc123".to_string(),
+                queue_id: Some("q-2026-05-01-6087".to_string()),
+                alive: true,
+                jsonl_age_seconds: Some(15),
+            }],
         };
         let json = serde_json::to_value(&agents).expect("serialize");
         assert_eq!(json["subagents"], serde_json::json!([1234, 5678]));
@@ -275,11 +557,18 @@ mod tests {
             json["workloads"],
             serde_json::json!(["promote-foo", "scan-bar"])
         );
-        // No extra keys leak through (e.g. internal scope tokens, paths,
-        // queue ids). The whole point of this surface is the minimum
-        // possible fact-set.
+        assert_eq!(
+            json["agents"],
+            serde_json::json!([{
+                "agent_id": "abc123",
+                "queue_id": "q-2026-05-01-6087",
+                "alive": true,
+                "jsonl_age_seconds": 15,
+            }])
+        );
+        // No extra keys leak through.
         let obj = json.as_object().expect("object");
-        assert_eq!(obj.len(), 2);
+        assert_eq!(obj.len(), 3);
     }
 
     #[test]
@@ -287,8 +576,207 @@ mod tests {
         let agents = ActiveAgents {
             subagents: vec![],
             workloads: vec![],
+            agents: vec![],
         };
         let json = serde_json::to_string(&agents).expect("serialize");
-        assert_eq!(json, r#"{"subagents":[],"workloads":[]}"#);
+        assert_eq!(
+            json,
+            r#"{"subagents":[],"workloads":[],"agents":[]}"#
+        );
+    }
+
+    // --- queue id extraction ---
+
+    #[test]
+    fn extract_queue_id_basic() {
+        let s = "Queue item: q-2026-05-01-6087\n\nAndrew DM 15:57";
+        assert_eq!(
+            extract_queue_id(s).as_deref(),
+            Some("q-2026-05-01-6087")
+        );
+    }
+
+    #[test]
+    fn extract_queue_id_short_form() {
+        let s = "blah blah Queue item: q-bd3a stuff";
+        assert_eq!(extract_queue_id(s).as_deref(), Some("q-bd3a"));
+    }
+
+    #[test]
+    fn extract_queue_id_no_marker() {
+        let s = "totally normal prompt with no marker";
+        assert_eq!(extract_queue_id(s), None);
+    }
+
+    #[test]
+    fn extract_queue_id_marker_no_qid() {
+        // Marker present but next token isn't a queue id — should NOT match.
+        let s = "Queue item: TBD";
+        assert_eq!(extract_queue_id(s), None);
+    }
+
+    #[test]
+    fn extract_queue_id_extra_whitespace() {
+        let s = "Queue item:    q-abc-123  more text";
+        assert_eq!(extract_queue_id(s).as_deref(), Some("q-abc-123"));
+    }
+
+    #[test]
+    fn extract_queue_id_terminator_punctuation() {
+        // Trailing comma should NOT be part of the id.
+        let s = "Queue item: q-2026-05-01-a50a, please do X";
+        assert_eq!(
+            extract_queue_id(s).as_deref(),
+            Some("q-2026-05-01-a50a")
+        );
+    }
+
+    #[test]
+    fn extract_queue_id_first_match_wins() {
+        let s = "Queue item: q-first ... Queue item: q-second";
+        assert_eq!(extract_queue_id(s).as_deref(), Some("q-first"));
+    }
+
+    // --- liveness ---
+
+    #[test]
+    fn agent_alive_from_mtime_fresh() {
+        let now = SystemTime::now();
+        let mt = now - Duration::from_secs(10);
+        let (alive, age) = agent_alive_from_mtime(Some(mt), now, 120);
+        assert!(alive);
+        assert_eq!(age, Some(10));
+    }
+
+    #[test]
+    fn agent_alive_from_mtime_stale() {
+        let now = SystemTime::now();
+        let mt = now - Duration::from_secs(300);
+        let (alive, age) = agent_alive_from_mtime(Some(mt), now, 120);
+        assert!(!alive);
+        assert_eq!(age, Some(300));
+    }
+
+    #[test]
+    fn agent_alive_from_mtime_at_threshold() {
+        let now = SystemTime::now();
+        let mt = now - Duration::from_secs(120);
+        let (alive, age) = agent_alive_from_mtime(Some(mt), now, 120);
+        // Exactly at threshold = still alive (<=).
+        assert!(alive);
+        assert_eq!(age, Some(120));
+    }
+
+    #[test]
+    fn agent_alive_from_mtime_none() {
+        let now = SystemTime::now();
+        let (alive, age) = agent_alive_from_mtime(None, now, 120);
+        assert!(!alive);
+        assert_eq!(age, None);
+    }
+
+    #[test]
+    fn agent_alive_from_mtime_future() {
+        // Clock skew: mtime in the future — be lenient, treat as just-modified.
+        let now = SystemTime::now();
+        let mt = now + Duration::from_secs(5);
+        let (alive, age) = agent_alive_from_mtime(Some(mt), now, 120);
+        assert!(alive);
+        assert_eq!(age, Some(0));
+    }
+
+    // --- collect_agent_records integration ---
+
+    #[test]
+    fn collect_agent_records_parses_queue_id_and_alive() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Two agents:
+        //  agent-aaaa1.jsonl: marker present, very recent mtime → alive
+        //  agent-bbbb2.jsonl: no marker, old mtime → stale, queue_id=None
+        let p1 = dir.path().join("agent-aaaa1.jsonl");
+        std::fs::write(
+            &p1,
+            r#"{"message":{"content":"Queue item: q-2026-05-01-6087\n\nDo the thing"}}
+{"message":{"content":[{"type":"text","text":"working..."}]}}
+"#,
+        )
+        .unwrap();
+        let p2 = dir.path().join("agent-bbbb2.jsonl");
+        std::fs::write(
+            &p2,
+            r#"{"message":{"content":"This prompt has no queue marker."}}
+"#,
+        )
+        .unwrap();
+
+        // Backdate agent-bbbb2 by 10 minutes via filetime so it's clearly stale.
+        // Use SystemTime::now() - 600s.
+        let stale = SystemTime::now() - Duration::from_secs(600);
+        let stale_ft = filetime::FileTime::from_system_time(stale);
+        filetime::set_file_mtime(&p2, stale_ft).unwrap();
+
+        // Also include a meta.json + a non-agent file — should be ignored.
+        std::fs::write(
+            dir.path().join("agent-aaaa1.meta.json"),
+            r#"{"description":"x","agentType":"general-purpose"}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("README.txt"), "not an agent").unwrap();
+
+        let now = SystemTime::now();
+        let records = collect_agent_records(dir.path(), now, 120);
+        assert_eq!(records.len(), 2, "{:?}", records);
+
+        // Sorted by agent_id; aaaa1 < bbbb2 lexicographically.
+        let a = &records[0];
+        assert_eq!(a.agent_id, "aaaa1");
+        assert_eq!(a.queue_id.as_deref(), Some("q-2026-05-01-6087"));
+        assert!(a.alive);
+        assert!(a.jsonl_age_seconds.unwrap_or(999) < 120);
+
+        let b = &records[1];
+        assert_eq!(b.agent_id, "bbbb2");
+        assert!(b.queue_id.is_none());
+        assert!(!b.alive);
+        assert!(b.jsonl_age_seconds.unwrap_or(0) >= 600);
+    }
+
+    #[test]
+    fn collect_agent_records_empty_dir() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let records = collect_agent_records(dir.path(), SystemTime::now(), 120);
+        assert!(records.is_empty());
+    }
+
+    #[test]
+    fn collect_agent_records_missing_dir() {
+        let records = collect_agent_records(
+            Path::new("/nonexistent/path/that/does/not/exist"),
+            SystemTime::now(),
+            120,
+        );
+        assert!(records.is_empty());
+    }
+
+    // --- atomic_write ---
+
+    #[test]
+    fn atomic_write_writes_and_replaces() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("state.json");
+        atomic_write(&path, "first\n").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "first\n");
+        atomic_write(&path, "second\n").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "second\n");
+        // No leftover .tmp.
+        assert!(!path.with_extension("json.tmp").exists());
+    }
+
+    #[test]
+    fn atomic_write_creates_parent_dir() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("nested").join("deep").join("state.json");
+        atomic_write(&path, "hi\n").unwrap();
+        assert!(path.exists());
     }
 }
