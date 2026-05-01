@@ -951,12 +951,20 @@ pub fn format_list(entries: &[WatcherEntry]) -> String {
 pub fn format_status(statuses: &[WatcherStatus]) -> String {
     let mut out = String::new();
     let mut all_healthy = true;
+    let mut down_names: Vec<String> = Vec::new();
+    let mut has_duplicate = false;
     for s in statuses {
         if s.status == "off" {
             out.push_str(&format!("{:<20} {:<9} (disabled)\n", s.name, s.status));
         } else {
             if s.status == "DOWN" || s.status == "DUPLICATE" {
                 all_healthy = false;
+            }
+            if s.status == "DOWN" {
+                down_names.push(s.name.clone());
+            }
+            if s.status == "DUPLICATE" {
+                has_duplicate = true;
             }
             out.push_str(&format!(
                 "{:<20} {:<9} ({}/{})  {}\n",
@@ -992,6 +1000,28 @@ pub fn format_status(statuses: &[WatcherStatus]) -> String {
         out.push_str("\nAll watchers healthy.\n");
     } else {
         out.push_str("\nWARNING: Some watchers are down or duplicated!\n");
+        // State-aware recovery suggestion. The footer is the canonical
+        // place for an actionable next step; the per-row text above stays
+        // pure status data so existing parsers (cron jobs, dashboards)
+        // don't have to filter prose. DUPLICATE always wins because
+        // `watcher-restart` is a superset fix (kills everything, lets
+        // supervisors respawn DOWN watchers from a clean slate); a per-
+        // watcher `watcher-ctl run <name>` wouldn't clear the duplicate
+        // pollers/supervisors.
+        if has_duplicate {
+            out.push_str(
+                "Recovery for DUPLICATE state: `watcher-restart` \
+                 (kills all watchers + cleans PID files; supervisors will respawn).\n",
+            );
+        } else if !down_names.is_empty() {
+            // DOWN-only: per-watcher restart is the surgical fix.
+            let names = down_names.join(" ");
+            out.push_str(&format!(
+                "Recovery for DOWN state: `watcher-ctl run <name>` (e.g. {}). \
+                 Or `watcher-restart` to reset everything.\n",
+                names
+            ));
+        }
     }
     out
 }
@@ -1346,6 +1376,129 @@ mod tests {
         assert!(output.contains("duplicate supervisors:"));
         // DUPLICATE keyword in the status column is also greppable
         assert!(output.contains("DUPLICATE"));
+    }
+
+    // --- State-aware recovery suggestion tests (q-2026-05-01-d487) -------
+    //
+    // The footer must DIFFERENTIATE the recovery command by the failure
+    // state. DUPLICATE => `watcher-restart` (the only thing that clears
+    // duplicate pollers/supervisors); DOWN-only => per-watcher
+    // `watcher-ctl run <name>` (surgical), with `watcher-restart` as a
+    // secondary option.
+
+    #[test]
+    fn test_format_status_duplicate_suggests_watcher_restart() {
+        let statuses = vec![WatcherStatus {
+            name: "signal-wait-dm".to_string(),
+            status: "DUPLICATE".to_string(),
+            count: 3,
+            required: 1,
+            pids: "111 222 333".to_string(),
+            enabled: true,
+            dup_supervisors: Vec::new(),
+            dup_pollers: vec![111, 222, 333],
+        }];
+        let output = format_status(&statuses);
+        assert!(
+            output.contains("Recovery for DUPLICATE state:"),
+            "expected 'Recovery for DUPLICATE state:' footer, got:\n{}",
+            output
+        );
+        assert!(
+            output.contains("`watcher-restart`"),
+            "expected the literal `watcher-restart` (backticks) as the \
+             recovery command for DUPLICATE state, got:\n{}",
+            output
+        );
+        // DUPLICATE-only must NOT recommend `watcher-ctl run <name>` as
+        // the primary path: that command can't kill duplicate
+        // supervisors/pollers, so it would just leave the user in the
+        // same state.
+        assert!(
+            !output.contains("Recovery for DOWN state:"),
+            "DUPLICATE-only must not surface the DOWN recovery line, \
+             got:\n{}",
+            output
+        );
+    }
+
+    #[test]
+    fn test_format_status_down_only_suggests_watcher_ctl_run() {
+        let statuses = vec![down_status("claude-event-watch", 1)];
+        let output = format_status(&statuses);
+        assert!(
+            output.contains("Recovery for DOWN state:"),
+            "expected 'Recovery for DOWN state:' footer, got:\n{}",
+            output
+        );
+        assert!(
+            output.contains("`watcher-ctl run <name>`"),
+            "expected `watcher-ctl run <name>` as the surgical recovery \
+             command for DOWN state, got:\n{}",
+            output
+        );
+        // The footer should name the actually-DOWN watcher in the
+        // example.
+        assert!(
+            output.contains("claude-event-watch"),
+            "expected the DOWN watcher's name to appear in the recovery \
+             example, got:\n{}",
+            output
+        );
+        // `watcher-restart` should still appear as a fallback.
+        assert!(
+            output.contains("`watcher-restart`"),
+            "expected `watcher-restart` mentioned as the fallback, got:\n{}",
+            output
+        );
+    }
+
+    #[test]
+    fn test_format_status_mixed_down_and_duplicate_prefers_watcher_restart() {
+        // When DOWN and DUPLICATE coexist, `watcher-restart` is the
+        // superset fix (clears duplicates AND the supervisors will
+        // respawn the DOWN ones). The per-watcher `watcher-ctl run`
+        // path would still leave the duplicates in place, so the
+        // primary recommendation should be `watcher-restart`.
+        let statuses = vec![
+            down_status("claude-event-watch", 1),
+            WatcherStatus {
+                name: "signal-wait-dm".to_string(),
+                status: "DUPLICATE".to_string(),
+                count: 3,
+                required: 1,
+                pids: "111 222 333".to_string(),
+                enabled: true,
+                dup_supervisors: Vec::new(),
+                dup_pollers: vec![111, 222, 333],
+            },
+        ];
+        let output = format_status(&statuses);
+        assert!(
+            output.contains("Recovery for DUPLICATE state:"),
+            "DUPLICATE wins precedence in mixed state, got:\n{}",
+            output
+        );
+        assert!(
+            output.contains("`watcher-restart`"),
+            "expected `watcher-restart` as the recovery command, got:\n{}",
+            output
+        );
+    }
+
+    #[test]
+    fn test_format_status_healthy_no_recovery_footer() {
+        // The recovery hints must only appear when something is wrong;
+        // an all-healthy run should print only "All watchers healthy."
+        let statuses = vec![ok_status("signal-wait-dm", 1, 1, "1234")];
+        let output = format_status(&statuses);
+        assert!(output.contains("All watchers healthy."));
+        assert!(
+            !output.contains("Recovery for"),
+            "healthy state must not include any 'Recovery for ...' line, \
+             got:\n{}",
+            output
+        );
     }
 
     #[test]
