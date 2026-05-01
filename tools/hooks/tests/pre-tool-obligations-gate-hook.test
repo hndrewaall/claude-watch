@@ -75,6 +75,22 @@ Test cases (PreToolUse):
  72. watcher-ctl gate: subshell `$()` -> deny
  73. watcher-ctl gate: OBLIGATIONS_BYPASS=1 forces allow
  74. watcher-ctl gate: Bash-only (Read tool with watcher-text path -> allow)
+ 75. stale_ready_queue_present: empty queue -> allow
+ 76. stale_ready_queue_present: queue file missing -> allow (default-open)
+ 77. stale_ready_queue_present: malformed queue.json -> allow (default-open)
+ 78. stale_ready_queue_present: ready+pending fresh (1 min) -> allow
+ 79. stale_ready_queue_present: ready+pending stale (10 min) -> deny + ids in why
+ 80. stale_ready_queue_present: status=running not counted -> allow
+ 81. stale_ready_queue_present: blocked-pending (running peer in group) -> allow
+ 82. stale_ready_queue_present: non-head pending in group -> allow
+ 83. stale_ready_queue_present: custom threshold honored
+ 84. stale_ready_queue_present: multiple stale items -> all named, oldest first
+ 85. stale_ready_queue_present: exempt Agent allows even when stale present
+ 86. stale_ready_queue_present: exempt session-task queue register allows
+ 87. stale_ready_queue_present: scope-guard subagent bypasses (all_of with is_main_loop)
+ 88. stale_ready_queue_present: override bypasses gate
+ 89. override: pingme called when override created
+ 90. override: pingme suppressed by OBLIGATIONS_DISABLE_PINGME=1
 
 Each test uses a SEPARATE OBLIGATIONS_FILE path (not the live ~/.config/claude/
 one) by overriding via environment + an isolated state dir, so we never touch
@@ -2183,6 +2199,412 @@ def main() -> int:
                 rc == 0 and _is_allow(out),
                 f"rc={rc} out={out}",
             ))
+
+        # ---------------------------------------------------------------
+        # Tests 75-88: stale_ready_queue_present predicate.
+        #
+        # Each test starts with a clean obligations sandbox and a custom
+        # queue.json fixture under tmpdir. The predicate is registered
+        # with `queue_path` overridden to point at the fixture so the
+        # tests don't touch the live queue.
+        # ---------------------------------------------------------------
+        with tempfile.TemporaryDirectory(prefix="obligations-stale-") as td_s:
+            tmpdir_s = Path(td_s)
+            env_s, _ob_s = _make_isolated_env(tmpdir_s)
+            queue_path = tmpdir_s / "queue.json"
+
+            def _write_queue(items):
+                queue_path.write_text(json.dumps({"items": items}))
+
+            def _add_stale_ob(threshold=300, exempt=None):
+                return _add_ob(
+                    env_s,
+                    tool_pattern="*",
+                    predicate="stale_ready_queue_present",
+                    params={
+                        "queue_path": str(queue_path),
+                        "threshold_secs": threshold,
+                    },
+                    ttl=600,
+                    deny_msg="dispatch the stale queue item before unrelated work",
+                    exempt_tool_patterns=exempt,
+                )
+
+            now_ts = time.time()
+
+            def _iso(offset_secs):
+                from datetime import datetime as _dt, timezone as _tz
+                return _dt.fromtimestamp(now_ts + offset_secs,
+                                         tz=_tz.utc).isoformat()
+
+            # --- 75: empty queue -> allow ---
+            _write_queue([])
+            ob = _add_stale_ob()
+            rc, out, _err = _hook_pre(
+                {"tool_name": "Bash", "tool_input": {"command": "ls"}},
+                env_s,
+            )
+            results.append(_check(
+                "75. stale_ready_queue_present: empty queue -> allow",
+                rc == 0 and _is_allow(out),
+                f"rc={rc} out={out}",
+            ))
+            _run([str(CLI), "satisfy", ob], env_s)
+
+            # --- 76: queue file missing -> allow (default-open) ---
+            queue_path.unlink(missing_ok=True)
+            ob = _add_stale_ob()
+            rc, out, _err = _hook_pre(
+                {"tool_name": "Bash", "tool_input": {"command": "ls"}},
+                env_s,
+            )
+            results.append(_check(
+                "76. stale_ready_queue_present: queue missing -> allow (default-open)",
+                rc == 0 and _is_allow(out),
+                f"rc={rc} out={out}",
+            ))
+            _run([str(CLI), "satisfy", ob], env_s)
+
+            # --- 77: malformed queue.json -> allow (default-open) ---
+            queue_path.write_text("{not json")
+            ob = _add_stale_ob()
+            rc, out, _err = _hook_pre(
+                {"tool_name": "Bash", "tool_input": {"command": "ls"}},
+                env_s,
+            )
+            results.append(_check(
+                "77. stale_ready_queue_present: malformed -> allow (default-open)",
+                rc == 0 and _is_allow(out),
+                f"rc={rc} out={out}",
+            ))
+            _run([str(CLI), "satisfy", ob], env_s)
+
+            # --- 78: ready+pending fresh (1 min old) -> allow ---
+            _write_queue([{
+                "id": "q-fresh",
+                "status": "pending",
+                "group_id": "g-1",
+                "priority": 5,
+                "created_at": _iso(-60),
+                "summary": "fresh item",
+            }])
+            ob = _add_stale_ob()
+            rc, out, _err = _hook_pre(
+                {"tool_name": "Bash", "tool_input": {"command": "ls"}},
+                env_s,
+            )
+            results.append(_check(
+                "78. stale_ready_queue_present: fresh ready -> allow",
+                rc == 0 and _is_allow(out),
+                f"rc={rc} out={out}",
+            ))
+            _run([str(CLI), "satisfy", ob], env_s)
+
+            # --- 79: ready+pending stale (10 min) -> deny + id in why ---
+            _write_queue([{
+                "id": "q-stale-79",
+                "status": "pending",
+                "group_id": "g-1",
+                "priority": 5,
+                "created_at": _iso(-600),
+                "summary": "stale item",
+            }])
+            ob = _add_stale_ob()
+            rc, out, _err = _hook_pre(
+                {"tool_name": "Bash", "tool_input": {"command": "ls"}},
+                env_s,
+            )
+            denied = _is_deny(out)
+            reason = (out.get("hookSpecificOutput") or {}).get(
+                "permissionDecisionReason", ""
+            )
+            banner = out.get("systemMessage", "")
+            results.append(_check(
+                "79. stale_ready_queue_present: stale ready -> deny + id in why",
+                rc == 0 and denied
+                and ("q-stale-79" in reason or "q-stale-79" in banner),
+                f"rc={rc} reason={reason!r}",
+            ))
+            _run([str(CLI), "satisfy", ob], env_s)
+
+            # --- 80: status=running NOT counted (only pending) ---
+            _write_queue([{
+                "id": "q-run",
+                "status": "running",
+                "group_id": "g-1",
+                "priority": 5,
+                "created_at": _iso(-600),
+                "summary": "running item",
+            }])
+            ob = _add_stale_ob()
+            rc, out, _err = _hook_pre(
+                {"tool_name": "Bash", "tool_input": {"command": "ls"}},
+                env_s,
+            )
+            results.append(_check(
+                "80. stale_ready_queue_present: running item not counted -> allow",
+                rc == 0 and _is_allow(out),
+                f"rc={rc} out={out}",
+            ))
+            _run([str(CLI), "satisfy", ob], env_s)
+
+            # --- 81: pending blocked by running peer in same group -> allow ---
+            _write_queue([
+                {"id": "q-running-head", "status": "running", "group_id": "g-1",
+                 "priority": 5, "created_at": _iso(-1200), "summary": "head"},
+                {"id": "q-blocked", "status": "pending", "group_id": "g-1",
+                 "priority": 5, "created_at": _iso(-600), "summary": "blocked"},
+            ])
+            ob = _add_stale_ob()
+            rc, out, _err = _hook_pre(
+                {"tool_name": "Bash", "tool_input": {"command": "ls"}},
+                env_s,
+            )
+            results.append(_check(
+                "81. stale_ready_queue_present: blocked-by-running-peer -> allow",
+                rc == 0 and _is_allow(out),
+                f"rc={rc} out={out}",
+            ))
+            _run([str(CLI), "satisfy", ob], env_s)
+
+            # --- 82: non-head pending in group (lower priority) -> allow ---
+            _write_queue([
+                # Higher priority pending item is the head; lower-priority
+                # entry is not ready_now even though both are stale.
+                {"id": "q-head-pending", "status": "pending", "group_id": "g-1",
+                 "priority": 7, "created_at": _iso(-1200), "summary": "head"},
+                {"id": "q-tail-pending", "status": "pending", "group_id": "g-1",
+                 "priority": 5, "created_at": _iso(-1200), "summary": "tail"},
+            ])
+            ob = _add_stale_ob()
+            rc, out, _err = _hook_pre(
+                {"tool_name": "Bash", "tool_input": {"command": "ls"}},
+                env_s,
+            )
+            denied = _is_deny(out)
+            reason = (out.get("hookSpecificOutput") or {}).get(
+                "permissionDecisionReason", ""
+            ) + " " + out.get("systemMessage", "")
+            # Head should be flagged; tail should NOT.
+            results.append(_check(
+                "82. stale_ready_queue_present: non-head pending NOT counted",
+                rc == 0 and denied
+                and "q-head-pending" in reason
+                and "q-tail-pending" not in reason,
+                f"rc={rc} reason={reason!r}",
+            ))
+            _run([str(CLI), "satisfy", ob], env_s)
+
+            # --- 83: custom threshold honored (60s; 90s old item triggers) ---
+            _write_queue([{
+                "id": "q-90s", "status": "pending", "group_id": "g-1",
+                "priority": 5, "created_at": _iso(-90), "summary": "90s old",
+            }])
+            # threshold=60 => 90s item DOES qualify; threshold=120 => doesn't.
+            ob_low = _add_stale_ob(threshold=60)
+            rc, out, _err = _hook_pre(
+                {"tool_name": "Bash", "tool_input": {"command": "ls"}},
+                env_s,
+            )
+            denied_low = _is_deny(out)
+            _run([str(CLI), "satisfy", ob_low], env_s)
+            ob_high = _add_stale_ob(threshold=120)
+            rc, out, _err = _hook_pre(
+                {"tool_name": "Bash", "tool_input": {"command": "ls"}},
+                env_s,
+            )
+            allowed_high = _is_allow(out)
+            _run([str(CLI), "satisfy", ob_high], env_s)
+            results.append(_check(
+                "83. stale_ready_queue_present: custom threshold honored",
+                denied_low and allowed_high,
+                f"denied_low={denied_low} allowed_high={allowed_high}",
+            ))
+
+            # --- 84: multiple stale items, oldest first ---
+            _write_queue([
+                {"id": "q-old-30m", "status": "pending", "group_id": "g-1",
+                 "priority": 5, "created_at": _iso(-1800), "summary": "30m old"},
+                {"id": "q-mid-10m", "status": "pending", "group_id": "g-2",
+                 "priority": 5, "created_at": _iso(-600), "summary": "10m old"},
+            ])
+            ob = _add_stale_ob()
+            rc, out, _err = _hook_pre(
+                {"tool_name": "Bash", "tool_input": {"command": "ls"}},
+                env_s,
+            )
+            banner = out.get("systemMessage", "")
+            reason = (out.get("hookSpecificOutput") or {}).get(
+                "permissionDecisionReason", ""
+            )
+            combined = banner + " " + reason
+            # Both ids should appear; oldest first ordering: q-old-30m before q-mid-10m
+            i_old = combined.find("q-old-30m")
+            i_mid = combined.find("q-mid-10m")
+            results.append(_check(
+                "84. stale_ready_queue_present: multiple stale, oldest first",
+                rc == 0 and _is_deny(out)
+                and i_old != -1 and i_mid != -1 and i_old < i_mid,
+                f"i_old={i_old} i_mid={i_mid} combined={combined[:300]!r}",
+            ))
+            _run([str(CLI), "satisfy", ob], env_s)
+
+            # --- 85: exempt Agent tool allowed even when stale items present ---
+            _write_queue([{
+                "id": "q-stale-85", "status": "pending", "group_id": "g-1",
+                "priority": 5, "created_at": _iso(-600), "summary": "stale",
+            }])
+            ob = _add_stale_ob(exempt=["Agent"])
+            rc, out, _err = _hook_pre(
+                {"tool_name": "Agent",
+                 "tool_input": {"prompt": "Queue item: q-stale-85\nDo X"}},
+                env_s,
+            )
+            results.append(_check(
+                "85. stale_ready_queue_present: Agent exempt -> allow",
+                rc == 0 and _is_allow(out),
+                f"rc={rc} out={out}",
+            ))
+            # Sanity: a non-exempt Bash call IS denied with the same obligation.
+            rc2, out2, _e2 = _hook_pre(
+                {"tool_name": "Bash", "tool_input": {"command": "ls"}}, env_s,
+            )
+            results.append(_check(
+                "85b. stale_ready_queue_present: non-exempt Bash still denied",
+                rc2 == 0 and _is_deny(out2),
+                f"rc={rc2} out={out2}",
+            ))
+            _run([str(CLI), "satisfy", ob], env_s)
+
+            # --- 86: exempt session-task queue register/spawn-check allowed ---
+            ob = _add_stale_ob(exempt=[
+                "Bash:^session-task queue (register|spawn-check|add|abandon|done)\\b",
+            ])
+            rc, out, _err = _hook_pre(
+                {"tool_name": "Bash",
+                 "tool_input": {"command":
+                                "session-task queue register q-stale-85"}},
+                env_s,
+            )
+            results.append(_check(
+                "86. stale_ready_queue_present: session-task queue register exempt",
+                rc == 0 and _is_allow(out),
+                f"rc={rc} out={out}",
+            ))
+            _run([str(CLI), "satisfy", ob], env_s)
+
+            # --- 87: scope-guard subagent bypass via all_of[is_main_loop, X] ---
+            # Register an obligation that's main-loop-only via all_of.
+            proc_add = _run([
+                str(CLI), "add",
+                "--tool-pattern", "*",
+                "--predicate", "all_of",
+                "--params", json.dumps({"predicates": [
+                    {"kind": "is_main_loop", "params": {}},
+                    {"kind": "stale_ready_queue_present",
+                     "params": {"queue_path": str(queue_path)}},
+                ]}),
+                "--ttl", "600",
+                "--deny-msg", "dispatch stale queue item",
+                "--created-by", "test",
+                "--json",
+            ], env_s)
+            ob_id = json.loads(proc_add.stdout)["id"]
+            # Subagent call (agent_id present) -> scope-guard inactive -> allow
+            rc, out, _err = _hook_pre(
+                {"tool_name": "Bash", "tool_input": {"command": "ls"},
+                 "agent_id": "subagent-xyz"},
+                env_s,
+            )
+            sub_allow = _is_allow(out)
+            # Main-loop call (no agent_id) -> predicate fires -> deny
+            rc2, out2, _e2 = _hook_pre(
+                {"tool_name": "Bash", "tool_input": {"command": "ls"}}, env_s,
+            )
+            main_deny = _is_deny(out2)
+            results.append(_check(
+                "87. stale_ready_queue_present: scope-guard "
+                "(subagent allow / main-loop deny)",
+                sub_allow and main_deny,
+                f"sub_allow={sub_allow} main_deny={main_deny}",
+            ))
+            _run([str(CLI), "satisfy", ob_id], env_s)
+
+            # --- 88: override bypasses gate ---
+            ob = _add_stale_ob()
+            ov_id = _add_override(env_s, "test bypass for stale", 60)
+            rc, out, _err = _hook_pre(
+                {"tool_name": "Bash", "tool_input": {"command": "ls"}},
+                env_s,
+            )
+            results.append(_check(
+                "88. stale_ready_queue_present: override bypasses gate",
+                rc == 0 and _is_allow(out),
+                f"rc={rc} out={out}",
+            ))
+            _run([str(CLI), "satisfy", ov_id], env_s)
+            _run([str(CLI), "satisfy", ob], env_s)
+
+            # --- 89: override calls pingme (when not suppressed) ---
+            # Install a fake pingme on PATH that records its argv to a file.
+            pingme_log = tmpdir_s / "pingme.log"
+            fake_bin = tmpdir_s / "fake-bin"
+            fake_bin.mkdir(parents=True, exist_ok=True)
+            fake_pingme = fake_bin / "pingme"
+            fake_pingme.write_text(
+                "#!/usr/bin/env bash\n"
+                f"echo \"$@\" >> {pingme_log}\n"
+                "exit 0\n"
+            )
+            fake_pingme.chmod(0o755)
+            env_pm = env_s.copy()
+            env_pm["PATH"] = f"{fake_bin}:{env_s.get('PATH','')}"
+            # Make sure the suppression is OFF for this test (it's set in
+            # the outer test invocation env, but we want to actively
+            # exercise the call path here).
+            env_pm.pop("OBLIGATIONS_DISABLE_PINGME", None)
+            # Create the override.
+            proc = _run([
+                str(CLI), "override", "test pingme override",
+                "--duration", "120",
+                "--created-by", "test",
+                "--json",
+            ], env_pm)
+            ov_pm_id = (json.loads(proc.stdout)["id"]
+                        if proc.returncode == 0 else "")
+            pingme_called = (
+                pingme_log.exists()
+                and ov_pm_id in pingme_log.read_text()
+                and "test pingme override" in pingme_log.read_text()
+            )
+            results.append(_check(
+                "89. override: pingme called with override id + reason + duration",
+                proc.returncode == 0 and pingme_called,
+                f"rc={proc.returncode} pingme_log_exists={pingme_log.exists()} "
+                f"contents={pingme_log.read_text() if pingme_log.exists() else None!r}",
+            ))
+            if ov_pm_id:
+                _run([str(CLI), "satisfy", ov_pm_id], env_pm)
+
+            # --- 90: override pingme suppressed by env flag ---
+            pingme_log.unlink(missing_ok=True)
+            env_pm_off = env_pm.copy()
+            env_pm_off["OBLIGATIONS_DISABLE_PINGME"] = "1"
+            proc = _run([
+                str(CLI), "override", "suppressed override",
+                "--duration", "120",
+                "--created-by", "test",
+                "--json",
+            ], env_pm_off)
+            ov_off_id = (json.loads(proc.stdout)["id"]
+                         if proc.returncode == 0 else "")
+            results.append(_check(
+                "90. override: pingme suppressed by OBLIGATIONS_DISABLE_PINGME",
+                proc.returncode == 0 and not pingme_log.exists(),
+                f"rc={proc.returncode} pingme_log_exists={pingme_log.exists()}",
+            ))
+            if ov_off_id:
+                _run([str(CLI), "satisfy", ov_off_id], env_pm_off)
 
     total = len(results)
     passed = sum(1 for r in results if r)
