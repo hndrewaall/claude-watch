@@ -1,0 +1,481 @@
+#!/usr/bin/env python3
+"""PreToolUse hook -- enforces the generic obligations gate.
+
+Reads the standard Claude Code PreToolUse JSON payload on stdin and consults
+``obligations check --tool ... --command-string ... --json``. If any obligations
+match the tool but are not satisfied, returns a ``permissionDecision: deny``
+with a workflow-reminder banner.
+
+Wiring (in ``~/.claude/settings.json``): point ``command`` at the installed
+hook script (``$BIN_DIR/pre-tool-obligations-gate-hook``, default
+``~/bin/pre-tool-obligations-gate-hook``)::
+
+    {
+      "hooks": {
+        "PreToolUse": [
+          {
+            "matcher": "*",
+            "hooks": [
+              {
+                "type": "command",
+                "command": "/path/to/pre-tool-obligations-gate-hook",
+                "timeout": 5
+              }
+            ]
+          }
+        ]
+      }
+    }
+
+Behavior:
+- Default-open: if the obligations CLI is missing, the JSON parse fails, or
+  any other internal error occurs, log to
+  ``~/.config/claude/obligations-hook-errors.log`` and exit 0 (allow). A
+  broken hook must NEVER blackhole the loop.
+- Bypass: if ``OBLIGATIONS_BYPASS=1`` is set in the environment, log to
+  ``~/.config/claude/obligations-bypass.log`` and exit 0.
+"""
+
+from __future__ import annotations
+
+import datetime as _dt
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+ERR_LOG_DIR = Path(os.path.expanduser("~/.config/claude"))
+ERR_LOG_PATH = ERR_LOG_DIR / "obligations-hook-errors.log"
+BYPASS_LOG_PATH = ERR_LOG_DIR / "obligations-bypass.log"
+
+
+def _allow() -> dict:
+    return {}
+
+
+def _deny(banner: str, reason: str) -> dict:
+    return {
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": reason,
+        },
+        "systemMessage": banner,
+    }
+
+
+def _log(path: Path, payload: dict) -> None:
+    """Best-effort append-only log. Swallow all I/O errors."""
+    try:
+        ERR_LOG_DIR.mkdir(parents=True, exist_ok=True)
+        ts = _dt.datetime.now(_dt.timezone.utc).isoformat()
+        rec = {"ts": ts, "pid": os.getpid(), **payload}
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(rec) + "\n")
+        try:
+            path.chmod(0o600)
+        except OSError:
+            pass
+    except (OSError, ValueError):
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Hardcoded gate: `watcher-ctl run` must be a BARE invocation.
+#
+# Watchers MUST be spawned via Claude Code's `run_in_background: true` Bash
+# tool param. Shell `&` (or any compound/subshell construct) breaks the
+# architecture: the watcher gets reparented to init and is orphaned from
+# Claude Code's process tree. This gate refuses any `watcher-ctl run`
+# invocation that isn't a bare `watcher-ctl run <name>` (optionally with
+# `2>&1` for stderr merging).
+#
+# We deliberately implement this in the hook script itself (NOT as a stored
+# obligation row) because it's an architectural axiom that must be enforced
+# regardless of obligation-state corruption.
+# ---------------------------------------------------------------------------
+
+# Allowed forms:
+#   watcher-ctl run <name>
+#   watcher-ctl run <name> 2>&1
+# We accept a leading whitespace and an optional trailing whitespace; that's
+# all. <name> is a single token of safe identifier characters (letters,
+# digits, dash, underscore). NO shell metacharacters allowed in the name --
+# this rules out subshell forms like `watcher-ctl run $(echo X)` and
+# `watcher-ctl run \`whoami\`` even though they have no global operators
+# outside the name token.
+_WATCHER_BARE_RE = re.compile(
+    r"^\s*watcher-ctl\s+run\s+[A-Za-z0-9_.-]+(?:\s+2>&1)?\s*$"
+)
+
+# Match `watcher-ctl run` anywhere in the command string. We use this to
+# decide whether the gate even applies. We deliberately don't anchor at the
+# start so we catch sneaky compound commands like `cd /tmp && watcher-ctl
+# run X`.
+_WATCHER_PRESENT_RE = re.compile(r"\bwatcher-ctl\s+run\b")
+
+
+def _watcher_ctl_violation(cmd: str) -> str | None:
+    """If `cmd` violates the bare-watcher-ctl-run rule, return a deny reason.
+
+    Returns None when the command does not invoke `watcher-ctl run` at all,
+    OR when it invokes it in the bare allowed form. Returns a short
+    human-readable reason string when the command is a violation.
+    """
+    if not isinstance(cmd, str) or not cmd:
+        return None
+    if not _WATCHER_PRESENT_RE.search(cmd):
+        return None
+    # `watcher-ctl run` is present. Now check whether the WHOLE command is
+    # a bare invocation (just `watcher-ctl run X` or `watcher-ctl run X
+    # 2>&1`). Any other shape (compound, pipe, subshell, trailing &, ;,
+    # etc.) is a violation.
+    if _WATCHER_BARE_RE.match(cmd):
+        return None
+    # Pinpoint the most-likely operator for a more useful error.
+    if cmd.rstrip().endswith("&"):
+        op = "trailing `&` (shell background)"
+    elif "&&" in cmd or "||" in cmd:
+        op = "compound (`&&` / `||`)"
+    elif ";" in cmd:
+        op = "command separator `;`"
+    elif "|" in cmd:
+        op = "pipe `|`"
+    elif "$(" in cmd or "`" in cmd:
+        op = "subshell (`$(...)` or backticks)"
+    else:
+        op = "non-bare invocation"
+    return op
+
+
+def _watcher_ctl_deny(op: str, cmd: str) -> dict:
+    banner_lines = [
+        "!! BLOCKED: watcher architecture cardinal rule",
+        "!!",
+        "!! Tool: Bash",
+        f"!! Detected: {op}",
+        "!!",
+        "!! Watchers MUST be spawned by Claude Code's main loop via the",
+        "!! Bash tool's `run_in_background: true` parameter. Shell `&`,",
+        "!! pipes, subshells, and compound operators all reparent the",
+        "!! watcher to init -- it becomes ORPHANED from the start.",
+        "!!",
+        "!! WRONG: Bash(command=\"watcher-ctl run X &\")",
+        "!! WRONG: Bash(command=\"watcher-ctl run X 2>&1 &\")",
+        "!! WRONG: Bash(command=\"(watcher-ctl run X &)\")",
+        "!! WRONG: Bash(command=\"nohup watcher-ctl run X &\")",
+        "!!",
+        "!! RIGHT: Bash(command=\"watcher-ctl run X\",      run_in_background=true)",
+        "!! RIGHT: Bash(command=\"watcher-ctl run X 2>&1\", run_in_background=true)",
+        "!!",
+        "!! Re-issue the call with `run_in_background: true` and the bare",
+        "!! command (no &, no ;, no |, no &&/||, no $() or backticks).",
+        "!!",
+        "!! Hook source:   pre-tool-obligations-gate-hook (claude-watch tools/hooks/)",
+        "!! Emergency bypass: set OBLIGATIONS_BYPASS=1 (audited)",
+    ]
+    banner = "\n".join(banner_lines)
+    reason = (
+        f"watcher-ctl run must be a bare invocation; detected {op}. "
+        "Use `run_in_background: true` instead of shell `&` "
+        "(see feedback_watcher-architecture-cardinal.md)."
+    )
+    return _deny(banner, reason)
+
+
+_WHY_PATH_PREFIXES = (
+    "unread watcher output:",
+    "unread watcher outputs:",
+)
+
+
+def _split_why_paths(why: str) -> list[str]:
+    """If `why` is a path-list-style message, return the list of paths.
+
+    Returns [] if `why` is a plain narrative (no paths to enumerate). The
+    parsed paths are used to render the deny banner with one path per line
+    so the caller can directly `Read` each one without first round-tripping
+    through `obligations check --json` to enumerate them.
+    """
+    if not isinstance(why, str) or not why:
+        return []
+    body = ""
+    for prefix in _WHY_PATH_PREFIXES:
+        if why.startswith(prefix):
+            body = why[len(prefix):].strip()
+            break
+    if not body:
+        return []
+    parts = [p.strip() for p in body.split(",")]
+    return [p for p in parts if p]
+
+
+def _watcher_state_recovery(why: str) -> str | None:
+    """Return a state-aware Recovery line for the watcher-health gate.
+
+    The `watchers_healthy` predicate's `why` field carries the verbatim
+    output of `watcher-status --unhealthy-only` (one row per unhealthy
+    watcher, with a column reading `DOWN` or `DUPLICATE`). We use that
+    column to pick the right canonical recovery command:
+
+      - DUPLICATE present  =>  `watcher-restart` (the only command that
+        clears duplicate pollers/supervisors).
+      - DOWN-only          =>  `watcher-ctl run <name>` (surgical), with
+        `watcher-restart` mentioned as a fallback.
+
+    Returns None when the `why` text doesn't look like watcher-status
+    output (e.g. it's the unread-sidecar narrative, or any other
+    predicate's output) -- the caller falls back to the generic banner
+    rendering. Pure function: no I/O, no shelling out.
+    """
+    if not isinstance(why, str) or not why:
+        return None
+    # `watcher-status --unhealthy-only` rows look like:
+    #   signal-wait-dm       DUPLICATE (3/1)  111 222 333
+    #   claude-event-watch   DOWN      (0/1)
+    # We detect on the column literal -- whitespace-padded so we don't
+    # match the substring inside an arbitrary narrative.
+    has_duplicate = " DUPLICATE " in why or " DUPLICATE\n" in why
+    # DOWN can appear at end-of-line for a 0-pid row; check both.
+    has_down = " DOWN " in why or " DOWN\n" in why
+    if not (has_duplicate or has_down):
+        return None
+    if has_duplicate:
+        return (
+            "Recovery for DUPLICATE state: `watcher-restart` "
+            "(kills all watchers + cleans PID files; supervisors will respawn)."
+        )
+    # DOWN-only: name the offending watcher(s) so the surgical path is
+    # one copy-paste away.
+    down_names: list[str] = []
+    for line in why.splitlines():
+        # Match the leading-name + DOWN-column shape. The name is the
+        # first whitespace-delimited token; DOWN sits on column 2.
+        toks = line.split()
+        if len(toks) >= 2 and toks[1] == "DOWN":
+            down_names.append(toks[0])
+    if down_names:
+        names = " ".join(down_names)
+        return (
+            "Recovery for DOWN state: `watcher-ctl run <name>` "
+            f"(e.g. {names}). Or `watcher-restart` to reset everything."
+        )
+    return (
+        "Recovery for DOWN state: `watcher-ctl run <name>`. "
+        "Or `watcher-restart` to reset everything."
+    )
+
+
+def _build_banner(blocking_list, tool_name) -> str:
+    lines = [
+        "!! BLOCKED: obligations gate (1 or more outstanding obligations)",
+        "!!",
+        f"!! Tool: {tool_name}",
+        "!!",
+        "!! The following obligation(s) must be satisfied first:",
+    ]
+    for b in blocking_list[:10]:  # cap at 10 for sanity
+        lines.append(f"!!   - [{b.get('id')}] {b.get('deny_message')}")
+        why = b.get("why")
+        if why:
+            paths = _split_why_paths(why)
+            if paths:
+                # Render each path on its own indented line so the caller
+                # can scan and Read each one directly. No need to call
+                # `obligations check --json` to enumerate them.
+                lines.append("!!     why: unread watcher output(s):")
+                for p in paths:
+                    lines.append(f"!!       {p}")
+            else:
+                lines.append(f"!!     why: {why}")
+            # For watcher-health denials, append a state-aware recovery
+            # hint right under the obligation row so DOWN vs DUPLICATE
+            # gets the right canonical command.
+            recovery = _watcher_state_recovery(why)
+            if recovery:
+                lines.append(f"!!     {recovery}")
+    if len(blocking_list) > 10:
+        lines.append(f"!!   (+{len(blocking_list) - 10} more)")
+    lines += [
+        "!!",
+        "!! Inspect:  obligations list",
+        "!! Manual satisfy:  obligations satisfy <id>",
+        "!! Hook source: pre-tool-obligations-gate-hook (claude-watch tools/hooks/)",
+        "!! Emergency bypass: set OBLIGATIONS_BYPASS=1 (audited)",
+    ]
+    return "\n".join(lines)
+
+
+def _build_reason(blocking_list) -> str:
+    """Build the `permissionDecisionReason` string.
+
+    Embed the per-obligation `why` field inline so paths/details surface in
+    the most-visible place in the deny payload. Without this, the caller
+    only sees `id: deny_message` and has to round-trip through
+    `obligations check --json` to enumerate (e.g.) the unread watcher
+    output paths needed to clear the gate.
+    """
+    chunks: list[str] = []
+    for b in blocking_list[:3]:
+        head = f"{b.get('id')}: {b.get('deny_message')}"
+        why = b.get("why") or ""
+        paths = _split_why_paths(why)
+        if paths:
+            head += ":\n  " + "\n  ".join(paths)
+        elif why:
+            head += f" (why: {why})"
+        chunks.append(head)
+    out = "; ".join(chunks)
+    if len(out) > 1200:
+        out = out[:1197] + "..."
+    return out
+
+
+def _short_command_string(tool_input: dict, tool_name: str) -> str:
+    """Best-effort extraction of a 'command string' for predicate matching.
+
+    For Bash: returns the literal command. For other tools: returns a JSON
+    rendering of the input so regex predicates can target file_path etc.
+    """
+    if not isinstance(tool_input, dict):
+        return ""
+    if tool_name == "Bash":
+        cmd = tool_input.get("command", "")
+        return cmd if isinstance(cmd, str) else ""
+    # Generic best-effort string rendering for other tools.
+    try:
+        return json.dumps(tool_input, default=str)
+    except (TypeError, ValueError):
+        return str(tool_input)
+
+
+def main() -> int:
+    # Read stdin first; if anything fails, default-open.
+    try:
+        payload = json.load(sys.stdin)
+    except (json.JSONDecodeError, ValueError):
+        # Nothing to enforce against. Default-open silently.
+        print(json.dumps(_allow()))
+        return 0
+
+    if not isinstance(payload, dict):
+        print(json.dumps(_allow()))
+        return 0
+
+    tool_name = payload.get("tool_name", "")
+    if not isinstance(tool_name, str) or not tool_name:
+        print(json.dumps(_allow()))
+        return 0
+
+    tool_input = payload.get("tool_input", {})
+    cmd_str = _short_command_string(tool_input, tool_name)
+
+    # Per Claude Code's hook contract, `agent_id` appears ONLY when the tool
+    # call originates from inside a subagent. Forward it to the obligations
+    # CLI so the `is_main_loop` predicate (and any `all_of` containing it)
+    # can branch on subagent vs main-loop context. Defensive: coerce
+    # non-string / missing to "".
+    raw_agent_id = payload.get("agent_id", "")
+    agent_id = raw_agent_id.strip() if isinstance(raw_agent_id, str) else ""
+
+    # Emergency bypass
+    if os.environ.get("OBLIGATIONS_BYPASS", "").strip() not in ("", "0"):
+        _log(BYPASS_LOG_PATH, {
+            "tool_name": tool_name,
+            "command_string_preview": cmd_str[:200],
+            "agent_id": agent_id,
+        })
+        print(json.dumps(_allow()))
+        return 0
+
+    # ---------------------------------------------------------------------
+    # Hardcoded watcher-ctl run gate. See `_watcher_ctl_violation` above for
+    # the full rationale (cardinal rule: watchers must be launched via
+    # Claude Code's `run_in_background: true`, never via shell `&`).
+    # We run this BEFORE the obligations CLI dispatch so a stored-state
+    # bug can't disable the architectural axiom.
+    # ---------------------------------------------------------------------
+    if tool_name == "Bash":
+        violation = _watcher_ctl_violation(cmd_str)
+        if violation:
+            print(json.dumps(_watcher_ctl_deny(violation, cmd_str)))
+            return 0
+
+    # Locate the obligations CLI. Prefer PATH, fall back to a sibling in
+    # the claude-watch tools/ tree (when this hook is run uninstalled).
+    cli = shutil.which("obligations")
+    if not cli:
+        here = Path(__file__).resolve().parent
+        # tools/hooks/ -> tools/obligations/obligations
+        sibling = here.parent / "obligations" / "obligations"
+        if sibling.exists():
+            cli = str(sibling)
+    if not cli or not os.path.exists(cli):
+        # Tool missing -> default-open.
+        _log(ERR_LOG_PATH, {
+            "kind": "cli-missing",
+            "cli": cli,
+            "tool_name": tool_name,
+        })
+        print(json.dumps(_allow()))
+        return 0
+
+    try:
+        proc = subprocess.run(
+            [cli, "check", "--tool", tool_name,
+             "--command-string", cmd_str,
+             "--agent-id", agent_id,
+             "--json"],
+            capture_output=True, text=True, timeout=4, check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as e:
+        _log(ERR_LOG_PATH, {
+            "kind": "cli-exception",
+            "exc": str(e),
+            "tool_name": tool_name,
+        })
+        print(json.dumps(_allow()))
+        return 0
+
+    # exit codes: 0 = ok, 2 = blocking. Anything else = treat as "no decision".
+    try:
+        result = json.loads(proc.stdout) if proc.stdout.strip() else {}
+    except (json.JSONDecodeError, ValueError):
+        _log(ERR_LOG_PATH, {
+            "kind": "cli-bad-json",
+            "stdout_preview": (proc.stdout or "")[:200],
+            "stderr_preview": (proc.stderr or "")[:200],
+            "tool_name": tool_name,
+        })
+        print(json.dumps(_allow()))
+        return 0
+
+    ok = result.get("ok", True)
+    if ok:
+        print(json.dumps(_allow()))
+        return 0
+
+    blocking = result.get("blocking") or []
+    if not blocking:
+        # Inconsistent response -- default-open.
+        print(json.dumps(_allow()))
+        return 0
+
+    reason = _build_reason(blocking)
+    print(json.dumps(_deny(_build_banner(blocking, tool_name), reason)))
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except Exception as exc:  # noqa: BLE001 -- last-ditch default-open
+        try:
+            _log(ERR_LOG_PATH, {"kind": "uncaught", "exc": str(exc)})
+        except Exception:
+            pass
+        print("{}")
+        sys.exit(0)
