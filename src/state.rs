@@ -224,6 +224,35 @@ pub struct State {
     /// so Prometheus metrics can graph the suppression rate.
     #[serde(default)]
     pub api_retry_suppressions_total: u64,
+
+    // --- Auto-respawn-on-hang -------------------------------------------
+    /// Sliding-window observation history of "Claude Code is hung" signals.
+    /// Multiple independent signals must fire within
+    /// `auto_respawn_on_hang.signal_window_secs` for the auto-respawn
+    /// decision to fire. See `crate::respawn`.
+    #[serde(default)]
+    pub hang_signal_history: crate::respawn::HangSignalHistory,
+    /// Timestamp of the last auto-respawn fire (for the cooldown gate).
+    #[serde(default)]
+    pub last_respawn_at: Option<String>,
+    /// Cumulative count of auto-respawn fires (for metrics).
+    #[serde(default)]
+    pub auto_respawn_count: u32,
+    /// Cumulative count of auto-respawn fires emitted as interrupts (for
+    /// metrics — mirrors the `*_interrupts_total` naming convention).
+    #[serde(default)]
+    pub auto_respawn_interrupts_total: u64,
+    /// Hash of the last pane capture (for the PaneCaptureUnchanged signal).
+    /// Stored as a u64 of the FxHash digest. Resets to None when the pane
+    /// content changes.
+    #[serde(default)]
+    pub pane_content_hash: Option<u64>,
+    /// Timestamp of the first cycle the pane content hash matched the
+    /// current value (`pane_content_hash`). When the pane changes this
+    /// resets to None / now. The PaneCaptureUnchanged signal fires when
+    /// (now - pane_content_unchanged_since) >= pane_unchanged_secs.
+    #[serde(default)]
+    pub pane_content_unchanged_since: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

@@ -27,6 +27,12 @@ pub struct Config {
     pub suppression: SuppressionConfig,
     #[serde(default)]
     pub api_retry: ApiRetryConfig,
+    /// Auto-respawn-on-hang. Default off; opt in via config to allow
+    /// claude-watch to kill + relaunch the dashboard when multiple
+    /// independent signals indicate Claude Code is wedged. See
+    /// `crate::respawn` for the design.
+    #[serde(default)]
+    pub auto_respawn_on_hang: crate::respawn::AutoRespawnConfig,
 }
 
 #[derive(Debug, Deserialize, Clone)]

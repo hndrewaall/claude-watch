@@ -30,6 +30,7 @@ mod metrics;
 mod policy;
 mod proc_util;
 mod reminders;
+mod respawn;
 mod session_event;
 mod state;
 mod status;
