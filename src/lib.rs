@@ -2,6 +2,7 @@
 //!
 //! Exposes core modules for integration testing.
 
+pub mod active_agents;
 pub mod agent;
 pub mod cmd;
 pub mod config;
@@ -14,3 +15,4 @@ pub mod status;
 pub mod task_watch;
 pub mod tmux;
 pub mod watcher;
+pub mod workload;
