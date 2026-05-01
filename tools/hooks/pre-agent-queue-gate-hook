@@ -1,0 +1,262 @@
+#!/usr/bin/env python3
+"""PreToolUse hook for the Agent/Task tool.
+
+Enforces "STRONG" queue discipline (Andrew, 2026-04-24): every Agent tool
+invocation MUST include a ``Queue item: q-XXXX`` marker in its prompt, AND
+that queue id must exist with status == running. If not, we DENY the spawn
+via the Claude Code hook permissionDecision protocol and present a banner
+explaining the workflow.
+
+Wiring (in ``~/.claude/settings.json``): point ``command`` at the installed
+hook script (``$BIN_DIR/pre-agent-queue-gate-hook``, default
+``~/bin/pre-agent-queue-gate-hook``)::
+
+    {
+      "hooks": {
+        "PreToolUse": [
+          {
+            "matcher": "Agent",
+            "hooks": [
+              {
+                "type": "command",
+                "command": "/path/to/pre-agent-queue-gate-hook",
+                "timeout": 5
+              }
+            ]
+          }
+        ]
+      }
+    }
+
+Input: JSON on stdin with the standard Claude Code PreToolUse payload, e.g.::
+
+    {
+      "tool_name": "Agent",
+      "tool_input": {
+        "subagent_type": "general-purpose",
+        "prompt": "...Queue item: q-2026-04-24-abcd...",
+        ...
+      },
+      ...
+    }
+
+Decision protocol:
+
+- Exit 0 with JSON ``{}`` to allow (silently). Any other tool than Agent/Task
+  is a trivial allow.
+- Exit 0 with ``hookSpecificOutput.permissionDecision == "deny"`` plus a
+  ``systemMessage`` banner to block. Exit code stays 0; the *decision* field
+  is what stops the tool.
+- On any unexpected internal error, default-open (exit 0, empty output).
+  Fail-closed would turn a hook bug into a full-agent outage.
+
+Emergency bypass: set ``QUEUE_GATE_BYPASS=1`` in the environment. Bypass
+events are logged to ``~/.config/claude/queue-gate-bypass.log`` for later
+auditing.
+"""
+
+from __future__ import annotations
+
+import datetime as _dt
+import json
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+# Match both 'Agent' (modern) and 'Task' (legacy) internal tool names. Andrew
+# wrote "Agent" in the spec -- the matcher in settings.json is "Agent", but we
+# also accept Task here so that if Claude Code ever reverts/renames we still
+# enforce.
+AGENT_TOOL_NAMES = {"Agent", "Task"}
+
+# Queue id format from session-task: ``q-YYYY-MM-DD-xxxx`` (lowercase hex-ish
+# suffix). We stay permissive: 'q-' + one or more allowed chars.
+QUEUE_MARKER_RE = re.compile(r"Queue\s+item\s*:\s*(q-[0-9a-zA-Z][0-9a-zA-Z-]*)")
+
+BYPASS_LOG_DIR = Path(os.path.expanduser("~/.config/claude"))
+BYPASS_LOG_PATH = BYPASS_LOG_DIR / "queue-gate-bypass.log"
+
+
+def _allow() -> dict:
+    """Empty dict means 'no decision override' -> tool proceeds."""
+    return {}
+
+
+def _deny(reason: str, banner: str) -> dict:
+    """Build a PreToolUse deny response.
+
+    ``permissionDecision: deny`` blocks the tool. ``permissionDecisionReason``
+    surfaces on the user side (and often in Claude's context). We also include
+    ``systemMessage`` so the full banner lands verbatim in the transcript.
+    """
+    return {
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": reason,
+        },
+        "systemMessage": banner,
+    }
+
+
+def _banner(specific_reason: str) -> str:
+    return (
+        "!! BLOCKED: Agent tool spawn without valid queue discipline\n"
+        "!!\n"
+        "!! Every Agent invocation MUST include a 'Queue item: q-XXXX' marker\n"
+        "!! in its prompt, and that queue item must be status=running.\n"
+        "!!\n"
+        "!! Workflow:\n"
+        "!!   1. session-task queue add \"desc\" --scope <scope> --summary \"...\"  ->  get id\n"
+        "!!   2. session-task queue register <id>  ->  marks it running\n"
+        "!!   3. Spawn agent with 'Queue item: q-XXXX' in the prompt\n"
+        "!!   4. On completion: session-task queue done <id>\n"
+        "!!\n"
+        f"!! What was wrong: {specific_reason}\n"
+        "!!\n"
+        "!! Hook source: pre-agent-queue-gate-hook (claude-watch tools/hooks/)\n"
+        "!! Emergency bypass: set QUEUE_GATE_BYPASS=1 env var (logs)"
+    )
+
+
+def _log_bypass(tool_name: str, prompt_preview: str) -> None:
+    """Audit log for emergency bypass. Best-effort; swallow errors."""
+    try:
+        BYPASS_LOG_DIR.mkdir(parents=True, exist_ok=True)
+        ts = _dt.datetime.now(_dt.timezone.utc).isoformat()
+        with BYPASS_LOG_PATH.open("a", encoding="utf-8") as fh:
+            fh.write(
+                json.dumps(
+                    {
+                        "ts": ts,
+                        "tool_name": tool_name,
+                        "prompt_preview": prompt_preview[:200],
+                        "pid": os.getpid(),
+                    }
+                )
+                + "\n"
+            )
+        try:
+            BYPASS_LOG_PATH.chmod(0o600)
+        except OSError:
+            pass
+    except (OSError, ValueError):
+        pass
+
+
+def _queue_status(queue_id: str) -> tuple[str | None, bool]:
+    """Return (status, found) for a queue item id.
+
+    ``found=False`` means session-task queue show could not locate it.
+    ``status`` is None when not found or when the JSON lacked a 'status' field.
+    """
+    try:
+        proc = subprocess.run(
+            ["session-task", "queue", "show", queue_id],
+            capture_output=True,
+            text=True,
+            timeout=4,
+            check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        # Tool missing or hung. Default-open: don't let a broken environment
+        # block every Agent spawn.
+        return (None, False)
+
+    if proc.returncode != 0:
+        return (None, False)
+
+    try:
+        data = json.loads(proc.stdout)
+    except (json.JSONDecodeError, ValueError):
+        return (None, False)
+
+    if not isinstance(data, dict):
+        return (None, False)
+
+    status = data.get("status")
+    if isinstance(status, str):
+        return (status, True)
+    return (None, True)
+
+
+def main() -> int:
+    # Read stdin payload.
+    try:
+        payload = json.load(sys.stdin)
+    except (json.JSONDecodeError, ValueError):
+        # Malformed / empty stdin: default-open.
+        print(json.dumps(_allow()))
+        return 0
+
+    if not isinstance(payload, dict):
+        print(json.dumps(_allow()))
+        return 0
+
+    tool_name = payload.get("tool_name", "")
+    if tool_name not in AGENT_TOOL_NAMES:
+        # Some other tool -- not our concern. Should not happen if settings.json
+        # matcher is "Agent", but defend in depth.
+        print(json.dumps(_allow()))
+        return 0
+
+    tool_input = payload.get("tool_input", {})
+    if not isinstance(tool_input, dict):
+        tool_input = {}
+
+    prompt = tool_input.get("prompt", "")
+    if not isinstance(prompt, str):
+        prompt = ""
+
+    # Emergency bypass. Documented in CLAUDE.md.
+    if os.environ.get("QUEUE_GATE_BYPASS", "").strip() not in ("", "0"):
+        _log_bypass(tool_name, prompt)
+        print(json.dumps(_allow()))
+        return 0
+
+    # --- Enforcement starts here ---
+
+    match = QUEUE_MARKER_RE.search(prompt)
+    if not match:
+        reason = "no 'Queue item: q-XXXX' marker found in the Agent prompt"
+        print(json.dumps(_deny(reason, _banner(reason))))
+        return 0
+
+    queue_id = match.group(1)
+    status, found = _queue_status(queue_id)
+
+    if not found:
+        reason = (
+            f"queue id {queue_id!r} not found via "
+            "`session-task queue show` (did you forget `queue add`?)"
+        )
+        print(json.dumps(_deny(reason, _banner(reason))))
+        return 0
+
+    if status != "running":
+        reason = (
+            f"queue id {queue_id!r} status is {status!r}, expected 'running' "
+            "(run `session-task queue register <id>` before spawning)"
+        )
+        print(json.dumps(_deny(reason, _banner(reason))))
+        return 0
+
+    # Valid marker + running status -> allow.
+    print(json.dumps(_allow()))
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except Exception as exc:  # noqa: BLE001  -- last-ditch default-open
+        try:
+            sys.stderr.write(f"pre-agent-queue-gate-hook: unexpected error: {exc}\n")
+        except OSError:
+            pass
+        # Default-open on any crash so a hook bug never silences the whole
+        # Agent tool.
+        print("{}")
+        sys.exit(0)

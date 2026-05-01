@@ -1,0 +1,1809 @@
+#!/usr/bin/env python3
+"""Generic obligations gate -- enforces "must do X before Y" rules at the tool layer.
+
+Background: too many "I will always X before Y" verbal commitments evaporate
+within the same session because nothing in the harness enforces them. This tool
+lets us register a structural gate: an "obligation" is a predicate that must be
+true (OR a regex that must NOT match a command) before a particular tool may
+fire. PreToolUse hook checks every call; PostToolUse hook auto-satisfies
+obligations whose "satisfied_by" pattern matches the tool that just ran.
+
+State: ``~/.config/claude/obligations.json`` (0600), schema:
+    {
+      "obligations": [
+        {
+          "id": "ob-YYYY-MM-DD-NNNN",
+          "tool_pattern": "Bash" | "Bash:^cat" | "*",
+          "exempt_patterns": ["Bash:^watcher-ctl run", "Read"],  # optional
+          "predicate": {
+            "kind": "file_mtime_within" | "env_present" | "queue_status"
+                  | "file_exists" | "no_pipe_pattern" | "marker_file_present"
+                  | "watchers_healthy" | "is_main_loop" | "all_of"
+                  | ...,
+            "params": {...}
+          },
+          "enforcement": "gate" | "inform",   # default "gate"
+          "ttl_secs": 300,
+          "expires_at": <unix_ts | null for non-expiring>,
+          "created_at": <unix_ts>,
+          "created_by": "...",
+          "satisfied_by": {
+            "tool_pattern": "Bash",
+            "command_pattern": "^watcher-ctl run signal-wait-dm"
+          } | null,
+          "deny_message": "..."
+        }
+      ],
+      "overrides": [
+        {
+          "id": "ov-YYYY-MM-DD-NNNN",
+          "reason": "human-readable why",
+          "expires_at": <unix_ts>,
+          "created_at": <unix_ts>,
+          "created_by": "main-loop"
+        }
+      ]
+    }
+
+Two flavors of "do not block this":
+
+1. **Per-obligation exempt_patterns** (the structural fix). An obligation
+   applies iff its ``tool_pattern`` matches AND no entry in
+   ``exempt_patterns`` matches. Use to encode "this gate exists but the
+   recovery path (e.g. ``watcher-ctl run X``) must always be allowed even
+   when the predicate is failing". Exempt-pattern syntax is identical to
+   the regular ``tool_pattern`` syntax.
+
+2. **Per-call audited overrides** (the escape hatch). A short-TTL record in
+   the ``overrides`` array bypasses ALL gate-mode obligations for the
+   duration. Created via ``obligations override <reason> --duration <s>``,
+   audited to ``~/.config/claude/obligations-bypass.log``, surfaced in
+   ``obligations list``, and self-clears via TTL. Use when you need a
+   targeted bypass without permanent harness env-var pollution.
+
+Predicates COMPOSE via the meta-predicate ``all_of`` (and trivially via the
+unary ``is_main_loop`` predicate). To express "must be main loop AND <X>",
+register ``predicate: {kind: all_of, params: {predicates: [{kind: is_main_loop,
+params: {}}, {kind: <X>, params: {...}}]}}``. There is no row-level
+``main_loop_only`` flag -- the canonical way to scope an obligation to the
+main loop is ``all_of [is_main_loop, ...]``.
+
+Enforcement modes:
+  - "gate" (default): PreToolUse hook DENIES the matching tool call when the
+        predicate is unsatisfied. The classic obligation: "must do X before Y."
+  - "inform": PreToolUse hook NEVER denies. Instead, the PostToolUse hook
+        evaluates the predicate after every matching tool call and prints a
+        single-line stderr banner if it's unsatisfied. Use for soft surfacing
+        ("watcher health is degraded") that should be visible without
+        blocking forward progress.
+
+Predicate vocabulary (BOUNDED -- not Turing complete):
+  - file_mtime_within: {path, max_age_secs}
+        gate is "satisfied" when path's mtime is within max_age_secs of now
+  - file_exists: {path, negate?}
+        satisfied when path exists (negate=true => satisfied when absent)
+  - env_present: {var, value?}
+        satisfied when env var is set (and equals value if specified)
+  - queue_status: {id, status}
+        satisfied when session-task queue item id has the given status
+  - no_pipe_pattern: {regex}
+        BAN-style predicate: for Bash commands, satisfied when regex does
+        NOT match the command string. (Always satisfied for non-Bash tools.)
+  - marker_file_present: {path, negate?}
+        alias of file_exists for "you owe X" trackers
+  - process_alive: {pid_file}
+        satisfied when pid_file exists, contains a positive integer, AND
+        that PID corresponds to a live process (kill(pid, 0) succeeds).
+        Use to enforce "watcher X must actually be running RIGHT NOW" --
+        unlike file_mtime_within, this checks process liveness, not file age.
+  - process_in_pgrep: {pattern}
+        satisfied when `pgrep -f <pattern>` returns at least one PID.
+        Use for watchers / processes that don't write a PID file.
+  - watchers_healthy: {} (no params)
+        satisfied iff `watcher-status --unhealthy-only` produces no output
+        (every enabled watcher is `ok`). The "why" string on failure carries
+        the unhealthy-watchers report verbatim, so an inform-mode obligation
+        using this predicate gives the main loop a concise "X is DOWN"
+        banner after every tool call.
+  - no_pending_watcher_outputs: {} (no params)
+        satisfied iff there are no captured-but-unread watcher outputs.
+        Reads sidecars from /tmp/claude-watcher-output-pending/ -- each one
+        describes a `watcher-ctl run <name>` background task and the path of
+        its captured output file. Predicate fails if any output file has
+        been written (size > 0, mtime > registered_at) without yet being
+        Read. Auto-cleans stale sidecars (missing output file). Exempts
+        Read, Bash:^watcher-ctl, Bash:^(pgrep|pkill|ps), Bash:^cat, and
+        Bash:^obligations from the gate to avoid self-deadlock; everything
+        else must Read the captured output before proceeding.
+  - agent_inbox_empty: {path}
+        satisfied iff the JSON inbox at ``path`` is missing OR contains
+        no UNREAD messages. Accepts both schema v2 (a dict envelope
+        ``{"schema_version": 2, "messages": [...]}``) and legacy v1
+        (a bare list of message dicts -- treated as all unread). When
+        unread messages are queued, the predicate FAILS and the
+        ``why`` field contains a human-readable summary (one line per
+        unread entry: from / ts / id / text). Already-read messages
+        (``read: true`` in v2) do NOT block the gate -- they remain
+        on disk for re-read but are no longer pending work.
+        Used by the agent-msg async messaging system: an inform-mode
+        obligation registered at agent-spawn time surfaces inbox
+        contents to the subagent on the next tool call.
+  - stale_ready_queue_present: {threshold_secs?, queue_path?}
+        BAN-style predicate: returns True (satisfied = OK) iff NO items in the
+        session-task queue are ready_now AND have been waiting >= threshold_secs
+        (default 300s = 5 min). Returns False (= deny) when at least one such
+        item exists -- the main loop is sitting on a dispatchable item past the
+        stale threshold and must dispatch it (or abandon it) before doing
+        unrelated work. queue_path defaults to ~/.config/session/queue.json.
+
+        ready_now logic (mirrors session-task `_item_is_ready`): an item is
+        ready_now iff status=pending AND it is the group head AND no other
+        member of its group is currently running. Group membership is by
+        ``group_id`` field. The predicate computes this directly from
+        queue.json so it can be evaluated synchronously without shelling
+        out to session-task.
+
+        Used by cron-queue-check: when the cron emits a queue-stale-ready
+        event, it ALSO registers an obligation with this predicate so the
+        gate self-clears once the main loop dispatches (no separate
+        post-tool-satisfy needed -- the predicate flips as soon as the
+        item leaves ready+pending state).
+
+  - is_main_loop: {negate?}
+        satisfied iff the tool call is from the main session loop (i.e. the
+        hook payload's ``agent_id`` field is empty/missing). With
+        ``negate: true``, satisfied iff inside a subagent (non-empty
+        ``agent_id``).
+
+        SCOPE-GUARD ROLE INSIDE all_of: when used as a child of ``all_of``,
+        a FAILING ``is_main_loop`` short-circuits the all_of to "inactive"
+        (returns satisfied=True from the all_of). Rationale: the natural
+        way to express "this obligation only applies in <context>" is to
+        AND a scope guard with the actual rule. With strict AND, a
+        guard-failed call would propagate False -> deny, which is the
+        opposite of "skip the rule when out of scope". So inside all_of,
+        ``is_main_loop`` is treated as a precondition gate (also called a
+        scope guard or guard clause) rather than a hard predicate. As a
+        STANDALONE predicate (not inside all_of), ``is_main_loop`` retains
+        its plain-boolean semantics (True iff main loop, optionally
+        negated).
+  - all_of: {predicates: [predicate, predicate, ...]}
+        meta-predicate. Satisfied iff EVERY child predicate is satisfied
+        (logical AND), with one short-circuit exception: if any
+        ``is_main_loop`` child FAILS, the all_of returns satisfied=True
+        ("scope-guard inactive"). The empty list is trivially satisfied.
+        The ``why`` string carries the first failing child's diagnostics
+        (or the scope-skip note), so the deny banner stays actionable.
+        Children are themselves ``{kind, params}`` and may nest
+        (``all_of`` inside ``all_of`` is fine, though usually unnecessary).
+
+Subcommands: see argparse below.
+
+Locking: same fcntl.flock pattern as session-task queue.
+"""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import json
+import os
+import re
+import secrets
+import shutil
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+OBLIGATIONS_FILE = Path.home() / ".config" / "claude" / "obligations.json"
+
+# Sidecar registry for the no_pending_watcher_outputs predicate. Each
+# `watcher-ctl run <name>` invocation that runs in the background gets a JSON
+# sidecar here describing the captured output file. The PostToolUse hook (in
+# post-tool-obligations-update-hook) writes a sidecar when the bg task starts
+# and deletes the sidecar when Claude Reads the matching output file. The
+# predicate fails for any sidecar whose output file has unread content.
+def _watcher_pending_dir() -> Path:
+    """Sidecar dir for the no_pending_watcher_outputs predicate. Default
+    /tmp/claude-watcher-output-pending/, overridable via the
+    WATCHER_PENDING_DIR env var (used by the test suite for isolation)."""
+    override = os.environ.get("WATCHER_PENDING_DIR", "").strip()
+    if override:
+        return Path(override)
+    return Path("/tmp/claude-watcher-output-pending")
+
+# Tool/command patterns exempt from the no_pending_watcher_outputs gate.
+# Without exemptions the gate would self-deadlock: the gate fires, but every
+# tool needed to clear it (Read the output, restart the watcher, diagnose
+# with pgrep/ps) would also be blocked. These patterns are checked BEFORE
+# the predicate is evaluated -- if any matches, the predicate auto-allows.
+#
+# Format: list of (tool_pattern, why) tuples. tool_pattern uses the same
+# syntax as `_tool_pattern_matches`.
+NO_PENDING_WATCHER_OUTPUTS_EXEMPT_PATTERNS = [
+    ("Read", "Read is the satisfier -- needed to clear the gate"),
+    ("Bash:^watcher-ctl\\b", "watcher-ctl needed to restart the watcher"),
+    ("Bash:^(pgrep|pkill|ps)\\b", "process diagnosis"),
+    ("Bash:^cat\\b", "alternative read path"),
+    ("Bash:^obligations\\b", "obligations CLI needed to inspect/manage gates"),
+]
+
+VALID_PREDICATE_KINDS = {
+    "file_mtime_within",
+    "file_exists",
+    "env_present",
+    "queue_status",
+    "no_pipe_pattern",
+    "marker_file_present",
+    "process_alive",
+    "process_in_pgrep",
+    "watchers_healthy",
+    "no_pending_watcher_outputs",
+    "agent_inbox_empty",
+    "is_main_loop",
+    "stale_ready_queue_present",
+    "all_of",
+}
+
+# Default location of the session-task queue file. Override via the
+# ``queue_path`` predicate param (mostly for tests).
+DEFAULT_QUEUE_PATH = Path.home() / ".config" / "session" / "queue.json"
+# Default stale threshold for stale_ready_queue_present (matches
+# DEFAULT_STALE_THRESHOLD_MIN in cron-queue-check: 5 min).
+DEFAULT_STALE_READY_THRESHOLD_SECS = 300
+
+VALID_ENFORCEMENT_MODES = {"gate", "inform"}
+
+# Hard cap on how long the watchers_healthy predicate may shell out for. Even
+# with --unhealthy-only this normally finishes in <100ms; this is a defensive
+# upper bound so a hung watcher-status can never wedge the PostToolUse hook.
+WATCHERS_HEALTHY_TIMEOUT_SECS = 3
+
+
+# ---------------------------------------------------------------------------
+# State file I/O (locked)
+# ---------------------------------------------------------------------------
+
+
+def _empty():
+    return {"obligations": [], "overrides": []}
+
+
+def _normalize_data(data):
+    """Ensure data is a dict with both 'obligations' and 'overrides' lists.
+
+    Backward-compat: existing state files predate the 'overrides' key, so we
+    silently add it when missing. Mutates ``data`` in place.
+    """
+    if not isinstance(data, dict):
+        return _empty()
+    if "obligations" not in data or not isinstance(data.get("obligations"), list):
+        data["obligations"] = []
+    if "overrides" not in data or not isinstance(data.get("overrides"), list):
+        data["overrides"] = []
+    return data
+
+
+def _open_locked():
+    """Open obligations.json with fcntl.LOCK_EX. Returns (fh, data)."""
+    OBLIGATIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(OBLIGATIONS_FILE), os.O_RDWR | os.O_CREAT, 0o600)
+    fh = os.fdopen(fd, "r+")
+    fcntl.flock(fh, fcntl.LOCK_EX)
+    fh.seek(0)
+    raw = fh.read()
+    if not raw.strip():
+        data = _empty()
+    else:
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            backup = OBLIGATIONS_FILE.with_suffix(".json.corrupt")
+            try:
+                backup.write_text(raw)
+            except OSError:
+                pass
+            data = _empty()
+    data = _normalize_data(data)
+    return fh, data
+
+
+def _write_unlock(fh, data):
+    fh.seek(0)
+    fh.truncate()
+    fh.write(json.dumps(data, indent=2) + "\n")
+    fh.flush()
+    try:
+        os.fsync(fh.fileno())
+    except OSError:
+        pass
+    fcntl.flock(fh, fcntl.LOCK_UN)
+    fh.close()
+    try:
+        OBLIGATIONS_FILE.chmod(0o600)
+    except OSError:
+        pass
+
+
+def _unlock(fh):
+    try:
+        fcntl.flock(fh, fcntl.LOCK_UN)
+    except OSError:
+        pass
+    try:
+        fh.close()
+    except OSError:
+        pass
+
+
+def _read_only():
+    """Read obligations without taking a lock. Returns the dict."""
+    if not OBLIGATIONS_FILE.exists():
+        return _empty()
+    try:
+        raw = OBLIGATIONS_FILE.read_text()
+        if not raw.strip():
+            return _empty()
+        data = json.loads(raw)
+        return _normalize_data(data)
+    except (OSError, json.JSONDecodeError):
+        return _empty()
+
+
+# ---------------------------------------------------------------------------
+# IDs and helpers
+# ---------------------------------------------------------------------------
+
+
+def _new_id():
+    day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    return f"ob-{day}-{secrets.token_hex(2)}"
+
+
+def _new_override_id():
+    day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    return f"ov-{day}-{secrets.token_hex(2)}"
+
+
+# Audit log path for override-create (separate from the env-var bypass log,
+# but we use the SAME file because both are "this call bypassed the gate"
+# events and operationally we want one place to look). The pre-tool hook
+# also writes here when OBLIGATIONS_BYPASS=1 fires.
+BYPASS_LOG_PATH = Path.home() / ".config" / "claude" / "obligations-bypass.log"
+
+
+def _audit_override(record):
+    """Append an audit record to the bypass log. Best-effort, swallows I/O errors."""
+    try:
+        BYPASS_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now(timezone.utc).isoformat()
+        with BYPASS_LOG_PATH.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps({"ts": ts, "pid": os.getpid(), **record}) + "\n")
+        try:
+            BYPASS_LOG_PATH.chmod(0o600)
+        except OSError:
+            pass
+    except (OSError, ValueError):
+        pass
+
+
+def _pingme_override(ov_id, reason, duration_secs):
+    """Fire a Pushover notification when an audited override is created.
+
+    Best-effort: any failure (missing pingme, exec error, timeout) is
+    swallowed so the override path itself never breaks. Test-suite
+    isolation: when ``OBLIGATIONS_DISABLE_PINGME=1`` is set, this is a
+    no-op (so unit tests don't spam Andrew's phone).
+
+    The notification carries the override id, reason, and duration --
+    the same data audited to obligations-bypass.log -- so a phone glance
+    is enough to know what was just bypassed and for how long.
+    """
+    if os.environ.get("OBLIGATIONS_DISABLE_PINGME", "").strip() not in ("", "0"):
+        return
+    cli = shutil.which("pingme")
+    if not cli:
+        return
+    title = "obligations override"
+    # Format duration human-friendly: <60s shows seconds, <3600 minutes,
+    # else hours. Cap precision at 1 decimal for the >60s cases.
+    if duration_secs < 60:
+        dur_str = f"{int(duration_secs)}s"
+    elif duration_secs < 3600:
+        dur_str = f"{duration_secs / 60:.1f}m".rstrip("0").rstrip(".")
+    else:
+        dur_str = f"{duration_secs / 3600:.1f}h".rstrip("0").rstrip(".")
+    body = f"{ov_id} ({dur_str}): {reason}"
+    try:
+        subprocess.run(
+            [cli, "-p", "low", body, title],
+            capture_output=True, text=True, timeout=5, check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        pass
+
+
+def _now() -> float:
+    return time.time()
+
+
+def _is_expired(ob, now=None):
+    expires_at = ob.get("expires_at")
+    if expires_at is None or expires_at == 0:
+        return False  # ttl_secs=0 means non-expiring
+    if now is None:
+        now = _now()
+    return now >= expires_at
+
+
+def _prune_expired(data, now=None):
+    """Mutate data in place, removing expired obligations + overrides.
+
+    Returns the list of dropped obligations (overrides are pruned but not
+    returned -- they're not interesting to callers).
+    """
+    if now is None:
+        now = _now()
+    keep = []
+    drop = []
+    for ob in data.get("obligations", []):
+        if _is_expired(ob, now):
+            drop.append(ob)
+        else:
+            keep.append(ob)
+    data["obligations"] = keep
+    # Overrides ALWAYS expire (TTL is required at create time). Drop any
+    # whose expires_at has passed.
+    overrides = data.get("overrides", [])
+    if isinstance(overrides, list):
+        data["overrides"] = [
+            ov for ov in overrides
+            if isinstance(ov, dict)
+            and ov.get("expires_at") is not None
+            and ov.get("expires_at", 0) > now
+        ]
+    return drop
+
+
+def _active_override(data, now=None):
+    """Return the first non-expired override (dict) or None.
+
+    Used by `_check_core` to bypass ALL gate-mode obligations when an
+    operator-issued override is in effect. The override is *not* mutated --
+    callers may inspect/audit it.
+    """
+    if now is None:
+        now = _now()
+    for ov in data.get("overrides", []) or []:
+        if not isinstance(ov, dict):
+            continue
+        exp = ov.get("expires_at")
+        if exp is None:
+            # Defensive: treat missing TTL as expired (we always set one).
+            continue
+        if exp > now:
+            return ov
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Queue introspection helpers (for the stale_ready_queue_present predicate)
+# ---------------------------------------------------------------------------
+
+
+def _parse_iso_ts(ts):
+    """Parse an ISO-8601 timestamp into a unix timestamp (float seconds since
+    epoch). Returns None on garbage input.
+
+    Accepts both ``...+00:00`` and trailing ``Z`` forms. Naive datetimes are
+    treated as UTC (the queue writes everything in UTC).
+    """
+    if not ts or not isinstance(ts, str):
+        return None
+    raw = ts.strip()
+    if not raw:
+        return None
+    # Python <3.11 doesn't accept trailing 'Z' in fromisoformat.
+    if raw.endswith("Z"):
+        raw = raw[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.timestamp()
+
+
+def _queue_item_is_ready_now(items, item):
+    """Replicate session-task's ``_item_is_ready`` logic against the bare
+    queue.json items list.
+
+    Pure function -- no I/O. An item is ready_now iff:
+      - status == "pending"
+      - it is the head of its group (highest-priority pending/running
+        member, with FIFO tiebreak by created_at)
+      - no other group member is currently running
+    """
+    if item.get("status") != "pending":
+        return False
+    group_id = item.get("group_id")
+    if not group_id:
+        # No group => degenerate single-member group containing only this
+        # item. With status=pending, it is trivially the head.
+        return True
+    # Members of the same group with status pending or running.
+    members = [
+        it for it in items
+        if it.get("group_id") == group_id
+        and it.get("status") in ("pending", "running")
+    ]
+    if not members:
+        return False
+    # Group head = running member if any (highest priority then FIFO),
+    # otherwise the highest-priority/FIFO pending member.
+    def _sort_key(it):
+        try:
+            prio = -int(it.get("priority", 5))
+        except (TypeError, ValueError):
+            prio = -5
+        return (prio, it.get("created_at", ""))
+    running = [m for m in members if m.get("status") == "running"]
+    if running:
+        # Something else in the group is running => no pending member is
+        # ready_now.
+        return False
+    head = sorted(members, key=_sort_key)[0]
+    return head.get("id") == item.get("id")
+
+
+def _stale_ready_items(queue_path, threshold_secs, now_unix):
+    """Return the list of queue items that are ready_now AND have been
+    waiting >= threshold_secs (computed from each item's created_at).
+
+    Each result dict is the raw queue item with an extra ``age_secs`` field
+    so callers can render summaries. Sorted oldest-first.
+
+    Raises if queue.json is unreadable or malformed -- callers (the
+    predicate) wrap with default-open semantics.
+    """
+    p = Path(queue_path) if not isinstance(queue_path, Path) else queue_path
+    if not p.exists():
+        return []
+    raw = p.read_text(encoding="utf-8")
+    if not raw.strip():
+        return []
+    data = json.loads(raw)
+    # queue.json may be either {"items": [...]} (the live shape) or a bare
+    # list (older shape / hand-built test fixtures).
+    if isinstance(data, dict):
+        items = data.get("items", [])
+        if not isinstance(items, list):
+            return []
+    elif isinstance(data, list):
+        items = data
+    else:
+        return []
+    out = []
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        if not _queue_item_is_ready_now(items, it):
+            continue
+        created = _parse_iso_ts(it.get("created_at", ""))
+        if created is None:
+            continue
+        age = now_unix - created
+        if age < float(threshold_secs):
+            continue
+        enriched = dict(it)
+        enriched["age_secs"] = age
+        out.append(enriched)
+    out.sort(key=lambda x: x.get("age_secs", 0), reverse=True)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Predicate evaluation
+# ---------------------------------------------------------------------------
+
+
+def _eval_predicate(pred, tool_name, command_string, agent_id=None):
+    """Return (satisfied: bool, why: str). 'satisfied' True => obligation met,
+    so the tool call is allowed. 'why' is human-readable diagnostics.
+
+    For BAN-style predicates (no_pipe_pattern), satisfied=True means the regex
+    did NOT match (i.e. the command is OK).
+
+    ``agent_id`` is the hook payload's ``agent_id`` field (empty/missing in
+    the main loop, non-empty inside a subagent). Threaded through so the
+    ``is_main_loop`` predicate -- and any future predicate that needs to
+    distinguish the main loop from subagents -- can read it. ``all_of``
+    forwards it to child predicates so the composition works at any depth.
+    """
+    kind = pred.get("kind", "")
+    params = pred.get("params", {}) or {}
+
+    if kind == "file_mtime_within":
+        path = params.get("path")
+        max_age = params.get("max_age_secs")
+        if not path or max_age is None:
+            return (True, "missing path/max_age_secs (allow by default)")
+        try:
+            full = os.path.expanduser(str(path))
+            st = os.stat(full)
+            age = _now() - st.st_mtime
+            if age <= float(max_age):
+                return (True, f"{path} mtime is {age:.1f}s old (<= {max_age}s)")
+            return (False, f"{path} mtime is {age:.1f}s old (> {max_age}s -- stale)")
+        except (OSError, ValueError):
+            return (False, f"{path} not found or unreadable")
+
+    if kind in ("file_exists", "marker_file_present"):
+        path = params.get("path")
+        negate = bool(params.get("negate", False))
+        if not path:
+            return (True, "missing path (allow by default)")
+        full = os.path.expanduser(str(path))
+        present = os.path.exists(full)
+        # Default semantics: satisfied = present. negate flips.
+        ok = (not present) if negate else present
+        if ok:
+            return (True, f"{path} exists={present} (negate={negate}) -> satisfied")
+        return (False, f"{path} exists={present} (negate={negate}) -> NOT satisfied")
+
+    if kind == "env_present":
+        var = params.get("var")
+        value = params.get("value")
+        if not var:
+            return (True, "missing var (allow)")
+        env_val = os.environ.get(var)
+        if env_val is None:
+            return (False, f"env var {var!r} not set")
+        if value is not None and env_val != value:
+            return (False, f"env var {var!r}={env_val!r}, expected {value!r}")
+        return (True, f"env var {var!r} present")
+
+    if kind == "queue_status":
+        qid = params.get("id")
+        want = params.get("status")
+        if not qid or not want:
+            return (True, "missing id/status (allow)")
+        try:
+            proc = subprocess.run(
+                ["session-task", "queue", "show", qid],
+                capture_output=True, text=True, timeout=4, check=False,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+            return (True, "session-task unavailable (default-open)")
+        if proc.returncode != 0:
+            return (False, f"queue id {qid!r} not found")
+        try:
+            d = json.loads(proc.stdout)
+        except (json.JSONDecodeError, ValueError):
+            return (True, "could not parse queue show output (default-open)")
+        got = d.get("status") if isinstance(d, dict) else None
+        if got == want:
+            return (True, f"queue {qid} status={got}")
+        return (False, f"queue {qid} status={got!r}, want {want!r}")
+
+    if kind == "no_pipe_pattern":
+        regex = params.get("regex", "")
+        if not regex:
+            return (True, "no regex configured (allow)")
+        # Only check Bash-like tools. For non-Bash tools, the predicate is N/A.
+        if tool_name not in ("Bash",):
+            return (True, f"tool {tool_name} is not Bash (predicate N/A)")
+        cmd = command_string or ""
+        try:
+            patt = re.compile(regex)
+        except re.error as e:
+            return (True, f"invalid regex (default-open): {e}")
+        if patt.search(cmd):
+            return (False, f"command matches forbidden pattern /{regex}/")
+        return (True, f"command does not match /{regex}/")
+
+    if kind == "process_alive":
+        pid_file = params.get("pid_file")
+        if not pid_file:
+            return (True, "missing pid_file (allow by default)")
+        full = os.path.expanduser(str(pid_file))
+        if not os.path.exists(full):
+            return (False, f"pid_file {pid_file} does not exist")
+        try:
+            raw = open(full, "r", encoding="utf-8").read().strip()
+        except (OSError, UnicodeDecodeError) as e:
+            return (False, f"pid_file {pid_file} unreadable: {e}")
+        if not raw:
+            return (False, f"pid_file {pid_file} is empty")
+        try:
+            pid = int(raw)
+        except ValueError:
+            return (False, f"pid_file {pid_file} contents {raw!r} is not an integer")
+        if pid <= 0:
+            return (False, f"pid_file {pid_file} contains non-positive pid {pid}")
+        # Check process liveness. Prefer /proc/<pid> (Linux), fall back to kill(pid, 0).
+        proc_path = f"/proc/{pid}"
+        if os.path.isdir(proc_path):
+            return (True, f"pid {pid} (from {pid_file}) is alive (/proc/{pid} exists)")
+        try:
+            os.kill(pid, 0)
+            return (True, f"pid {pid} (from {pid_file}) is alive (kill 0 ok)")
+        except ProcessLookupError:
+            return (False, f"pid {pid} (from {pid_file}) is not running")
+        except PermissionError:
+            # Process exists but we can't signal it -- treat as alive.
+            return (True, f"pid {pid} (from {pid_file}) exists (EPERM on kill 0)")
+        except OSError as e:
+            return (False, f"pid {pid} (from {pid_file}) liveness check failed: {e}")
+
+    if kind == "process_in_pgrep":
+        pattern = params.get("pattern", "")
+        if not pattern:
+            return (True, "missing pattern (allow by default)")
+        try:
+            proc = subprocess.run(
+                ["pgrep", "-f", str(pattern)],
+                capture_output=True, text=True, timeout=4, check=False,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as e:
+            return (True, f"pgrep unavailable (default-open): {e}")
+        # pgrep exits 0 with PIDs on stdout when matches found, 1 when none.
+        if proc.returncode == 0 and proc.stdout.strip():
+            pids = proc.stdout.strip().split()
+            return (True, f"pgrep -f {pattern!r} matched pids {pids}")
+        return (False, f"pgrep -f {pattern!r} found no matching processes")
+
+    if kind == "no_pending_watcher_outputs":
+        # Default-open on any filesystem error: a broken sidecar dir must
+        # never blackhole the loop.
+        try:
+            # Exemption short-circuit: if the tool/command being checked is one
+            # of the recovery / diagnosis / read paths needed to clear the
+            # gate, allow it through unconditionally. Without this the gate
+            # self-deadlocks (the very tools needed to satisfy it would also
+            # be blocked).
+            for exempt_pat, why in NO_PENDING_WATCHER_OUTPUTS_EXEMPT_PATTERNS:
+                if _tool_pattern_matches(exempt_pat, tool_name, command_string):
+                    return (True, f"exempt: {exempt_pat} ({why})")
+
+            # Walk the sidecar dir. Each file is a JSON describing one
+            # captured-but-possibly-unread watcher output.
+            sidecar_dir = _watcher_pending_dir()
+            if not sidecar_dir.exists():
+                return (True, "no pending watcher output sidecars")
+            unread = []
+            for sidecar_path in sorted(sidecar_dir.glob("*.json")):
+                try:
+                    sc = json.loads(sidecar_path.read_text())
+                except (OSError, json.JSONDecodeError):
+                    # Corrupt sidecar -- remove it so the gate doesn't wedge.
+                    try:
+                        sidecar_path.unlink()
+                    except OSError:
+                        pass
+                    continue
+                output_path = sc.get("output_file_path")
+                registered_at = sc.get("registered_at", 0)
+                if not output_path:
+                    try:
+                        sidecar_path.unlink()
+                    except OSError:
+                        pass
+                    continue
+                # Stat the output file. Missing file => stale sidecar => clean.
+                try:
+                    st = os.stat(output_path)
+                except OSError:
+                    try:
+                        sidecar_path.unlink()
+                    except OSError:
+                        pass
+                    continue
+                # Predicate fails iff the output file has been written since
+                # the watcher was registered (size > 0 AND mtime > registered_at).
+                if st.st_size > 0 and st.st_mtime > float(registered_at):
+                    unread.append(output_path)
+            if not unread:
+                return (True, "all pending watcher outputs are empty or read")
+            # Carry ALL unread paths in the why so the deny banner can render
+            # every path the caller needs to Read. Comma-separated for easy
+            # parse + bullet-list render in the hook formatter.
+            if len(unread) == 1:
+                return (False, f"unread watcher output: {unread[0]}")
+            return (False,
+                    "unread watcher outputs: " + ", ".join(unread))
+        except Exception as e:  # noqa: BLE001 -- default-open on any error
+            return (True, f"no_pending_watcher_outputs default-open on error: {e}")
+
+    if kind == "agent_inbox_empty":
+        # Satisfied iff the JSON inbox at `path` is absent OR contains
+        # no UNREAD messages. The inbox is the agent-msg v2 envelope:
+        #     {"schema_version": 2, "messages": [{... "read": bool ...}]}
+        # but we also accept the legacy v1 bare-list shape and treat
+        # every entry there as unread (since v1 had no read field).
+        # When unread messages are queued, the predicate fails and the
+        # `why` string carries a multi-line summary so an inform-mode
+        # obligation can surface the contents to the subagent.
+        path = params.get("path")
+        if not path:
+            return (True, "missing path (allow by default)")
+        full = os.path.expanduser(str(path))
+        if not os.path.exists(full):
+            return (True, f"inbox {path} does not exist (no messages)")
+        try:
+            raw = open(full, "r", encoding="utf-8").read()
+        except (OSError, UnicodeDecodeError) as e:
+            # Default-open: a broken inbox file must not blackhole the
+            # loop. The agent-msg arm/disarm path keeps it 0o600 + valid
+            # JSON; if something corrupted it, prefer noise-free.
+            return (True, f"inbox {path} unreadable (default-open): {e}")
+        if not raw.strip():
+            return (True, f"inbox {path} is empty (treated as no messages)")
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError as e:
+            return (True, f"inbox {path} malformed JSON (default-open): {e}")
+        # Coerce to a list of message dicts. v2: dict with "messages";
+        # v1: bare list (every entry treated as unread). Anything else
+        # is default-open.
+        if isinstance(data, dict):
+            messages = data.get("messages", [])
+            if not isinstance(messages, list):
+                return (True,
+                        f"inbox {path} v2 envelope has non-list messages "
+                        f"(default-open)")
+        elif isinstance(data, list):
+            messages = data
+        else:
+            return (True, f"inbox {path} is not a JSON array or v2 envelope "
+                          f"(default-open)")
+        if len(messages) == 0:
+            return (True, f"inbox {path} has no messages")
+        # Filter to UNREAD. A v1 entry has no "read" field -- treat as
+        # unread (legacy compat: pre-migration messages must still
+        # block). For v2 entries, read=true means already-acked and
+        # therefore satisfies the predicate (history, not pending work).
+        unread = []
+        for entry in messages:
+            if not isinstance(entry, dict):
+                # Defensive: malformed entries always count as unread
+                # so the agent gets a chance to inspect them.
+                unread.append(entry)
+                continue
+            if not entry.get("read"):
+                unread.append(entry)
+        if len(unread) == 0:
+            return (True,
+                    f"inbox {path} has {len(messages)} message(s), all read "
+                    f"(no unread to surface)")
+        # Non-empty unread set: build a banner-friendly summary. Header
+        # line names the inbox path so the subagent knows where to ack
+        # it; per-entry lines show from / ts / text (truncated).
+        total = len(messages)
+        lines = [f"AGENT INBOX has {len(unread)} unread message(s) "
+                 f"({total} total) at {path}:"]
+        for idx, entry in enumerate(unread):
+            if not isinstance(entry, dict):
+                lines.append(f"  [{idx}] (malformed entry: {entry!r})")
+                continue
+            sender = entry.get("from", "?")
+            ts = entry.get("ts", "?")
+            qi = entry.get("queue_item")
+            mid = entry.get("id")
+            text = entry.get("text", "")
+            if not isinstance(text, str):
+                text = str(text)
+            # Cap each message body at 240 chars so a runaway inbox
+            # doesn't flood the banner.
+            if len(text) > 240:
+                text = text[:237] + "..."
+            qi_part = f" [q={qi}]" if qi else ""
+            id_part = f" id={mid}" if mid else ""
+            lines.append(f"  [{idx}] from={sender}{qi_part} ts={ts}{id_part}")
+            for body_line in text.splitlines() or [""]:
+                lines.append(f"    {body_line}")
+        lines.append(
+            "Run `agent-msg ack <agent-id>` after processing -- bodies stay "
+            "on disk so you can re-read with `agent-msg inbox <agent-id> --all`."
+        )
+        return (False, "\n".join(lines))
+
+    if kind == "stale_ready_queue_present":
+        # BAN-style: satisfied (=True, allow) iff NO ready_now item has been
+        # waiting >= threshold_secs. Failure (=False, deny) means the main
+        # loop is sitting on a dispatchable queue item.
+        threshold = params.get("threshold_secs",
+                               DEFAULT_STALE_READY_THRESHOLD_SECS)
+        try:
+            threshold_secs = float(threshold)
+        except (TypeError, ValueError):
+            threshold_secs = float(DEFAULT_STALE_READY_THRESHOLD_SECS)
+        path_param = params.get("queue_path")
+        queue_path = (Path(os.path.expanduser(str(path_param)))
+                      if path_param else DEFAULT_QUEUE_PATH)
+        # Default-open on any read / parse error: a broken queue.json must
+        # never blackhole the loop.
+        try:
+            stale = _stale_ready_items(queue_path, threshold_secs, _now())
+        except Exception as e:  # noqa: BLE001
+            return (True, f"stale_ready_queue_present default-open on error: {e}")
+        if not stale:
+            return (True,
+                    f"no ready+pending items past {int(threshold_secs)}s "
+                    f"in {queue_path}")
+        # Build a multi-line why so the deny banner names the offending ids.
+        n = len(stale)
+        oldest_age = max(it["age_secs"] for it in stale)
+        head = (f"{n} ready+pending item(s) in queue past "
+                f"{int(threshold_secs)}s (oldest {int(oldest_age)}s); "
+                f"dispatch (queue register + Agent) or abandon before unrelated work")
+        lines = [head]
+        # Cap the per-item enumeration so a runaway queue doesn't blow up
+        # the banner.
+        for it in stale[:5]:
+            qid = it.get("id", "?")
+            summary = it.get("summary") or "(no summary)"
+            age_min = int(it["age_secs"] // 60)
+            lines.append(f"  {qid} [{age_min}m] {summary}")
+        if n > 5:
+            lines.append(f"  ... (+{n - 5} more)")
+        return (False, "\n".join(lines))
+
+    if kind == "is_main_loop":
+        # Satisfied iff the call is from the main loop (no agent_id).
+        # negate=true flips: satisfied iff inside a subagent.
+        negate = bool(params.get("negate", False))
+        in_main = not _is_subagent_context(agent_id)
+        ok = (not in_main) if negate else in_main
+        if ok:
+            if negate:
+                return (True, f"in subagent context (agent_id={agent_id!r})")
+            return (True, "in main-loop context (no agent_id)")
+        if negate:
+            return (False, "in main-loop context (expected subagent)")
+        return (False, f"in subagent context (agent_id={agent_id!r}); main-loop required")
+
+    if kind == "all_of":
+        children = params.get("predicates", [])
+        if not isinstance(children, list):
+            return (True, "all_of params.predicates is not a list (default-open)")
+        if not children:
+            # Empty AND is trivially true (logical convention).
+            return (True, "all_of [] (empty -> trivially satisfied)")
+        for idx, child in enumerate(children):
+            if not isinstance(child, dict):
+                return (True, f"all_of child {idx} is not a dict (default-open)")
+            child_kind = child.get("kind", "")
+            if child_kind not in VALID_PREDICATE_KINDS:
+                # Unknown nested kind => default-open with a note (mirrors
+                # the leaf default-open semantics).
+                return (True, f"all_of child {idx} has unknown kind {child_kind!r} (default-open)")
+            ok, why = _eval_predicate(child, tool_name, command_string,
+                                       agent_id=agent_id)
+            if not ok:
+                # Scope-guard short-circuit: a failing is_main_loop child
+                # means "this obligation does not apply in the current
+                # context (subagent vs main-loop, or vice versa with
+                # negate=true)". Treat the all_of as inactive (satisfied)
+                # rather than denying. This is the cornerstone of the
+                # "main-loop only enforce X" pattern: register
+                # `all_of [is_main_loop, X]`, and subagents bypass.
+                if child_kind == "is_main_loop":
+                    return (True, f"all_of child[{idx}] is_main_loop scope-guard "
+                                  f"INACTIVE: {why}")
+                # Any other failing child => standard AND => not satisfied.
+                # Surface the failing child's why for actionable banners.
+                return (False, f"all_of child[{idx}] kind={child_kind} FAIL: {why}")
+        return (True, f"all_of [{len(children)}] all children satisfied")
+
+    if kind == "watchers_healthy":
+        # Run `watcher-status --unhealthy-only`. Empty stdout => everything is
+        # healthy => predicate satisfied. Any stdout => predicate fails, and we
+        # carry the unhealthy report through as the `why` string so the
+        # PostToolUse hook can surface it verbatim.
+        cli = shutil.which("watcher-status")
+        if not cli:
+            for cand in (
+                os.path.expanduser("~/bin/watcher-status"),
+                "/usr/local/bin/watcher-status",
+            ):
+                if os.path.exists(cand):
+                    cli = cand
+                    break
+        if not cli or not os.path.exists(cli):
+            # Default-open: missing tool must not block / spam.
+            return (True, "watcher-status not found (default-open)")
+        try:
+            proc = subprocess.run(
+                [cli, "--unhealthy-only"],
+                capture_output=True, text=True,
+                timeout=WATCHERS_HEALTHY_TIMEOUT_SECS, check=False,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as e:
+            return (True, f"watcher-status unavailable (default-open): {e}")
+        out = (proc.stdout or "").rstrip()
+        if not out:
+            return (True, "all watchers healthy")
+        return (False, out)
+
+    # Unknown predicate kind: default-open with a note.
+    return (True, f"unknown predicate kind {kind!r} (default-open)")
+
+
+# ---------------------------------------------------------------------------
+# tool_pattern matching
+# ---------------------------------------------------------------------------
+
+
+def _tool_pattern_matches(pattern, tool_name, command_string):
+    """A tool_pattern is one of:
+        '*'                       => matches every tool
+        'Bash'                    => matches when tool_name == 'Bash'
+        'Bash:<regex>'            => matches when tool_name=='Bash' AND
+                                     command_string matches <regex>
+        '<name>'                  => matches when tool_name == <name>
+    """
+    if not pattern or pattern == "*":
+        return True
+    if ":" in pattern:
+        head, rest = pattern.split(":", 1)
+        if tool_name != head:
+            return False
+        try:
+            return re.search(rest, command_string or "") is not None
+        except re.error:
+            # Bad regex => treat as match-by-name only, conservative
+            return True
+    return pattern == tool_name
+
+
+def _exempt_match(exempt_patterns, tool_name, command_string):
+    """Return (matched: bool, which: str|None).
+
+    Iterate ``exempt_patterns`` (list of tool_pattern strings) and return
+    True + the first matching pattern as soon as one fires. Empty / missing
+    exempt list => never matches.
+    """
+    if not exempt_patterns:
+        return (False, None)
+    if not isinstance(exempt_patterns, list):
+        return (False, None)
+    for pat in exempt_patterns:
+        if not isinstance(pat, str) or not pat:
+            continue
+        if _tool_pattern_matches(pat, tool_name, command_string):
+            return (True, pat)
+    return (False, None)
+
+
+# ---------------------------------------------------------------------------
+# Subcommand: add
+# ---------------------------------------------------------------------------
+
+
+def cmd_add(args):
+    try:
+        params = json.loads(args.params) if args.params else {}
+    except json.JSONDecodeError as e:
+        print(f"ERROR: --params must be JSON: {e}", file=sys.stderr)
+        return 2
+
+    if args.predicate not in VALID_PREDICATE_KINDS:
+        print(
+            f"ERROR: --predicate must be one of {sorted(VALID_PREDICATE_KINDS)}",
+            file=sys.stderr,
+        )
+        return 2
+
+    enforcement = args.enforcement
+    if enforcement not in VALID_ENFORCEMENT_MODES:
+        print(
+            f"ERROR: --enforcement must be one of {sorted(VALID_ENFORCEMENT_MODES)}",
+            file=sys.stderr,
+        )
+        return 2
+
+    ttl = int(args.ttl)
+    now = _now()
+    expires_at = now + ttl if ttl > 0 else None
+
+    satisfied_by = None
+    if args.satisfied_by_tool or args.satisfied_by_cmd_regex:
+        satisfied_by = {
+            "tool_pattern": args.satisfied_by_tool or "*",
+            "command_pattern": args.satisfied_by_cmd_regex or "",
+        }
+
+    # Normalize the exempt patterns list. argparse with action="append"
+    # leaves None when the flag was never passed.
+    exempt_patterns = list(args.exempt_tool_pattern or [])
+
+    fh, data = _open_locked()
+    try:
+        _prune_expired(data, now)
+        ob_id = _new_id()
+        # Avoid duplicate ids in the unlikely case of secrets collision
+        existing_ids = {it.get("id") for it in data["obligations"]}
+        while ob_id in existing_ids:
+            ob_id = _new_id()
+        ob = {
+            "id": ob_id,
+            "tool_pattern": args.tool_pattern,
+            "exempt_patterns": exempt_patterns,
+            "predicate": {"kind": args.predicate, "params": params},
+            "enforcement": enforcement,
+            "ttl_secs": ttl,
+            "expires_at": expires_at,
+            "created_at": now,
+            "created_by": args.created_by,
+            "satisfied_by": satisfied_by,
+            "deny_message": args.deny_msg,
+        }
+        data["obligations"].append(ob)
+        _write_unlock(fh, data)
+    except Exception:
+        _unlock(fh)
+        raise
+
+    if args.json:
+        print(json.dumps(ob, indent=2))
+    else:
+        print(f"Added obligation {ob_id}")
+        print(f"  tool_pattern:    {args.tool_pattern}")
+        if exempt_patterns:
+            print(f"  exempt_patterns: {exempt_patterns}")
+        print(f"  predicate:       {args.predicate} {params}")
+        print(f"  enforcement:     {enforcement}")
+        print(f"  ttl:             {ttl}s ({'non-expiring' if ttl == 0 else f'expires at {expires_at}'})")
+        if satisfied_by:
+            print(f"  satisfied_by:    {satisfied_by}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Subcommand: list
+# ---------------------------------------------------------------------------
+
+
+def cmd_list(args):
+    data = _read_only()
+    now = _now()
+    items = list(data.get("obligations", []))
+    overrides = list(data.get("overrides", []))
+    if not args.all:
+        items = [ob for ob in items if not _is_expired(ob, now)]
+        overrides = [
+            ov for ov in overrides
+            if isinstance(ov, dict) and ov.get("expires_at", 0) > now
+        ]
+    if args.json:
+        print(json.dumps({
+            "obligations": items,
+            "overrides": overrides,
+        }, indent=2))
+        return 0
+    if overrides:
+        print("ACTIVE OVERRIDES (bypass all gate-mode obligations):")
+        for ov in overrides:
+            exp = ov.get("expires_at")
+            when = (f"expires in {int(exp - now)}s"
+                    if exp and exp > now else "EXPIRED")
+            print(f"  {ov.get('id')} [{when}] by {ov.get('created_by','?')}")
+            print(f"    reason: {ov.get('reason','(no reason)')}")
+        print()
+    if not items:
+        print("(no obligations)")
+        return 0
+    for ob in items:
+        exp = ob.get("expires_at")
+        when = "non-expiring" if not exp else (
+            f"expires in {int(exp - now)}s" if exp > now else "EXPIRED"
+        )
+        enforcement = ob.get("enforcement", "gate")
+        print(f"  {ob.get('id')} [{when}] enforcement={enforcement}")
+        print(f"    tool_pattern: {ob.get('tool_pattern')}")
+        if ob.get("exempt_patterns"):
+            print(f"    exempt_patterns: {ob['exempt_patterns']}")
+        pred = ob.get("predicate", {}) or {}
+        print(f"    predicate:    {pred.get('kind')} {pred.get('params')}")
+        if ob.get("satisfied_by"):
+            print(f"    satisfied_by: {ob['satisfied_by']}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Subcommand: show
+# ---------------------------------------------------------------------------
+
+
+def cmd_show(args):
+    data = _read_only()
+    for ob in data.get("obligations", []):
+        if ob.get("id") == args.id:
+            print(json.dumps(ob, indent=2))
+            return 0
+    print(f"not found: {args.id}", file=sys.stderr)
+    return 2
+
+
+# ---------------------------------------------------------------------------
+# Subcommand: satisfy
+# ---------------------------------------------------------------------------
+
+
+def cmd_satisfy(args):
+    fh, data = _open_locked()
+    try:
+        before_obs = len(data["obligations"])
+        before_ovs = len(data.get("overrides", []))
+        data["obligations"] = [
+            ob for ob in data["obligations"] if ob.get("id") != args.id
+        ]
+        data["overrides"] = [
+            ov for ov in data.get("overrides", [])
+            if ov.get("id") != args.id
+        ]
+        after_obs = len(data["obligations"])
+        after_ovs = len(data.get("overrides", []))
+        _write_unlock(fh, data)
+    except Exception:
+        _unlock(fh)
+        raise
+    if before_obs == after_obs and before_ovs == after_ovs:
+        print(f"not found: {args.id}", file=sys.stderr)
+        return 2
+    if before_ovs != after_ovs:
+        print(f"Cleared override {args.id}")
+    else:
+        print(f"Satisfied (removed) {args.id}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Subcommand: override -- per-call audited bypass with TTL
+# ---------------------------------------------------------------------------
+
+
+def cmd_override(args):
+    """Register a short-TTL override that bypasses all gate-mode obligations.
+
+    Every override carries a human-readable reason, a TTL, and gets audited
+    to ``~/.config/claude/obligations-bypass.log`` at create time AND on
+    every call it ends up bypassing (see ``_check_core``). Overrides
+    self-clear via ``_prune_expired`` and are also clearable early via
+    ``obligations satisfy <ov-id>``.
+    """
+    duration = _parse_duration(args.duration)
+    if duration <= 0:
+        print(
+            "ERROR: --duration must be a positive value like 60, 5m, 1h",
+            file=sys.stderr,
+        )
+        return 2
+    if duration > 86400:
+        # 24h cap. Anything longer should be a real obligation edit, not an
+        # override -- otherwise the gate is effectively disabled.
+        print(
+            "ERROR: --duration capped at 24h (86400s); for longer bypasses "
+            "edit the underlying obligation directly",
+            file=sys.stderr,
+        )
+        return 2
+    reason = (args.reason or "").strip()
+    if not reason:
+        print("ERROR: reason argument is required and must be non-empty",
+              file=sys.stderr)
+        return 2
+
+    now = _now()
+    fh, data = _open_locked()
+    try:
+        _prune_expired(data, now)
+        ov_id = _new_override_id()
+        existing = {ov.get("id") for ov in data.get("overrides", [])}
+        while ov_id in existing:
+            ov_id = _new_override_id()
+        ov = {
+            "id": ov_id,
+            "reason": reason,
+            "duration_secs": duration,
+            "expires_at": now + duration,
+            "created_at": now,
+            "created_by": args.created_by,
+        }
+        data["overrides"].append(ov)
+        _write_unlock(fh, data)
+    except Exception:
+        _unlock(fh)
+        raise
+
+    _audit_override({
+        "kind": "override-created",
+        "override_id": ov_id,
+        "reason": reason,
+        "duration_secs": duration,
+        "created_by": args.created_by,
+    })
+    # Fire-and-forget Pushover so Andrew sees on his phone that an audited
+    # bypass just landed. Best-effort -- any pingme failure is swallowed.
+    _pingme_override(ov_id, reason, duration)
+
+    if args.json:
+        print(json.dumps(ov, indent=2))
+    else:
+        print(f"Override active: {ov_id}")
+        print(f"  reason:     {reason}")
+        print(f"  duration:   {duration}s (expires in {duration}s)")
+        print(f"  created_by: {args.created_by}")
+        print()
+        print("All gate-mode obligations are bypassed for the duration.")
+        print(f"Cancel early: obligations satisfy {ov_id}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Subcommand: prune
+# ---------------------------------------------------------------------------
+
+
+def _parse_duration(s):
+    """Parse '1h', '30m', '5d', '120s' into seconds."""
+    if not s:
+        return 0
+    s = str(s).strip().lower()
+    units = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+    if s[-1] in units:
+        try:
+            return int(s[:-1]) * units[s[-1]]
+        except ValueError:
+            return 0
+    try:
+        return int(s)
+    except ValueError:
+        return 0
+
+
+def cmd_prune(args):
+    cutoff_age = _parse_duration(args.older_than) if args.older_than else 0
+    fh, data = _open_locked()
+    try:
+        now = _now()
+        kept = []
+        dropped = []
+        for ob in data["obligations"]:
+            # Always drop expired
+            if _is_expired(ob, now):
+                dropped.append(ob)
+                continue
+            # If older-than is set, also drop very-old non-expiring obligations
+            if cutoff_age:
+                created = ob.get("created_at", now)
+                if (now - created) >= cutoff_age:
+                    dropped.append(ob)
+                    continue
+            kept.append(ob)
+        if args.dry_run:
+            _unlock(fh)
+            print(f"would prune {len(dropped)} (keep {len(kept)})")
+            for ob in dropped:
+                print(f"  drop: {ob.get('id')}")
+            return 0
+        data["obligations"] = kept
+        _write_unlock(fh, data)
+    except Exception:
+        _unlock(fh)
+        raise
+    print(f"pruned {len(dropped)} (kept {len(kept)})")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Subcommand: check  -- the hot path called by hooks
+# ---------------------------------------------------------------------------
+
+
+def _is_subagent_context(agent_id):
+    """Return True iff the caller is inside a subagent.
+
+    Per Claude Code's hook contract, the PreToolUse / PostToolUse JSON payload
+    carries an ``agent_id`` field ONLY when the tool call originates from
+    inside a subagent. Main-loop tool calls have no ``agent_id`` (or an empty
+    string). We accept both ``None`` and ``""`` as "main loop".
+    """
+    return bool(agent_id) and isinstance(agent_id, str) and agent_id.strip() != ""
+
+
+def _check_core(tool_name, command_string, prune=True, agent_id=None):
+    """Pure check: returns (ok: bool, blocking: list). blocking is a list of
+    {id, deny_message, predicate, why} dicts for any obligations that match
+    the tool but are not currently satisfied.
+
+    Inform-mode obligations are SKIPPED here -- they never gate. They are
+    surfaced separately by `inform_check_core` in the PostToolUse hook.
+
+    ``agent_id``: forwarded to ``_eval_predicate`` so predicates that care
+    about subagent vs main-loop context (currently ``is_main_loop``, and
+    by composition any ``all_of`` containing it) can distinguish. There is
+    no row-level main-loop scoping; encode it via ``all_of [is_main_loop,
+    <other>]`` instead.
+    """
+    # Read-only path (no lock) for speed.
+    data = _read_only()
+    now = _now()
+
+    # Per-call audited override: if any non-expired override exists, ALL
+    # gate-mode obligations are bypassed. The override is logged at create
+    # time; we re-audit each bypassed call for forensic completeness.
+    active_ov = _active_override(data, now)
+    if active_ov:
+        _audit_override({
+            "kind": "override-applied",
+            "override_id": active_ov.get("id"),
+            "reason": active_ov.get("reason"),
+            "tool_name": tool_name,
+            "command_string_preview": (command_string or "")[:200],
+            "agent_id": agent_id or "",
+        })
+        return (True, [])
+
+    blocking = []
+    for ob in data.get("obligations", []):
+        if _is_expired(ob, now):
+            continue
+        # Inform-mode obligations are non-gating: they only surface in
+        # PostToolUse via inform_check_core. Skip here so we never deny.
+        if ob.get("enforcement", "gate") == "inform":
+            continue
+        pat = ob.get("tool_pattern", "*")
+        if not _tool_pattern_matches(pat, tool_name, command_string):
+            continue
+        # Per-obligation exemption: even when tool_pattern matches, an
+        # entry in exempt_patterns wins ("the gate exists, but THIS
+        # specific recovery / read-only path must always be allowed").
+        exempt_hit, _exempt_pat = _exempt_match(
+            ob.get("exempt_patterns") or [], tool_name, command_string,
+        )
+        if exempt_hit:
+            continue
+        pred = ob.get("predicate", {}) or {}
+        ok, why = _eval_predicate(pred, tool_name, command_string,
+                                   agent_id=agent_id)
+        if not ok:
+            blocking.append({
+                "id": ob.get("id"),
+                "deny_message": ob.get("deny_message", ""),
+                "predicate": pred,
+                "why": why,
+            })
+    return (len(blocking) == 0, blocking)
+
+
+def _inform_check_core(tool_name, command_string, agent_id=None):
+    """Evaluate every active inform-mode obligation whose tool_pattern matches
+    the tool that just completed. Returns a list of
+    {id, deny_message, predicate, why} dicts for any whose predicate fails.
+
+    Used by the PostToolUse hook to print non-blocking advisories to stderr.
+
+    ``agent_id``: forwarded to ``_eval_predicate`` so ``is_main_loop`` (and
+    any ``all_of`` containing it) can distinguish main-loop from subagent
+    callers. No row-level main-loop scoping -- compose with ``all_of``.
+    """
+    data = _read_only()
+    now = _now()
+    failing = []
+    for ob in data.get("obligations", []):
+        if _is_expired(ob, now):
+            continue
+        if ob.get("enforcement", "gate") != "inform":
+            continue
+        pat = ob.get("tool_pattern", "*")
+        if not _tool_pattern_matches(pat, tool_name, command_string):
+            continue
+        # Honor exempt_patterns even for inform-mode -- if the caller is on
+        # the recovery path, surfacing "watcher X is DOWN" again would be
+        # noise. (Overrides do NOT suppress inform-mode advisories: they
+        # are about gating, not visibility.)
+        exempt_hit, _exempt_pat = _exempt_match(
+            ob.get("exempt_patterns") or [], tool_name, command_string,
+        )
+        if exempt_hit:
+            continue
+        pred = ob.get("predicate", {}) or {}
+        ok, why = _eval_predicate(pred, tool_name, command_string,
+                                   agent_id=agent_id)
+        if not ok:
+            failing.append({
+                "id": ob.get("id"),
+                "deny_message": ob.get("deny_message", ""),
+                "predicate": pred,
+                "why": why,
+            })
+    return failing
+
+
+def cmd_check(args):
+    ok, blocking = _check_core(
+        args.tool, args.command_string or "",
+        agent_id=getattr(args, "agent_id", None),
+    )
+    if args.json:
+        print(json.dumps({"ok": ok, "blocking": blocking}, indent=2))
+        return 0 if ok else 2
+    if ok:
+        print("OK: no blocking obligations")
+        return 0
+    print("BLOCKED by obligations:")
+    for b in blocking:
+        print(f"  - {b['id']}: {b['deny_message']}")
+        print(f"    why: {b['why']}")
+    return 2
+
+
+# ---------------------------------------------------------------------------
+# Subcommand: post-tool-satisfy  -- called by PostToolUse hook
+# ---------------------------------------------------------------------------
+
+
+def _satisfy_by_completion(tool_name, command_string):
+    """Find any obligations whose satisfied_by matches the tool that just ran.
+    Remove them. Returns list of removed obligation ids.
+    """
+    fh, data = _open_locked()
+    try:
+        before_ids = {ob.get("id") for ob in data["obligations"]}
+        kept = []
+        removed_ids = []
+        for ob in data["obligations"]:
+            sb = ob.get("satisfied_by")
+            if not sb:
+                kept.append(ob)
+                continue
+            sb_tool_pat = sb.get("tool_pattern") or "*"
+            sb_cmd_pat = sb.get("command_pattern") or ""
+            # tool_pattern check uses our standard matcher
+            if not _tool_pattern_matches(sb_tool_pat, tool_name, command_string):
+                kept.append(ob)
+                continue
+            # command_pattern is a regex match against command_string
+            if sb_cmd_pat:
+                try:
+                    patt = re.compile(sb_cmd_pat)
+                except re.error:
+                    kept.append(ob)
+                    continue
+                if not patt.search(command_string or ""):
+                    kept.append(ob)
+                    continue
+            removed_ids.append(ob.get("id"))
+        data["obligations"] = [
+            ob for ob in data["obligations"] if ob.get("id") not in removed_ids
+        ]
+        # Also opportunistically prune expired
+        _prune_expired(data)
+        _write_unlock(fh, data)
+        return removed_ids
+    except Exception:
+        _unlock(fh)
+        raise
+
+
+def cmd_post_satisfy(args):
+    removed = _satisfy_by_completion(args.tool, args.command_string or "")
+    if args.json:
+        print(json.dumps({"removed": removed}, indent=2))
+        return 0
+    if removed:
+        print(f"satisfied {len(removed)} obligation(s): {removed}")
+    else:
+        print("no obligations satisfied")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Subcommand: inform-check  -- called by PostToolUse hook for inform-mode
+# ---------------------------------------------------------------------------
+
+
+def _format_inform_failures(failing):
+    lines = []
+    for f in failing:
+        msg = f.get("deny_message") or "(no message)"
+        lines.append(f"[obligations:inform] {f.get('id')}: {msg}")
+        why = f.get("why")
+        if why:
+            for line in str(why).splitlines() or [""]:
+                lines.append(f"    {line}")
+    return "\n".join(lines)
+
+
+def cmd_inform_check(args):
+    failing = _inform_check_core(
+        args.tool, args.command_string or "",
+        agent_id=getattr(args, "agent_id", None),
+    )
+    if args.json:
+        print(json.dumps({"failing": failing}, indent=2))
+        return 0 if not failing else 2
+    if not failing:
+        return 0
+    print(_format_inform_failures(failing))
+    return 2
+
+
+# ---------------------------------------------------------------------------
+# Subcommand: post-tool  -- combined hot path called by PostToolUse hook
+# ---------------------------------------------------------------------------
+
+
+def cmd_post_tool(args):
+    """One-shot for the PostToolUse hook: runs satisfy-by-completion AND
+    inform-check in a single python process.
+
+    Wire output:
+      - stdout: JSON {"removed": [...], "failing": [...]} when --json,
+                otherwise the inform-check banner (one line per failure).
+      - stderr: never used by this subcommand directly.
+      - exit:   0 always (the post-tool hook never blocks).
+    """
+    removed = _satisfy_by_completion(args.tool, args.command_string or "")
+    failing = _inform_check_core(
+        args.tool, args.command_string or "",
+        agent_id=getattr(args, "agent_id", None),
+    )
+    if args.json:
+        print(json.dumps({"removed": removed, "failing": failing}, indent=2))
+        return 0
+    if failing:
+        print(_format_inform_failures(failing))
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Argparse wiring
+# ---------------------------------------------------------------------------
+
+
+def build_parser():
+    p = argparse.ArgumentParser(
+        prog="obligations",
+        description="Generic obligations gate -- enforces 'must do X before Y' rules at the tool layer.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    # add
+    p_add = sub.add_parser("add", help="register a new obligation")
+    p_add.add_argument("--tool-pattern", required=True,
+                       help="'*' | 'Bash' | 'Bash:<regex>' | '<ToolName>'")
+    p_add.add_argument("--exempt-tool-pattern", action="append", default=None,
+                       help="repeatable; tool_pattern syntax. When the call "
+                            "being checked matches the obligation's "
+                            "tool_pattern AND any --exempt-tool-pattern, the "
+                            "obligation auto-allows. Use to encode 'this gate "
+                            "exists but the recovery path (e.g. "
+                            "Bash:^watcher-ctl run) must always be allowed'.")
+    p_add.add_argument("--predicate", required=True,
+                       help=f"one of {sorted(VALID_PREDICATE_KINDS)}")
+    p_add.add_argument("--params", default="{}", help="JSON object of predicate params")
+    p_add.add_argument("--ttl", type=int, required=True,
+                       help="seconds; 0 = non-expiring")
+    p_add.add_argument("--enforcement", default="gate",
+                       choices=sorted(VALID_ENFORCEMENT_MODES),
+                       help="'gate' (default; PreToolUse denies) or 'inform' "
+                            "(PostToolUse prints a banner; never blocks)")
+    p_add.add_argument("--deny-msg", required=True,
+                       help="message shown when the obligation blocks a tool call "
+                            "(or surfaces in the inform banner)")
+    p_add.add_argument("--satisfied-by-tool", default=None,
+                       help="tool_pattern for auto-satisfy")
+    p_add.add_argument("--satisfied-by-cmd-regex", default=None,
+                       help="command regex for auto-satisfy")
+    p_add.add_argument("--created-by", default="manual",
+                       help="audit string (e.g. 'main-loop', 'andrew')")
+    p_add.add_argument("--json", action="store_true", help="emit JSON")
+    p_add.set_defaults(func=cmd_add)
+
+    # list
+    p_list = sub.add_parser("list", help="list active obligations")
+    p_list.add_argument("--all", action="store_true",
+                        help="include expired entries")
+    p_list.add_argument("--json", action="store_true")
+    p_list.set_defaults(func=cmd_list)
+
+    # show
+    p_show = sub.add_parser("show", help="show one obligation by id")
+    p_show.add_argument("id")
+    p_show.set_defaults(func=cmd_show)
+
+    # satisfy
+    p_sat = sub.add_parser("satisfy",
+                           help="manually mark obligation satisfied (remove); "
+                                "also accepts override ids to cancel early")
+    p_sat.add_argument("id")
+    p_sat.set_defaults(func=cmd_satisfy)
+
+    # override
+    p_ov = sub.add_parser(
+        "override",
+        help="register an audited per-call bypass that disables all "
+             "gate-mode obligations for a short duration",
+        description="Audited per-call escape hatch. Logs to "
+                    "~/.config/claude/obligations-bypass.log and self-clears "
+                    "via TTL. Cap: 24h (86400s).",
+    )
+    p_ov.add_argument("reason", help="human-readable why (required, audited)")
+    p_ov.add_argument("--duration", required=True,
+                      help="how long to bypass: 60, 5m, 1h, 30m, 1d, etc. "
+                           "Hard cap 24h.")
+    p_ov.add_argument("--created-by", default="main-loop",
+                      help="audit string (e.g. 'main-loop', 'andrew')")
+    p_ov.add_argument("--json", action="store_true")
+    p_ov.set_defaults(func=cmd_override)
+
+    # prune
+    p_prune = sub.add_parser("prune", help="remove expired (and optionally old) obligations")
+    p_prune.add_argument("--older-than", default=None,
+                         help="duration like 1h / 30m / 5d / 3600 (default: only expired)")
+    p_prune.add_argument("-n", "--dry-run", action="store_true")
+    p_prune.set_defaults(func=cmd_prune)
+
+    # check (used by PreToolUse hook)
+    p_chk = sub.add_parser("check", help="check whether a tool call is currently blocked")
+    p_chk.add_argument("--tool", required=True)
+    p_chk.add_argument("--command-string", default="")
+    p_chk.add_argument("--agent-id", default="",
+                       help="payload.agent_id from the hook, when present; "
+                            "non-empty value marks a subagent context. "
+                            "Forwarded to the is_main_loop predicate (and "
+                            "any all_of containing it).")
+    p_chk.add_argument("--json", action="store_true")
+    p_chk.set_defaults(func=cmd_check)
+
+    # post-satisfy (used by PostToolUse hook)
+    p_post = sub.add_parser("post-satisfy",
+                            help="auto-satisfy obligations whose satisfied_by matches the just-run tool")
+    p_post.add_argument("--tool", required=True)
+    p_post.add_argument("--command-string", default="")
+    p_post.add_argument("--json", action="store_true")
+    p_post.set_defaults(func=cmd_post_satisfy)
+
+    # inform-check (used by PostToolUse hook for non-gating obligations)
+    p_inform = sub.add_parser("inform-check",
+                              help="evaluate inform-mode obligations after the tool ran; "
+                                   "print failures (exit 2 when any fail, 0 when all healthy)")
+    p_inform.add_argument("--tool", required=True)
+    p_inform.add_argument("--command-string", default="")
+    p_inform.add_argument("--agent-id", default="",
+                          help="payload.agent_id from the hook (subagent bypass)")
+    p_inform.add_argument("--json", action="store_true")
+    p_inform.set_defaults(func=cmd_inform_check)
+
+    # post-tool (combined satisfy + inform-check in one process for hook speed)
+    p_pt = sub.add_parser("post-tool",
+                          help="combined post-satisfy + inform-check (PostToolUse hot path); "
+                               "always exits 0; prints inform banner on stdout")
+    p_pt.add_argument("--tool", required=True)
+    p_pt.add_argument("--command-string", default="")
+    p_pt.add_argument("--agent-id", default="",
+                      help="payload.agent_id from the hook (subagent bypass)")
+    p_pt.add_argument("--json", action="store_true")
+    p_pt.set_defaults(func=cmd_post_tool)
+
+    return p
+
+
+def main(argv=None):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)

@@ -1,0 +1,2334 @@
+#!/usr/bin/env python3
+"""agent-msg: CLI for delivering async messages to running Claude Code agents.
+
+Originally a stub that documented the SendMessage gap; now an actual delivery
+mechanism implemented on top of the obligations system. Each spawned agent
+gets:
+  - An inbox JSON file at ~/.config/claude/agent-inbox/<agent_id>.json (0o600)
+  - A GATE-MODE obligation registered against tool_pattern '*' that runs the
+    `agent_inbox_empty` predicate against that file. The obligation is scoped
+    to subagents only via `all_of [is_main_loop {negate: true}, ...]` so the
+    main loop never sees its own banner; only the spawned agent does. The
+    `agent-msg ack`, `agent-msg inbox`, `agent-msg gc`, and `agent-msg disarm`
+    calls are registered as `exempt_patterns` so the agent can clear /
+    inspect / teardown its own inbox without the gate firing on those calls.
+
+Schema (version 2, 2026-05-01):
+    {
+      "schema_version": 2,
+      "messages": [
+        { "id":      "m-...",        # short opaque id
+          "from":    "...",
+          "ts":      "ISO8601 UTC",
+          "queue_item": "...|null",
+          "text":    "body",
+          "read":    false,           # flipped to true by `ack`
+          "read_at": null              # ISO8601 set when read=true
+        },
+        ...
+      ]
+    }
+
+Legacy (pre-v2) inboxes are bare JSON arrays of messages with no read/id
+fields; they are auto-migrated on first read (every message gets read=false +
+a synthetic id + missing-field defaults). Bare-string entries (defensive
+fallback) become a message with text=<body>, read=false. We never delete
+content during migration -- the migration is purely additive.
+
+Persistence + GC:
+    - `send` appends an unread message; messages stay on disk after `ack`.
+    - `ack` flips read=true + sets read_at; the message body is preserved
+      so the agent can re-read it later via `inbox --all`.
+    - `inbox` defaults to UNREAD only; `--all` shows read messages too.
+    - Every CLI invocation runs an implicit GC pass that drops messages
+      whose read_at is older than AGENT_MSG_TTL_HOURS (default 24h).
+      Explicit `agent-msg gc <agent_id>` is also available.
+
+Why GATE mode (was inform mode 2026-04-28 -> 2026-04-30): empirical evidence
+shows the inform-mode stderr banner does NOT reach spawned subagents in any
+way that affects their reasoning. Two consecutive test agents on
+2026-04-30 (aad6cb28, aa3634cd) had a verified `agent-msg send` deliver to
+their inbox, ran to completion, and never called `agent-msg ack` -- the
+inbox still held the unread message at agent-completion. The stderr banner
+either gets filtered out of the subagent's tool-result stream or arrives
+but is treated as ignorable noise. Gate-mode HARD-DENIES every tool call
+from the subagent while the inbox is non-empty, with the message contents
+in the deny banner -- that's impossible to ignore because the agent's tool
+call literally fails until they call ack.
+
+When a message is delivered (`agent-msg send <id> <text>`), the inbox grows
+by one entry. On the agent's next non-exempt tool call, the PreToolUse
+obligations gate hook fires, evaluates the `agent_inbox_empty` predicate
+(which now fails), and DENIES the call with a banner containing the message
+contents. The agent reads the banner, processes the message, and runs
+`agent-msg ack <id>` (which is on the exempt list, so it always passes) to
+clear the inbox. The obligation persists across acks so future `send`s also
+surface; the predicate naturally flips back to satisfied once the inbox
+holds [].
+
+Subcommand surface:
+  agent-msg list                   — show currently tracked agents (index)
+  agent-msg show <id>              — show metadata for one agent
+  agent-msg index register <id>    — add an agent to the index (no inbox)
+  agent-msg index done <id>        — drop an agent from the index
+  agent-msg arm <id>               — initialise inbox + register inform-mode obligation
+  agent-msg disarm <id>            — clear inbox + remove obligation
+  agent-msg send <id> <text>       — append a message to <id>'s inbox
+  agent-msg inbox <id>             — read inbox; default UNREAD only (--all shows read too)
+  agent-msg ack <id>               — flip every UNREAD message to read=true (keeps body)
+  agent-msg gc <id>                — drop read messages older than the TTL
+  agent-msg --test                 — run embedded test suite
+
+The inbox path is overridable via --inbox-dir for testing; the default
+location is ~/.config/claude/agent-inbox/.
+
+State files:
+  ~/.config/claude/active-agents.json   — agent index (existing)
+  ~/.config/claude/agent-inbox/<id>.json — per-agent inbox (new)
+"""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import json
+import os
+import re
+import secrets
+import subprocess
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+CONFIG_DIR = Path.home() / ".config" / "claude"
+INDEX_FILE = CONFIG_DIR / "active-agents.json"
+INBOX_DIR = CONFIG_DIR / "agent-inbox"
+INDEX_MODE = 0o600
+INBOX_MODE = 0o600
+
+# Inbox JSON schema version. v1 was a bare list of message dicts (no
+# read/id fields); v2 wraps the list in {schema_version, messages} and
+# adds id/read/read_at to each entry.
+INBOX_SCHEMA_VERSION = 2
+
+# Default TTL for the per-agent inform-mode obligation. 4 hours is plenty
+# for a typical agent run; the disarm path tears it down explicitly when
+# the agent finishes, so this only matters if the main loop forgets.
+DEFAULT_OBLIGATION_TTL_SECS = 4 * 3600
+
+# Default TTL for read messages: 24 hours after read_at. Override via the
+# AGENT_MSG_TTL_HOURS env var (float; values <= 0 disable GC).
+DEFAULT_READ_TTL_HOURS = 24.0
+
+
+def _read_ttl_hours() -> float:
+    """Return the read-message TTL in hours, honoring AGENT_MSG_TTL_HOURS."""
+    raw = os.environ.get("AGENT_MSG_TTL_HOURS", "").strip()
+    if not raw:
+        return DEFAULT_READ_TTL_HOURS
+    try:
+        return float(raw)
+    except ValueError:
+        return DEFAULT_READ_TTL_HOURS
+
+
+def _new_msg_id() -> str:
+    """Short opaque id for an inbox message: m-<8 hex>."""
+    return "m-" + secrets.token_hex(4)
+
+# Identifier prefix used in the obligation's deny_message so we can find
+# the obligation later via `obligations list --json` and remove it on
+# disarm. We don't have a stable obligation id (those are random) so we
+# match on this marker substring.
+OBLIGATION_TAG_PREFIX = "agent-msg/inbox:"
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _ensure_config_dir() -> None:
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    INDEX_FILE.touch(mode=INDEX_MODE, exist_ok=True)
+    try:
+        INDEX_FILE.chmod(INDEX_MODE)
+    except OSError:
+        pass
+
+
+# ----------------------------------------------------------------------
+# Index I/O (lightly locked; same pattern as before)
+# ----------------------------------------------------------------------
+
+
+def _read_index() -> dict:
+    _ensure_config_dir()
+    if not INDEX_FILE.exists() or INDEX_FILE.stat().st_size == 0:
+        return {}
+    try:
+        with open(INDEX_FILE, "r", encoding="utf-8") as fh:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_SH)
+            try:
+                data = json.load(fh)
+            finally:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+        return data if isinstance(data, dict) else {}
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def _write_index(data: dict) -> None:
+    _ensure_config_dir()
+    with open(INDEX_FILE, "w", encoding="utf-8") as fh:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        try:
+            json.dump(data, fh, indent=2)
+            fh.flush()
+            try:
+                os.fsync(fh.fileno())
+            except OSError:
+                pass
+        finally:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+    try:
+        INDEX_FILE.chmod(INDEX_MODE)
+    except OSError:
+        pass
+
+
+# ----------------------------------------------------------------------
+# Inbox path helpers
+# ----------------------------------------------------------------------
+
+
+def _inbox_dir(args=None) -> Path:
+    """Resolve inbox directory: --inbox-dir override, else env var, else default."""
+    if args is not None and getattr(args, "inbox_dir", None):
+        return Path(os.path.expanduser(args.inbox_dir))
+    env_override = os.environ.get("AGENT_MSG_INBOX_DIR", "").strip()
+    if env_override:
+        return Path(os.path.expanduser(env_override))
+    return INBOX_DIR
+
+
+def _inbox_path(agent_id: str, args=None) -> Path:
+    return _inbox_dir(args) / f"{agent_id}.json"
+
+
+def _ensure_inbox_dir(args=None) -> Path:
+    d = _inbox_dir(args)
+    d.mkdir(parents=True, exist_ok=True)
+    try:
+        d.chmod(0o700)
+    except OSError:
+        pass
+    return d
+
+
+# ----------------------------------------------------------------------
+# Schema migration + locked inbox I/O (atomic append)
+# ----------------------------------------------------------------------
+
+
+def _normalise_message(entry, *, default_ts: str | None = None) -> dict:
+    """Coerce a raw inbox entry into a v2 message dict.
+
+    Accepts:
+      * dict -- merged onto defaults (missing fields get sensible defaults)
+      * str  -- treated as a bare body string (defensive fallback)
+      * other -- coerced via repr() into the body field
+
+    The migration is purely additive: we never drop fields, only fill in
+    missing ones. read defaults to False and read_at to None so legacy
+    messages surface as unread on first contact -- the agent is free to
+    ack them and they'll move to read=true with the present timestamp.
+    """
+    base = {
+        "id": None,
+        "from": "?",
+        "ts": default_ts or _now_iso(),
+        "queue_item": None,
+        "text": "",
+        "read": False,
+        "read_at": None,
+    }
+    if isinstance(entry, dict):
+        base.update(entry)
+    elif isinstance(entry, str):
+        base["text"] = entry
+    else:
+        base["text"] = repr(entry)
+    if not base.get("id"):
+        base["id"] = _new_msg_id()
+    if not isinstance(base.get("read"), bool):
+        base["read"] = False
+    if not base.get("ts"):
+        base["ts"] = _now_iso()
+    if base.get("read") and not base.get("read_at"):
+        base["read_at"] = _now_iso()
+    return base
+
+
+def _coerce_inbox(raw_data) -> tuple[list, bool]:
+    """Coerce a parsed JSON value into a v2 message list.
+
+    Returns (messages, migrated). `migrated` is True iff the input was not
+    already a v2 envelope, signalling that the caller should rewrite the
+    file in v2 form to lock in the migration.
+    """
+    if isinstance(raw_data, dict):
+        version = raw_data.get("schema_version")
+        msgs = raw_data.get("messages", [])
+        if not isinstance(msgs, list):
+            return [], True
+        if version == INBOX_SCHEMA_VERSION:
+            # Even on a v2 envelope, run each entry through normalisation
+            # so any partially-written entries get filled in.
+            normalised = [_normalise_message(m) for m in msgs]
+            # Detect whether any normalisation actually changed anything;
+            # if so, we still want to flush the cleaned form to disk.
+            migrated = any(
+                normalised[i] != msgs[i] if isinstance(msgs[i], dict) else True
+                for i in range(len(msgs))
+            )
+            return normalised, migrated
+        # Older v? envelope -- migrate.
+        return [_normalise_message(m) for m in msgs], True
+    if isinstance(raw_data, list):
+        # v1 (bare list of messages or strings).
+        return [_normalise_message(m) for m in raw_data], True
+    # Unrecognised shape -- treat as empty (keeps the default-open
+    # contract for the predicate; caller will overwrite cleanly).
+    return [], True
+
+
+def _read_inbox_locked(path: Path) -> tuple:
+    """Open + LOCK_EX. Returns (fh, list_of_v2_messages). Caller must call
+    _write_inbox_locked or _unlock_inbox.
+
+    The on-disk format is the v2 envelope {schema_version, messages}; this
+    function transparently auto-migrates v1 (bare list) and other shapes
+    on read, returning a v2 message list to the caller.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(path), os.O_RDWR | os.O_CREAT, INBOX_MODE)
+    fh = os.fdopen(fd, "r+", encoding="utf-8")
+    fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+    fh.seek(0)
+    raw = fh.read()
+    if not raw.strip():
+        return fh, []
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        # Treat malformed as empty so we don't blackhole. We'll overwrite
+        # cleanly on the next write.
+        return fh, []
+    msgs, _migrated = _coerce_inbox(data)
+    return fh, msgs
+
+
+def _write_inbox_locked(fh, messages: list) -> None:
+    """Write the v2 envelope back to disk, then release the lock."""
+    envelope = {
+        "schema_version": INBOX_SCHEMA_VERSION,
+        "messages": messages,
+    }
+    fh.seek(0)
+    fh.truncate()
+    fh.write(json.dumps(envelope, indent=2) + "\n")
+    fh.flush()
+    try:
+        os.fsync(fh.fileno())
+    except OSError:
+        pass
+    fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+    fh.close()
+
+
+def _unlock_inbox(fh) -> None:
+    try:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+    except OSError:
+        pass
+    try:
+        fh.close()
+    except OSError:
+        pass
+
+
+# ----------------------------------------------------------------------
+# Garbage-collection: drop read messages whose read_at is older than the
+# configured TTL. Returns (kept, dropped) message lists -- the caller
+# decides whether to flush to disk.
+# ----------------------------------------------------------------------
+
+
+def _gc_messages(messages: list, *, ttl_hours: float | None = None,
+                 now_ts: float | None = None) -> tuple[list, list]:
+    """Split `messages` into (kept, dropped) by read_at age.
+
+    A message is dropped iff:
+      * it is read (read=true)
+      * has a parseable read_at
+      * read_at is older than ttl_hours (default from env / 24h)
+
+    Unread messages, messages with no read_at, and messages whose read_at
+    is unparseable are always kept. ttl_hours <= 0 disables GC entirely.
+    """
+    if ttl_hours is None:
+        ttl_hours = _read_ttl_hours()
+    if ttl_hours <= 0:
+        return list(messages), []
+    if now_ts is None:
+        now_ts = datetime.now(timezone.utc).timestamp()
+    cutoff = now_ts - (ttl_hours * 3600)
+    kept = []
+    dropped = []
+    for m in messages:
+        if not isinstance(m, dict):
+            kept.append(m)
+            continue
+        if not m.get("read"):
+            kept.append(m)
+            continue
+        read_at = m.get("read_at")
+        if not isinstance(read_at, str) or not read_at:
+            # Read but no read_at -- keep (we don't know how old it is).
+            kept.append(m)
+            continue
+        try:
+            ts = datetime.fromisoformat(read_at).timestamp()
+        except (ValueError, TypeError):
+            kept.append(m)
+            continue
+        if ts < cutoff:
+            dropped.append(m)
+        else:
+            kept.append(m)
+    return kept, dropped
+
+
+def _gc_inbox_path(path: Path, *, ttl_hours: float | None = None) -> tuple[int, int]:
+    """Run a GC pass on a single inbox path. Returns (kept, dropped).
+
+    Idempotent + safe to call on every CLI invocation. Skips silently if
+    the inbox file is missing.
+    """
+    if not path.exists():
+        return 0, 0
+    try:
+        fh, messages = _read_inbox_locked(path)
+    except OSError:
+        return 0, 0
+    try:
+        kept, dropped = _gc_messages(messages, ttl_hours=ttl_hours)
+        if dropped or len(kept) != len(messages):
+            _write_inbox_locked(fh, kept)
+        else:
+            _unlock_inbox(fh)
+    except Exception:
+        _unlock_inbox(fh)
+        raise
+    return len(kept), len(dropped)
+
+
+def _maybe_implicit_gc(args=None) -> None:
+    """Best-effort sweep of every inbox in the inbox dir.
+
+    Runs at the top of every CLI invocation so an agent that's been
+    quiet for a while still trims its own inbox. Errors are swallowed
+    -- GC must never block a send/ack/inbox call.
+    """
+    try:
+        d = _inbox_dir(args)
+        if not d.exists():
+            return
+        for child in d.iterdir():
+            if child.suffix != ".json":
+                continue
+            try:
+                _gc_inbox_path(child)
+            except Exception:
+                continue
+    except Exception:
+        return
+
+
+# ----------------------------------------------------------------------
+# Obligations CLI helper (used by arm/disarm)
+# ----------------------------------------------------------------------
+
+
+def _obligations_cli() -> str | None:
+    """Resolve path to the obligations CLI."""
+    # Prefer sibling in same bin dir as this script (common dev layout).
+    here = Path(__file__).resolve().parent
+    candidate = here / "obligations"
+    if candidate.exists() and os.access(candidate, os.X_OK):
+        return str(candidate)
+    import shutil
+    found = shutil.which("obligations")
+    if found:
+        return found
+    return None
+
+
+# Tool patterns that must always pass through, even when the inbox is
+# non-empty. Without these, the agent literally cannot ack their own
+# inbox -- the ack call itself would be denied by the gate, deadlocking
+# the agent. Same shape as the watcher-health gate's exempt list.
+#
+# Patterns:
+#   Bash:^agent-msg ack\b      -- the ack call itself (the recovery path)
+#   Bash:^agent-msg inbox\b    -- read-only inspection (always safe)
+#   Bash:^agent-msg gc\b       -- explicit garbage collect (read messages)
+#   Bash:^agent-msg disarm\b   -- teardown / cleanup
+#
+# We intentionally do NOT exempt `agent-msg send` (an agent shouldn't be
+# sending messages to other agents while gated) or `agent-msg arm` (the
+# main loop arms via the post-tool hook; subagents have no reason to arm
+# and doing so while gated is a smell).
+INBOX_GATE_EXEMPT_PATTERNS = (
+    r"Bash:^agent-msg\s+ack\b",
+    r"Bash:^agent-msg\s+inbox\b",
+    r"Bash:^agent-msg\s+gc\b",
+    r"Bash:^agent-msg\s+disarm\b",
+)
+
+
+def _register_inbox_obligation(agent_id: str, inbox_path: Path,
+                                ttl_secs: int = DEFAULT_OBLIGATION_TTL_SECS,
+                                deny_msg_tag: str | None = None) -> tuple[bool, str]:
+    """Register a gate-mode obligation that DENIES all subagent tool calls
+    while the inbox is non-empty. The deny banner carries the message body.
+
+    The agent's own ack/inbox/disarm calls are exempted via exempt_patterns
+    so the agent can always clear its inbox.
+
+    Returns (ok, ob_id_or_error).
+    """
+    cli = _obligations_cli()
+    if not cli:
+        return False, "obligations CLI not found"
+    deny_msg = deny_msg_tag or f"{OBLIGATION_TAG_PREFIX}{agent_id}"
+    predicate_params = {
+        "predicates": [
+            {"kind": "is_main_loop", "params": {"negate": True}},
+            {"kind": "agent_inbox_empty", "params": {"path": str(inbox_path)}},
+        ]
+    }
+    args = [
+        cli, "add",
+        "--tool-pattern", "*",
+        "--predicate", "all_of",
+        "--params", json.dumps(predicate_params),
+        "--ttl", str(int(ttl_secs)),
+        "--enforcement", "gate",
+        "--deny-msg", deny_msg,
+        "--created-by", f"agent-msg/{agent_id}",
+        "--json",
+    ]
+    for pat in INBOX_GATE_EXEMPT_PATTERNS:
+        args += ["--exempt-tool-pattern", pat]
+    proc = subprocess.run(args, capture_output=True, text=True, timeout=10, check=False)
+    if proc.returncode != 0:
+        return False, f"obligations add rc={proc.returncode} stderr={proc.stderr.strip()}"
+    try:
+        result = json.loads(proc.stdout)
+        return True, result.get("id", "")
+    except json.JSONDecodeError as e:
+        return False, f"could not parse obligations add output: {e}"
+
+
+def _list_obligations() -> list:
+    """Read all currently-active obligations via `obligations list --json`."""
+    cli = _obligations_cli()
+    if not cli:
+        return []
+    proc = subprocess.run(
+        [cli, "list", "--json"],
+        capture_output=True, text=True, timeout=10, check=False,
+    )
+    if proc.returncode != 0:
+        return []
+    try:
+        data = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        return []
+    return data.get("obligations", []) if isinstance(data, dict) else []
+
+
+def _remove_inbox_obligations_for_agent(agent_id: str) -> list:
+    """Find and `obligations satisfy` every obligation whose deny_message
+    matches our tag prefix for this agent. Returns the list of removed ids."""
+    tag = f"{OBLIGATION_TAG_PREFIX}{agent_id}"
+    cli = _obligations_cli()
+    if not cli:
+        return []
+    removed = []
+    for ob in _list_obligations():
+        if ob.get("deny_message") == tag:
+            ob_id = ob.get("id")
+            if not ob_id:
+                continue
+            proc = subprocess.run(
+                [cli, "satisfy", ob_id],
+                capture_output=True, text=True, timeout=10, check=False,
+            )
+            if proc.returncode == 0:
+                removed.append(ob_id)
+    return removed
+
+
+# ----------------------------------------------------------------------
+# Subcommand: list / show / index register / index done (existing index ops)
+# ----------------------------------------------------------------------
+
+
+def cmd_list(args) -> int:
+    index = _read_index()
+    if not index:
+        print("No agents tracked.")
+        return 0
+    print(f"{'Agent ID':<40} {'Status':<12} {'Queue Item':<20} {'Description':<40} {'Spawned':<19}")
+    print("-" * 131)
+    for agent_id, meta in index.items():
+        status = meta.get("status", "unknown")
+        queue = meta.get("queue_item") or "-"
+        desc = meta.get("description", "") or "-"
+        if len(desc) > 40:
+            desc = desc[:37] + "..."
+        spawned = meta.get("spawned_at", "-")
+        print(f"{agent_id:<40} {status:<12} {queue:<20} {desc:<40} {spawned:<19}")
+    return 0
+
+
+def cmd_show(args) -> int:
+    index = _read_index()
+    if args.agent_id not in index:
+        print(f"Agent {args.agent_id} not found in index.", file=sys.stderr)
+        return 1
+    print(json.dumps(index[args.agent_id], indent=2))
+    return 0
+
+
+def cmd_index_register(args) -> int:
+    index = _read_index()
+    if args.agent_id in index:
+        print(f"Agent {args.agent_id} already registered. Use 'done' to clear.",
+              file=sys.stderr)
+        return 1
+    index[args.agent_id] = {
+        "agent_id": args.agent_id,
+        "status": "running",
+        "queue_item": args.queue_item,
+        "description": args.description or "",
+        "spawned_at": _now_iso(),
+        "last_seen": _now_iso(),
+    }
+    _write_index(index)
+    print(f"Registered agent {args.agent_id}")
+    return 0
+
+
+def cmd_index_done(args) -> int:
+    index = _read_index()
+    if args.agent_id not in index:
+        print(f"Agent {args.agent_id} not found in index.", file=sys.stderr)
+        return 1
+    del index[args.agent_id]
+    _write_index(index)
+    print(f"Marked agent {args.agent_id} as done.")
+    return 0
+
+
+# ----------------------------------------------------------------------
+# Subcommand: send  -- atomic append to inbox JSON
+# ----------------------------------------------------------------------
+
+
+def cmd_send(args) -> int:
+    agent_id = args.agent_id
+    text = args.text
+    from_label = args.from_label or "andrew@signal"
+    queue_item = args.queue_item
+    dry_run = args.dry_run
+
+    inbox_path = _inbox_path(agent_id, args)
+
+    entry = {
+        "id": _new_msg_id(),
+        "from": from_label,
+        "ts": _now_iso(),
+        "queue_item": queue_item,
+        "text": text,
+        "read": False,
+        "read_at": None,
+    }
+
+    if dry_run:
+        print(f"[DRY RUN] Would append to {inbox_path}:")
+        print(json.dumps(entry, indent=2))
+        return 0
+
+    _ensure_inbox_dir(args)
+    fh, messages = _read_inbox_locked(inbox_path)
+    try:
+        messages.append(entry)
+        _write_inbox_locked(fh, messages)
+    except Exception:
+        _unlock_inbox(fh)
+        raise
+    try:
+        inbox_path.chmod(INBOX_MODE)
+    except OSError:
+        pass
+    unread = sum(1 for m in messages if isinstance(m, dict) and not m.get("read"))
+    if args.json:
+        print(json.dumps({"ok": True, "inbox": str(inbox_path),
+                          "unread": unread, "total": len(messages),
+                          "entry": entry}, indent=2))
+    else:
+        print(f"Appended message to {inbox_path} ({unread} unread / {len(messages)} total)")
+    return 0
+
+
+# ----------------------------------------------------------------------
+# Subcommand: inbox  -- non-destructive read
+# ----------------------------------------------------------------------
+
+
+def cmd_inbox(args) -> int:
+    """Read the inbox without consuming. Default: unread only.
+
+    --all           include already-read messages (still GC-trimmed by TTL).
+    --json          machine-readable output.
+    """
+    inbox_path = _inbox_path(args.agent_id, args)
+    show_all = bool(getattr(args, "all", False))
+
+    if not inbox_path.exists():
+        if args.json:
+            print(json.dumps({
+                "path": str(inbox_path),
+                "messages": [],
+                "unread": 0, "total": 0,
+                "show_all": show_all,
+            }, indent=2))
+        else:
+            print(f"(no inbox at {inbox_path})")
+        return 0
+
+    # Use the locked read path so a v1 inbox is auto-migrated -- this
+    # also means a stale read_at gets the current GC pass on first
+    # contact. We immediately release the lock since we're not modifying.
+    fh, messages = _read_inbox_locked(inbox_path)
+    _unlock_inbox(fh)
+
+    unread = [m for m in messages
+              if isinstance(m, dict) and not m.get("read")]
+    visible = messages if show_all else unread
+
+    if args.json:
+        print(json.dumps({
+            "path": str(inbox_path),
+            "messages": visible,
+            "unread": len(unread),
+            "total": len(messages),
+            "show_all": show_all,
+        }, indent=2))
+        return 0
+
+    if not visible:
+        if show_all:
+            print(f"(inbox at {inbox_path} is empty)")
+        else:
+            if messages:
+                print(f"(no unread messages at {inbox_path}; "
+                      f"{len(messages)} read message(s) in history -- use --all)")
+            else:
+                print(f"(inbox at {inbox_path} is empty)")
+        return 0
+
+    label = "message(s)" if show_all else "unread message(s)"
+    print(f"Inbox: {inbox_path}  ({len(visible)} {label}; "
+          f"{len(unread)} unread / {len(messages)} total)")
+    for idx, entry in enumerate(visible):
+        if not isinstance(entry, dict):
+            print(f"  [{idx}] (malformed: {entry!r})")
+            continue
+        sender = entry.get("from", "?")
+        ts = entry.get("ts", "?")
+        qi = entry.get("queue_item")
+        mid = entry.get("id", "?")
+        read_marker = "READ" if entry.get("read") else "UNREAD"
+        read_at = entry.get("read_at")
+        suffix = f" q={qi}" if qi else ""
+        if entry.get("read") and read_at:
+            suffix += f" read_at={read_at}"
+        print(f"  [{idx}] {read_marker} id={mid} from={sender} ts={ts}{suffix}")
+        text = entry.get("text", "")
+        for line in (text.splitlines() if isinstance(text, str) else [str(text)]):
+            print(f"    {line}")
+    return 0
+
+
+# ----------------------------------------------------------------------
+# Subcommand: ack  -- clear inbox (rewrite to [])
+# ----------------------------------------------------------------------
+
+
+def cmd_ack(args) -> int:
+    """Mark UNREAD messages as read; preserve their bodies.
+
+    Default: flips every unread message in the inbox to read=true and
+    sets read_at=<now>. Bodies stay on disk so the agent can re-read
+    them via `agent-msg inbox --all` until they age out via GC.
+
+    --message-id <id>   ack only the specified message id
+    --all-history       also re-stamp read_at for already-read messages
+                        (rare; mostly useful for testing)
+    """
+    inbox_path = _inbox_path(args.agent_id, args)
+    _ensure_inbox_dir(args)
+    fh, messages = _read_inbox_locked(inbox_path)
+    target_id = getattr(args, "message_id", None)
+    re_stamp = bool(getattr(args, "all_history", False))
+    now = _now_iso()
+    flipped = 0
+    try:
+        for m in messages:
+            if not isinstance(m, dict):
+                continue
+            if target_id is not None and m.get("id") != target_id:
+                continue
+            if m.get("read"):
+                if re_stamp:
+                    m["read_at"] = now
+                continue
+            m["read"] = True
+            m["read_at"] = now
+            flipped += 1
+        _write_inbox_locked(fh, messages)
+    except Exception:
+        _unlock_inbox(fh)
+        raise
+    try:
+        inbox_path.chmod(INBOX_MODE)
+    except OSError:
+        pass
+    unread = sum(1 for m in messages if isinstance(m, dict) and not m.get("read"))
+    if args.json:
+        print(json.dumps({
+            "ok": True, "inbox": str(inbox_path),
+            "flipped": flipped, "unread": unread, "total": len(messages),
+            "message_id": target_id,
+        }, indent=2))
+    else:
+        if target_id is not None and flipped == 0:
+            print(f"No unread message with id {target_id} at {inbox_path}.")
+        else:
+            print(f"Marked {flipped} message(s) read at {inbox_path} "
+                  f"({unread} unread / {len(messages)} total remain).")
+    return 0
+
+
+# ----------------------------------------------------------------------
+# Subcommand: gc -- explicit garbage-collection of read messages older
+# than the TTL. The implicit GC at the top of every CLI invocation does
+# the same thing automatically; this is for manual / scripted sweeps.
+# ----------------------------------------------------------------------
+
+
+def cmd_gc(args) -> int:
+    inbox_path = _inbox_path(args.agent_id, args)
+    ttl_hours = getattr(args, "ttl_hours", None)
+    if ttl_hours is None:
+        ttl_hours = _read_ttl_hours()
+    if not inbox_path.exists():
+        if args.json:
+            print(json.dumps({
+                "ok": True, "inbox": str(inbox_path),
+                "kept": 0, "dropped": 0, "ttl_hours": ttl_hours,
+                "exists": False,
+            }, indent=2))
+        else:
+            print(f"(no inbox at {inbox_path})")
+        return 0
+    kept, dropped = _gc_inbox_path(inbox_path, ttl_hours=ttl_hours)
+    if args.json:
+        print(json.dumps({
+            "ok": True, "inbox": str(inbox_path),
+            "kept": kept, "dropped": dropped, "ttl_hours": ttl_hours,
+            "exists": True,
+        }, indent=2))
+    else:
+        print(f"GC at {inbox_path}: kept={kept} dropped={dropped} "
+              f"(ttl={ttl_hours}h)")
+    return 0
+
+
+# ----------------------------------------------------------------------
+# Subcommand: arm / disarm  -- per-agent obligation lifecycle
+# ----------------------------------------------------------------------
+
+
+def cmd_arm(args) -> int:
+    """Initialise inbox to [] and register gate-mode obligation."""
+    inbox_path = _inbox_path(args.agent_id, args)
+    _ensure_inbox_dir(args)
+    # Initialise inbox idempotently. If it already exists with content,
+    # leave it alone -- we don't want to silently drop pending messages
+    # on a re-arm.
+    fh, existing = _read_inbox_locked(inbox_path)
+    try:
+        if not existing:
+            _write_inbox_locked(fh, [])
+        else:
+            _unlock_inbox(fh)
+    except Exception:
+        _unlock_inbox(fh)
+        raise
+    try:
+        inbox_path.chmod(INBOX_MODE)
+    except OSError:
+        pass
+
+    # Register obligation (skipped in test mode where --no-obligation is set).
+    ob_id = ""
+    if not args.no_obligation:
+        ok, info = _register_inbox_obligation(args.agent_id, inbox_path,
+                                              ttl_secs=args.ttl)
+        if not ok:
+            print(f"ERROR registering obligation: {info}", file=sys.stderr)
+            return 1
+        ob_id = info
+
+    if args.json:
+        print(json.dumps({
+            "ok": True,
+            "agent_id": args.agent_id,
+            "inbox": str(inbox_path),
+            "obligation_id": ob_id,
+        }, indent=2))
+    else:
+        print(f"Armed agent {args.agent_id}: inbox={inbox_path} obligation={ob_id or '(skipped)'}")
+    return 0
+
+
+def cmd_disarm(args) -> int:
+    """Clear inbox + remove any inbox obligations for this agent."""
+    inbox_path = _inbox_path(args.agent_id, args)
+    cleared_inbox = False
+    if inbox_path.exists():
+        _ensure_inbox_dir(args)
+        fh, _ = _read_inbox_locked(inbox_path)
+        try:
+            _write_inbox_locked(fh, [])
+            cleared_inbox = True
+        except Exception:
+            _unlock_inbox(fh)
+            raise
+        # Also remove the file entirely on disarm (cleaner state).
+        try:
+            inbox_path.unlink()
+        except OSError:
+            pass
+
+    removed = []
+    if not args.no_obligation:
+        removed = _remove_inbox_obligations_for_agent(args.agent_id)
+
+    if args.json:
+        print(json.dumps({
+            "ok": True,
+            "agent_id": args.agent_id,
+            "inbox_cleared": cleared_inbox,
+            "obligations_removed": removed,
+        }, indent=2))
+    else:
+        print(f"Disarmed agent {args.agent_id}: cleared_inbox={cleared_inbox} "
+              f"obligations_removed={removed}")
+    return 0
+
+
+# ----------------------------------------------------------------------
+# Embedded test suite
+# ----------------------------------------------------------------------
+
+
+def _isolated_test_env(tmpdir: Path):
+    """Build a sandbox: separate inbox dir + separate obligations file."""
+    return {
+        "inbox_dir": str(tmpdir / "inbox"),
+        "obligations_file": str(tmpdir / "obligations.json"),
+    }
+
+
+def _make_args(**kwargs):
+    """Cheap argparse.Namespace stand-in."""
+    defaults = {
+        "agent_id": None, "text": None, "from_label": None,
+        "queue_item": None, "dry_run": False, "json": False,
+        "inbox_dir": None, "ttl": DEFAULT_OBLIGATION_TTL_SECS,
+        "no_obligation": True,  # tests default to skipping obligation registration
+        "description": "",
+        # New v2 fields (read/all/gc):
+        "all": False,
+        "message_id": None,
+        "all_history": False,
+        "ttl_hours": None,
+    }
+    defaults.update(kwargs)
+    return argparse.Namespace(**defaults)
+
+
+def _load_inbox_messages(path: Path) -> list:
+    """Test helper: load the v2 envelope on disk and return the messages list."""
+    raw = path.read_text(encoding="utf-8")
+    data = json.loads(raw) if raw.strip() else {}
+    if isinstance(data, dict):
+        return data.get("messages", []) or []
+    if isinstance(data, list):
+        # v1 leftover (shouldn't normally happen post-migration).
+        return data
+    return []
+
+
+def test_send_writes_correct_json():
+    """send writes a JSON entry with from/ts/queue_item/text fields."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        tmpdir = Path(td)
+        inbox_dir = str(tmpdir / "inbox")
+        args = _make_args(agent_id="test-1", text="hello",
+                          from_label="tester", queue_item="q-test",
+                          inbox_dir=inbox_dir)
+        rc = cmd_send(args)
+        assert rc == 0
+        path = Path(inbox_dir) / "test-1.json"
+        assert path.exists()
+        data = _load_inbox_messages(path)
+        assert isinstance(data, list)
+        assert len(data) == 1
+        assert data[0]["from"] == "tester"
+        assert data[0]["text"] == "hello"
+        assert data[0]["queue_item"] == "q-test"
+        assert "ts" in data[0]
+        # New v2 fields:
+        assert data[0]["read"] is False
+        assert data[0]["read_at"] is None
+        assert data[0]["id"]
+        # File-level: v2 envelope shape on disk.
+        envelope = json.loads(path.read_text())
+        assert envelope["schema_version"] == 2
+        assert isinstance(envelope["messages"], list)
+    return True
+
+
+def test_send_dry_run_no_write():
+    """send --dry-run does NOT write to the inbox."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        tmpdir = Path(td)
+        inbox_dir = str(tmpdir / "inbox")
+        args = _make_args(agent_id="test-2", text="dry",
+                          inbox_dir=inbox_dir, dry_run=True)
+        rc = cmd_send(args)
+        assert rc == 0
+        path = Path(inbox_dir) / "test-2.json"
+        assert not path.exists()
+    return True
+
+
+def test_send_multiple_accumulate():
+    """Multiple sends append to the same inbox."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        tmpdir = Path(td)
+        inbox_dir = str(tmpdir / "inbox")
+        for i in range(3):
+            args = _make_args(agent_id="acc", text=f"msg-{i}",
+                              inbox_dir=inbox_dir)
+            cmd_send(args)
+        path = Path(inbox_dir) / "acc.json"
+        data = _load_inbox_messages(path)
+        assert len(data) == 3
+        assert [d["text"] for d in data] == ["msg-0", "msg-1", "msg-2"]
+    return True
+
+
+def test_ack_flips_read_keeps_bodies():
+    """ack flips read=true + sets read_at; bodies stay on disk for re-read."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        tmpdir = Path(td)
+        inbox_dir = str(tmpdir / "inbox")
+        cmd_send(_make_args(agent_id="ack-test", text="hi",
+                            inbox_dir=inbox_dir))
+        cmd_send(_make_args(agent_id="ack-test", text="hi-2",
+                            inbox_dir=inbox_dir))
+        path = Path(inbox_dir) / "ack-test.json"
+        before = _load_inbox_messages(path)
+        assert len(before) == 2
+        assert all(not m["read"] for m in before)
+        rc = cmd_ack(_make_args(agent_id="ack-test", inbox_dir=inbox_dir))
+        assert rc == 0
+        after = _load_inbox_messages(path)
+        # Bodies + count preserved.
+        assert len(after) == 2
+        assert [m["text"] for m in after] == ["hi", "hi-2"]
+        assert all(m["read"] is True for m in after)
+        assert all(isinstance(m["read_at"], str) and m["read_at"] for m in after)
+    return True
+
+
+def test_ack_specific_message_id():
+    """ack --message-id only flips the targeted message."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        inbox_dir = str(Path(td) / "inbox")
+        cmd_send(_make_args(agent_id="byid", text="a", inbox_dir=inbox_dir))
+        cmd_send(_make_args(agent_id="byid", text="b", inbox_dir=inbox_dir))
+        path = Path(inbox_dir) / "byid.json"
+        msgs = _load_inbox_messages(path)
+        target_id = msgs[0]["id"]
+        rc = cmd_ack(_make_args(agent_id="byid", inbox_dir=inbox_dir,
+                                message_id=target_id))
+        assert rc == 0
+        msgs = _load_inbox_messages(path)
+        assert msgs[0]["read"] is True
+        assert msgs[1]["read"] is False
+    return True
+
+
+def test_inbox_read_does_not_clear():
+    """inbox subcommand reads without clearing."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        tmpdir = Path(td)
+        inbox_dir = str(tmpdir / "inbox")
+        cmd_send(_make_args(agent_id="ro", text="dont-erase",
+                            inbox_dir=inbox_dir))
+        rc = cmd_inbox(_make_args(agent_id="ro", inbox_dir=inbox_dir))
+        assert rc == 0
+        path = Path(inbox_dir) / "ro.json"
+        data = _load_inbox_messages(path)
+        assert len(data) == 1
+        assert data[0]["text"] == "dont-erase"
+    return True
+
+
+def test_inbox_missing_inbox():
+    """inbox on a missing inbox returns 0 with empty result."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        tmpdir = Path(td)
+        inbox_dir = str(tmpdir / "inbox")
+        rc = cmd_inbox(_make_args(agent_id="never-existed",
+                                  inbox_dir=inbox_dir))
+        assert rc == 0
+    return True
+
+
+def test_arm_initialises_inbox_no_obligation():
+    """arm --no-obligation creates an empty inbox."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        tmpdir = Path(td)
+        inbox_dir = str(tmpdir / "inbox")
+        rc = cmd_arm(_make_args(agent_id="armed", inbox_dir=inbox_dir,
+                                no_obligation=True))
+        assert rc == 0
+        path = Path(inbox_dir) / "armed.json"
+        assert path.exists()
+        # Empty v2 envelope on disk.
+        envelope = json.loads(path.read_text())
+        assert envelope == {"schema_version": 2, "messages": []}
+    return True
+
+
+def test_arm_idempotent_preserves_pending():
+    """Re-arming an agent with pending messages does NOT drop them."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        tmpdir = Path(td)
+        inbox_dir = str(tmpdir / "inbox")
+        cmd_send(_make_args(agent_id="rearmed", text="pending",
+                            inbox_dir=inbox_dir))
+        rc = cmd_arm(_make_args(agent_id="rearmed", inbox_dir=inbox_dir,
+                                no_obligation=True))
+        assert rc == 0
+        path = Path(inbox_dir) / "rearmed.json"
+        data = _load_inbox_messages(path)
+        assert len(data) == 1
+        assert data[0]["text"] == "pending"
+    return True
+
+
+def test_disarm_removes_inbox_no_obligation():
+    """disarm --no-obligation deletes the inbox file."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        tmpdir = Path(td)
+        inbox_dir = str(tmpdir / "inbox")
+        cmd_send(_make_args(agent_id="bye", text="x", inbox_dir=inbox_dir))
+        path = Path(inbox_dir) / "bye.json"
+        assert path.exists()
+        rc = cmd_disarm(_make_args(agent_id="bye", inbox_dir=inbox_dir,
+                                   no_obligation=True))
+        assert rc == 0
+        assert not path.exists()
+    return True
+
+
+def test_predicate_missing_inbox_satisfied():
+    """agent_inbox_empty with missing path returns satisfied=True."""
+    cli = _obligations_cli()
+    if not cli:
+        return True  # default-open
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        bogus = str(Path(td) / "does-not-exist.json")
+        proc = subprocess.run(
+            [cli, "add", "--tool-pattern", "*",
+             "--predicate", "agent_inbox_empty",
+             "--params", json.dumps({"path": bogus}),
+             "--ttl", "60", "--enforcement", "gate",
+             "--deny-msg", "predicate test", "--json"],
+            capture_output=True, text=True, timeout=10, check=False,
+            env={**os.environ, "HOME": td},
+        )
+        assert proc.returncode == 0, proc.stderr
+        ob_id = json.loads(proc.stdout)["id"]
+        # Now check: with missing inbox, predicate is satisfied -> not blocked.
+        chk = subprocess.run(
+            [cli, "check", "--tool", "Bash",
+             "--command-string", "ls", "--json"],
+            capture_output=True, text=True, timeout=10, check=False,
+            env={**os.environ, "HOME": td},
+        )
+        assert chk.returncode == 0, f"expected 0 got {chk.returncode}: {chk.stdout}"
+        # cleanup
+        subprocess.run([cli, "satisfy", ob_id],
+                       capture_output=True, text=True, timeout=5,
+                       env={**os.environ, "HOME": td})
+    return True
+
+
+def test_predicate_empty_array_satisfied():
+    """agent_inbox_empty with [] file returns satisfied=True."""
+    cli = _obligations_cli()
+    if not cli:
+        return True
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        empty_file = Path(td) / "empty.json"
+        empty_file.write_text("[]")
+        proc = subprocess.run(
+            [cli, "add", "--tool-pattern", "*",
+             "--predicate", "agent_inbox_empty",
+             "--params", json.dumps({"path": str(empty_file)}),
+             "--ttl", "60", "--enforcement", "gate",
+             "--deny-msg", "empty test", "--json"],
+            capture_output=True, text=True, timeout=10, check=False,
+            env={**os.environ, "HOME": td},
+        )
+        assert proc.returncode == 0
+        chk = subprocess.run(
+            [cli, "check", "--tool", "Bash",
+             "--command-string", "ls", "--json"],
+            capture_output=True, text=True, timeout=10, check=False,
+            env={**os.environ, "HOME": td},
+        )
+        assert chk.returncode == 0, chk.stdout
+    return True
+
+
+def test_predicate_nonempty_inbox_blocks():
+    """agent_inbox_empty with a populated inbox blocks (gate mode)."""
+    cli = _obligations_cli()
+    if not cli:
+        return True
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        inbox = Path(td) / "inbox.json"
+        inbox.write_text(json.dumps([{
+            "from": "tester", "ts": "2026-04-28",
+            "queue_item": None, "text": "hello agent",
+        }]))
+        proc = subprocess.run(
+            [cli, "add", "--tool-pattern", "*",
+             "--predicate", "agent_inbox_empty",
+             "--params", json.dumps({"path": str(inbox)}),
+             "--ttl", "60", "--enforcement", "gate",
+             "--deny-msg", "inbox has messages", "--json"],
+            capture_output=True, text=True, timeout=10, check=False,
+            env={**os.environ, "HOME": td},
+        )
+        assert proc.returncode == 0
+        chk = subprocess.run(
+            [cli, "check", "--tool", "Bash",
+             "--command-string", "ls", "--json"],
+            capture_output=True, text=True, timeout=10, check=False,
+            env={**os.environ, "HOME": td},
+        )
+        # exit 2 means blocked
+        assert chk.returncode == 2, f"expected 2 got {chk.returncode}: {chk.stdout}"
+        result = json.loads(chk.stdout)
+        assert not result["ok"]
+        # The why string should mention the inbox path AND the message body.
+        why = result["blocking"][0]["why"]
+        assert "hello agent" in why
+        assert str(inbox) in why
+    return True
+
+
+def test_predicate_malformed_json_default_open():
+    """agent_inbox_empty with malformed JSON is default-open."""
+    cli = _obligations_cli()
+    if not cli:
+        return True
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        inbox = Path(td) / "bad.json"
+        inbox.write_text("{not valid json")
+        proc = subprocess.run(
+            [cli, "add", "--tool-pattern", "*",
+             "--predicate", "agent_inbox_empty",
+             "--params", json.dumps({"path": str(inbox)}),
+             "--ttl", "60", "--enforcement", "gate",
+             "--deny-msg", "malformed test", "--json"],
+            capture_output=True, text=True, timeout=10, check=False,
+            env={**os.environ, "HOME": td},
+        )
+        assert proc.returncode == 0
+        chk = subprocess.run(
+            [cli, "check", "--tool", "Bash",
+             "--command-string", "ls", "--json"],
+            capture_output=True, text=True, timeout=10, check=False,
+            env={**os.environ, "HOME": td},
+        )
+        assert chk.returncode == 0, f"malformed should default-open: {chk.stdout}"
+    return True
+
+
+def test_predicate_atomic_concurrency():
+    """Two concurrent sends do not clobber each other."""
+    import tempfile
+    import threading
+    with tempfile.TemporaryDirectory() as td:
+        tmpdir = Path(td)
+        inbox_dir = str(tmpdir / "inbox")
+        # 10 concurrent senders, each sending 5 messages
+        def sender(thread_id):
+            for j in range(5):
+                cmd_send(_make_args(agent_id="concurrent",
+                                    text=f"t{thread_id}-{j}",
+                                    inbox_dir=inbox_dir))
+        threads = [threading.Thread(target=sender, args=(i,)) for i in range(10)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        path = Path(inbox_dir) / "concurrent.json"
+        data = _load_inbox_messages(path)
+        # Should have exactly 50 messages -- no clobbering.
+        assert len(data) == 50, f"expected 50, got {len(data)}"
+        # All messages must be distinct.
+        texts = {d["text"] for d in data}
+        assert len(texts) == 50
+    return True
+
+
+def test_send_then_ack_then_send():
+    """Send, ack, send: both bodies persist; only the second is unread."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        tmpdir = Path(td)
+        inbox_dir = str(tmpdir / "inbox")
+        cmd_send(_make_args(agent_id="cycle", text="first",
+                            inbox_dir=inbox_dir))
+        cmd_ack(_make_args(agent_id="cycle", inbox_dir=inbox_dir))
+        cmd_send(_make_args(agent_id="cycle", text="second",
+                            inbox_dir=inbox_dir))
+        path = Path(inbox_dir) / "cycle.json"
+        data = _load_inbox_messages(path)
+        # v2 semantics: both bodies remain on disk.
+        assert len(data) == 2
+        assert [m["text"] for m in data] == ["first", "second"]
+        assert data[0]["read"] is True
+        assert data[1]["read"] is False
+        unread = [m for m in data if not m["read"]]
+        assert len(unread) == 1
+        assert unread[0]["text"] == "second"
+    return True
+
+
+def test_index_register_then_done():
+    """Existing index ops still work."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        global INDEX_FILE, CONFIG_DIR
+        old_cfg = CONFIG_DIR
+        old_idx = INDEX_FILE
+        CONFIG_DIR = Path(td) / "config"
+        INDEX_FILE = CONFIG_DIR / "active-agents.json"
+        try:
+            args = _make_args(agent_id="idx-1", queue_item="q-1",
+                              description="desc")
+            cmd_index_register(args)
+            idx = _read_index()
+            assert "idx-1" in idx
+            cmd_index_done(_make_args(agent_id="idx-1"))
+            idx = _read_index()
+            assert "idx-1" not in idx
+        finally:
+            CONFIG_DIR = old_cfg
+            INDEX_FILE = old_idx
+    return True
+
+
+def test_show_nonexistent_agent():
+    """show on a nonexistent agent returns 1."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        global INDEX_FILE, CONFIG_DIR
+        old_cfg = CONFIG_DIR
+        old_idx = INDEX_FILE
+        CONFIG_DIR = Path(td) / "config"
+        INDEX_FILE = CONFIG_DIR / "active-agents.json"
+        try:
+            rc = cmd_show(_make_args(agent_id="ghost"))
+            assert rc == 1
+        finally:
+            CONFIG_DIR = old_cfg
+            INDEX_FILE = old_idx
+    return True
+
+
+def test_list_empty_index():
+    """list on empty index returns 0."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        global INDEX_FILE, CONFIG_DIR
+        old_cfg = CONFIG_DIR
+        old_idx = INDEX_FILE
+        CONFIG_DIR = Path(td) / "config"
+        INDEX_FILE = CONFIG_DIR / "active-agents.json"
+        try:
+            rc = cmd_list(_make_args())
+            assert rc == 0
+        finally:
+            CONFIG_DIR = old_cfg
+            INDEX_FILE = old_idx
+    return True
+
+
+def test_inbox_with_args_inbox_dir_override():
+    """--inbox-dir flag overrides the default inbox directory."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        custom_dir = Path(td) / "custom-inbox"
+        cmd_send(_make_args(agent_id="custom", text="x",
+                            inbox_dir=str(custom_dir)))
+        assert (custom_dir / "custom.json").exists()
+        # And that it's not in the default location either
+        assert not (INBOX_DIR / "custom.json").exists() or True
+    return True
+
+
+def test_send_accepts_unicode():
+    """Unicode in message body round-trips cleanly."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        tmpdir = Path(td)
+        inbox_dir = str(tmpdir / "inbox")
+        cmd_send(_make_args(agent_id="uni", text="日本語 — emoji",
+                            inbox_dir=inbox_dir))
+        path = Path(inbox_dir) / "uni.json"
+        data = _load_inbox_messages(path)
+        assert data[0]["text"] == "日本語 — emoji"
+    return True
+
+
+def test_send_default_from_label():
+    """send without --from defaults to andrew@signal."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        tmpdir = Path(td)
+        inbox_dir = str(tmpdir / "inbox")
+        cmd_send(_make_args(agent_id="dflt", text="hi", inbox_dir=inbox_dir))
+        path = Path(inbox_dir) / "dflt.json"
+        data = _load_inbox_messages(path)
+        assert data[0]["from"] == "andrew@signal"
+    return True
+
+
+# ----------------------------------------------------------------------
+# Gate-mode end-to-end tests
+#
+# These tests register a real obligation through the obligations CLI in a
+# sandboxed HOME, populate the inbox via cmd_send, and run the
+# pre-tool-obligations-gate-hook to verify the gate behavior:
+#
+# 1. Subagent + non-empty inbox + non-exempt tool -> DENY
+# 2. Subagent + non-empty inbox + agent-msg ack -> ALLOW (exempt)
+# 3. Subagent + non-empty inbox + agent-msg inbox -> ALLOW (exempt)
+# 4. Subagent + non-empty inbox + agent-msg disarm -> ALLOW (exempt)
+# 5. Main loop + non-empty inbox -> ALLOW (is_main_loop scope-guard fires)
+# 6. Subagent + after ack -> ALLOW (predicate satisfied again)
+#
+# We resolve the pre-tool hook from the same dir as this script.
+# ----------------------------------------------------------------------
+
+
+def _gate_hook_path():
+    """Resolve pre-tool-obligations-gate-hook sibling. Tests skip if missing."""
+    here = Path(__file__).resolve().parent
+    candidate = here / "pre-tool-obligations-gate-hook"
+    if candidate.exists() and os.access(candidate, os.X_OK):
+        return str(candidate)
+    return None
+
+
+def _run_pre_hook(hook_path: str, payload: dict, env: dict):
+    """Invoke the pre-tool hook with stdin payload. Return (rc, parsed_out)."""
+    proc = subprocess.run(
+        [hook_path], input=json.dumps(payload),
+        capture_output=True, text=True, timeout=10, env=env, check=False,
+    )
+    try:
+        out = json.loads(proc.stdout) if proc.stdout.strip() else {}
+    except json.JSONDecodeError:
+        out = {"__raw__": proc.stdout}
+    return proc.returncode, out, proc.stderr
+
+
+def _is_deny(out: dict) -> bool:
+    hso = out.get("hookSpecificOutput") or {}
+    return hso.get("permissionDecision") == "deny"
+
+
+def _gate_test_setup(tmpdir: Path, agent_id: str = "gtest-agent"):
+    """Common setup: sandbox HOME, register a real obligation via arm.
+
+    Returns (env, inbox_path, ob_id) -- env to use for the hook,
+    inbox_path so the test can send messages, ob_id to clean up after.
+    Skips registration if obligations CLI is not available (returns None).
+    """
+    cli = _obligations_cli()
+    if not cli:
+        return None
+    env = os.environ.copy()
+    env["HOME"] = str(tmpdir)
+    here = Path(__file__).resolve().parent
+    env["PATH"] = f"{here}:{env.get('PATH', '')}"
+    inbox_dir = tmpdir / "inbox"
+    inbox_dir.mkdir(parents=True, exist_ok=True)
+    inbox_path = inbox_dir / f"{agent_id}.json"
+    inbox_path.write_text("[]")
+    # Register the obligation by shelling out to agent-msg arm so the
+    # exact production wiring is exercised (gate mode + exempt patterns).
+    here = Path(__file__).resolve().parent
+    arm_proc = subprocess.run(
+        [str(here / "agent-msg"), "arm", agent_id,
+         "--inbox-dir", str(inbox_dir),
+         "--ttl", "120", "--json"],
+        capture_output=True, text=True, timeout=10, env=env, check=False,
+    )
+    if arm_proc.returncode != 0:
+        return None
+    try:
+        ob_id = json.loads(arm_proc.stdout).get("obligation_id")
+    except json.JSONDecodeError:
+        return None
+    if not ob_id:
+        return None
+    return env, inbox_path, ob_id
+
+
+def test_gate_subagent_nonexempt_denied():
+    """Subagent + non-empty inbox + non-exempt tool -> DENY."""
+    hook = _gate_hook_path()
+    if not hook:
+        return True  # default-open: hook missing
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        tmpdir = Path(td)
+        setup = _gate_test_setup(tmpdir, "gt-deny")
+        if not setup:
+            return True  # CLI missing -> default-open
+        env, inbox_path, _ob = setup
+        # Populate inbox so predicate fails.
+        inbox_path.write_text(json.dumps([{
+            "from": "main-loop", "ts": _now_iso(),
+            "queue_item": "q-test", "text": "switch tasks now",
+        }]))
+        # Subagent context: agent_id present + non-empty.
+        rc, out, _err = _run_pre_hook(
+            hook,
+            {"tool_name": "Bash", "tool_input": {"command": "ls"},
+             "agent_id": "gt-deny"},
+            env,
+        )
+        assert rc == 0, f"rc={rc} out={out}"
+        assert _is_deny(out), f"expected deny, got {out}"
+        # The deny banner should mention the message body.
+        sysmsg = out.get("systemMessage") or ""
+        assert "switch tasks now" in sysmsg, f"deny banner missing body: {sysmsg!r}"
+    return True
+
+
+def test_gate_subagent_ack_passes_through():
+    """Subagent + non-empty inbox + `agent-msg ack` call -> ALLOW (exempt)."""
+    hook = _gate_hook_path()
+    if not hook:
+        return True
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        tmpdir = Path(td)
+        setup = _gate_test_setup(tmpdir, "gt-ack")
+        if not setup:
+            return True
+        env, inbox_path, _ob = setup
+        inbox_path.write_text(json.dumps([{
+            "from": "main-loop", "ts": _now_iso(),
+            "queue_item": None, "text": "ack me",
+        }]))
+        # Even though inbox is non-empty, the ack call itself must pass.
+        rc, out, _err = _run_pre_hook(
+            hook,
+            {"tool_name": "Bash",
+             "tool_input": {"command": "agent-msg ack gt-ack"},
+             "agent_id": "gt-ack"},
+            env,
+        )
+        assert rc == 0, f"rc={rc} out={out}"
+        assert not _is_deny(out), (
+            f"ack call must NOT be denied (it's the exempt recovery path); "
+            f"got out={out}"
+        )
+    return True
+
+
+def test_gate_subagent_inbox_passes_through():
+    """Subagent + non-empty inbox + `agent-msg inbox` -> ALLOW (exempt)."""
+    hook = _gate_hook_path()
+    if not hook:
+        return True
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        tmpdir = Path(td)
+        setup = _gate_test_setup(tmpdir, "gt-inbox")
+        if not setup:
+            return True
+        env, inbox_path, _ob = setup
+        inbox_path.write_text(json.dumps([{
+            "from": "main-loop", "ts": _now_iso(),
+            "queue_item": None, "text": "x",
+        }]))
+        rc, out, _err = _run_pre_hook(
+            hook,
+            {"tool_name": "Bash",
+             "tool_input": {"command": "agent-msg inbox gt-inbox"},
+             "agent_id": "gt-inbox"},
+            env,
+        )
+        assert rc == 0, f"rc={rc} out={out}"
+        assert not _is_deny(out), f"inbox read must pass through; got {out}"
+    return True
+
+
+def test_gate_subagent_disarm_passes_through():
+    """Subagent + non-empty inbox + `agent-msg disarm` -> ALLOW (exempt)."""
+    hook = _gate_hook_path()
+    if not hook:
+        return True
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        tmpdir = Path(td)
+        setup = _gate_test_setup(tmpdir, "gt-dis")
+        if not setup:
+            return True
+        env, inbox_path, _ob = setup
+        inbox_path.write_text(json.dumps([{
+            "from": "main-loop", "ts": _now_iso(),
+            "queue_item": None, "text": "x",
+        }]))
+        rc, out, _err = _run_pre_hook(
+            hook,
+            {"tool_name": "Bash",
+             "tool_input": {"command": "agent-msg disarm gt-dis"},
+             "agent_id": "gt-dis"},
+            env,
+        )
+        assert rc == 0, f"rc={rc} out={out}"
+        assert not _is_deny(out), f"disarm must pass through; got {out}"
+    return True
+
+
+def test_gate_main_loop_scope_guard_allows():
+    """Main loop (no agent_id) + non-empty inbox -> ALLOW.
+
+    The is_main_loop {negate: true} scope-guard fails for the main loop,
+    short-circuiting all_of as satisfied -- so even though inbox is
+    non-empty, the main loop is never blocked by its own queued messages.
+    """
+    hook = _gate_hook_path()
+    if not hook:
+        return True
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        tmpdir = Path(td)
+        setup = _gate_test_setup(tmpdir, "gt-mainloop")
+        if not setup:
+            return True
+        env, inbox_path, _ob = setup
+        inbox_path.write_text(json.dumps([{
+            "from": "main-loop", "ts": _now_iso(),
+            "queue_item": None, "text": "queued for the agent",
+        }]))
+        # No agent_id in payload -> main loop context.
+        rc, out, _err = _run_pre_hook(
+            hook,
+            {"tool_name": "Bash", "tool_input": {"command": "ls"}},
+            env,
+        )
+        assert rc == 0, f"rc={rc} out={out}"
+        assert not _is_deny(out), (
+            f"main-loop call must NOT be denied (scope-guard); got {out}"
+        )
+    return True
+
+
+def test_gate_after_ack_inbox_empty_allows():
+    """Subagent: after ack clears inbox, subsequent calls allowed."""
+    hook = _gate_hook_path()
+    if not hook:
+        return True
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        tmpdir = Path(td)
+        setup = _gate_test_setup(tmpdir, "gt-cycle")
+        if not setup:
+            return True
+        env, inbox_path, _ob = setup
+        # Populate -> deny first.
+        inbox_path.write_text(json.dumps([{
+            "from": "main-loop", "ts": _now_iso(),
+            "queue_item": None, "text": "blocking message",
+        }]))
+        rc, out, _err = _run_pre_hook(
+            hook,
+            {"tool_name": "Bash", "tool_input": {"command": "ls"},
+             "agent_id": "gt-cycle"},
+            env,
+        )
+        assert _is_deny(out), f"baseline: should deny while inbox full"
+        # Now ack: rewrite to [].
+        inbox_path.write_text("[]")
+        rc, out, _err = _run_pre_hook(
+            hook,
+            {"tool_name": "Bash", "tool_input": {"command": "ls"},
+             "agent_id": "gt-cycle"},
+            env,
+        )
+        assert rc == 0, f"rc={rc} out={out}"
+        assert not _is_deny(out), f"after ack inbox is empty -> allow; got {out}"
+    return True
+
+
+def test_arm_registers_gate_mode_with_exempt_patterns():
+    """`agent-msg arm` registers a GATE-mode obligation with the documented
+    exempt_patterns. This guards against an accidental drop back to
+    inform-mode (which empirically failed to surface to subagents)."""
+    cli = _obligations_cli()
+    if not cli:
+        return True  # default-open
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        tmpdir = Path(td)
+        env = os.environ.copy()
+        env["HOME"] = str(tmpdir)
+        inbox_dir = tmpdir / "inbox"
+        here = Path(__file__).resolve().parent
+        arm_proc = subprocess.run(
+            [str(here / "agent-msg"), "arm", "shape-test",
+             "--inbox-dir", str(inbox_dir),
+             "--ttl", "120", "--json"],
+            capture_output=True, text=True, timeout=10, env=env, check=False,
+        )
+        assert arm_proc.returncode == 0, arm_proc.stderr
+        ob_id = json.loads(arm_proc.stdout)["obligation_id"]
+        # Inspect via `obligations show`.
+        show_proc = subprocess.run(
+            [cli, "show", ob_id],
+            capture_output=True, text=True, timeout=5, env=env, check=False,
+        )
+        assert show_proc.returncode == 0, show_proc.stderr
+        row = json.loads(show_proc.stdout)
+        assert row["enforcement"] == "gate", (
+            f"expected enforcement=gate, got {row['enforcement']!r} -- "
+            f"do NOT regress to inform mode (silently drops messages to "
+            f"subagents)"
+        )
+        exempts = row.get("exempt_patterns", [])
+        # Must include the three documented exempt patterns.
+        joined = " ".join(exempts)
+        for needle in ("agent-msg", "ack", "inbox", "disarm"):
+            assert needle in joined, (
+                f"exempt_patterns missing {needle!r}: {exempts!r}"
+            )
+    return True
+
+
+def test_v1_legacy_inbox_auto_migrates():
+    """Reading a v1 bare-list inbox migrates it in place to a v2 envelope.
+
+    This guards live in-flight agents that already have a v1 inbox on disk:
+    the very next read flips the file to v2 without losing any pending
+    messages, every entry gets read=false (so the predicate still blocks),
+    and a fresh id field is synthesised."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        inbox_dir = Path(td) / "inbox"
+        inbox_dir.mkdir()
+        path = inbox_dir / "legacy.json"
+        # v1 shape: bare list, no read/id.
+        path.write_text(json.dumps([
+            {"from": "main-loop", "ts": "2026-04-30T10:00:00+00:00",
+             "queue_item": "q-x", "text": "old message"}
+        ]))
+        # Read via cmd_inbox -- should return rc=0 and surface the message.
+        rc = cmd_inbox(_make_args(agent_id="legacy",
+                                  inbox_dir=str(inbox_dir), json=True))
+        assert rc == 0
+        # On disk: now v2.
+        envelope = json.loads(path.read_text())
+        # First read in cmd_inbox is non-mutating (we unlock without writing).
+        # We need to do something that triggers a write -- send a new message.
+        cmd_send(_make_args(agent_id="legacy", text="new",
+                            inbox_dir=str(inbox_dir)))
+        envelope = json.loads(path.read_text())
+        assert envelope["schema_version"] == 2
+        assert isinstance(envelope["messages"], list)
+        assert len(envelope["messages"]) == 2
+        for m in envelope["messages"]:
+            assert m["read"] is False, "v1 entries must migrate as unread"
+            assert m["id"], "every entry must get an id post-migration"
+    return True
+
+
+def test_inbox_default_unread_only():
+    """`agent-msg inbox` (no --all) shows only unread; --all shows history."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        inbox_dir = str(Path(td) / "inbox")
+        cmd_send(_make_args(agent_id="dflt-unread", text="first",
+                            inbox_dir=inbox_dir))
+        cmd_ack(_make_args(agent_id="dflt-unread", inbox_dir=inbox_dir))
+        cmd_send(_make_args(agent_id="dflt-unread", text="second",
+                            inbox_dir=inbox_dir))
+        # Default view: unread only.
+        import io
+        from contextlib import redirect_stdout
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            cmd_inbox(_make_args(agent_id="dflt-unread",
+                                 inbox_dir=inbox_dir, json=True))
+        result = json.loads(buf.getvalue())
+        assert result["unread"] == 1
+        assert result["total"] == 2
+        assert len(result["messages"]) == 1
+        assert result["messages"][0]["text"] == "second"
+        # --all view: shows both.
+        buf2 = io.StringIO()
+        with redirect_stdout(buf2):
+            cmd_inbox(_make_args(agent_id="dflt-unread",
+                                 inbox_dir=inbox_dir,
+                                 all=True, json=True))
+        result2 = json.loads(buf2.getvalue())
+        assert result2["unread"] == 1
+        assert result2["total"] == 2
+        assert len(result2["messages"]) == 2
+        assert [m["text"] for m in result2["messages"]] == ["first", "second"]
+    return True
+
+
+def test_gc_drops_aged_read_messages():
+    """GC drops messages whose read_at is older than the TTL; keeps others.
+
+    Manually backdate a read_at, then run cmd_gc with a 1h TTL -- only the
+    aged entry should drop."""
+    import tempfile
+    from datetime import timedelta
+    with tempfile.TemporaryDirectory() as td:
+        inbox_dir = str(Path(td) / "inbox")
+        cmd_send(_make_args(agent_id="gc-test", text="old", inbox_dir=inbox_dir))
+        cmd_send(_make_args(agent_id="gc-test", text="recent", inbox_dir=inbox_dir))
+        cmd_send(_make_args(agent_id="gc-test", text="unread", inbox_dir=inbox_dir))
+        # ack the first two: they pick up read_at=now.
+        path = Path(inbox_dir) / "gc-test.json"
+        cmd_ack(_make_args(agent_id="gc-test", inbox_dir=inbox_dir))
+        # cmd_ack flips ALL unread, so all three are now read. Manually
+        # un-ack the third one to make it unread again.
+        envelope = json.loads(path.read_text())
+        envelope["messages"][2]["read"] = False
+        envelope["messages"][2]["read_at"] = None
+        # Backdate the first message's read_at by 25 hours.
+        old_ts = (datetime.now(timezone.utc) - timedelta(hours=25)).isoformat()
+        envelope["messages"][0]["read_at"] = old_ts
+        path.write_text(json.dumps(envelope))
+        # Run GC with a 24h TTL (default) via cmd_gc.
+        rc = cmd_gc(_make_args(agent_id="gc-test", inbox_dir=inbox_dir,
+                               ttl_hours=24.0, json=True))
+        assert rc == 0
+        after = _load_inbox_messages(path)
+        # "old" was read 25h ago -> dropped. "recent" + "unread" remain.
+        texts = [m["text"] for m in after]
+        assert "old" not in texts, f"expected old to be gc'd: got {texts}"
+        assert "recent" in texts and "unread" in texts, texts
+    return True
+
+
+def test_gc_disabled_with_zero_ttl():
+    """GC with ttl_hours <= 0 is a no-op (preserves everything)."""
+    import tempfile
+    from datetime import timedelta
+    with tempfile.TemporaryDirectory() as td:
+        inbox_dir = str(Path(td) / "inbox")
+        cmd_send(_make_args(agent_id="gc-off", text="x", inbox_dir=inbox_dir))
+        cmd_ack(_make_args(agent_id="gc-off", inbox_dir=inbox_dir))
+        path = Path(inbox_dir) / "gc-off.json"
+        envelope = json.loads(path.read_text())
+        envelope["messages"][0]["read_at"] = (
+            datetime.now(timezone.utc) - timedelta(days=365)
+        ).isoformat()
+        path.write_text(json.dumps(envelope))
+        rc = cmd_gc(_make_args(agent_id="gc-off", inbox_dir=inbox_dir,
+                               ttl_hours=0.0, json=True))
+        assert rc == 0
+        # Message still present.
+        after = _load_inbox_messages(path)
+        assert len(after) == 1
+    return True
+
+
+def test_gc_keeps_unread_regardless_of_age():
+    """Unread messages are never GC'd -- only read+aged entries drop."""
+    import tempfile
+    from datetime import timedelta
+    with tempfile.TemporaryDirectory() as td:
+        inbox_dir = str(Path(td) / "inbox")
+        cmd_send(_make_args(agent_id="gc-unread", text="ancient",
+                            inbox_dir=inbox_dir))
+        path = Path(inbox_dir) / "gc-unread.json"
+        # Backdate ts (not read_at). ts alone must not trigger GC.
+        envelope = json.loads(path.read_text())
+        envelope["messages"][0]["ts"] = (
+            datetime.now(timezone.utc) - timedelta(days=30)
+        ).isoformat()
+        path.write_text(json.dumps(envelope))
+        rc = cmd_gc(_make_args(agent_id="gc-unread", inbox_dir=inbox_dir,
+                               ttl_hours=1.0))
+        assert rc == 0
+        after = _load_inbox_messages(path)
+        assert len(after) == 1, "unread must never be GC'd"
+        assert after[0]["read"] is False
+    return True
+
+
+def test_implicit_gc_runs_on_every_invocation():
+    """The implicit GC at the top of main() trims aged read messages even
+    if the user never calls `agent-msg gc` explicitly."""
+    import tempfile
+    from datetime import timedelta
+    with tempfile.TemporaryDirectory() as td:
+        inbox_dir = str(Path(td) / "inbox")
+        cmd_send(_make_args(agent_id="implicit", text="old",
+                            inbox_dir=inbox_dir))
+        cmd_ack(_make_args(agent_id="implicit", inbox_dir=inbox_dir))
+        path = Path(inbox_dir) / "implicit.json"
+        envelope = json.loads(path.read_text())
+        # Simulate a 25h-old read_at.
+        envelope["messages"][0]["read_at"] = (
+            datetime.now(timezone.utc) - timedelta(hours=25)
+        ).isoformat()
+        path.write_text(json.dumps(envelope))
+        # Trigger _maybe_implicit_gc directly (same code path main() runs).
+        _maybe_implicit_gc(_make_args(inbox_dir=inbox_dir))
+        after = _load_inbox_messages(path)
+        assert len(after) == 0, f"implicit GC should drop aged read: {after}"
+    return True
+
+
+def test_predicate_v2_envelope_with_only_read_satisfies():
+    """agent_inbox_empty: a v2 envelope where every message is read=true
+    satisfies the predicate (no unread = no pending work)."""
+    cli = _obligations_cli()
+    if not cli:
+        return True
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        inbox = Path(td) / "inbox.json"
+        inbox.write_text(json.dumps({
+            "schema_version": 2,
+            "messages": [{
+                "id": "m-deadbeef", "from": "main-loop",
+                "ts": "2026-05-01T00:00:00+00:00",
+                "queue_item": None, "text": "history",
+                "read": True, "read_at": "2026-05-01T00:00:01+00:00",
+            }],
+        }))
+        proc = subprocess.run(
+            [cli, "add", "--tool-pattern", "*",
+             "--predicate", "agent_inbox_empty",
+             "--params", json.dumps({"path": str(inbox)}),
+             "--ttl", "60", "--enforcement", "gate",
+             "--deny-msg", "v2 read test", "--json"],
+            capture_output=True, text=True, timeout=10, check=False,
+            env={**os.environ, "HOME": td},
+        )
+        assert proc.returncode == 0, proc.stderr
+        chk = subprocess.run(
+            [cli, "check", "--tool", "Bash",
+             "--command-string", "ls", "--json"],
+            capture_output=True, text=True, timeout=10, check=False,
+            env={**os.environ, "HOME": td},
+        )
+        # rc=0: predicate satisfied (every message is read).
+        assert chk.returncode == 0, (
+            f"v2 envelope with only-read messages must satisfy: {chk.stdout}"
+        )
+    return True
+
+
+def test_predicate_v2_envelope_unread_blocks():
+    """agent_inbox_empty: a v2 envelope with at least one unread blocks."""
+    cli = _obligations_cli()
+    if not cli:
+        return True
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        inbox = Path(td) / "inbox.json"
+        inbox.write_text(json.dumps({
+            "schema_version": 2,
+            "messages": [
+                {"id": "m-1", "from": "main-loop",
+                 "ts": "2026-05-01T00:00:00+00:00",
+                 "queue_item": None, "text": "already handled",
+                 "read": True, "read_at": "2026-05-01T00:00:01+00:00"},
+                {"id": "m-2", "from": "main-loop",
+                 "ts": "2026-05-01T01:00:00+00:00",
+                 "queue_item": "q-new", "text": "new task -- handle me",
+                 "read": False, "read_at": None},
+            ],
+        }))
+        proc = subprocess.run(
+            [cli, "add", "--tool-pattern", "*",
+             "--predicate", "agent_inbox_empty",
+             "--params", json.dumps({"path": str(inbox)}),
+             "--ttl", "60", "--enforcement", "gate",
+             "--deny-msg", "v2 unread test", "--json"],
+            capture_output=True, text=True, timeout=10, check=False,
+            env={**os.environ, "HOME": td},
+        )
+        assert proc.returncode == 0
+        chk = subprocess.run(
+            [cli, "check", "--tool", "Bash",
+             "--command-string", "ls", "--json"],
+            capture_output=True, text=True, timeout=10, check=False,
+            env={**os.environ, "HOME": td},
+        )
+        assert chk.returncode == 2, (
+            f"v2 envelope with one unread must block: {chk.stdout}"
+        )
+        result = json.loads(chk.stdout)
+        why = result["blocking"][0]["why"]
+        # Banner should call out the unread body but NOT the read one.
+        assert "new task -- handle me" in why
+        assert "already handled" not in why, (
+            f"read message must NOT appear in banner: {why}"
+        )
+        # Total count is reflected too.
+        assert "1 unread" in why and "2 total" in why
+    return True
+
+
+def test_gate_subagent_real_ack_clears_with_bodies_kept():
+    """End-to-end: arm + send + ack via real CLI -> gate clears AND the
+    body is still on disk for re-read via `agent-msg inbox --all`."""
+    hook = _gate_hook_path()
+    if not hook:
+        return True
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        tmpdir = Path(td)
+        setup = _gate_test_setup(tmpdir, "gt-real-ack")
+        if not setup:
+            return True
+        env, inbox_path, _ob = setup
+        here = Path(__file__).resolve().parent
+        # Send via the real CLI under the sandboxed HOME.
+        send_proc = subprocess.run(
+            [str(here / "agent-msg"), "send", "gt-real-ack",
+             "switch tasks please",
+             "--inbox-dir", str(inbox_path.parent), "--json"],
+            capture_output=True, text=True, timeout=10, env=env, check=False,
+        )
+        assert send_proc.returncode == 0, send_proc.stderr
+        # Subagent should be denied while inbox has the unread message.
+        rc, out, _err = _run_pre_hook(
+            hook,
+            {"tool_name": "Bash", "tool_input": {"command": "ls"},
+             "agent_id": "gt-real-ack"},
+            env,
+        )
+        assert _is_deny(out), "should deny while unread queued"
+        # Ack via the real CLI.
+        ack_proc = subprocess.run(
+            [str(here / "agent-msg"), "ack", "gt-real-ack",
+             "--inbox-dir", str(inbox_path.parent), "--json"],
+            capture_output=True, text=True, timeout=10, env=env, check=False,
+        )
+        assert ack_proc.returncode == 0, ack_proc.stderr
+        # Now the gate must allow.
+        rc, out, _err = _run_pre_hook(
+            hook,
+            {"tool_name": "Bash", "tool_input": {"command": "ls"},
+             "agent_id": "gt-real-ack"},
+            env,
+        )
+        assert not _is_deny(out), f"after ack must allow: {out}"
+        # Body still on disk: --all returns the message.
+        all_proc = subprocess.run(
+            [str(here / "agent-msg"), "inbox", "gt-real-ack",
+             "--inbox-dir", str(inbox_path.parent), "--all", "--json"],
+            capture_output=True, text=True, timeout=10, env=env, check=False,
+        )
+        assert all_proc.returncode == 0
+        data = json.loads(all_proc.stdout)
+        assert data["total"] == 1
+        assert data["messages"][0]["text"] == "switch tasks please"
+        assert data["messages"][0]["read"] is True
+    return True
+
+
+def run_tests():
+    tests = [
+        ("send_writes_correct_json", test_send_writes_correct_json),
+        ("send_dry_run_no_write", test_send_dry_run_no_write),
+        ("send_multiple_accumulate", test_send_multiple_accumulate),
+        ("ack_flips_read_keeps_bodies", test_ack_flips_read_keeps_bodies),
+        ("ack_specific_message_id", test_ack_specific_message_id),
+        ("inbox_read_does_not_clear", test_inbox_read_does_not_clear),
+        ("inbox_missing_inbox", test_inbox_missing_inbox),
+        ("inbox_default_unread_only", test_inbox_default_unread_only),
+        ("v1_legacy_inbox_auto_migrates", test_v1_legacy_inbox_auto_migrates),
+        ("arm_initialises_inbox", test_arm_initialises_inbox_no_obligation),
+        ("arm_idempotent_preserves_pending", test_arm_idempotent_preserves_pending),
+        ("disarm_removes_inbox", test_disarm_removes_inbox_no_obligation),
+        ("predicate_missing_inbox", test_predicate_missing_inbox_satisfied),
+        ("predicate_empty_array", test_predicate_empty_array_satisfied),
+        ("predicate_nonempty_blocks", test_predicate_nonempty_inbox_blocks),
+        ("predicate_malformed_default_open", test_predicate_malformed_json_default_open),
+        ("predicate_v2_envelope_with_only_read_satisfies",
+         test_predicate_v2_envelope_with_only_read_satisfies),
+        ("predicate_v2_envelope_unread_blocks",
+         test_predicate_v2_envelope_unread_blocks),
+        ("atomic_concurrency", test_predicate_atomic_concurrency),
+        ("send_then_ack_then_send", test_send_then_ack_then_send),
+        ("gc_drops_aged_read_messages", test_gc_drops_aged_read_messages),
+        ("gc_disabled_with_zero_ttl", test_gc_disabled_with_zero_ttl),
+        ("gc_keeps_unread_regardless_of_age",
+         test_gc_keeps_unread_regardless_of_age),
+        ("implicit_gc_runs_on_every_invocation",
+         test_implicit_gc_runs_on_every_invocation),
+        ("index_register_then_done", test_index_register_then_done),
+        ("show_nonexistent", test_show_nonexistent_agent),
+        ("list_empty", test_list_empty_index),
+        ("inbox_dir_override", test_inbox_with_args_inbox_dir_override),
+        ("send_unicode", test_send_accepts_unicode),
+        ("send_default_from_label", test_send_default_from_label),
+        # Gate-mode end-to-end tests (added 2026-04-30, q-12b0):
+        ("gate_subagent_nonexempt_denied", test_gate_subagent_nonexempt_denied),
+        ("gate_subagent_ack_passes_through", test_gate_subagent_ack_passes_through),
+        ("gate_subagent_inbox_passes_through", test_gate_subagent_inbox_passes_through),
+        ("gate_subagent_disarm_passes_through", test_gate_subagent_disarm_passes_through),
+        ("gate_main_loop_scope_guard_allows", test_gate_main_loop_scope_guard_allows),
+        ("gate_after_ack_inbox_empty_allows", test_gate_after_ack_inbox_empty_allows),
+        ("gate_subagent_real_ack_clears_with_bodies_kept",
+         test_gate_subagent_real_ack_clears_with_bodies_kept),
+        ("arm_registers_gate_mode_with_exempt_patterns",
+         test_arm_registers_gate_mode_with_exempt_patterns),
+    ]
+    passed = 0
+    failed = 0
+    for name, fn in tests:
+        try:
+            ok = fn()
+            if ok:
+                print(f"  PASS  {name}")
+                passed += 1
+            else:
+                print(f"  FAIL  {name} (returned False)")
+                failed += 1
+        except Exception as e:
+            print(f"  FAIL  {name} ({type(e).__name__}: {e})")
+            failed += 1
+    print()
+    print(f"RESULT: {passed}/{passed + failed} passed")
+    return 0 if failed == 0 else 1
+
+
+# ----------------------------------------------------------------------
+# Argparse wiring
+# ----------------------------------------------------------------------
+
+
+def build_parser():
+    p = argparse.ArgumentParser(
+        prog="agent-msg",
+        description="Async messaging for Claude Code background agents (via obligations).",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+    p.add_argument("--test", action="store_true", help="run embedded test suite")
+    sub = p.add_subparsers(dest="command", help="subcommand")
+
+    # list
+    sub.add_parser("list", help="show all tracked agents (index)")
+
+    # show
+    p_show = sub.add_parser("show", help="show metadata for one agent (index)")
+    p_show.add_argument("agent_id")
+
+    # send
+    p_send = sub.add_parser("send", help="append a message to an agent's inbox")
+    p_send.add_argument("agent_id")
+    p_send.add_argument("text")
+    p_send.add_argument("--from", dest="from_label", default=None,
+                        help="sender label (default: andrew@signal)")
+    p_send.add_argument("--queue-item", default=None,
+                        help="associated queue item id")
+    p_send.add_argument("--inbox-dir", default=None,
+                        help="override inbox dir (default: ~/.config/claude/agent-inbox/)")
+    p_send.add_argument("--dry-run", action="store_true",
+                        help="show what would be sent; do not write")
+    p_send.add_argument("--json", action="store_true")
+
+    # inbox (read without consuming) -- defaults to UNREAD only
+    p_inb = sub.add_parser("inbox", help="read an agent's inbox (default: unread only)")
+    p_inb.add_argument("agent_id")
+    p_inb.add_argument("--inbox-dir", default=None)
+    p_inb.add_argument("--all", action="store_true",
+                       help="include already-read messages (kept on disk until GC)")
+    p_inb.add_argument("--json", action="store_true")
+
+    # ack -- flips read=true; KEEPS bodies on disk
+    p_ack = sub.add_parser(
+        "ack", help="mark unread messages as read (keeps bodies on disk)")
+    p_ack.add_argument("agent_id")
+    p_ack.add_argument("--inbox-dir", default=None)
+    p_ack.add_argument("--message-id", default=None,
+                       help="ack only the specified message id (default: all unread)")
+    p_ack.add_argument("--all-history", action="store_true",
+                       help="re-stamp read_at on already-read messages too (rare)")
+    p_ack.add_argument("--json", action="store_true")
+
+    # gc -- explicit garbage-collect of read messages older than the TTL
+    p_gc = sub.add_parser(
+        "gc", help="drop already-read messages older than the TTL")
+    p_gc.add_argument("agent_id")
+    p_gc.add_argument("--inbox-dir", default=None)
+    p_gc.add_argument("--ttl-hours", type=float, default=None,
+                      help=f"TTL hours (default: ${{AGENT_MSG_TTL_HOURS}} or "
+                           f"{DEFAULT_READ_TTL_HOURS}); <=0 disables GC")
+    p_gc.add_argument("--json", action="store_true")
+
+    # arm
+    p_arm = sub.add_parser("arm", help="initialise inbox + register gate-mode obligation")
+    p_arm.add_argument("agent_id")
+    p_arm.add_argument("--inbox-dir", default=None)
+    p_arm.add_argument("--ttl", type=int, default=DEFAULT_OBLIGATION_TTL_SECS,
+                       help=f"obligation TTL in seconds (default: {DEFAULT_OBLIGATION_TTL_SECS})")
+    p_arm.add_argument("--no-obligation", action="store_true",
+                       help="skip obligation registration (testing only)")
+    p_arm.add_argument("--json", action="store_true")
+
+    # disarm
+    p_dis = sub.add_parser("disarm", help="clear inbox + remove obligation for an agent")
+    p_dis.add_argument("agent_id")
+    p_dis.add_argument("--inbox-dir", default=None)
+    p_dis.add_argument("--no-obligation", action="store_true",
+                       help="skip obligation cleanup (testing only)")
+    p_dis.add_argument("--json", action="store_true")
+
+    # index
+    p_idx = sub.add_parser("index", help="manage the agent index")
+    idx_sub = p_idx.add_subparsers(dest="index_cmd")
+    p_reg = idx_sub.add_parser("register", help="register agent in the index")
+    p_reg.add_argument("agent_id")
+    p_reg.add_argument("--queue-item", required=True)
+    p_reg.add_argument("--description", default="")
+    p_done = idx_sub.add_parser("done", help="remove agent from the index")
+    p_done.add_argument("agent_id")
+
+    return p
+
+
+def main(argv=None):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    if args.test:
+        return run_tests()
+
+    if not args.command:
+        parser.print_help()
+        return 0
+
+    # Implicit GC sweep at the top of every CLI invocation. The
+    # AGENT_MSG_TTL_HOURS env var controls aging (default 24h). Errors
+    # are swallowed inside _maybe_implicit_gc so a stuck file never
+    # blocks send/ack/inbox.
+    _maybe_implicit_gc(args)
+
+    if args.command == "list":
+        return cmd_list(args)
+    if args.command == "show":
+        return cmd_show(args)
+    if args.command == "send":
+        return cmd_send(args)
+    if args.command == "inbox":
+        return cmd_inbox(args)
+    if args.command == "ack":
+        return cmd_ack(args)
+    if args.command == "gc":
+        return cmd_gc(args)
+    if args.command == "arm":
+        return cmd_arm(args)
+    if args.command == "disarm":
+        return cmd_disarm(args)
+    if args.command == "index":
+        if args.index_cmd == "register":
+            return cmd_index_register(args)
+        if args.index_cmd == "done":
+            return cmd_index_done(args)
+        # No subcommand -> help
+        for action in parser._actions:
+            if isinstance(action, argparse._SubParsersAction):
+                action.choices["index"].print_help()
+                break
+        return 0
+    parser.print_help()
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)

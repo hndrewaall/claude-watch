@@ -1,0 +1,222 @@
+#!/bin/bash
+# claude-event-watch: Block until a new event appears in the Claude event queue,
+# then print all pending events and exit. Intended to be run as a background
+# task via watcher-ctl / claude-watch — the main loop re-invokes it after each
+# delivery.
+#
+# Queue: ~/claude-events/ (override with $CLAUDE_EVENT_QUEUE, legacy
+#        $CRON_EVENT_QUEUE also honored for backward compat)
+#
+# Behavior:
+#   - If events already pending, print them immediately and exit.
+#   - Otherwise, block on inotifywait for create/moved_to.
+#   - Debounce / cooloff: after the FIRST event arrives, sleep N seconds
+#     (default 30) to BATCH any additional events that land during the
+#     window. This prevents the main loop from cycling rapidly through
+#     event bursts (e.g. torrent-completed flood from 45 grabbed torrents
+#     finishing roughly together). Configure via:
+#       --debounce SECONDS         (CLI flag, takes precedence)
+#       $EVENT_WATCH_DEBOUNCE_SECONDS  (env var)
+#     Set to 0 to disable (pre-debounce behavior — short 2s settle only).
+#   - Print each event as a single one-liner: EVENT[<source>/<tag>] <msg…>
+#     then delete the queue file. Full event JSON (compact, one line) is
+#     appended to the consumed-event ring buffer log at
+#     $LOG_DIR/consumed.jsonl so `claude-event-tail` can show it after
+#     the fact.
+#   - Print the WATCHER EXITED restart banner at the end.
+#
+# The one-liner stdout shape is intentional — the main loop's bash-task view
+# stays small. Use `claude-event-tail` to inspect details.
+
+set -uo pipefail
+
+QUEUE_DIR="${CLAUDE_EVENT_QUEUE:-${CRON_EVENT_QUEUE:-$HOME/claude-events}}"
+LOG_DIR="${CLAUDE_EVENT_LOG_DIR:-$HOME/.config/claude-events}"
+LOG_FILE="$LOG_DIR/consumed.jsonl"
+LOG_MAX_LINES="${CLAUDE_EVENT_LOG_MAX_LINES:-10000}"
+LOG_KEEP_ROTATIONS=3
+
+# Debounce/cooloff window (seconds). After the first event fires we sleep this
+# long, letting any additional events accumulate, then drain everything in one
+# shot. Default 30s; override via --debounce flag or env var. Setting 0
+# disables the cooloff (falls back to a short 2s settle).
+DEBOUNCE_SECONDS="${EVENT_WATCH_DEBOUNCE_SECONDS:-30}"
+
+usage() {
+    cat <<EOF
+Usage: claude-event-watch [--debounce SECONDS] [-h|--help]
+
+Block until a new claude-event arrives in \$CLAUDE_EVENT_QUEUE
+(default ~/claude-events/), print all pending events as one-liners,
+then exit.
+
+Options:
+  --debounce SECONDS  Cooloff window after first event (default: 30).
+                      During this window additional events are batched
+                      into the same emit. Set to 0 to disable (uses a
+                      short 2s settle only). Also configurable via
+                      \$EVENT_WATCH_DEBOUNCE_SECONDS.
+  -h, --help          Show this help.
+
+Output: one line per event, shape:
+  EVENT[<source>/<tag>] <first-60-chars-of-message>…
+
+Full event JSON appended to \$CLAUDE_EVENT_LOG_DIR/consumed.jsonl
+(default ~/.config/claude-events/, ring-buffered at
+\$CLAUDE_EVENT_LOG_MAX_LINES lines, default 10000).
+EOF
+}
+
+# Parse CLI args. Keep it simple — only --debounce / --help.
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --debounce)
+            if [[ $# -lt 2 ]]; then
+                echo "claude-event-watch: --debounce requires a value" >&2
+                exit 2
+            fi
+            DEBOUNCE_SECONDS="$2"
+            shift 2
+            ;;
+        --debounce=*)
+            DEBOUNCE_SECONDS="${1#--debounce=}"
+            shift
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            echo "claude-event-watch: unknown argument: $1" >&2
+            usage >&2
+            exit 2
+            ;;
+    esac
+done
+
+# Validate DEBOUNCE_SECONDS is a non-negative integer.
+if ! [[ "$DEBOUNCE_SECONDS" =~ ^[0-9]+$ ]]; then
+    echo "claude-event-watch: DEBOUNCE_SECONDS must be a non-negative integer (got: $DEBOUNCE_SECONDS)" >&2
+    exit 2
+fi
+
+mkdir -p "$QUEUE_DIR"
+mkdir -p "$LOG_DIR"
+
+print_restart_banner() {
+    echo "===="
+    echo "WATCHER EXITED. RESTART NOW: watcher-ctl run claude-event-watch"
+    echo "===="
+}
+
+# Rotate consumed.jsonl when it exceeds LOG_MAX_LINES. Keeps last N rotations
+# (consumed.jsonl.1 .. consumed.jsonl.N). Cheap line-count check before each
+# append batch.
+maybe_rotate_log() {
+    [[ -f "$LOG_FILE" ]] || return 0
+    local lines
+    lines=$(wc -l <"$LOG_FILE" 2>/dev/null || echo 0)
+    if (( lines >= LOG_MAX_LINES )); then
+        local i
+        for (( i=LOG_KEEP_ROTATIONS; i>=1; i-- )); do
+            local src="$LOG_FILE.$i"
+            local dst="$LOG_FILE.$((i+1))"
+            if [[ -f "$src" ]]; then
+                if (( i >= LOG_KEEP_ROTATIONS )); then
+                    rm -f "$src"
+                else
+                    mv -f "$src" "$dst"
+                fi
+            fi
+        done
+        mv -f "$LOG_FILE" "$LOG_FILE.1"
+    fi
+}
+
+# Process one event file: print a single one-liner to stdout AND append
+# the compact JSON form to the log. We delegate JSON munging to Python so
+# we don't depend on jq being installed (it isn't on every system).
+#
+# Concurrent appenders are safe because Python opens the log with
+# O_APPEND ('a' mode) — POSIX guarantees atomicity for single write() calls
+# below PIPE_BUF, and a one-line JSON event is well under that limit.
+process_event() {
+    local f="$1"
+    local log="$2"
+    python3 - "$f" "$log" <<'PYEOF'
+import json, os, sys
+src, log = sys.argv[1], sys.argv[2]
+try:
+    with open(src, "r", encoding="utf-8", errors="replace") as fp:
+        ev = json.load(fp)
+except Exception as e:
+    # Malformed event file — print a placeholder one-liner, skip log append.
+    print(f"EVENT[malformed/unknown] {os.path.basename(src)} ({e})")
+    sys.exit(0)
+
+source = str(ev.get("source", "unknown"))
+tag = str(ev.get("tag", "untagged"))
+message = str(ev.get("message", ""))
+# Collapse whitespace; truncate at 60 chars + ellipsis.
+message = " ".join(message.split())
+if len(message) > 60:
+    message = message[:60] + "…"
+print(f"EVENT[{source}/{tag}] {message}")
+
+# Compact one-line JSON for the log; ensure_ascii keeps the line PIPE_BUF-safe
+# even with multibyte chars in the message field.
+line = json.dumps(ev, separators=(",", ":"), ensure_ascii=False)
+data = (line + "\n").encode("utf-8")
+fd = os.open(log, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
+try:
+    os.write(fd, data)
+finally:
+    os.close(fd)
+PYEOF
+}
+
+print_pending() {
+    local any=0
+    maybe_rotate_log
+    # Sort by filename (timestamp prefix) for chronological order
+    while IFS= read -r -d '' f; do
+        any=1
+        process_event "$f" "$LOG_FILE"
+        rm -f "$f"
+    done < <(find "$QUEUE_DIR" -maxdepth 1 -type f -name '*.json' -print0 2>/dev/null | sort -z)
+    return $any
+}
+
+# Fast path: drain anything already pending. Note: no debounce here — if events
+# are already queued when the watcher starts up we surface them immediately.
+# The cooloff only applies AFTER the watcher has been blocking on inotify
+# (i.e. it's a fresh burst, not backlog).
+if find "$QUEUE_DIR" -maxdepth 1 -type f -name '*.json' -print -quit 2>/dev/null | grep -q .; then
+    print_pending || true
+    print_restart_banner
+    exit 0
+fi
+
+# Block until something new shows up
+if ! command -v inotifywait >/dev/null 2>&1; then
+    echo "claude-event-watch: inotifywait not found (install inotify-tools)" >&2
+    exit 1
+fi
+
+inotifywait -q -e create -e moved_to --include '\.json$' "$QUEUE_DIR" >/dev/null 2>&1
+
+# Cooloff window: after the first event fires we sleep DEBOUNCE_SECONDS
+# (default 30) to let any related events from the same burst accumulate,
+# then drain everything in one batch. This is the primary lever that keeps
+# the main loop from cycling rapidly through event floods.
+#
+# When DEBOUNCE_SECONDS=0 we fall back to the old 2s settle (just enough
+# for batched cron emissions to all land before we read the directory).
+if (( DEBOUNCE_SECONDS > 0 )); then
+    sleep "$DEBOUNCE_SECONDS"
+else
+    sleep 2
+fi
+
+print_pending || true
+print_restart_banner

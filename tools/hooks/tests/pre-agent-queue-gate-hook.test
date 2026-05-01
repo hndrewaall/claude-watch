@@ -1,0 +1,290 @@
+#!/usr/bin/env python3
+"""Tests for pre-agent-queue-gate-hook.
+
+Exercises four cases:
+  1. Valid marker + running queue id -> allow
+  2. Missing marker -> deny
+  3. Marker points to a done queue id -> deny
+  4. Marker points to a nonexistent queue id -> deny
+
+Also verifies:
+  - Non-Agent tool payloads pass through (allow)
+  - QUEUE_GATE_BYPASS=1 skips enforcement
+  - Malformed JSON on stdin defaults open
+
+Uses the real session-task queue tool. We create test queue items with
+disjoint scopes (repo:queue-gate-hook-test) to avoid colliding with the
+live queue, then clean up at exit.
+
+Run:  pre-agent-queue-gate-hook.test
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+HOOK = HERE.parent / "pre-agent-queue-gate-hook"
+# Each test item gets its own unique scope -- the queue's hard-fail spawn gate
+# (2026-04-17) blocks `queue add` when a new item's scope overlaps a currently-
+# running item, so we can't reuse the same scope across the three fixtures.
+import os as _os_for_scope
+_SCOPE_SUFFIX = f"hook-test-{_os_for_scope.getpid()}"
+TEST_SCOPE_RUNNING = f"repo:queue-gate-{_SCOPE_SUFFIX}-running"
+TEST_SCOPE_DONE = f"repo:queue-gate-{_SCOPE_SUFFIX}-done"
+
+# Collect ids we create so we can abandon them at exit.
+_created_ids: list[str] = []
+
+
+def _run_hook(payload: dict, extra_env: dict | None = None) -> tuple[int, dict, str]:
+    env = os.environ.copy()
+    if extra_env:
+        env.update(extra_env)
+    proc = subprocess.run(
+        [str(HOOK)],
+        input=json.dumps(payload),
+        capture_output=True,
+        text=True,
+        timeout=10,
+        env=env,
+        check=False,
+    )
+    try:
+        out = json.loads(proc.stdout) if proc.stdout.strip() else {}
+    except json.JSONDecodeError:
+        out = {"__raw__": proc.stdout}
+    return proc.returncode, out, proc.stderr
+
+
+def _is_deny(out: dict) -> bool:
+    hso = out.get("hookSpecificOutput") or {}
+    return hso.get("permissionDecision") == "deny"
+
+
+def _is_allow(out: dict) -> bool:
+    return not _is_deny(out)
+
+
+def _queue_add(desc: str, summary: str, scope: str) -> str:
+    proc = subprocess.run(
+        [
+            "session-task", "queue", "add", desc,
+            "--scope", scope,
+            "--summary", summary,
+            "--created-by", "hook-test",
+        ],
+        capture_output=True, text=True, timeout=10, check=False,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"queue add failed rc={proc.returncode}\nstdout={proc.stdout}\nstderr={proc.stderr}"
+        )
+    # Find id in stdout (session-task prints JSON output)
+    try:
+        data = json.loads(proc.stdout)
+        qid = data.get("id")
+        if qid:
+            _created_ids.append(qid)
+            return qid
+    except json.JSONDecodeError:
+        pass
+    # Fallback: scan stdout for q-...
+    import re
+    m = re.search(r"(q-[0-9a-zA-Z][0-9a-zA-Z-]*)", proc.stdout)
+    if m:
+        qid = m.group(1)
+        _created_ids.append(qid)
+        return qid
+    raise RuntimeError(f"Could not parse queue id from: {proc.stdout!r}")
+
+
+def _queue_register(qid: str) -> None:
+    proc = subprocess.run(
+        ["session-task", "queue", "register", qid],
+        capture_output=True, text=True, timeout=10, check=False,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"queue register failed rc={proc.returncode}\nstdout={proc.stdout}\nstderr={proc.stderr}"
+        )
+
+
+def _queue_done(qid: str) -> None:
+    subprocess.run(
+        ["session-task", "queue", "done", qid],
+        capture_output=True, text=True, timeout=10, check=False,
+    )
+
+
+def _cleanup() -> None:
+    for qid in _created_ids:
+        # Try abandon (covers pending + running); done already went through above.
+        subprocess.run(
+            ["session-task", "queue", "abandon", qid, "--reason", "hook test cleanup"],
+            capture_output=True, text=True, timeout=5, check=False,
+        )
+
+
+def _check(name: str, cond: bool, detail: str = "") -> bool:
+    if cond:
+        print(f"  PASS  {name}")
+        return True
+    print(f"  FAIL  {name}  {detail}")
+    return False
+
+
+def main() -> int:
+    if not HOOK.exists():
+        print(f"ERROR: hook not found at {HOOK}")
+        return 1
+
+    results: list[bool] = []
+
+    # Setup: create two queue items, keep one running, mark the other done.
+    running_id = _queue_add(
+        "hook test - running", "hook test running", TEST_SCOPE_RUNNING,
+    )
+    _queue_register(running_id)
+    done_id = _queue_add(
+        "hook test - to be marked done", "hook test done", TEST_SCOPE_DONE,
+    )
+    _queue_register(done_id)
+    _queue_done(done_id)
+    fake_id = "q-2026-01-01-nonexistent-xyz123"
+
+    print("=== Core tests ===")
+
+    # 1. Valid marker + running -> allow
+    payload = {
+        "tool_name": "Agent",
+        "tool_input": {
+            "subagent_type": "general-purpose",
+            "prompt": f"Do the thing.\n\nQueue item: {running_id}\n\nReport back.",
+        },
+    }
+    rc, out, _err = _run_hook(payload)
+    results.append(_check(
+        "1. valid running marker allows",
+        rc == 0 and _is_allow(out),
+        f"rc={rc} out={out}",
+    ))
+
+    # 2. Missing marker -> deny
+    payload = {
+        "tool_name": "Agent",
+        "tool_input": {
+            "subagent_type": "general-purpose",
+            "prompt": "Do the thing. No marker here.",
+        },
+    }
+    rc, out, _err = _run_hook(payload)
+    results.append(_check(
+        "2. missing marker denies",
+        rc == 0 and _is_deny(out),
+        f"rc={rc} out={out}",
+    ))
+
+    # 3. Marker -> done item -> deny
+    payload = {
+        "tool_name": "Agent",
+        "tool_input": {
+            "subagent_type": "general-purpose",
+            "prompt": f"Do the thing.\n\nQueue item: {done_id}\n",
+        },
+    }
+    rc, out, _err = _run_hook(payload)
+    results.append(_check(
+        "3. done-status marker denies",
+        rc == 0 and _is_deny(out),
+        f"rc={rc} out={out}",
+    ))
+
+    # 4. Marker -> nonexistent id -> deny
+    payload = {
+        "tool_name": "Agent",
+        "tool_input": {
+            "subagent_type": "general-purpose",
+            "prompt": f"Do the thing.\n\nQueue item: {fake_id}\n",
+        },
+    }
+    rc, out, _err = _run_hook(payload)
+    results.append(_check(
+        "4. nonexistent id denies",
+        rc == 0 and _is_deny(out),
+        f"rc={rc} out={out}",
+    ))
+
+    print("=== Auxiliary tests ===")
+
+    # 5. Non-Agent tool passes through
+    payload = {
+        "tool_name": "Bash",
+        "tool_input": {"command": "ls"},
+    }
+    rc, out, _err = _run_hook(payload)
+    results.append(_check(
+        "5. non-Agent tool allowed",
+        rc == 0 and _is_allow(out),
+        f"rc={rc} out={out}",
+    ))
+
+    # 6. QUEUE_GATE_BYPASS=1 with no marker still allows
+    payload = {
+        "tool_name": "Agent",
+        "tool_input": {"prompt": "no marker, emergency bypass"},
+    }
+    rc, out, _err = _run_hook(payload, extra_env={"QUEUE_GATE_BYPASS": "1"})
+    results.append(_check(
+        "6. QUEUE_GATE_BYPASS=1 bypasses",
+        rc == 0 and _is_allow(out),
+        f"rc={rc} out={out}",
+    ))
+
+    # 7. Malformed stdin defaults open (no crash)
+    proc = subprocess.run(
+        [str(HOOK)],
+        input="not json {{{",
+        capture_output=True, text=True, timeout=5, check=False,
+    )
+    try:
+        out = json.loads(proc.stdout) if proc.stdout.strip() else {}
+    except json.JSONDecodeError:
+        out = {"__raw__": proc.stdout}
+    results.append(_check(
+        "7. malformed stdin defaults open",
+        proc.returncode == 0 and _is_allow(out),
+        f"rc={proc.returncode} stdout={proc.stdout!r}",
+    ))
+
+    # Banner sanity on case 2
+    payload = {
+        "tool_name": "Agent",
+        "tool_input": {"prompt": "no marker"},
+    }
+    _rc, out, _err = _run_hook(payload)
+    banner = out.get("systemMessage", "")
+    results.append(_check(
+        "8. denial banner contains workflow hints",
+        all(s in banner for s in ("BLOCKED", "Queue item: q-XXXX", "queue add", "queue register", "QUEUE_GATE_BYPASS")),
+        f"banner={banner!r}",
+    ))
+
+    total = len(results)
+    passed = sum(1 for r in results if r)
+    print()
+    print(f"RESULT: {passed}/{total} passed")
+    return 0 if passed == total else 1
+
+
+if __name__ == "__main__":
+    rc = 1
+    try:
+        rc = main()
+    finally:
+        _cleanup()
+    sys.exit(rc)
