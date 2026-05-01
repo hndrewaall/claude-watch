@@ -25,6 +25,16 @@ dashboard_pane = "dashboard:0.2"
 # Override: tmux session name where Claude Code runs (e.g. "dashboard").
 # Leave empty or omit to auto-detect across all sessions.
 dashboard_session = "dashboard"
+# Settle delay (milliseconds) inserted between the ESC -> NORMAL-mode
+# transition and the dd/i/text sequence inside inject_text. Default: 0
+# (disabled — fast path). Tune up only if a particular environment shows
+# follow-up keystrokes (typed prompt text, vim-mode dd/i, /clear, resume,
+# etc.) being garbled or eaten because Claude Code's pane hasn't finished
+# processing the Escape before the next keys arrive. Most setups don't
+# need this — the ESC loop's per-iteration is_insert_mode() check already
+# confirms each Escape was processed before the next is sent (and PR #46
+# adds explicit INSERT-mode verification after `i`).
+post_escape_settle_ms = 0
 
 [claude]
 # Max context window tokens
@@ -98,10 +108,41 @@ expected_watchmen = 0
 # Consecutive missing checks before injecting restart (6 = ~60s at 10s interval)
 inject_threshold = 6
 # Cooldown between watcher-missing injections (seconds).
-# Raised 120 -> 300 on 2026-04-21: when watchers are down, one interrupt
-# every 5 min is plenty to nudge the main loop; rapid re-fires just
-# generate alert fatigue and Pushover noise without fixing anything.
-inject_cooldown = 300
+# 2026-04-28: Tightened 300 -> 60 (PR #44). A down watcher is a hard
+# liveness failure (no signal, no events, no torrents getting through),
+# so when the previous inject didn't land — e.g. main loop was
+# mid-tool-call and ate the tmux keystroke — we want to re-inject
+# quickly rather than wait 5 minutes while the user is silent. Paired
+# with the global-post-interrupt-cooldown EXEMPTION on the watcher-down
+# path (src/policy.rs check_once); the prior cascade-suppression
+# rationale from the 2026-04-21 raise no longer applies.
+inject_cooldown = 60
+# Per-watcher cooldown (seconds) between daemon-side auto-restart attempts
+# (q-2026-04-28-5481, PR #43). Distinct from inject_cooldown —
+# auto-restart spawns the start_cmd as a detached child without touching
+# the tmux pane, so it can fire much faster. 30s = ~3 check cycles at the
+# default 10s general interval, which keeps wait-and-exit watchers
+# (claude-event-watch) reliably re-spawned between event deliveries.
+auto_restart_cooldown_secs = 30
+# Quiet path (PR #48): emit a `watcher-down` claude-event
+# (source=claude-watch, tag=watcher-down) when consecutive_missing hits
+# this threshold. Set below inject_threshold so the quiet path runs first
+# and the loud tmux-inject is reserved as a fallback. Default 3 (~30s at
+# 10s interval).
+event_threshold = 3
+# Grace period (seconds) after a quiet-path event is emitted, during
+# which the heavyweight tmux-inject path is suppressed for the same
+# watcher. If the watcher is still missing past the grace window, the
+# inject path activates as fallback (covers the chicken-and-egg case
+# where the consumer watcher itself is missing or stalled). Default 60.
+event_grace_secs = 60
+# Path to the `claude-event` CLI used to fire watcher-down events.
+# Resolved via $PATH by default.
+event_command = "claude-event"
+# Watcher name whose absence makes the quiet path useless (no consumer
+# for the event). When THIS watcher is the missing one, claude-watch
+# skips event emission and falls through to inject immediately.
+event_consumer_watcher_name = "claude-event-watch"
 
 [context_monitor]
 # Enable context usage monitoring and deferred self-clear
@@ -118,7 +159,12 @@ threshold_percent = 75
 # Compact remaining % at which to trigger (primary — "Context left until auto-compact: N%")
 compact_trigger_percent = 5
 # Grace period before forced self-clear (seconds)
-grace_period = 120
+# Set to 300s (5min) — gives the agent enough time to wrap up the current
+# turn (commit/push, session-task set, attendant tool calls) before the
+# daemon force-clears. The deferred-clear child polls in 10s slices so
+# fire-time matches displayed value within ~10s when tokens stay high
+# (and the child exits cleanly with no clear if tokens drop below 30k).
+grace_period = 300
 # Minimum interval between context clear triggers (seconds)
 cooldown = 300
 
@@ -153,6 +199,49 @@ agent_done_delay = 120
 max_panes = 20
 # Show all tasks including persistent watchers (false = workloads only)
 show_all = false
+
+[suppression]
+# Cross-gate suppression-escalation backstop. The watcher-down, fresh-/clear,
+# and dead-process suppression gates each defer their inject when the main
+# loop is "actively turning". A long sustained dispatcher window can hold
+# the gate open indefinitely (real incident 2026-04-27: claude-event-watch
+# was suppressed for 33 min). These two limits cap the suppression run.
+# When EITHER trips on the next gate-fire, the fire force-injects regardless.
+# Counters are SHARED across all three gates (see State.consecutive_suppressions).
+#
+# After this many consecutive suppressed fires, the next fire force-injects.
+max_consecutive_suppressions = 3
+# Wall-clock backstop (seconds) since the FIRST suppression in the current run.
+# 600 = 10 min; the 33-min real-world incident would have triggered at 10 min.
+max_suppression_window_secs = 600
+
+[api_retry]
+# Upstream-API retry-backoff detection.
+#
+# When Anthropic returns 529 (overloaded) or transient 5xx errors, Claude Code
+# retries with exponential backoff and prints lines like:
+#   API Error: 529 {"type":"error","error":{"type":"overloaded_error",...}}
+#   ⎿  Retrying in 24s · attempt 3/10
+# During that window every claude-watch inject (Escape + text) wipes the retry
+# state machine and forces Claude to start a brand-new turn — which then hits
+# the same overload and re-enters retry. The result is a livelock where the
+# daemon's interrupts perpetually reset the retry timer (seen 2026-04-28).
+#
+# When this guard is enabled, the daemon detects the retry banner each cycle
+# and suppresses fires from the four sites that matter (prolonged-thinking,
+# watcher-down, context-warning, wedged-clear) until the retry resolves OR
+# max_stuck_secs elapses (whichever happens first). Heartbeat / dead-process
+# detection are NOT suppressed — those measure liveness and must still alert.
+enabled = true
+# Number of consecutive check cycles a retry banner must be observed before
+# suppression activates. Default 1 (suppress on first detection — the cost of
+# a missed interrupt is negligible compared to the cost of resetting the
+# retry loop).
+consecutive = 1
+# Maximum seconds the suppression may persist before the daemon resumes
+# normal monitoring (so a hung retry banner doesn't suppress recovery
+# forever). Default 1800 = 30 minutes.
+max_stuck_secs = 1800
 
 [hybrid]
 # Hybrid hooks + daemon-fallback tuning.

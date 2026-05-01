@@ -680,6 +680,179 @@ async fn test_orphan_panes_cleaned_on_startup() {
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 }
 
+/// E2E test: workload panes (registered in `/tmp/claude-workloads/state.json`)
+/// must NOT be killed during orphan-pane cleanup on daemon startup.
+///
+/// Bug context (2026-04-30 incident, pane_id=%1832, label=promote-layl-s01):
+///   Prior to this fix, the orphan-pane cleanup at the start of `run_task_watch_loop`
+///   killed every non-pane-0 pane that wasn't in `state.tracked`. `state.tracked`
+///   is populated from agent .output files only, so workload panes (which live
+///   in a separate registry under `/tmp/claude-workloads/state.json`) were
+///   misidentified as orphans and killed. The underlying long-running process
+///   often survived (reparented to init), but the live tmux pane disappeared.
+///
+/// This test:
+///   1. Creates a tmux session with pane 0 + a "fake workload" pane.
+///   2. Writes a workload state.json mock that registers the fake pane.
+///   3. Points `CLAUDE_WATCH_WORKLOAD_STATE` at the mock.
+///   4. Spawns `run_task_watch_loop`.
+///   5. Asserts the workload pane SURVIVES (still in tmux list-panes).
+#[tokio::test]
+async fn test_workload_pane_preserved_on_startup() {
+    use claude_watch::config::TaskWatchConfig;
+    use std::process::Command;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let pid = std::process::id();
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let session = format!("tw-workload-{}-{}", pid, n);
+
+    // Cleanup guard for the tmux session
+    struct TestGuard {
+        session: String,
+    }
+    impl Drop for TestGuard {
+        fn drop(&mut self) {
+            let _ = Command::new("tmux")
+                .args(["kill-session", "-t", &self.session])
+                .output();
+        }
+    }
+
+    let _guard = TestGuard {
+        session: session.clone(),
+    };
+
+    // --- Setup: tmux session ---
+    let create = Command::new("tmux")
+        .args(["new-session", "-d", "-s", &session, "-x", "120", "-y", "40"])
+        .output()
+        .expect("failed to create tmux session");
+    assert!(
+        create.status.success(),
+        "tmux new-session failed: {}",
+        String::from_utf8_lossy(&create.stderr)
+    );
+
+    // --- Setup: empty tasks_dir (no agent tasks — only workload pane should exist) ---
+    let (_base, tasks_dir) = create_mock_tasks_dir();
+
+    // --- Create the "fake workload" pane (long-running tail -f on a file) ---
+    let workload_file = _base.path().join("workload.log");
+    fs::write(&workload_file, "workload running\n").unwrap();
+    let workload_cmd = format!("tail -f {}", workload_file.display());
+    let split = Command::new("tmux")
+        .args([
+            "split-window",
+            "-t",
+            &session,
+            "-v",
+            "-P",
+            "-F",
+            "#{pane_id}",
+            &workload_cmd,
+        ])
+        .output()
+        .expect("failed to create workload pane");
+    assert!(
+        split.status.success(),
+        "tmux split-window for workload failed: {}",
+        String::from_utf8_lossy(&split.stderr)
+    );
+    let workload_pane_id = String::from_utf8_lossy(&split.stdout).trim().to_string();
+    eprintln!(
+        "[test-workload] created workload pane {} for fake long-running task",
+        workload_pane_id
+    );
+
+    // Verify: session has 2 panes (pane 0 + workload)
+    assert_eq!(
+        count_panes(&session),
+        2,
+        "session should have 2 panes before daemon starts (pane 0 + workload)"
+    );
+
+    // --- Write workload state.json mock ---
+    let workload_state_path = _base.path().join("workload-state.json");
+    let workload_state_json = format!(
+        r#"{{
+            "fake-promote-task": {{
+                "pane_id": "{}",
+                "command": "fake long-running command",
+                "output": "/tmp/claude-workloads/fake-promote-task.output",
+                "started_at": "2026-04-30T16:00:00"
+            }}
+        }}"#,
+        workload_pane_id
+    );
+    fs::write(&workload_state_path, workload_state_json).unwrap();
+
+    // Point claude-watch at our mock state file (not /tmp/claude-workloads/state.json)
+    std::env::set_var("CLAUDE_WATCH_WORKLOAD_STATE", &workload_state_path);
+
+    // --- Spawn the daemon loop ---
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let config = TaskWatchConfig {
+        enabled: true,
+        session: session.clone(),
+        poll_interval: 1,
+        done_delay: 5,
+        agent_done_delay: 5,
+        max_panes: 10,
+        show_all: true,
+        tasks_dir_override: Some(tasks_dir.clone()),
+    };
+
+    let shutdown_clone = shutdown.clone();
+    let _loop_handle = tokio::spawn(async move {
+        claude_watch::task_watch::run_task_watch_loop(config, shutdown_clone).await;
+    });
+
+    // --- Wait for the daemon to complete its initial sync + orphan cleanup ---
+    // Initial sync runs synchronously before the poll loop starts, so we just
+    // need a short wait. We deliberately keep this window tight (1500 ms,
+    // shorter than poll_interval=1s + some breathing room) because the poll
+    // loop's `find_tasks_dir()` call would override our `tasks_dir` config
+    // and start adopting REAL agent tasks from the system, polluting the test
+    // session with unrelated panes — see comments in `run_task_watch_loop`.
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+
+    let panes_remaining: Vec<String> = {
+        let out = Command::new("tmux")
+            .args(["list-panes", "-t", &session, "-F", "#{pane_id}"])
+            .output()
+            .expect("list-panes failed");
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
+    };
+
+    // --- Cleanup BEFORE assertion (env var, shutdown) so we don't poison other tests ---
+    std::env::remove_var("CLAUDE_WATCH_WORKLOAD_STATE");
+    shutdown.store(true, Ordering::Relaxed);
+
+    // The crucial check is that the WORKLOAD pane survives orphan cleanup.
+    // We don't assert exact pane count because the poll loop may have already
+    // started discovering external agents (see comment above).
+    assert!(
+        panes_remaining.contains(&workload_pane_id),
+        "BUG: workload pane {} was killed during orphan-pane cleanup — \
+         got panes: {:?}. The cleanup loop in run_task_watch_loop killed \
+         the pane because it isn't in state.tracked (state.tracked is only \
+         populated from agent .output files; workload panes live in a separate \
+         registry under /tmp/claude-workloads/state.json that the cleanup loop \
+         must consult).",
+        workload_pane_id,
+        panes_remaining
+    );
+
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+}
+
 /// Count panes in a tmux session.
 fn count_panes(session: &str) -> usize {
     use std::process::Command;

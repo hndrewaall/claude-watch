@@ -5,7 +5,16 @@
 //! `/tmp/claude-workloads/` (state.json, <label>.output, <label>.exit,
 //! <label>.sh) for compatibility with the existing layout so in-flight
 //! workloads from the old script keep working during the transition.
+//!
+//! On workload completion (natural or via `workload kill`), an event of
+//! `tag=workload-done`, `source=workload` is emitted into
+//! `~/claude-events/` so `claude-event-watch` surfaces the completion to
+//! the main loop without needing a separate `workload wait` background
+//! task. Idempotency: the wrapper script writes an exit-code marker file
+//! BEFORE invoking the emitter; `cmd_kill` consults that marker and
+//! skips its own emit if the wrapper already finished naturally.
 
+use crate::event_bus::{emit_workload_done, WorkloadDoneEvent};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
@@ -242,10 +251,24 @@ pub fn cmd_run(label: &str, cmd_args: &[String]) -> i32 {
         let _ = save_state(&state);
     }
 
-    // Wrapper script — identical layout to Python version.
+    // Wrapper script — identical layout to Python version, plus a
+    // claude-event emit step after the exit-code is written so the main
+    // loop's `claude-event-watch` learns about the completion without
+    // needing a separate `workload wait` background task.
+    //
+    // The emit invokes the claude-watch binary itself (this process's
+    // current_exe path baked in at run time) via the hidden `workload
+    // emit-done` subcommand. We embed the absolute path so the wrapper
+    // doesn't depend on PATH discovery inside tmux.
     let out_q = shell_quote(&out_path.to_string_lossy());
     let exit_q = shell_quote(&exit_path.to_string_lossy());
     let cmd_q = shell_quote(&command);
+    let label_q = shell_quote(label);
+    let exe_path = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.to_str().map(str::to_string))
+        .unwrap_or_else(|| "claude-watch".to_string());
+    let exe_q = shell_quote(&exe_path);
     let script = format!(
         "#!/bin/bash\n\
          # Trap SIGINT/SIGTERM — fatfinger-proof against accidental Ctrl-C\n\
@@ -260,6 +283,10 @@ pub fn cmd_run(label: &str, cmd_args: &[String]) -> i32 {
          echo ''\n\
          echo \"=== DONE (exit $EC) at $(date -Iseconds) ===\"\n\
          echo $EC > {exit_q}\n\
+         # Emit claude-event for the main loop. Default-open: any failure\n\
+         # here is silently swallowed — the exit-file write above is the\n\
+         # source of truth for `workload wait`.\n\
+         {exe_q} workload emit-done --label {label_q} --exit-code \"$EC\" --log-path {out_q} >/dev/null 2>&1 || true\n\
          sleep 30\n",
         // The "Command: " line gets the unquoted version for readability;
         // escape single quotes for the heredoc context.
@@ -429,7 +456,28 @@ pub fn cmd_kill(label: &str) -> i32 {
             return 1;
         }
     };
+
+    // If the wrapper script already wrote its exit file, it also
+    // already emitted (or will emit before its 30s sleep ends). Skip
+    // our kill-event emit to keep the contract "exactly one event per
+    // workload run". Only synthesise a kill event when we're racing
+    // ahead of a still-alive wrapper.
+    let exit_path = exit_file(label);
+    let already_exited = exit_path.exists();
+
     if pane_alive(&info.pane_id) {
+        if !already_exited {
+            // Synthesise the exit marker so subsequent `workload wait`
+            // calls return cleanly with the kill code, and emit the
+            // claude-event before tearing down the pane.
+            let _ = fs::write(&exit_path, "-15\n");
+            emit_workload_done(&WorkloadDoneEvent {
+                label,
+                exit_code: -15,
+                killed: true,
+                log_path: &info.output,
+            });
+        }
         kill_pane_tree(&info.pane_id);
         let _ = Command::new("tmux")
             .args(["kill-pane", "-t", &info.pane_id])
@@ -441,6 +489,19 @@ pub fn cmd_kill(label: &str) -> i32 {
     state.remove(label);
     let _ = save_state(&state);
     rebalance();
+    0
+}
+
+/// CLI (hidden): `workload emit-done --label X --exit-code N --log-path P [--killed]`.
+/// Invoked by the wrapper script after the workload exits. Keeps the
+/// emit logic in Rust (testable, dep-free) instead of in bash.
+pub fn cmd_emit_done(label: &str, exit_code: i32, log_path: &str, killed: bool) -> i32 {
+    emit_workload_done(&WorkloadDoneEvent {
+        label,
+        exit_code,
+        killed,
+        log_path,
+    });
     0
 }
 
@@ -482,5 +543,84 @@ mod tests {
         let s = load_state();
         // Just verify no panic and is a BTreeMap
         let _ = s.len();
+    }
+
+    #[test]
+    fn cmd_emit_done_writes_event_file() {
+        // Point CLAUDE_EVENT_QUEUE at a tempdir; cmd_emit_done should
+        // produce exactly one workload-done event with the right shape.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let prev = std::env::var("CLAUDE_EVENT_QUEUE").ok();
+        // SAFETY: same justification as the event_bus tests — these are
+        // not concurrently mutating the env var with peers.
+        unsafe {
+            std::env::set_var("CLAUDE_EVENT_QUEUE", tmp.path());
+        }
+
+        let rc = cmd_emit_done("test-task", 0, "/tmp/foo.output", false);
+        assert_eq!(rc, 0);
+
+        // Restore env first so any panic below doesn't leak.
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("CLAUDE_EVENT_QUEUE", v),
+                None => std::env::remove_var("CLAUDE_EVENT_QUEUE"),
+            }
+        }
+
+        let entries: Vec<_> = std::fs::read_dir(tmp.path())
+            .expect("read tempdir")
+            .filter_map(Result::ok)
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .ends_with("_workload-done.json")
+            })
+            .collect();
+        assert_eq!(entries.len(), 1, "expected exactly one event");
+
+        let body = std::fs::read_to_string(entries[0].path()).expect("read");
+        let v: serde_json::Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(v["tag"], "workload-done");
+        assert_eq!(v["data"]["label"], "test-task");
+        assert_eq!(v["data"]["exit_code"], 0);
+        assert_eq!(v["data"]["killed"], false);
+        assert_eq!(v["data"]["log_path"], "/tmp/foo.output");
+    }
+
+    #[test]
+    fn cmd_emit_done_killed_marker() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let prev = std::env::var("CLAUDE_EVENT_QUEUE").ok();
+        unsafe {
+            std::env::set_var("CLAUDE_EVENT_QUEUE", tmp.path());
+        }
+        let rc = cmd_emit_done("killed-task", -15, "/tmp/k.output", true);
+        assert_eq!(rc, 0);
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("CLAUDE_EVENT_QUEUE", v),
+                None => std::env::remove_var("CLAUDE_EVENT_QUEUE"),
+            }
+        }
+
+        let entries: Vec<_> = std::fs::read_dir(tmp.path())
+            .expect("read tempdir")
+            .filter_map(Result::ok)
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .ends_with("_workload-done.json")
+            })
+            .collect();
+        assert_eq!(entries.len(), 1);
+        let body = std::fs::read_to_string(entries[0].path()).expect("read");
+        let v: serde_json::Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(v["data"]["killed"], true);
+        assert_eq!(v["data"]["exit_code"], -15);
+        assert!(v["message"]
+            .as_str()
+            .unwrap()
+            .contains("workload killed-task killed"));
     }
 }
