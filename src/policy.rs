@@ -1090,6 +1090,82 @@ async fn inject_context_warning(pane: &str, pct: f64, compact_remaining: Option<
     tmux::inject_text(pane, &msg).await;
 }
 
+/// Below this token count, Claude Code is treated as "fresh / just-cleared"
+/// and the trigger flag resets. The deferred-clear child uses the same
+/// constant in its inner poll, and `self-clear` confirms a clear by reading
+/// tokens drop below it.
+pub(crate) const CONTEXT_FRESH_TOKEN_THRESHOLD: u64 = 30000;
+
+/// Threshold below which `last_seen_tokens` is considered "previously low /
+/// boot state" — used to suppress spammy external-clear logs while the daemon
+/// is just starting up (no prior high reading).
+const PREV_HIGH_FOR_EXTERNAL_CLEAR_LOG: u64 = 30000;
+
+/// Reset `state.context_clear_triggered` when tokens drop below the fresh
+/// threshold, regardless of whether the inner trigger gate (`tokens > 0`)
+/// runs this cycle. Also handles the external-clear bookkeeping path so the
+/// "Since Last Clear" dashboard metric stays accurate.
+///
+/// Why this lives outside the `tokens > 0` guard in `check_cycle`:
+/// when `self-clear` succeeds, the pane briefly shows tokens=0. The inner
+/// trigger block was skipped on that sample (tokens=0 → guard false), and
+/// the reset path was nested inside the same guard — so the flag never
+/// reset. As soon as Claude resumed (tokens jumps to >30K), the sub-30K
+/// branch couldn't fire either, and `context_clear_triggered` stayed stuck
+/// at true for the rest of the session. Real incident 2026-05-01: deferred
+/// clear ran cleanly, but the next four hours of context-threshold checks
+/// were all suppressed by the stuck flag — the user had to manually /clear.
+pub(crate) fn maybe_reset_context_clear(
+    config: &Config,
+    state: &mut State,
+    tokens: u64,
+    now: &str,
+) {
+    if tokens >= CONTEXT_FRESH_TOKEN_THRESHOLD {
+        return;
+    }
+
+    // Path 1: we triggered the clear and it landed (tokens dropped). Reset
+    // the in-flight flag + child-pid bookkeeping so the next threshold
+    // crossing can fire.
+    if state.context_clear_triggered {
+        info!(tokens, "context clear detected — resetting trigger");
+        write_jsonl_log(
+            &config.general.log_file,
+            "context_clear_reset",
+            serde_json::json!({
+                "tokens": tokens,
+            }),
+        );
+        record_reminder_latency_if_recent(ReminderType::ContextHigh, state, true);
+        state.context_clear_triggered = false;
+        state.context_clear_child_pid = None;
+        state.last_context_clear = Some(now.to_string());
+        return;
+    }
+
+    // Path 2: external clear (user `/clear`, fresh-clear path, or any other
+    // off-path reset). Only emit the log when we previously saw a high
+    // sample, to avoid logging on every check during boot.
+    if state.last_seen_tokens.unwrap_or(0) >= PREV_HIGH_FOR_EXTERNAL_CLEAR_LOG {
+        info!(
+            tokens,
+            prev_tokens = state.last_seen_tokens,
+            "external context clear detected"
+        );
+        write_jsonl_log(
+            &config.general.log_file,
+            "context_clear_reset",
+            serde_json::json!({
+                "tokens": tokens,
+                "external": true,
+            }),
+        );
+        record_reminder_latency_if_recent(ReminderType::ContextHigh, state, true);
+        state.last_context_clear = Some(now.to_string());
+    }
+}
+
 /// Determine if context threshold is exceeded.
 /// Returns Some((pct, triggered_by_compact)) if triggered, None otherwise.
 ///
@@ -2466,6 +2542,27 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
     check_foreground_inner(config, state, &effective_pane, tokens, bashes, api_retrying).await;
 
     // --- Context monitoring ---
+    //
+    // Reset paths run UNCONDITIONALLY (not gated on tokens > 0) — when self-clear
+    // succeeds the pane briefly shows "0 tokens", and that single check used to
+    // skip the entire context-monitoring block, leaving `context_clear_triggered`
+    // stuck at true. Once tokens climbed back above 30K (the agent resumed), the
+    // sub-30K reset block could no longer fire either, and the flag stayed stuck
+    // for the rest of the session — blocking every subsequent threshold fire.
+    // Real incident 2026-05-01: deferred clear ran cleanly at 12:23 UTC, the
+    // tokens=0 sample at 12:28:20 UTC didn't reset the flag, and the next
+    // threshold fire was suppressed for ~4 hours until the user manually /cleared.
+    //
+    // Calling maybe_reset_context_clear() ahead of the trigger gate also means a
+    // fresh fire can happen in the same cycle the reset lands, if tokens jump
+    // straight from <30K to >threshold (boundary case, but cheap to handle).
+    if config.context_monitor.enabled {
+        // Reset path runs first so it can observe the pre-update last_seen_tokens.
+        maybe_reset_context_clear(config, state, tokens, &now);
+        // Always record the latest token sample (even tokens=0) so the next
+        // cycle's "previously high → now low" detector sees the right history.
+        state.last_seen_tokens = Some(tokens);
+    }
     if config.context_monitor.enabled && tokens > 0 {
         if let Some((pct, _by_compact)) = check_context_threshold_with_margin(
             tokens,
@@ -2605,43 +2702,10 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
             }
         }
 
-        // Reset trigger flag when tokens drop (clear happened)
-        if state.context_clear_triggered && tokens < 30000 {
-            info!(tokens, "context clear detected — resetting trigger");
-            write_jsonl_log(
-                &config.general.log_file,
-                "context_clear_reset",
-                serde_json::json!({
-                    "tokens": tokens,
-                }),
-            );
-            record_reminder_latency_if_recent(ReminderType::ContextHigh, state, true);
-            state.context_clear_triggered = false;
-            state.context_clear_child_pid = None;
-            state.last_context_clear = Some(now.clone());
-        }
-
-        // Detect external clears (self-clear, user /clear) that claude-watch didn't trigger.
-        // If tokens drop below 30K but we didn't trigger the clear, still update the timestamp
-        // so the "Since Last Clear" dashboard metric stays accurate.
-        if !state.context_clear_triggered && tokens < 30000 {
-            // Only log if we previously saw high tokens (avoid re-logging on every check
-            // while tokens are still low during boot)
-            if state.last_seen_tokens.unwrap_or(0) >= 30000 {
-                info!(tokens, prev_tokens = state.last_seen_tokens, "external context clear detected");
-                write_jsonl_log(
-                    &config.general.log_file,
-                    "context_clear_reset",
-                    serde_json::json!({
-                        "tokens": tokens,
-                        "external": true,
-                    }),
-                );
-                record_reminder_latency_if_recent(ReminderType::ContextHigh, state, true);
-                state.last_context_clear = Some(now.clone());
-            }
-        }
-        state.last_seen_tokens = Some(tokens);
+        // Reset paths (tokens < 30K) and last_seen_tokens bookkeeping run
+        // unconditionally above this block via maybe_reset_context_clear() —
+        // keeping them outside the `tokens > 0` guard so a clean tokens=0
+        // sample successfully resets `context_clear_triggered`.
     }
 
     // --- Wedged-pane detection (context limit / persistent rate limit) ---
@@ -3713,6 +3777,195 @@ mod tests {
         let (pct, by_compact) = result.unwrap();
         assert!(!by_compact, "should be BY_PERCENT, not BY_COMPACT");
         assert!((pct - 80.0).abs() < 0.1);
+    }
+
+    // --- maybe_reset_context_clear tests (regression guard for 2026-05-01) ---
+    //
+    // 2026-05-01 incident: deferred clear ran cleanly at UTC 12:23:13, the pane
+    // briefly read tokens=0 at 12:28:20, but the reset path was nested inside
+    // the `tokens > 0` outer guard in check_cycle, so the tokens=0 sample never
+    // reset `context_clear_triggered`. Tokens climbed back above 30K, the
+    // sub-30K branch couldn't fire either, and the flag stayed stuck for ~4
+    // hours — every subsequent threshold crossing was suppressed by
+    // `if !state.context_clear_triggered`. Pulling the reset path out of the
+    // guard fixes it, and these tests pin the contract.
+
+    fn config_for_reset_test() -> Config {
+        let toml_str = r#"
+[general]
+check_interval = 10
+state_file = "/tmp/s.json"
+log_file = "/tmp/s.jsonl"
+legacy_log_file = "/tmp/s.log"
+
+[claude]
+max_context_tokens = 1000000
+heartbeat_file = "/tmp/hb"
+relaunch_script = "/tmp/rel.sh"
+
+[dead_process]
+checks_required = 3
+restart_cooldown = 60
+
+[fresh_clear]
+min_tokens = 1000
+max_tokens = 5000
+detections_required = 2
+cooldown = 60
+
+[heartbeat]
+stale_minutes = 10
+
+[alerts]
+initial_cooldown = 60
+escalation_tiers = [60]
+max_pingme_alerts = 1
+resume_prompt = "x"
+
+[foreground_monitor]
+enabled = true
+threshold_seconds = 60
+check_interval = 3
+
+[watcher_monitor]
+enabled = false
+watchers_config = "/tmp/w.conf"
+expected_watchmen = 0
+
+[context_monitor]
+enabled = true
+threshold_margin = 100000
+threshold_percent = 90
+compact_trigger_percent = 5
+grace_period = 300
+cooldown = 300
+"#;
+        crate::config::parse_config(toml_str).expect("parse")
+    }
+
+    #[test]
+    fn test_reset_zero_tokens_clears_triggered_flag() {
+        // The 2026-05-01 regression: tokens=0 right after self-clear must
+        // reset `context_clear_triggered`. Before the fix, the outer
+        // `tokens > 0` guard in check_cycle skipped the reset path entirely
+        // on this exact sample, leaving the flag stuck.
+        let config = config_for_reset_test();
+        let mut state = State::default();
+        state.context_clear_triggered = true;
+        state.context_clear_child_pid = Some(12345);
+        state.last_seen_tokens = Some(916_581);
+        let now = Utc::now().to_rfc3339();
+        maybe_reset_context_clear(&config, &mut state, 0, &now);
+        assert!(
+            !state.context_clear_triggered,
+            "tokens=0 must reset the trigger flag"
+        );
+        assert!(
+            state.context_clear_child_pid.is_none(),
+            "child pid bookkeeping must clear"
+        );
+        assert!(
+            state.last_context_clear.is_some(),
+            "last_context_clear must update"
+        );
+    }
+
+    #[test]
+    fn test_reset_low_tokens_clears_triggered_flag() {
+        // A non-zero tokens sample below the fresh threshold (e.g. 5300, the
+        // value right after a /clear) must also reset the flag.
+        let config = config_for_reset_test();
+        let mut state = State::default();
+        state.context_clear_triggered = true;
+        state.context_clear_child_pid = Some(12345);
+        state.last_seen_tokens = Some(959_704);
+        let now = Utc::now().to_rfc3339();
+        maybe_reset_context_clear(&config, &mut state, 5_300, &now);
+        assert!(!state.context_clear_triggered);
+        assert!(state.context_clear_child_pid.is_none());
+    }
+
+    #[test]
+    fn test_reset_high_tokens_leaves_flag_set() {
+        // While tokens are still high, the flag stays set so an in-flight
+        // deferred clear isn't double-spawned.
+        let config = config_for_reset_test();
+        let mut state = State::default();
+        state.context_clear_triggered = true;
+        state.last_seen_tokens = Some(905_000);
+        let now = Utc::now().to_rfc3339();
+        maybe_reset_context_clear(&config, &mut state, 950_000, &now);
+        assert!(
+            state.context_clear_triggered,
+            "tokens >= fresh threshold must NOT reset the flag"
+        );
+    }
+
+    #[test]
+    fn test_reset_at_exact_fresh_threshold_does_not_reset() {
+        // Boundary: tokens == 30000 is treated as "still in flight".
+        let config = config_for_reset_test();
+        let mut state = State::default();
+        state.context_clear_triggered = true;
+        let now = Utc::now().to_rfc3339();
+        maybe_reset_context_clear(&config, &mut state, 30_000, &now);
+        assert!(state.context_clear_triggered);
+    }
+
+    #[test]
+    fn test_reset_just_below_threshold_resets() {
+        let config = config_for_reset_test();
+        let mut state = State::default();
+        state.context_clear_triggered = true;
+        let now = Utc::now().to_rfc3339();
+        maybe_reset_context_clear(&config, &mut state, 29_999, &now);
+        assert!(!state.context_clear_triggered);
+    }
+
+    #[test]
+    fn test_external_clear_path_records_timestamp() {
+        // External clear (user /clear): no in-flight trigger flag, but
+        // last_seen_tokens was high. Path should log + update last_context_clear.
+        let config = config_for_reset_test();
+        let mut state = State::default();
+        state.context_clear_triggered = false;
+        state.last_seen_tokens = Some(800_000);
+        state.last_context_clear = None;
+        let now = Utc::now().to_rfc3339();
+        maybe_reset_context_clear(&config, &mut state, 5_300, &now);
+        assert!(
+            state.last_context_clear.is_some(),
+            "external clear must update last_context_clear"
+        );
+    }
+
+    #[test]
+    fn test_external_clear_path_skipped_during_boot() {
+        // No prior high reading -> don't log spurious external clear during boot.
+        let config = config_for_reset_test();
+        let mut state = State::default();
+        state.context_clear_triggered = false;
+        state.last_seen_tokens = Some(0);
+        state.last_context_clear = None;
+        let now = Utc::now().to_rfc3339();
+        maybe_reset_context_clear(&config, &mut state, 100, &now);
+        assert!(
+            state.last_context_clear.is_none(),
+            "boot path must not update last_context_clear"
+        );
+    }
+
+    #[test]
+    fn test_reset_idempotent_when_flag_already_clear() {
+        // Calling reset when nothing was triggered AND no prior high sample
+        // is a no-op — important because check_cycle calls it every iteration.
+        let config = config_for_reset_test();
+        let mut state = State::default();
+        let now = Utc::now().to_rfc3339();
+        let before = state.last_context_clear.clone();
+        maybe_reset_context_clear(&config, &mut state, 5_300, &now);
+        assert!(!state.context_clear_triggered);
+        assert_eq!(state.last_context_clear, before);
     }
 
     // --- Thinking backoff threshold tests ---
