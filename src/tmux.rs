@@ -2,9 +2,48 @@
 
 use crate::cmd::{run_cmd, run_cmd_any};
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::time::sleep;
 use tracing::debug;
+
+/// Settle delay (milliseconds) inserted between the ESC -> NORMAL-mode
+/// transition and the dd/i/text sequence in `inject_text`. See
+/// `TmuxConfig::post_escape_settle_ms` for the rationale. Initialized at
+/// daemon startup from config; defaults to 0 (disabled) so the fast path
+/// is the default. Set via `set_post_escape_settle_ms()`.
+static POST_ESCAPE_SETTLE_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Update the global post-escape settle delay. Called from main.rs at daemon
+/// startup and on every config reload. Safe to call concurrently — uses a
+/// relaxed atomic store.
+pub fn set_post_escape_settle_ms(ms: u64) {
+    POST_ESCAPE_SETTLE_MS.store(ms, Ordering::Relaxed);
+}
+
+/// Read the current post-escape settle delay. Used internally by injection
+/// helpers; exposed for tests.
+pub fn post_escape_settle_ms() -> u64 {
+    POST_ESCAPE_SETTLE_MS.load(Ordering::Relaxed)
+}
+
+/// Sleep for the configured post-escape settle delay. No-op when the knob
+/// is set to 0 (the default). Call this AFTER Escape keystroke(s) and
+/// BEFORE any further keystrokes (typed text, vim-mode dd/i, /clear,
+/// Enter, etc.) when extra settle time is needed to keep follow-up keys
+/// from being garbled or eaten.
+///
+/// Currently invoked only at the ESC -> NORMAL-mode boundary inside
+/// `inject_text` (replacing what used to be a hardcoded 500ms sleep).
+/// Default is 0 so the fast path is the default; set
+/// `[tmux].post_escape_settle_ms` in config.toml if a particular
+/// environment needs the extra cushion.
+async fn settle_after_escape() {
+    let ms = post_escape_settle_ms();
+    if ms > 0 {
+        sleep(Duration::from_millis(ms)).await;
+    }
+}
 
 /// Current activity state of Claude Code as observed from tmux pane output.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -169,40 +208,84 @@ pub async fn dismiss_feedback_prompt(pane: &str) {
 }
 
 /// Actively interrupt Claude Code: rapid-fire Escape, periodically Ctrl-B x2.
-/// Returns true if idle state confirmed within timeout.
+/// Returns true if idle state confirmed within `timeout_secs`. Returns false
+/// at the deadline; callers should still proceed with their inject (the
+/// pane may not match `detect_activity()`'s idle predicate but Claude Code
+/// has typically responded long before the timeout fires).
 ///
 /// Uses `get_activity()` (content-area aware) instead of `is_idle()` (prompt-only)
 /// to ensure the thinking indicator has fully cleared before returning.
+///
+/// Timing: blasts Escape every 250ms. A 1s wall-clock budget gives ~4
+/// Escape sends, which is enough to interrupt anything Claude is doing
+/// short of a foreground bash command (those need Ctrl-C, not Escape).
+/// Idle confirmation requires two consecutive Idle reads 150ms apart to
+/// guard against transient state during the pane redraw.
 pub async fn interrupt_and_wait(pane: &str, timeout_secs: u64) -> bool {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
     let mut escape_count: u32 = 0;
 
     while tokio::time::Instant::now() < deadline {
         if get_activity(pane).await == ClaudeActivity::Idle {
-            sleep(Duration::from_millis(300)).await;
+            sleep(Duration::from_millis(150)).await;
             if get_activity(pane).await == ClaudeActivity::Idle {
+                // Idle confirmed. Settle BEFORE returning so any caller
+                // about to send follow-up keystrokes (typed prompt text,
+                // vim-mode dd/i, /clear) doesn't race the just-sent
+                // Escape that brought us idle. Without this, downstream
+                // inject_* keys can land before Claude finishes processing
+                // the interrupt and get garbled or eaten.
+                settle_after_escape().await;
                 return true;
             }
         }
 
         if escape_count > 0 && escape_count % 5 == 0 {
             send_keys(pane, &["C-b"]).await;
-            sleep(Duration::from_millis(300)).await;
+            sleep(Duration::from_millis(150)).await;
             send_keys(pane, &["C-b"]).await;
-            sleep(Duration::from_millis(500)).await;
+            sleep(Duration::from_millis(250)).await;
         } else {
             send_keys(pane, &["Escape"]).await;
-            sleep(Duration::from_millis(500)).await;
+            sleep(Duration::from_millis(250)).await;
         }
         escape_count += 1;
     }
+    debug!(
+        pane = %pane,
+        timeout_secs,
+        escape_count,
+        "interrupt_and_wait: idle never observed within timeout, proceeding"
+    );
     false
 }
 
 /// Inject text into Claude Code via vim-mode keystrokes.
 /// Escape(s) -> wait for Idle -> dd -> i -> type -> Escape -> Enter
+///
+/// Designed to be FAST. Most callers reach inject_text right after
+/// `interrupt_and_wait` has already brought the pane to idle, so the
+/// per-step waits below should be the worst case, not the typical case.
+/// The Step 1b idle-wait uses a short fast-path bail
+/// (`INJECT_IDLE_FAST_PATH_MS`) rather than blocking for the full pre-fix
+/// 10s window — if Claude Code's pane hasn't shown Idle within ~1.5s
+/// after our Escape loop, it's overwhelmingly likely the predicate just
+/// isn't matching what the pane actually shows (stale thinking line in
+/// scrollback, custom theme, etc.) and waiting longer doesn't help.
+/// We send anyway.
 pub async fn inject_text(pane: &str, text: &str) {
-    // Step 1: Escape to NORMAL mode (up to 3 attempts)
+    // Step 0: Settle. Most callers reach inject_text right after
+    // interrupt_and_wait, which has already fired Escape repeatedly.
+    // If interrupt_and_wait returned false (idle never confirmed) the
+    // pane may still be processing the very last Escape — settling here
+    // gives Claude Code time to finish before our own Escape loop below
+    // piles on. interrupt_and_wait's success path also settles, so this
+    // is a low-cost extra guard, not a duplicate delay. No-op when
+    // post_escape_settle_ms is 0 (fast-path default).
+    settle_after_escape().await;
+
+    // Step 1: Escape to NORMAL mode (up to 3 attempts). The is_insert_mode()
+    // check confirms tmux processed each Escape before we send the next.
     for _ in 0..3 {
         send_keys(pane, &["Escape"]).await;
         sleep(Duration::from_secs(1)).await;
@@ -210,18 +293,39 @@ pub async fn inject_text(pane: &str, text: &str) {
             break;
         }
     }
-    sleep(Duration::from_millis(500)).await;
+    // Step 1a: Optional configurable settle after the Escape loop, before
+    // typing dd/i/text. Default 0 (no extra wait — fast path). Tunable
+    // via [tmux].post_escape_settle_ms when a slow environment needs the
+    // extra cushion. Replaced what used to be a hardcoded 500ms sleep so
+    // the wait is opt-in rather than always-paid.
+    settle_after_escape().await;
 
-    // Step 1b: Wait for activity to settle to Idle (thinking indicator cleared).
-    // The prompt may be visible while thinking text is still rendering in the
-    // content area above. Wait up to 10s for get_activity() == Idle before
-    // proceeding with dd/i/type to avoid typing over stale thinking text.
-    let idle_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    // Step 1b: Wait briefly for the activity indicator to settle to Idle
+    // (thinking indicator cleared). `interrupt_and_wait` is normally
+    // called first and has already done the heavy lifting — this is a
+    // last-line check in case the predicate flickers across the Escape
+    // boundary. Fast-path bails after `INJECT_IDLE_FAST_PATH_MS` and
+    // sends anyway: if the pane's idle predicate hasn't matched by then,
+    // it almost certainly never will (stale scrollback thinking text,
+    // custom prompt, etc.), and blocking longer just makes recovery feel
+    // sluggish without changing the outcome.
+    const INJECT_IDLE_FAST_PATH_MS: u64 = 1500;
+    let idle_deadline =
+        tokio::time::Instant::now() + Duration::from_millis(INJECT_IDLE_FAST_PATH_MS);
+    let mut idle_observed = false;
     while tokio::time::Instant::now() < idle_deadline {
         if get_activity(pane).await == ClaudeActivity::Idle {
+            idle_observed = true;
             break;
         }
-        sleep(Duration::from_millis(500)).await;
+        sleep(Duration::from_millis(200)).await;
+    }
+    if !idle_observed {
+        debug!(
+            pane = %pane,
+            fast_path_ms = INJECT_IDLE_FAST_PATH_MS,
+            "inject_text: idle not observed within fast-path window, sending anyway"
+        );
     }
 
     // Step 2: dd -- delete entire line
@@ -230,9 +334,46 @@ pub async fn inject_text(pane: &str, text: &str) {
     send_keys(pane, &["d"]).await;
     sleep(Duration::from_millis(500)).await;
 
-    // Step 3: i -- enter INSERT mode
-    send_keys(pane, &["i"]).await;
-    sleep(Duration::from_millis(1500)).await;
+    // Step 3: i -- enter INSERT mode, AND VERIFY we actually entered INSERT
+    // before typing the payload.
+    //
+    // ROOT CAUSE of "cursor stuck mid-text" bug (Andrew flagged 2026-04-28):
+    // The old code was a fixed 1500ms sleep after `i` with NO verification.
+    // When that wasn't long enough (Claude Code's input editor still
+    // processing the previous keystrokes — Escape, dd — under load), the
+    // FIRST characters of `send_literal(text)` arrived while the editor was
+    // still in NORMAL mode. NORMAL-mode interpretation of typical inject-text
+    // characters jumps the cursor around:
+    //   `[`  — back to previous section
+    //   `C`  — change-to-end-of-line
+    //   `L`  — jump to bottom of viewport
+    //   `A`  — append at end of line (FINALLY enters INSERT)
+    //   etc.
+    // After `A` finally engaged INSERT, the rest of the text inserted at
+    // wherever the NORMAL-mode commands had left the cursor, leaving the
+    // cursor visibly mid-text on a letter (the "n" in `event-watch` Andrew
+    // saw). Symmetric design fix: do the SAME verify-loop the Escape→NORMAL
+    // path does at Step 1 (lines 256-262), but in reverse — verify
+    // INSERT mode is active before proceeding.
+    let mut entered_insert = false;
+    for _ in 0..3 {
+        send_keys(pane, &["i"]).await;
+        sleep(Duration::from_millis(500)).await;
+        if is_insert_mode(pane).await {
+            entered_insert = true;
+            break;
+        }
+    }
+    // Final settle even on success — Claude Code may render `-- INSERT --`
+    // before the input editor has fully accepted typed characters.
+    sleep(Duration::from_millis(500)).await;
+    if !entered_insert {
+        debug!(
+            pane = pane,
+            "inject_text: INSERT mode not confirmed after 3 `i` attempts; \
+             proceeding anyway (fall-through to legacy behavior)"
+        );
+    }
 
     // Step 4: Type the text
     send_literal(pane, text).await;
@@ -910,6 +1051,77 @@ pub(crate) fn check_lines_for_wedged(pane_output: &str) -> Option<WedgedReason> 
 pub async fn detect_wedged(pane: &str) -> Option<WedgedReason> {
     let out = capture_pane_history(pane, 80).await?;
     check_lines_for_wedged(&out)
+}
+
+/// Pure function: detect whether the pane shows Claude Code in an upstream-API
+/// retry-backoff state. When Anthropic returns 5xx (overloaded / 529) or
+/// transient 5xx errors, Claude Code retries with exponential backoff and
+/// prints lines like:
+///
+///   API Error: 529 {"type":"error","error":{"type":"overloaded_error",...}}
+///   ⎿  Retrying in 24s · attempt 3/10
+///
+/// During this window Claude Code is NOT thinking and NOT busy in the normal
+/// sense — it is waiting on a sleep before the next HTTP attempt. claude-watch
+/// MUST NOT inject during that window: every inject (Escape + text) wipes the
+/// retry state machine and forces Claude to start a brand-new turn, which then
+/// hits the same overload and re-enters retry. The result is a livelock where
+/// the daemon's interrupts perpetually reset the retry timer.
+///
+/// Detection requirements (BOTH must hold so chat-history references to the
+/// strings don't trip the detector):
+///   1. A line containing "Retrying in <N>s" or "Retrying in <N> seconds"
+///      OR a line containing "attempt N/M" (Claude Code prints this pair as
+///      one structured cue when actively retrying).
+///   2. Either the same line OR a nearby line carries an "API Error: 5xx"
+///      / "API Error: 429" / "Overloaded" / "overloaded_error" marker so we
+///      know the retry is upstream-API driven.
+///
+/// We intentionally scope the inspection to the LAST ~25 lines so the cue must
+/// be currently visible (not just somewhere in scrollback chat history).
+pub(crate) fn check_lines_for_api_retry(pane_output: &str) -> bool {
+    let lines: Vec<&str> = pane_output.lines().collect();
+    let start = if lines.len() > 25 {
+        lines.len() - 25
+    } else {
+        0
+    };
+    let tail = &lines[start..];
+    let lower: String = tail.join("\n").to_lowercase();
+
+    // Cue 1: "Retrying in Ns" or "attempt N/M" must be present in the live
+    // tail. Both phrases are emitted directly by Claude Code's retry loop
+    // — they don't appear in normal conversation.
+    let retrying_in = regex_lite::Regex::new(r"retrying in\s+\d+\s*(s|sec|seconds)\b")
+        .ok()
+        .is_some_and(|re| re.is_match(&lower));
+    let attempt_n_of_m = regex_lite::Regex::new(r"attempt\s+\d+\s*/\s*\d+\b")
+        .ok()
+        .is_some_and(|re| re.is_match(&lower));
+    if !(retrying_in || attempt_n_of_m) {
+        return false;
+    }
+
+    // Cue 2: an upstream-API error marker must accompany the retry cue. This
+    // is the load-bearing safety check — without it, an isolated "attempt
+    // 2/3" mention in chat history would falsely flag every session as
+    // retrying.
+    let has_api_error_5xx = regex_lite::Regex::new(r"api error:\s*5\d{2}\b")
+        .ok()
+        .is_some_and(|re| re.is_match(&lower));
+    let has_api_error_429 = lower.contains("api error: 429") || lower.contains("api error:429");
+    let has_overloaded = lower.contains("overloaded_error") || lower.contains("overloaded");
+
+    has_api_error_5xx || has_api_error_429 || has_overloaded
+}
+
+/// Capture the pane and check whether Claude Code is in an upstream-API retry
+/// backoff. Returns true on detection.
+pub async fn detect_api_retry(pane: &str) -> bool {
+    if let Some(out) = capture_pane_history(pane, 60).await {
+        return check_lines_for_api_retry(&out);
+    }
+    false
 }
 
 /// Run tmux healthcheck brief.
@@ -1731,5 +1943,130 @@ API Error: Request rejected (429)\n";
     fn test_wedged_reason_display() {
         assert_eq!(format!("{}", WedgedReason::ContextLimit), "context_limit");
         assert_eq!(format!("{}", WedgedReason::RateLimited), "rate_limited");
+    }
+
+    // --- check_lines_for_api_retry tests ---
+
+    #[test]
+    fn test_api_retry_overload_with_retrying_in() {
+        // The exact failure mode from 2026-04-28: 529 + retry-in-Ns banner.
+        let output = "\
+\u{276f} a tool call\n\
+API Error: 529 {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\
+\u{23ba}  Retrying in 24s \u{00b7} attempt 3/10\n\
+";
+        assert!(check_lines_for_api_retry(output));
+    }
+
+    #[test]
+    fn test_api_retry_attempt_marker_with_5xx() {
+        // "attempt N/M" alone with the 5xx error nearby is enough.
+        let output = "\
+API Error: 503 service unavailable\n\
+attempt 2/10\n\
+";
+        assert!(check_lines_for_api_retry(output));
+    }
+
+    #[test]
+    fn test_api_retry_overloaded_keyword_alone() {
+        // "Overloaded" + "Retrying in Ns" — sufficient even without an
+        // explicit "API Error: 5xx" prefix.
+        let output = "\
+overloaded_error: Overloaded\n\
+Retrying in 8 seconds\n\
+";
+        assert!(check_lines_for_api_retry(output));
+    }
+
+    #[test]
+    fn test_api_retry_429_with_retrying_in() {
+        // A 429 backoff also counts — same livelock failure mode.
+        let output = "\
+API Error: 429 rate limited\n\
+Retrying in 32s\n\
+";
+        assert!(check_lines_for_api_retry(output));
+    }
+
+    #[test]
+    fn test_not_api_retry_without_error_marker() {
+        // "attempt 2/3" on its own (e.g. chat history mentioning a retry)
+        // must NOT trip the detector — we require a 5xx/429/Overloaded cue.
+        let output = "\
+\u{276f} doing attempt 2/3 of the test plan\n\
+\u{276f}\n\
+";
+        assert!(!check_lines_for_api_retry(output));
+    }
+
+    #[test]
+    fn test_not_api_retry_normal_thinking() {
+        // Normal long thinking shouldn't trip — no retry banner, no error.
+        let output = "\
+\u{2731} Thinking\u{2026} (45s \u{00b7} \u{2193} 384 tokens)\n\
+";
+        assert!(!check_lines_for_api_retry(output));
+    }
+
+    #[test]
+    fn test_not_api_retry_old_history_only() {
+        // A "Retrying in 12s" + "529" mentioned 100 lines ago shouldn't
+        // count — only the last ~25 lines are inspected.
+        let mut lines: Vec<String> = vec![
+            "API Error: 529 Overloaded".to_string(),
+            "Retrying in 12s".to_string(),
+        ];
+        for _ in 0..50 {
+            lines.push("\u{276f} normal chat line".to_string());
+        }
+        let output = lines.join("\n");
+        assert!(!check_lines_for_api_retry(&output));
+    }
+
+    #[test]
+    fn test_api_retry_empty_input() {
+        assert!(!check_lines_for_api_retry(""));
+    }
+
+    #[test]
+    fn test_api_retry_resolved_no_banner() {
+        // After the retry succeeds, the banner is gone — only normal
+        // working state remains. No suppression should happen.
+        let output = "\
+\u{276f} Now processing your request\n\
+\u{2731} Thinking\u{2026} (3s)\n\
+";
+        assert!(!check_lines_for_api_retry(output));
+    }
+
+    #[test]
+    fn test_api_retry_isolated_overloaded_word() {
+        // Bare "Overloaded" without any retrying-in cue must NOT trip —
+        // we require both a retry marker AND an upstream-API error cue.
+        let output = "\
+\u{276f} The server is sometimes Overloaded but not now\n\
+\u{276f}\n\
+";
+        assert!(!check_lines_for_api_retry(output));
+    }
+
+    /// Verify the post-escape settle delay is wired through the global
+    /// atomic. We don't test the full settle_after_escape() async helper
+    /// here (it's exercised by the e2e inject tests); we just verify the
+    /// getter reflects the setter so the daemon's startup wiring is sound.
+    ///
+    /// NOTE: this mutates a process-global. Other tests in the same
+    /// process must not depend on a specific value for the setting. We
+    /// restore the default at the end so subsequent tests aren't surprised.
+    #[test]
+    fn test_post_escape_settle_ms_get_set_roundtrip() {
+        let original = post_escape_settle_ms();
+        set_post_escape_settle_ms(1234);
+        assert_eq!(post_escape_settle_ms(), 1234);
+        set_post_escape_settle_ms(0);
+        assert_eq!(post_escape_settle_ms(), 0);
+        // Restore for downstream tests.
+        set_post_escape_settle_ms(original);
     }
 }

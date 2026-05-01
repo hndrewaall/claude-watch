@@ -171,6 +171,88 @@ pub struct State {
     /// never becomes active within N minutes after inject, allow resetting the flag.
     #[serde(default)]
     pub last_fresh_inject: Option<String>,
+    /// Timestamp of the last check where the main loop was observed actively
+    /// running a tool call (`bashes > 0`). Used by the watcher-down inject
+    /// suppression gate so we don't preempt an in-flight turn with a
+    /// `WATCHER(S) DOWN` prompt. Updated on every check that sees
+    /// `bashes > 0`. Not cleared on daemon restart — a stale value just
+    /// suppresses one inject cycle, which is the safer side to err on.
+    #[serde(default)]
+    pub last_active_at: Option<String>,
+    /// Number of consecutive cycles where ANY of the three suppression
+    /// gates (watcher-down, fresh-/clear, dead-process) suppressed an
+    /// inject because the main loop was actively turning. When this
+    /// reaches `[suppression] max_consecutive_suppressions` OR the
+    /// wall-clock since `first_suppression_at` exceeds
+    /// `max_suppression_window_secs`, the next gate fire force-injects
+    /// regardless of `actively_turning`.
+    ///
+    /// Reset to 0 when an actual inject lands at any of the three gates
+    /// (a force-inject or a non-suppressed inject — either way the gate
+    /// has demonstrably "made progress"). The wall-clock backstop is
+    /// what catches the slow-drip case where progress is never made;
+    /// trying to reset on per-gate "predicate stopped matching" would
+    /// be incorrect for a counter shared across three independent gates.
+    /// Transient — cleared on daemon restart so a long-stale daemon
+    /// doesn't escalate immediately on the first suppression after
+    /// coming back up.
+    #[serde(default)]
+    pub consecutive_suppressions: u32,
+    /// Wall-clock timestamp of the first suppression in the current run.
+    /// Set the first time `consecutive_suppressions` increments from 0
+    /// to 1; cleared whenever `consecutive_suppressions` resets to 0.
+    /// Used by the wall-clock backstop in the escalation predicate.
+    /// Transient — cleared on daemon restart for the same reason as
+    /// `consecutive_suppressions`.
+    #[serde(default)]
+    pub first_suppression_at: Option<String>,
+    /// Number of consecutive check cycles where the pane has shown an
+    /// upstream-API retry banner ("Retrying in Ns / attempt N/M" with a 5xx
+    /// or "Overloaded" cue). Once this reaches `api_retry.consecutive`,
+    /// claude-watch suppresses all inject sites until the retry resolves.
+    /// Transient — reset on daemon load.
+    #[serde(default)]
+    pub api_retry_consecutive: u32,
+    /// Timestamp of the first cycle in the current api_retrying episode.
+    /// Used as the `max_stuck_secs` guard so a hung retry banner can't
+    /// suppress monitoring forever. Cleared when the pane no longer shows
+    /// a retry banner. Transient — reset on daemon load.
+    #[serde(default)]
+    pub api_retry_first_seen: Option<String>,
+    /// Cumulative count of cycles where claude-watch suppressed an interrupt
+    /// fire because api_retry was active. Persisted across daemon restarts
+    /// so Prometheus metrics can graph the suppression rate.
+    #[serde(default)]
+    pub api_retry_suppressions_total: u64,
+
+    // --- Auto-respawn-on-hang -------------------------------------------
+    /// Sliding-window observation history of "Claude Code is hung" signals.
+    /// Multiple independent signals must fire within
+    /// `auto_respawn_on_hang.signal_window_secs` for the auto-respawn
+    /// decision to fire. See `crate::respawn`.
+    #[serde(default)]
+    pub hang_signal_history: crate::respawn::HangSignalHistory,
+    /// Timestamp of the last auto-respawn fire (for the cooldown gate).
+    #[serde(default)]
+    pub last_respawn_at: Option<String>,
+    /// Cumulative count of auto-respawn fires (for metrics).
+    #[serde(default)]
+    pub auto_respawn_count: u32,
+    /// Cumulative count of auto-respawn fires emitted as interrupts (for
+    /// metrics — mirrors the `*_interrupts_total` naming convention).
+    #[serde(default)]
+    pub auto_respawn_interrupts_total: u64,
+    /// Hash of the last pane capture (for the PaneCaptureUnchanged signal).
+    /// Stored as a u64 of the FxHash digest. Resets to None when the pane
+    /// content changes.
+    #[serde(default)]
+    pub pane_content_hash: Option<u64>,
+    /// Timestamp of the first cycle the pane content hash matched the
+    /// current value (`pane_content_hash`). When the pane changes this
+    /// resets to None / now. The PaneCaptureUnchanged signal fires when
+    /// (now - pane_content_unchanged_since) >= pane_unchanged_secs.
+    #[serde(default)]
+    pub pane_content_unchanged_since: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -186,11 +268,26 @@ pub struct StatusSnapshot {
     pub watchmen: u32,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct WatcherState {
     pub last_seen_running: Option<String>,
     pub consecutive_missing: u32,
     pub enabled: bool,
+    /// Timestamp of the last daemon-side auto-restart for this watcher
+    /// (q-2026-04-28-5481). Per-watcher so a wait-and-exit watcher (like
+    /// claude-event-watch, which exits after delivering each event) can
+    /// be re-spawned quickly without sharing the much longer global
+    /// `inject_cooldown` clock used for tmux-pane injects.
+    #[serde(default)]
+    pub last_auto_restart_at: Option<String>,
+    /// RFC3339 timestamp of the last `watcher-down` claude-event emission for
+    /// this watcher (the "quiet path", PR #48). When set, subsequent
+    /// watcher-monitor cycles suppress re-emission within the configured
+    /// grace window AND suppress the heavyweight tmux-inject path entirely
+    /// until the grace window expires (at which point we fall through to
+    /// inject as a fallback). Cleared on recovery (count >= min_count).
+    #[serde(default)]
+    pub event_emitted_at: Option<String>,
 }
 
 pub fn load_state(path: &str) -> State {
@@ -216,6 +313,18 @@ pub fn load_state(path: &str) -> State {
     // "consecutive" semantics. Reset on load. (last_wedged_clear and
     // wedged_clear_count persist for cooldown + metrics.)
     state.wedged_consecutive = 0;
+    // Suppression-escalation counter and first-suppression timestamp are
+    // transient for the same reason: a daemon that's been down for an
+    // hour shouldn't escalate immediately on the first suppression
+    // after coming back up. The escalation re-builds from scratch.
+    state.consecutive_suppressions = 0;
+    state.first_suppression_at = None;
+    // api_retry tracking is transient — daemon downtime makes the
+    // "current episode" timestamp meaningless and the consecutive count
+    // unreliable. Reset on load. (api_retry_suppressions_total persists
+    // for metrics.)
+    state.api_retry_consecutive = 0;
+    state.api_retry_first_seen = None;
     state
 }
 
@@ -271,6 +380,8 @@ mod tests {
                 last_seen_running: Some("2026-03-16T12:00:00-05:00".to_string()),
                 consecutive_missing: 0,
                 enabled: true,
+                last_auto_restart_at: None,
+                event_emitted_at: None,
             },
         );
 
@@ -388,6 +499,60 @@ mod tests {
         // Transient state cleared (guarded by existing behavior in load_state)
         assert_eq!(loaded.thinking_interrupt_count, 0);
         assert!(loaded.last_interrupt_at.is_none());
+        let _ = std::fs::remove_file(path);
+    }
+
+    fn test_suppression_counters_cleared_on_load() {
+        // consecutive_suppressions and first_suppression_at are
+        // transient — daemon downtime breaks the "consecutive" semantics
+        // (watcher conditions could have churned during downtime) and a
+        // stale persisted timestamp would cause the wall-clock backstop
+        // to escalate immediately on the first suppression after restart.
+        // load_state() must clear both fields, alongside the other
+        // transient timers (thinking_start, last_interrupt_at, etc.).
+        let path = "/tmp/claude-watch-test-suppression-counters.json";
+        let mut state = State::default();
+        state.consecutive_suppressions = 5;
+        state.first_suppression_at = Some("2026-04-28T00:00:00+00:00".to_string());
+        save_state(path, &state);
+
+        let loaded = load_state(path);
+        assert_eq!(loaded.consecutive_suppressions, 0);
+        assert!(loaded.first_suppression_at.is_none());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_api_retry_state_transient_reset_on_load() {
+        // api_retry_consecutive and api_retry_first_seen are transient and
+        // must reset on load. The cumulative counter (suppressions_total)
+        // must persist.
+        let path = "/tmp/claude-watch-test-api-retry-transient.json";
+        let mut state = State::default();
+        state.api_retry_consecutive = 5;
+        state.api_retry_first_seen = Some("2026-04-28T18:00:00+00:00".to_string());
+        state.api_retry_suppressions_total = 42;
+        save_state(path, &state);
+
+        let loaded = load_state(path);
+        // Transient cleared
+        assert_eq!(loaded.api_retry_consecutive, 0);
+        assert!(loaded.api_retry_first_seen.is_none());
+        // Cumulative preserved
+        assert_eq!(loaded.api_retry_suppressions_total, 42);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_api_retry_suppressions_total_default_to_zero() {
+        // Old state files (written before this field existed) deserialize
+        // cleanly with the counter at 0.
+        let path = "/tmp/claude-watch-test-api-retry-default.json";
+        std::fs::write(path, "{}").unwrap();
+        let loaded = load_state(path);
+        assert_eq!(loaded.api_retry_suppressions_total, 0);
+        assert_eq!(loaded.api_retry_consecutive, 0);
+        assert!(loaded.api_retry_first_seen.is_none());
         let _ = std::fs::remove_file(path);
     }
 
