@@ -32,9 +32,12 @@ Tests run fully parallel by default. Configuration:
 
 ## Pre-commit Hook
 
-Run `make install-hooks` to set up the pre-commit hook. It runs `cargo nextest run -E 'not binary(~e2e_)'` (unit + fixture tests only, skips e2e tests that do real sleeps). **Completes in ~0.1 seconds** (~260 tests in parallel via cargo-nextest).
+Run `make install-hooks` to install the pre-commit hook. It symlinks `scripts/git-hooks/pre-commit` into `.git/hooks/` and runs two gates per commit:
 
-For RED-phase TDD commits (tests that intentionally fail), use `--no-verify` to skip the hook.
+1. **Warning-free release build** — `RUSTFLAGS="-D warnings" cargo build --release --tests`. Any rustc warning (dead code, unused imports, etc.) blocks the commit. Mirrors the CI `Warning-Free Build` job.
+2. **Unit + fixture tests** via `cargo nextest run -E 'not binary(~e2e_)'` (~0.5s in parallel, skips e2e tests that do real sleeps).
+
+For RED-phase TDD commits (tests that intentionally fail) or known-warning WIP, use `git commit --no-verify` to skip the hook.
 
 Full test suite (including e2e): `cargo nextest run` (~49s, 292 tests in parallel).
 

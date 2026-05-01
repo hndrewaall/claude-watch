@@ -38,12 +38,14 @@ build:
 deploy: build
 	sudo systemctl restart claude-watch
 
-# Install git pre-commit hook
+# Install git pre-commit hook (warning-free build + unit/fixture tests).
+# Symlinks scripts/git-hooks/pre-commit into .git/hooks so script edits
+# take effect without re-running this target. Removes any previous file
+# at .git/hooks/pre-commit (including older inline-generated versions).
 install-hooks:
-	@echo '#!/bin/sh' > .git/hooks/pre-commit
-	@echo 'cargo nextest run -E "not binary(~e2e_)"' >> .git/hooks/pre-commit
-	@chmod +x .git/hooks/pre-commit
-	@echo "Pre-commit hook installed."
+	@rm -f .git/hooks/pre-commit
+	@ln -s ../../scripts/git-hooks/pre-commit .git/hooks/pre-commit
+	@echo "Pre-commit hook installed (symlink -> scripts/git-hooks/pre-commit)."
 
 # Clean build artifacts
 clean:
