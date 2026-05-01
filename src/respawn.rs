@@ -184,8 +184,18 @@ impl HangSignalHistory {
     }
 }
 
-/// Pure decision: given a signal history (already pruned to the window)
-/// and the configured threshold, return whether a respawn should fire NOW.
+/// Pure decision: given a signal history (already pruned to the window),
+/// the configured threshold, and the count of currently-active subagents,
+/// return whether a respawn should fire NOW.
+///
+/// **Active-subagent guard (added 2026-05-01).** If `active_subagents > 0`,
+/// respawn is short-circuited to `false` regardless of all other signals.
+/// Rationale: when subagents are running, the main loop looks idle/silent
+/// from outside (no tool calls land while the parent waits on the child)
+/// but is legitimately blocked on agent work — killing it would also kill
+/// the agents and lose their state mid-task. Andrew flagged this 2026-05-01.
+/// The guard runs FIRST so even a fully-tripped multi-signal threshold
+/// cannot fire while agents are alive.
 ///
 /// `last_respawn_at`, if present, gates the decision against the cooldown.
 pub fn should_respawn(
@@ -194,7 +204,12 @@ pub fn should_respawn(
     now_iso: &str,
     signals_required: u32,
     cooldown_secs: u64,
+    active_subagents: u32,
 ) -> bool {
+    // Active-subagent guard — short-circuits regardless of signal state.
+    if active_subagents > 0 {
+        return false;
+    }
     if history.distinct_active().len() < signals_required as usize {
         return false;
     }
@@ -210,6 +225,54 @@ pub fn should_respawn(
         }
     }
     true
+}
+
+/// Count currently-active subagents of the running Claude Code main process.
+///
+/// **Heuristic**: a subagent is active iff it appears as a live child PID
+/// of the Claude Code main process AND its command does NOT match a known
+/// watcher pattern (signal-wait, torrent-wait, etc.) AND it is not one of
+/// our own introspection commands (agent-ctl / claude-watch agent / ps).
+/// This mirrors the existing `agent-ctl list` / `agent-ctl kill-all` logic.
+///
+/// We deliberately use **live child processes** rather than `agent-*.meta.json`
+/// files on disk, because meta.json files persist after the subagent process
+/// exits — counting those would over-count and never let the auto-respawn
+/// fire after the first agent ever ran in this Claude session. A live
+/// process is the single most reliable signal that a subagent is doing work.
+///
+/// Fail-open: if `find_claude_pid()` returns None (no Claude PID detectable
+/// from /proc) or `ps --ppid` fails, this returns 0 and the auto-respawn
+/// path proceeds with its existing signal-based decision. The point of the
+/// guard is to prevent killing live agents — when we can't see /proc at all,
+/// we also can't auto-respawn anyway (`execute_respawn` aborts on missing
+/// PID), so 0 is the safe default.
+///
+/// Cheap: one /proc scan + one `ps --ppid` invocation. Called at most once
+/// per check_auto_respawn cycle (default ~5s).
+pub fn count_active_subagents() -> u32 {
+    count_active_subagents_with_versions_dir(None)
+}
+
+/// Test-friendly variant that lets tests force `find_claude_pid` to return
+/// None (by passing a non-existent versions dir), giving the fail-open
+/// path. Production must pass `None`, which uses the real
+/// `~/.local/share/claude/versions` dir.
+pub fn count_active_subagents_with_versions_dir(versions_dir_override: Option<&str>) -> u32 {
+    let claude_pid_opt = match versions_dir_override {
+        Some(dir) => crate::agent::find_claude_pid_with_versions_dir(dir),
+        None => crate::agent::find_claude_pid(),
+    };
+    let Some(claude_pid) = claude_pid_opt else {
+        // No Claude PID — fail-open to 0 (existing respawn predicate gates).
+        return 0;
+    };
+    let children = crate::agent::get_children(claude_pid);
+    let agent_children = children
+        .iter()
+        .filter(|c| !crate::agent::is_watcher(&c.cmd) && !crate::agent::is_own_command(&c.cmd))
+        .count();
+    u32::try_from(agent_children).unwrap_or(u32::MAX)
 }
 
 /// Get the current local time as RFC3339, for testing seam.
@@ -496,7 +559,7 @@ mod tests {
         let now = iso_at(0);
         h.observe(&HangSignal::HeartbeatStale, &now);
 
-        let fire = should_respawn(&h, None, &now, 2, 1800);
+        let fire = should_respawn(&h, None, &now, 2, 1800, 0);
         assert!(!fire, "one signal alone must NOT trigger respawn");
     }
 
@@ -507,7 +570,7 @@ mod tests {
         h.observe(&HangSignal::HeartbeatStale, &now);
         h.observe(&HangSignal::WatcherDownPersistent, &now);
 
-        let fire = should_respawn(&h, None, &now, 2, 1800);
+        let fire = should_respawn(&h, None, &now, 2, 1800, 0);
         assert!(fire, "two distinct signals MUST trigger respawn");
     }
 
@@ -519,7 +582,7 @@ mod tests {
         h.observe(&HangSignal::HeartbeatStale, &iso_at(-30));
         h.observe(&HangSignal::HeartbeatStale, &now);
 
-        let fire = should_respawn(&h, None, &now, 2, 1800);
+        let fire = should_respawn(&h, None, &now, 2, 1800, 0);
         assert!(
             !fire,
             "duplicate signal of same kind must not satisfy the threshold"
@@ -551,7 +614,7 @@ mod tests {
 
         // Last respawn 10 minutes ago, cooldown 30 minutes — still in cooldown.
         let last = iso_at(-600);
-        let fire = should_respawn(&h, Some(&last), &now, 2, 1800);
+        let fire = should_respawn(&h, Some(&last), &now, 2, 1800, 0);
         assert!(!fire, "cooldown should block re-fire");
     }
 
@@ -564,7 +627,7 @@ mod tests {
 
         // Last respawn 60 minutes ago — past the 30-minute cooldown.
         let last = iso_at(-3600);
-        let fire = should_respawn(&h, Some(&last), &now, 2, 1800);
+        let fire = should_respawn(&h, Some(&last), &now, 2, 1800, 0);
         assert!(fire, "expired cooldown should allow re-fire");
     }
 
@@ -576,7 +639,7 @@ mod tests {
         h.observe(&HangSignal::WatcherDownPersistent, &now);
         h.observe(&HangSignal::ProlongedThinkingNoProgress, &now);
 
-        let fire = should_respawn(&h, None, &now, 2, 1800);
+        let fire = should_respawn(&h, None, &now, 2, 1800, 0);
         assert!(fire, "exceeding the threshold also fires");
     }
 
@@ -588,8 +651,97 @@ mod tests {
         h.observe(&HangSignal::WatcherDownPersistent, &now);
 
         // With required=3, two signals must NOT trigger.
-        let fire = should_respawn(&h, None, &now, 3, 1800);
+        let fire = should_respawn(&h, None, &now, 3, 1800, 0);
         assert!(!fire, "two signals must not satisfy a 3-signal requirement");
+    }
+
+    // -------------------------------------------------------------------
+    // Active-subagent guard (2026-05-01).
+    //
+    // When subagents are alive, the main loop is legitimately blocked on
+    // their work — killing it would also kill them and lose state. The
+    // guard short-circuits should_respawn() to false even when the
+    // multi-signal threshold + cooldown would otherwise fire.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn active_subagent_blocks_respawn_even_when_threshold_met() {
+        // Scenario mirrors `two_distinct_signals_trigger_respawn` (which
+        // returns true with 0 subagents) — the ONLY difference is one
+        // active subagent, which must flip the decision to false.
+        let mut h = HangSignalHistory::default();
+        let now = iso_at(0);
+        h.observe(&HangSignal::HeartbeatStale, &now);
+        h.observe(&HangSignal::WatcherDownPersistent, &now);
+
+        let fire_with_agent = should_respawn(&h, None, &now, 2, 1800, 1);
+        assert!(
+            !fire_with_agent,
+            "active subagent must veto respawn even when 2 distinct signals fired"
+        );
+
+        // Sanity: same scenario with 0 subagents still fires.
+        let fire_no_agent = should_respawn(&h, None, &now, 2, 1800, 0);
+        assert!(
+            fire_no_agent,
+            "0 subagents + 2 distinct signals must fire respawn (control)"
+        );
+    }
+
+    #[test]
+    fn many_active_subagents_block_respawn() {
+        // Even with three signals AND no cooldown, any positive
+        // subagent count must veto the fire.
+        let mut h = HangSignalHistory::default();
+        let now = iso_at(0);
+        h.observe(&HangSignal::HeartbeatStale, &now);
+        h.observe(&HangSignal::WatcherDownPersistent, &now);
+        h.observe(&HangSignal::ProlongedThinkingNoProgress, &now);
+
+        let fire = should_respawn(&h, None, &now, 2, 1800, 5);
+        assert!(!fire, "5 active subagents must block respawn");
+    }
+
+    #[test]
+    fn zero_subagents_does_not_change_existing_behavior() {
+        // Two distinct signals + zero agents → fire (regression sanity:
+        // the new parameter must be additive — passing 0 must not break
+        // any existing decision path).
+        let mut h = HangSignalHistory::default();
+        let now = iso_at(0);
+        h.observe(&HangSignal::HeartbeatStale, &now);
+        h.observe(&HangSignal::WatcherDownPersistent, &now);
+
+        let fire = should_respawn(&h, None, &now, 2, 1800, 0);
+        assert!(fire, "0 subagents + threshold met must fire");
+    }
+
+    #[test]
+    fn agent_guard_runs_before_threshold_check() {
+        // Even a single signal (which would NOT satisfy the threshold)
+        // produces the same answer (false) regardless of agent count.
+        // This isn't a behavioral change — it just confirms the guard
+        // doesn't accidentally make a false-firing scenario fire.
+        let mut h = HangSignalHistory::default();
+        let now = iso_at(0);
+        h.observe(&HangSignal::HeartbeatStale, &now);
+
+        assert!(!should_respawn(&h, None, &now, 2, 1800, 0));
+        assert!(!should_respawn(&h, None, &now, 2, 1800, 1));
+    }
+
+    #[test]
+    fn count_active_subagents_no_claude_pid_returns_zero() {
+        // Fail-open: when find_claude_pid_with_versions_dir returns None
+        // (because the versions_dir doesn't exist on disk), the count
+        // helper must return 0, not panic. Production code calls
+        // find_claude_pid (default location); this test forces the
+        // None path via a guaranteed-non-existent directory so we never
+        // touch real /proc PIDs.
+        let count = count_active_subagents_with_versions_dir(Some(
+            "/nonexistent/claude/versions/test/path",
+        ));
+        assert_eq!(count, 0, "missing claude PID must yield 0 active subagents");
     }
 
     #[test]
