@@ -128,6 +128,27 @@ Predicate vocabulary (BOUNDED -- not Turing complete):
         Used by the agent-msg async messaging system: an inform-mode
         obligation registered at agent-spawn time surfaces inbox
         contents to the subagent on the next tool call.
+  - stale_ready_queue_present: {threshold_secs?, queue_path?}
+        BAN-style predicate: returns True (satisfied = OK) iff NO items in the
+        session-task queue are ready_now AND have been waiting >= threshold_secs
+        (default 300s = 5 min). Returns False (= deny) when at least one such
+        item exists -- the main loop is sitting on a dispatchable item past the
+        stale threshold and must dispatch it (or abandon it) before doing
+        unrelated work. queue_path defaults to ~/.config/session/queue.json.
+
+        ready_now logic (mirrors session-task `_item_is_ready`): an item is
+        ready_now iff status=pending AND it is the group head AND no other
+        member of its group is currently running. Group membership is by
+        ``group_id`` field. The predicate computes this directly from
+        queue.json so it can be evaluated synchronously without shelling
+        out to session-task.
+
+        Used by cron-queue-check: when the cron emits a queue-stale-ready
+        event, it ALSO registers an obligation with this predicate so the
+        gate self-clears once the main loop dispatches (no separate
+        post-tool-satisfy needed -- the predicate flips as soon as the
+        item leaves ready+pending state).
+
   - is_main_loop: {negate?}
         satisfied iff the tool call is from the main session loop (i.e. the
         hook payload's ``agent_id`` field is empty/missing). With
@@ -222,8 +243,16 @@ VALID_PREDICATE_KINDS = {
     "no_pending_watcher_outputs",
     "agent_inbox_empty",
     "is_main_loop",
+    "stale_ready_queue_present",
     "all_of",
 }
+
+# Default location of the session-task queue file. Override via the
+# ``queue_path`` predicate param (mostly for tests).
+DEFAULT_QUEUE_PATH = Path.home() / ".config" / "session" / "queue.json"
+# Default stale threshold for stale_ready_queue_present (matches
+# DEFAULT_STALE_THRESHOLD_MIN in cron-queue-check: 5 min).
+DEFAULT_STALE_READY_THRESHOLD_SECS = 300
 
 VALID_ENFORCEMENT_MODES = {"gate", "inform"}
 
@@ -360,6 +389,42 @@ def _audit_override(record):
         pass
 
 
+def _pingme_override(ov_id, reason, duration_secs):
+    """Fire a Pushover notification when an audited override is created.
+
+    Best-effort: any failure (missing pingme, exec error, timeout) is
+    swallowed so the override path itself never breaks. Test-suite
+    isolation: when ``OBLIGATIONS_DISABLE_PINGME=1`` is set, this is a
+    no-op (so unit tests don't spam Andrew's phone).
+
+    The notification carries the override id, reason, and duration --
+    the same data audited to obligations-bypass.log -- so a phone glance
+    is enough to know what was just bypassed and for how long.
+    """
+    if os.environ.get("OBLIGATIONS_DISABLE_PINGME", "").strip() not in ("", "0"):
+        return
+    cli = shutil.which("pingme")
+    if not cli:
+        return
+    title = "obligations override"
+    # Format duration human-friendly: <60s shows seconds, <3600 minutes,
+    # else hours. Cap precision at 1 decimal for the >60s cases.
+    if duration_secs < 60:
+        dur_str = f"{int(duration_secs)}s"
+    elif duration_secs < 3600:
+        dur_str = f"{duration_secs / 60:.1f}m".rstrip("0").rstrip(".")
+    else:
+        dur_str = f"{duration_secs / 3600:.1f}h".rstrip("0").rstrip(".")
+    body = f"{ov_id} ({dur_str}): {reason}"
+    try:
+        subprocess.run(
+            [cli, "-p", "low", body, title],
+            capture_output=True, text=True, timeout=5, check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        pass
+
+
 def _now() -> float:
     return time.time()
 
@@ -421,6 +486,123 @@ def _active_override(data, now=None):
         if exp > now:
             return ov
     return None
+
+
+# ---------------------------------------------------------------------------
+# Queue introspection helpers (for the stale_ready_queue_present predicate)
+# ---------------------------------------------------------------------------
+
+
+def _parse_iso_ts(ts):
+    """Parse an ISO-8601 timestamp into a unix timestamp (float seconds since
+    epoch). Returns None on garbage input.
+
+    Accepts both ``...+00:00`` and trailing ``Z`` forms. Naive datetimes are
+    treated as UTC (the queue writes everything in UTC).
+    """
+    if not ts or not isinstance(ts, str):
+        return None
+    raw = ts.strip()
+    if not raw:
+        return None
+    # Python <3.11 doesn't accept trailing 'Z' in fromisoformat.
+    if raw.endswith("Z"):
+        raw = raw[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.timestamp()
+
+
+def _queue_item_is_ready_now(items, item):
+    """Replicate session-task's ``_item_is_ready`` logic against the bare
+    queue.json items list.
+
+    Pure function -- no I/O. An item is ready_now iff:
+      - status == "pending"
+      - it is the head of its group (highest-priority pending/running
+        member, with FIFO tiebreak by created_at)
+      - no other group member is currently running
+    """
+    if item.get("status") != "pending":
+        return False
+    group_id = item.get("group_id")
+    if not group_id:
+        # No group => degenerate single-member group containing only this
+        # item. With status=pending, it is trivially the head.
+        return True
+    # Members of the same group with status pending or running.
+    members = [
+        it for it in items
+        if it.get("group_id") == group_id
+        and it.get("status") in ("pending", "running")
+    ]
+    if not members:
+        return False
+    # Group head = running member if any (highest priority then FIFO),
+    # otherwise the highest-priority/FIFO pending member.
+    def _sort_key(it):
+        try:
+            prio = -int(it.get("priority", 5))
+        except (TypeError, ValueError):
+            prio = -5
+        return (prio, it.get("created_at", ""))
+    running = [m for m in members if m.get("status") == "running"]
+    if running:
+        # Something else in the group is running => no pending member is
+        # ready_now.
+        return False
+    head = sorted(members, key=_sort_key)[0]
+    return head.get("id") == item.get("id")
+
+
+def _stale_ready_items(queue_path, threshold_secs, now_unix):
+    """Return the list of queue items that are ready_now AND have been
+    waiting >= threshold_secs (computed from each item's created_at).
+
+    Each result dict is the raw queue item with an extra ``age_secs`` field
+    so callers can render summaries. Sorted oldest-first.
+
+    Raises if queue.json is unreadable or malformed -- callers (the
+    predicate) wrap with default-open semantics.
+    """
+    p = Path(queue_path) if not isinstance(queue_path, Path) else queue_path
+    if not p.exists():
+        return []
+    raw = p.read_text(encoding="utf-8")
+    if not raw.strip():
+        return []
+    data = json.loads(raw)
+    # queue.json may be either {"items": [...]} (the live shape) or a bare
+    # list (older shape / hand-built test fixtures).
+    if isinstance(data, dict):
+        items = data.get("items", [])
+        if not isinstance(items, list):
+            return []
+    elif isinstance(data, list):
+        items = data
+    else:
+        return []
+    out = []
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        if not _queue_item_is_ready_now(items, it):
+            continue
+        created = _parse_iso_ts(it.get("created_at", ""))
+        if created is None:
+            continue
+        age = now_unix - created
+        if age < float(threshold_secs):
+            continue
+        enriched = dict(it)
+        enriched["age_secs"] = age
+        out.append(enriched)
+    out.sort(key=lambda x: x.get("age_secs", 0), reverse=True)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -727,6 +909,47 @@ def _eval_predicate(pred, tool_name, command_string, agent_id=None):
             "Run `agent-msg ack <agent-id>` after processing -- bodies stay "
             "on disk so you can re-read with `agent-msg inbox <agent-id> --all`."
         )
+        return (False, "\n".join(lines))
+
+    if kind == "stale_ready_queue_present":
+        # BAN-style: satisfied (=True, allow) iff NO ready_now item has been
+        # waiting >= threshold_secs. Failure (=False, deny) means the main
+        # loop is sitting on a dispatchable queue item.
+        threshold = params.get("threshold_secs",
+                               DEFAULT_STALE_READY_THRESHOLD_SECS)
+        try:
+            threshold_secs = float(threshold)
+        except (TypeError, ValueError):
+            threshold_secs = float(DEFAULT_STALE_READY_THRESHOLD_SECS)
+        path_param = params.get("queue_path")
+        queue_path = (Path(os.path.expanduser(str(path_param)))
+                      if path_param else DEFAULT_QUEUE_PATH)
+        # Default-open on any read / parse error: a broken queue.json must
+        # never blackhole the loop.
+        try:
+            stale = _stale_ready_items(queue_path, threshold_secs, _now())
+        except Exception as e:  # noqa: BLE001
+            return (True, f"stale_ready_queue_present default-open on error: {e}")
+        if not stale:
+            return (True,
+                    f"no ready+pending items past {int(threshold_secs)}s "
+                    f"in {queue_path}")
+        # Build a multi-line why so the deny banner names the offending ids.
+        n = len(stale)
+        oldest_age = max(it["age_secs"] for it in stale)
+        head = (f"{n} ready+pending item(s) in queue past "
+                f"{int(threshold_secs)}s (oldest {int(oldest_age)}s); "
+                f"dispatch (queue register + Agent) or abandon before unrelated work")
+        lines = [head]
+        # Cap the per-item enumeration so a runaway queue doesn't blow up
+        # the banner.
+        for it in stale[:5]:
+            qid = it.get("id", "?")
+            summary = it.get("summary") or "(no summary)"
+            age_min = int(it["age_secs"] // 60)
+            lines.append(f"  {qid} [{age_min}m] {summary}")
+        if n > 5:
+            lines.append(f"  ... (+{n - 5} more)")
         return (False, "\n".join(lines))
 
     if kind == "is_main_loop":
@@ -1104,6 +1327,9 @@ def cmd_override(args):
         "duration_secs": duration,
         "created_by": args.created_by,
     })
+    # Fire-and-forget Pushover so Andrew sees on his phone that an audited
+    # bypass just landed. Best-effort -- any pingme failure is swallowed.
+    _pingme_override(ov_id, reason, duration)
 
     if args.json:
         print(json.dumps(ov, indent=2))
