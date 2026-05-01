@@ -65,18 +65,35 @@ Bounded set, NOT Turing-complete:
 
 ## Bypass / overrides
 
-Two flavors:
+Three flavors (in order of precedence at gate-evaluation time):
 
-  1. Per-obligation `exempt_patterns` — list of tool_pattern strings; if
+  1. Universal recovery exempts (framework-level deadlock floor) —
+     a fixed list of tool patterns that ALWAYS pass, regardless of per-row
+     configuration. Covers `obligations override / satisfy / prune`,
+     `session-task queue *`, `Agent`, `watcher-(ctl|status|restart)`,
+     `(pgrep|pkill|ps)`, `Read:tasks/<id>.output`, `self-clear`. See
+     `UNIVERSAL_RECOVERY_EXEMPT_PATTERNS` in the source for the
+     authoritative list + rationale.
+  2. Per-obligation `exempt_patterns` — list of tool_pattern strings; if
      any match, the obligation auto-allows even when tool_pattern matches.
-     Used to encode "this gate exists but the recovery path (e.g.
-     `watcher-ctl run X`) must always be allowed."
-  2. Per-call audited overrides — `obligations override <reason>
+     Used to encode "this gate exists but the row-specific satisfier
+     (e.g. the per-watcher recovery for THIS predicate) must always be
+     allowed."
+  3. Per-call audited overrides — `obligations override <reason>
      --duration <60|5m|1h>` registers a short-TTL override that bypasses
      ALL gate-mode obligations. Audited to
      `~/.config/claude/obligations-bypass.log`. 24h cap.
 
-Legacy env-var bypass: `OBLIGATIONS_BYPASS=1` (also audited).
+Legacy env-var bypass: `OBLIGATIONS_BYPASS=1` (also audited; only honored
+in the hook script's process env, NOT propagated from a Bash command's
+inline `OBLIGATIONS_BYPASS=1 cmd` prefix — use `obligations override`
+when you need per-call bypass).
+
+Design rule: obligations form a logical CONJUNCTION (every active
+gate must allow a tool for it to fire). Two obligations whose exempt
+sets do not overlap form a deadlock. The universal recovery floor is
+the structural guarantee that the recovery surface always overlaps —
+no obligation author can accidentally close it off.
 
 ## State files
 

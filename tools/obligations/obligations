@@ -228,6 +228,69 @@ NO_PENDING_WATCHER_OUTPUTS_EXEMPT_PATTERNS = [
     ("Bash:^(pgrep|pkill|ps)\\b", "process diagnosis"),
     ("Bash:^cat\\b", "alternative read path"),
     ("Bash:^obligations\\b", "obligations CLI needed to inspect/manage gates"),
+    # Queue dispatch surface must always work: when several gates fire at
+    # once, the recovery action is often "register the running queue item
+    # and Read the captured output". Exempt session-task queue + Agent
+    # so the loop can always make queue-state progress.
+    ("Bash:^session-task\\b",
+     "session-task queue dispatch needed for recovery"),
+    ("Agent", "spawning subagents is the dispatcher's recovery path"),
+]
+
+
+# UNIVERSAL RECOVERY EXEMPTS: applied to every obligation in `_check_core`
+# and `_inform_check_core` BEFORE the predicate is evaluated. These tools
+# are the recovery / escape-hatch surface that MUST always work, no matter
+# which combination of obligations is currently active.
+#
+# The deadlock that prompted this list: ob-c834 (no_pending_watcher_outputs)
+# and ob-bedb (stale_ready_queue_present) firing simultaneously, where each
+# obligation's exempt set was the recovery for the OTHER. The fix is to
+# enforce a global recovery floor at the framework level rather than
+# trusting every obligation author to remember the union.
+#
+# CONJUNCTION INVARIANT: obligations form a logical AND -- every active
+# obligation must allow a tool call for it to fire. Two obligations whose
+# exempt sets do not overlap form a deadlock-in-waiting. The universal
+# recovery list below GUARANTEES every obligation has at least the
+# escape-hatch surface (`obligations override`, `session-task queue
+# register`, Read of watcher-output paths) in its effective exempt set.
+#
+# Pattern syntax: same as `_tool_pattern_matches`. Patterns are checked
+# in `_universal_recovery_exempt_match` and SHORT-CIRCUIT the per-obligation
+# evaluation in both gate-mode (_check_core) and inform-mode
+# (_inform_check_core).
+UNIVERSAL_RECOVERY_EXEMPT_PATTERNS = [
+    # The escape hatch itself. `obligations override` MUST always work --
+    # it's the documented recovery for any deadlock scenario. Same for
+    # satisfy / prune / list / show / check (read-only inspection) and
+    # post-tool / inform-check (driven by hooks).
+    "Bash:^obligations\\b",
+    # Queue dispatch surface. When the main loop is being asked to clear a
+    # stale ready item, it MUST be able to call `session-task queue
+    # register / spawn-check / done / abandon / promote / set-summary /
+    # heartbeat / show / list / banner` and the layer-1 helpers
+    # (`session-task set / clear / get`). Listing the leading `session-task`
+    # token is enough to cover the entire dispatcher surface.
+    "Bash:^session-task\\b",
+    # Agent spawn. The dispatcher's primary recovery action is "delegate
+    # the queued item to a subagent". Blocking Agent from the main loop
+    # means the loop can't dispatch -> the deadlock self-perpetuates.
+    "Agent",
+    # Watcher recovery surface: when watchers_healthy / process_alive /
+    # no_pending_watcher_outputs fire, the recovery is `watcher-ctl run`
+    # / `watcher-restart` / `watcher-status`. Always allow.
+    "Bash:^watcher-(ctl|status|restart)\\b",
+    # Process diagnosis -- needed to figure out which watcher is wedged.
+    "Bash:^(pgrep|pkill|ps)\\b",
+    # Read of watcher captured-output paths. The pattern matches the
+    # ``file_path`` JSON field rendered by _short_command_string for the
+    # Read tool: ``{"file_path": "/tmp/claude-1000/.../tasks/<id>.output"}``.
+    # We deliberately match by suffix so any watcher captured-output file
+    # (regardless of where claude-1000's tmp dir lands) is allowed.
+    "Read:tasks/[^\"]+\\.output",
+    # Self-clear is the controlled-clear path that frees the loop.
+    "Bash:^self-clear\\b",
 ]
 
 VALID_PREDICATE_KINDS = {
@@ -1079,6 +1142,22 @@ def _exempt_match(exempt_patterns, tool_name, command_string):
     return (False, None)
 
 
+def _universal_recovery_exempt_match(tool_name, command_string):
+    """Return (matched: bool, which: str|None) against
+    ``UNIVERSAL_RECOVERY_EXEMPT_PATTERNS``.
+
+    Applied at the framework level by ``_check_core`` and
+    ``_inform_check_core`` BEFORE per-obligation predicates run. This is the
+    deadlock-prevention floor: no matter how many obligations are active,
+    the recovery / escape-hatch surface always passes.
+
+    See ``UNIVERSAL_RECOVERY_EXEMPT_PATTERNS`` for rationale + the list.
+    """
+    return _exempt_match(
+        UNIVERSAL_RECOVERY_EXEMPT_PATTERNS, tool_name, command_string,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Subcommand: add
 # ---------------------------------------------------------------------------
@@ -1449,6 +1528,20 @@ def _check_core(tool_name, command_string, prune=True, agent_id=None):
         })
         return (True, [])
 
+    # Universal recovery exempts: the framework-level deadlock-prevention
+    # floor. Tools matching UNIVERSAL_RECOVERY_EXEMPT_PATTERNS are allowed
+    # past EVERY obligation regardless of per-row exempt_patterns. This is
+    # the structural guarantee that the escape hatch (`obligations
+    # override`), the dispatcher (`session-task queue`, Agent), and the
+    # watcher recovery surface always work, no matter which combination of
+    # obligations is active. See UNIVERSAL_RECOVERY_EXEMPT_PATTERNS for
+    # the rationale + the list.
+    universal_hit, _universal_pat = _universal_recovery_exempt_match(
+        tool_name, command_string,
+    )
+    if universal_hit:
+        return (True, [])
+
     blocking = []
     for ob in data.get("obligations", []):
         if _is_expired(ob, now):
@@ -1494,6 +1587,16 @@ def _inform_check_core(tool_name, command_string, agent_id=None):
     """
     data = _read_only()
     now = _now()
+    # Universal recovery exempts apply to inform-mode too: if the caller
+    # is on a framework-level recovery path (override / dispatcher /
+    # watcher recovery), suppress the "watcher X is DOWN" / "queue is
+    # stale" advisory rather than re-surfacing what the caller is already
+    # acting on. Mirrors _check_core's framework floor.
+    universal_hit, _universal_pat = _universal_recovery_exempt_match(
+        tool_name, command_string,
+    )
+    if universal_hit:
+        return []
     failing = []
     for ob in data.get("obligations", []):
         if _is_expired(ob, now):

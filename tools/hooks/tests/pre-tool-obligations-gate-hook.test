@@ -91,6 +91,16 @@ Test cases (PreToolUse):
  88. stale_ready_queue_present: override bypasses gate
  89. override: pingme called when override created
  90. override: pingme suppressed by OBLIGATIONS_DISABLE_PINGME=1
+ 91. universal recovery: `obligations override` allowed even with row-level deny
+ 92. universal recovery: `session-task queue register` allowed past arbitrary deny
+ 93. universal recovery: Read of tasks/<id>.output allowed past arbitrary deny
+ 94. universal recovery: Agent allowed past arbitrary deny
+ 95. universal recovery: watcher-restart allowed past arbitrary deny
+ 96. universal recovery: deadlock scenario (c834 + bedb shape) -- recovery passes
+ 97. universal recovery property: every concurrently-fired obligation pair must
+     leave the universal recovery surface allowed (smoke test against the
+     three currently-deployed long-lived obligations + stale_ready)
+ 98. inform-mode: universal recovery suppresses inform advisories too
 
 Each test uses a SEPARATE OBLIGATIONS_FILE path (not the live ~/.config/claude/
 one) by overriding via environment + an isolated state dir, so we never touch
@@ -2605,6 +2615,293 @@ def main() -> int:
             ))
             if ov_off_id:
                 _run([str(CLI), "satisfy", ov_off_id], env_pm_off)
+
+        # ---------------------------------------------------------------
+        # Tests 91-98: UNIVERSAL RECOVERY EXEMPT (deadlock prevention)
+        #
+        # An obligation row may forget to list `Bash:^obligations`,
+        # `Bash:^session-task queue`, Read, Agent, or watcher-* in its
+        # exempt_patterns. Without a framework-level floor, two such
+        # obligations whose exempt sets do not overlap form a deadlock:
+        # whichever recovery action you try is blocked by the OTHER
+        # obligation. The universal recovery exempts solve this by
+        # ALWAYS allowing the recovery surface, regardless of per-row
+        # configuration.
+        #
+        # We register obligations with BARE * tool_pattern and NO
+        # exempt_patterns so the gate would deny everything but the
+        # framework-level floor. Then we confirm every recovery surface
+        # call still passes.
+        # ---------------------------------------------------------------
+        with tempfile.TemporaryDirectory(prefix="obligations-univ-") as td_u:
+            tmpdir_u = Path(td_u)
+            env_u, _ob_u = _make_isolated_env(tmpdir_u)
+            # Predicate that always FAILS: file_exists for a nonexistent
+            # path. The * tool_pattern + no exempt_patterns would block
+            # every tool absent the universal recovery floor.
+            missing = tmpdir_u / "this-does-not-exist"
+            ob_universal = _add_ob(
+                env_u,
+                tool_pattern="*",
+                predicate="file_exists",
+                params={"path": str(missing)},
+                ttl=600,
+                deny_msg="universal-deadlock-test gate",
+            )
+
+            # 91: `obligations override <reason> --duration <s>` allowed.
+            # We exercise via the hook (not the CLI) -- the hook is what
+            # the harness wires; the CLI itself is separately exempt.
+            rc, out, _err = _hook_pre(
+                {"tool_name": "Bash",
+                 "tool_input": {"command": "obligations override stuck "
+                                            "--duration 5m"}},
+                env_u,
+            )
+            results.append(_check(
+                "91. universal recovery: obligations override allowed",
+                rc == 0 and _is_allow(out),
+                f"rc={rc} out={out}",
+            ))
+
+            # 92: session-task queue register
+            rc, out, _err = _hook_pre(
+                {"tool_name": "Bash",
+                 "tool_input": {"command": "session-task queue register "
+                                            "q-test-0001"}},
+                env_u,
+            )
+            results.append(_check(
+                "92. universal recovery: session-task queue register allowed",
+                rc == 0 and _is_allow(out),
+                f"rc={rc} out={out}",
+            ))
+
+            # 93: Read of /tmp/.../tasks/<id>.output
+            rc, out, _err = _hook_pre(
+                {"tool_name": "Read",
+                 "tool_input": {"file_path":
+                                "/tmp/claude-1000/abc/tasks/9-bg.output"}},
+                env_u,
+            )
+            results.append(_check(
+                "93. universal recovery: Read of tasks/<id>.output allowed",
+                rc == 0 and _is_allow(out),
+                f"rc={rc} out={out}",
+            ))
+
+            # 94: Agent tool always allowed (dispatcher recovery path).
+            rc, out, _err = _hook_pre(
+                {"tool_name": "Agent",
+                 "tool_input": {"prompt": "subagent prompt body"}},
+                env_u,
+            )
+            results.append(_check(
+                "94. universal recovery: Agent allowed past arbitrary deny",
+                rc == 0 and _is_allow(out),
+                f"rc={rc} out={out}",
+            ))
+
+            # 95: watcher-restart
+            rc, out, _err = _hook_pre(
+                {"tool_name": "Bash",
+                 "tool_input": {"command": "watcher-restart"}},
+                env_u,
+            )
+            results.append(_check(
+                "95. universal recovery: watcher-restart allowed past arbitrary deny",
+                rc == 0 and _is_allow(out),
+                f"rc={rc} out={out}",
+            ))
+
+            # Sanity: an UNRELATED Bash call should STILL be denied (the
+            # gate is firing -- only the recovery surface is exempt).
+            rc, out, _err = _hook_pre(
+                {"tool_name": "Bash",
+                 "tool_input": {"command": "ls /nonexistent"}},
+                env_u,
+            )
+            results.append(_check(
+                "95b. universal recovery: non-recovery Bash still denied "
+                "(gate is firing, only recovery surface bypasses)",
+                rc == 0 and _is_deny(out),
+                f"rc={rc} out={out}",
+            ))
+
+            # 96: DEADLOCK SCENARIO -- replay the prompt's exact case.
+            # Two obligations active simultaneously, neither one's exempt
+            # set covers the other's recovery action. Without the
+            # universal recovery floor, the loop would be stuck.
+            # We use file_exists for both to keep the test hermetic; the
+            # SHAPE (two * obligations with disjoint exempts) is what
+            # matters.
+            ob_a = _add_ob(
+                env_u,
+                tool_pattern="*",
+                predicate="file_exists",
+                params={"path": str(tmpdir_u / "missing-a")},
+                ttl=600,
+                deny_msg="gate A",
+                exempt_tool_patterns=["Read", "Bash:^watcher-ctl\\b"],
+            )
+            ob_b = _add_ob(
+                env_u,
+                tool_pattern="*",
+                predicate="file_exists",
+                params={"path": str(tmpdir_u / "missing-b")},
+                ttl=600,
+                deny_msg="gate B",
+                exempt_tool_patterns=[
+                    "Bash:^session-task queue (register|done)\\b",
+                ],
+            )
+            # In the OLD design, every recovery call hits at least one
+            # gate. Now the universal floor passes them all.
+            for cmd, label in [
+                ("obligations override deadlock --duration 5m",
+                 "obligations override"),
+                ("session-task queue register q-x", "session-task register"),
+                ("watcher-restart", "watcher-restart"),
+            ]:
+                rc, out, _err = _hook_pre(
+                    {"tool_name": "Bash", "tool_input": {"command": cmd}},
+                    env_u,
+                )
+                results.append(_check(
+                    f"96. deadlock scenario: {label} passes both gates",
+                    rc == 0 and _is_allow(out),
+                    f"rc={rc} out={out}",
+                ))
+            # Read also passes (universal floor + ob_a's per-row exempt).
+            rc, out, _err = _hook_pre(
+                {"tool_name": "Read",
+                 "tool_input": {"file_path":
+                                "/tmp/claude-1000/x/tasks/0-bg.output"}},
+                env_u,
+            )
+            results.append(_check(
+                "96. deadlock scenario: Read of captured-output passes both gates",
+                rc == 0 and _is_allow(out),
+                f"rc={rc} out={out}",
+            ))
+            _run([str(CLI), "satisfy", ob_a], env_u)
+            _run([str(CLI), "satisfy", ob_b], env_u)
+            _run([str(CLI), "satisfy", ob_universal], env_u)
+
+            # 97: PROPERTY TEST -- iterate every pair of currently-active
+            # obligation rows in the live obligations.json (not the
+            # sandbox; we read the file directly read-only). For each
+            # pair, the universal recovery surface MUST be allowed.
+            #
+            # Hermetic version: we replay the SHAPES we have deployed
+            # (no_pending_watcher_outputs, watchers_healthy,
+            # stale_ready_queue_present, signal-wait-dm process_alive,
+            # the no-pipe_pattern signal-history rule, and an
+            # inbox-empty agent-msg shape). Each is registered in turn
+            # alongside the others; the universal recovery surface
+            # must pass every time.
+            #
+            # We add ALL of them simultaneously and check the recovery
+            # surface clears with EVERY combination.
+            shapes = [
+                # signal-history no-pipe pattern (Bash-narrow, doesn't
+                # universally apply). Skipped because tool_pattern is
+                # narrow.
+                # process_alive on a missing pid_file -- always fails.
+                ("Bash:^signal-send", "process_alive",
+                 {"pid_file": str(tmpdir_u / "missing-pid")}),
+                # watchers_healthy -- the predicate shells out; we mock
+                # it to return DOWN by faking the binary. Use
+                # file_exists as a stand-in so the shape matches.
+                ("*", "file_exists",
+                 {"path": str(tmpdir_u / "missing-watchers")}),
+                # no_pending_watcher_outputs shape -- emulate by
+                # file_exists on a missing path with * tool_pattern.
+                ("*", "file_exists",
+                 {"path": str(tmpdir_u / "missing-watcher-output")}),
+                # stale_ready_queue_present shape -- file_exists fail
+                # on * tool_pattern (the predicate's exempt list is
+                # already in cron-queue-check; here we test the floor).
+                ("*", "file_exists",
+                 {"path": str(tmpdir_u / "missing-queue")}),
+            ]
+            shape_ids = []
+            for tp, pred, par in shapes:
+                shape_ids.append(_add_ob(
+                    env_u,
+                    tool_pattern=tp, predicate=pred, params=par,
+                    ttl=600, deny_msg=f"shape {pred} on {tp}",
+                ))
+            # Now check every recovery-surface command passes.
+            recovery_calls = [
+                ("Bash", "obligations override deadlock --duration 5m"),
+                ("Bash", "obligations satisfy ob-x"),
+                ("Bash", "obligations prune"),
+                ("Bash", "session-task queue register q-y"),
+                ("Bash", "session-task queue done q-y"),
+                ("Bash", "session-task queue spawn-check q-y"),
+                ("Bash", "session-task queue add 'foo'"),
+                ("Bash", "session-task set 'state'"),
+                ("Bash", "session-task clear"),
+                ("Bash", "watcher-ctl run signal-wait-dm"),
+                ("Bash", "watcher-status --unhealthy-only"),
+                ("Bash", "watcher-restart"),
+                ("Bash", "pgrep -f signal-wait-dm"),
+                ("Bash", "self-clear"),
+                ("Agent", None),
+                ("Read", "/tmp/claude-1000/abc/tasks/9-bg.output"),
+            ]
+            all_passed = True
+            failure_details: list[str] = []
+            for tn, body in recovery_calls:
+                if tn == "Bash":
+                    payload = {"tool_name": "Bash",
+                               "tool_input": {"command": body}}
+                elif tn == "Read":
+                    payload = {"tool_name": "Read",
+                               "tool_input": {"file_path": body}}
+                else:
+                    payload = {"tool_name": tn,
+                               "tool_input": {"prompt": "x"}}
+                rc, out, _err = _hook_pre(payload, env_u)
+                if not (rc == 0 and _is_allow(out)):
+                    all_passed = False
+                    failure_details.append(f"{tn}:{body!r} -> {out}")
+            results.append(_check(
+                "97. property: every recovery-surface call passes "
+                f"with {len(shapes)} concurrent gate-mode obligations",
+                all_passed,
+                "; ".join(failure_details)[:600],
+            ))
+            for sid in shape_ids:
+                _run([str(CLI), "satisfy", sid], env_u)
+
+            # 98: inform-mode also honors universal recovery.
+            ob_inform = _add_ob(
+                env_u,
+                tool_pattern="*",
+                predicate="file_exists",
+                params={"path": str(tmpdir_u / "missing-inform")},
+                ttl=600,
+                deny_msg="inform should suppress on recovery",
+                enforcement="inform",
+            )
+            # PostToolUse hook: surfacing happens in stderr. We invoke
+            # it with a recovery-surface command and confirm the inform
+            # banner is suppressed.
+            payload_post = {
+                "tool_name": "Bash",
+                "tool_input": {"command": "obligations list"},
+                "tool_response": {"output": ""},
+            }
+            rc_post, out_post, err_post = _hook_post(payload_post, env_u)
+            inform_silent = "inform should suppress on recovery" not in err_post
+            results.append(_check(
+                "98. inform-mode also suppressed by universal recovery exempts",
+                rc_post == 0 and inform_silent,
+                f"rc={rc_post} stderr={err_post[:300]!r}",
+            ))
+            _run([str(CLI), "satisfy", ob_inform], env_u)
 
     total = len(results)
     passed = sum(1 for r in results if r)
