@@ -1663,8 +1663,9 @@ pub(crate) async fn check_auto_respawn_with_versions_dir(
     versions_dir_override: Option<&str>,
 ) {
     use crate::respawn::{
-        evaluate_pane_unchanged, execute_respawn_with_versions_dir, hash_pane_content,
-        should_respawn, HangSignal, RespawnOutcome,
+        count_active_subagents_with_versions_dir, evaluate_pane_unchanged,
+        execute_respawn_with_versions_dir, hash_pane_content, should_respawn, HangSignal,
+        RespawnOutcome,
     };
 
     if !config.auto_respawn_on_hang.enabled {
@@ -1703,8 +1704,17 @@ pub(crate) async fn check_auto_respawn_with_versions_dir(
         .prune_window(now, config.auto_respawn_on_hang.signal_window_secs);
 
     let active_count = state.hang_signal_history.distinct_active().len();
+
+    // Active-subagent guard: if subagents are alive, the main loop is not
+    // hung — it's legitimately waiting on agent work. Skip respawn.
+    // We thread the same `versions_dir_override` so unit tests can force
+    // the count to 0 (via a non-existent versions_dir → no claude PID
+    // detected → fail-open to 0). Production passes None.
+    let active_subagents = count_active_subagents_with_versions_dir(versions_dir_override);
+
     debug!(
         active_count,
+        active_subagents,
         signals_required = config.auto_respawn_on_hang.signals_required,
         "auto-respawn: signal evaluation"
     );
@@ -1715,7 +1725,14 @@ pub(crate) async fn check_auto_respawn_with_versions_dir(
         now,
         config.auto_respawn_on_hang.signals_required,
         config.auto_respawn_on_hang.cooldown_secs,
+        active_subagents,
     ) {
+        if active_subagents > 0 {
+            debug!(
+                active_subagents,
+                "auto-respawn: skipping fire — active subagents present (guard)"
+            );
+        }
         return;
     }
 
