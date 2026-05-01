@@ -29,6 +29,7 @@ mod logging;
 mod metrics;
 mod policy;
 mod proc_util;
+mod queue_check;
 mod reminders;
 mod respawn;
 mod session_event;
@@ -109,6 +110,22 @@ enum Commands {
     },
     /// Write Prometheus textfile metrics from claude-watch state
     Metrics,
+    /// Cross-check the session-task queue against actual workers
+    /// (workloads, subagents, tmux panes) and emit drift events
+    /// (`queue-orphan-running`, `queue-stale-ready`,
+    /// `queue-worker-without-item`).
+    ///
+    /// Read-only: never mutates queue state or kills processes.
+    /// Designed to be invoked by cron every few minutes.
+    #[command(name = "queue-check")]
+    QueueCheck {
+        /// Print findings as JSON instead of a human summary.
+        #[arg(long)]
+        json: bool,
+        /// Print findings but do not emit claude-events.
+        #[arg(long, short = 'n')]
+        dry_run: bool,
+    },
     /// Fire a hybrid-model hook reminder (invoked by Claude Code hooks).
     ///
     /// Writes a marker to `~/.cache/claude-watch/reminders/<type>.json` so
@@ -993,6 +1010,12 @@ async fn main() {
         }
         Some(Commands::Metrics) => {
             let code = metrics::cmd_metrics();
+            if code != 0 {
+                std::process::exit(code);
+            }
+        }
+        Some(Commands::QueueCheck { json, dry_run }) => {
+            let code = queue_check::cmd_queue_check(json, dry_run);
             if code != 0 {
                 std::process::exit(code);
             }
