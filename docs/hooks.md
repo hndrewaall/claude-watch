@@ -84,6 +84,7 @@ surface).
 | `watchers_healthy {}` | `watcher-status --unhealthy-only` is empty |
 | `is_main_loop {negate?}` | main-loop call vs subagent (scope guard) |
 | `agent_inbox_empty {path}` | `agent-msg` inbox has no unread messages |
+| `stale_ready_queue_present {threshold_secs?, queue_path?}` | BAN — true iff NO ready-now queue item has been waiting `>= threshold_secs` (default 300s). Failure carries the offending ids in `why`. |
 | `all_of {predicates: [...]}` | meta-predicate (logical AND, with `is_main_loop` scope-guard short-circuit) |
 | `no_pending_watcher_outputs {}` | every `tasks/*.output` sidecar has been Read |
 
@@ -149,6 +150,11 @@ Short-TTL bypass that disables ALL gate-mode obligations for the duration
 bypasses to `~/.config/claude/obligations-bypass.log`. Surfaces in
 `obligations list` as "ACTIVE OVERRIDES". Inform-mode advisories are NOT
 silenced (overrides gate forward progress, not visibility).
+
+Override creation also fires a low-priority Pushover notification via
+`pingme` (when present on `$PATH`) carrying `<ov-id> (<duration>): <reason>`,
+so an audited bypass surfaces on the operator's phone in addition to the
+log. Suppress in tests / CI via `OBLIGATIONS_DISABLE_PINGME=1`.
 
 ### Emergency bypass (legacy)
 
