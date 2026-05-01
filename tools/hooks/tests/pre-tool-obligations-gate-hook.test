@@ -1,0 +1,2617 @@
+#!/usr/bin/env python3
+"""Tests for pre-tool-obligations-gate-hook + post-tool-obligations-update-hook
++ the underlying obligations CLI.
+
+Test cases (PreToolUse):
+  1. No obligations             -> all tools allowed
+  2. file_mtime_within fresh    -> allowed
+  3. file_mtime_within stale    -> denied with banner
+  4. Expired obligation (TTL)   -> not enforced (should allow + auto-prune)
+  5. OBLIGATIONS_BYPASS=1       -> allowed even when predicate fails
+  6. no_pipe_pattern matching   -> denied
+  7. no_pipe_pattern non-match  -> allowed
+  8. PostToolUse satisfies      -> next PreToolUse passes
+  9. Malformed stdin            -> default-open
+ 10. Non-Bash tool with no_pipe -> allowed (predicate is N/A for non-Bash)
+ 11. Banner content sanity      -> contains expected workflow hints
+ 12. process_alive PID 1 alive  -> allowed
+ 13. process_alive dead PID     -> denied
+ 14. process_alive missing file -> denied
+ 15. process_alive garbage      -> denied (non-integer)
+ 16. process_in_pgrep matches   -> allowed
+ 17. process_in_pgrep no match  -> denied
+ 18. inform-mode never gates    -> allow even when predicate would fail
+ 19. inform-mode + post-hook    -> failing predicate surfaces on stderr
+ 20. inform-mode + healthy pred -> post-hook stays silent
+ 21. watchers_healthy w/no CLI  -> default-open (silent, no banner)
+ 22. no_pending_watcher_outputs no sidecars -> allow
+ 23. no_pending_watcher_outputs sidecar w/ written output -> deny w/ path in why
+ 24. no_pending_watcher_outputs sidecar w/ empty output -> allow
+ 25. no_pending_watcher_outputs stale sidecar (output gone) -> auto-clean + allow
+ 26. Read of sidecar output path clears sidecar -> next non-exempt tool allowed
+ 27. Exempt: Bash:^watcher-ctl bypasses gate even with unread sidecar
+ 28. Exempt: Bash:^pgrep bypasses gate even with unread sidecar
+ 29. Exempt: Read tool bypasses gate even with unread sidecar
+ 30. Sidecar-write on Bash + run_in_background + watcher-ctl run -> sidecar appears
+ 31. is_main_loop predicate alone: main-loop (no agent_id) -> allow
+ 32. is_main_loop predicate alone: subagent (agent_id present) -> deny
+ 32b. is_main_loop predicate: empty-string agent_id -> allow (treated as main loop)
+ 33. is_main_loop {negate: true} alone: subagent -> allow, main-loop -> deny
+ 34. all_of [is_main_loop, file_exists(missing)]: subagent -> ALLOW (scope-guard skip)
+ 35. all_of [is_main_loop, file_exists(missing)]: main-loop -> deny (file_exists fails, no skip)
+ 36. all_of [is_main_loop, file_exists(present)]: main-loop -> allow (both pass)
+ 37. all_of []: trivially satisfied -> allow
+ 38. all_of [is_main_loop, X(failing)] inform: subagent post-hook -> silent (scope-guard skip)
+ 39. all_of [is_main_loop, X(failing)] inform: main-loop post-hook -> banner present
+ 40. all_of with one non-is_main_loop failing child + main-loop -> deny
+ 41. all_of unknown child kind -> default-open allow
+ 45. exempt_patterns: matching exempt_pattern bypasses gate even when predicate fails
+ 46. exempt_patterns: non-matching call still gated
+ 47. exempt_patterns: multiple patterns, second one matches
+ 48. exempt_patterns: inform-mode also honors exempt_patterns
+ 49. override: active override bypasses ALL gate-mode obligations
+ 50. override: expired override does NOT bypass (TTL respected)
+ 51. override: cancelled-via-satisfy does NOT bypass
+ 52. override: invalid duration / empty reason rejected with exit 2
+ 53. override: 24h cap enforced
+ 54. override: bypass is audited to obligations-bypass.log
+ 55. override: shows in `obligations list` output
+ 56. override: does NOT silence inform-mode advisories
+ 57. state-aware recovery: DUPLICATE in why -> watcher-restart suggested
+ 58. state-aware recovery: DOWN-only in why -> watcher-ctl run <name> suggested
+ 59. state-aware recovery: mixed DOWN + DUPLICATE -> DUPLICATE wins
+ 60. state-aware recovery: non-watcher why text -> no recovery line (None)
+ 61. end-to-end: DUPLICATE deny banner contains watcher-restart line
+ 62. watcher-ctl gate: bare `watcher-ctl run X` -> allow
+ 63. watcher-ctl gate: bare `watcher-ctl run X 2>&1` -> allow
+ 64. watcher-ctl gate: trailing `2>&1 &` -> deny + cardinal banner
+ 65. watcher-ctl gate: trailing `&` -> deny
+ 66. watcher-ctl gate: `;` separator -> deny
+ 67. watcher-ctl gate: two bg watcher-ctls in one command -> deny
+ 68. watcher-ctl gate: `watcher-restart` -> allow (gate inert)
+ 69. watcher-ctl gate: unrelated `ls` -> allow (gate inert)
+ 70. watcher-ctl gate: pipe `|` -> deny
+ 71. watcher-ctl gate: `&&` compound -> deny
+ 72. watcher-ctl gate: subshell `$()` -> deny
+ 73. watcher-ctl gate: OBLIGATIONS_BYPASS=1 forces allow
+ 74. watcher-ctl gate: Bash-only (Read tool with watcher-text path -> allow)
+ 75. stale_ready_queue_present: empty queue -> allow
+ 76. stale_ready_queue_present: queue file missing -> allow (default-open)
+ 77. stale_ready_queue_present: malformed queue.json -> allow (default-open)
+ 78. stale_ready_queue_present: ready+pending fresh (1 min) -> allow
+ 79. stale_ready_queue_present: ready+pending stale (10 min) -> deny + ids in why
+ 80. stale_ready_queue_present: status=running not counted -> allow
+ 81. stale_ready_queue_present: blocked-pending (running peer in group) -> allow
+ 82. stale_ready_queue_present: non-head pending in group -> allow
+ 83. stale_ready_queue_present: custom threshold honored
+ 84. stale_ready_queue_present: multiple stale items -> all named, oldest first
+ 85. stale_ready_queue_present: exempt Agent allows even when stale present
+ 86. stale_ready_queue_present: exempt session-task queue register allows
+ 87. stale_ready_queue_present: scope-guard subagent bypasses (all_of with is_main_loop)
+ 88. stale_ready_queue_present: override bypasses gate
+ 89. override: pingme called when override created
+ 90. override: pingme suppressed by OBLIGATIONS_DISABLE_PINGME=1
+
+Each test uses a SEPARATE OBLIGATIONS_FILE path (not the live ~/.config/claude/
+one) by overriding via environment + an isolated state dir, so we never touch
+the user's real obligations.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import secrets
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+HOOKS_DIR = HERE.parent
+TOOLS_DIR = HOOKS_DIR.parent
+PRE_HOOK = HOOKS_DIR / "pre-tool-obligations-gate-hook"
+POST_HOOK = HOOKS_DIR / "post-tool-obligations-update-hook"
+CLI = TOOLS_DIR / "obligations" / "obligations"
+
+
+# We isolate the obligations file by setting HOME to a tmpdir for test runs,
+# so the script's hardcoded ~/.config/claude/obligations.json points into the
+# scratch dir. (The hooks resolve the CLI via PATH or fallback to a known
+# absolute path; we'll prepend the scratch HOME-aware bin dir to PATH.)
+
+
+def _make_isolated_env(tmpdir: Path):
+    """Return env dict + obligations_path for a sandboxed run."""
+    env = os.environ.copy()
+    env["HOME"] = str(tmpdir)
+    # Ensure both the obligations CLI and any sibling tools (e.g.
+    # session-task) are findable on PATH. The hook's CLI-resolution path
+    # falls back to the in-repo sibling, but the test exercises the
+    # PATH-resolved happy path.
+    obligations_dir = TOOLS_DIR / "obligations"
+    session_task_dir = TOOLS_DIR / "session-task"
+    env["PATH"] = (f"{obligations_dir}:{session_task_dir}:"
+                   f"{env.get('PATH','')}")
+    obligations_path = tmpdir / ".config" / "claude" / "obligations.json"
+    return env, obligations_path
+
+
+def _run(cmd, env, *, stdin=None, timeout=10):
+    return subprocess.run(
+        cmd, capture_output=True, text=True,
+        timeout=timeout, env=env, check=False, input=stdin,
+    )
+
+
+def _add_ob(env, *, tool_pattern, predicate, params, ttl, deny_msg,
+            satisfied_by_tool=None, satisfied_by_cmd_regex=None,
+            enforcement=None, exempt_tool_patterns=None):
+    args = [
+        str(CLI), "add",
+        "--tool-pattern", tool_pattern,
+        "--predicate", predicate,
+        "--params", json.dumps(params),
+        "--ttl", str(ttl),
+        "--deny-msg", deny_msg,
+        "--created-by", "test",
+        "--json",
+    ]
+    if enforcement:
+        args += ["--enforcement", enforcement]
+    if satisfied_by_tool:
+        args += ["--satisfied-by-tool", satisfied_by_tool]
+    if satisfied_by_cmd_regex:
+        args += ["--satisfied-by-cmd-regex", satisfied_by_cmd_regex]
+    for pat in (exempt_tool_patterns or []):
+        args += ["--exempt-tool-pattern", pat]
+    proc = _run(args, env)
+    if proc.returncode != 0:
+        raise RuntimeError(f"add failed rc={proc.returncode} stderr={proc.stderr}")
+    return json.loads(proc.stdout)["id"]
+
+
+def _add_override(env, reason, duration, created_by="test"):
+    proc = _run([
+        str(CLI), "override", reason,
+        "--duration", str(duration),
+        "--created-by", created_by,
+        "--json",
+    ], env)
+    if proc.returncode != 0:
+        raise RuntimeError(f"override add failed rc={proc.returncode} "
+                           f"stderr={proc.stderr}")
+    return json.loads(proc.stdout)["id"]
+
+
+def _hook_pre(payload: dict, env: dict, extra_env=None):
+    e = env.copy()
+    if extra_env:
+        e.update(extra_env)
+    proc = _run([str(PRE_HOOK)], e, stdin=json.dumps(payload))
+    try:
+        out = json.loads(proc.stdout) if proc.stdout.strip() else {}
+    except json.JSONDecodeError:
+        out = {"__raw__": proc.stdout}
+    return proc.returncode, out, proc.stderr
+
+
+def _hook_post(payload: dict, env: dict):
+    proc = _run([str(POST_HOOK)], env, stdin=json.dumps(payload))
+    return proc.returncode, proc.stdout, proc.stderr
+
+
+def _is_deny(out: dict) -> bool:
+    hso = out.get("hookSpecificOutput") or {}
+    return hso.get("permissionDecision") == "deny"
+
+
+def _is_allow(out: dict) -> bool:
+    return not _is_deny(out)
+
+
+def _check(name: str, cond: bool, detail: str = "") -> bool:
+    if cond:
+        print(f"  PASS  {name}")
+        return True
+    print(f"  FAIL  {name}  {detail}")
+    return False
+
+
+def main() -> int:
+    if not PRE_HOOK.exists():
+        print(f"ERROR: pre-hook not found at {PRE_HOOK}")
+        return 1
+    if not POST_HOOK.exists():
+        print(f"ERROR: post-hook not found at {POST_HOOK}")
+        return 1
+    if not CLI.exists():
+        print(f"ERROR: CLI not found at {CLI}")
+        return 1
+
+    results: list[bool] = []
+
+    with tempfile.TemporaryDirectory(prefix="obligations-test-") as td:
+        tmpdir = Path(td)
+        env, obligations_path = _make_isolated_env(tmpdir)
+
+        print(f"=== Sandbox: {tmpdir} ===")
+        print(f"=== Obligations file: {obligations_path} ===")
+
+        # --- Test 1: no obligations -> allow ---
+        payload = {"tool_name": "Bash", "tool_input": {"command": "ls"}}
+        rc, out, _err = _hook_pre(payload, env)
+        results.append(_check(
+            "1. no obligations -> allow",
+            rc == 0 and _is_allow(out),
+            f"rc={rc} out={out}",
+        ))
+
+        # --- Test 2: fresh file_mtime_within -> allow ---
+        marker = tmpdir / "fresh-marker"
+        marker.write_text("hi")  # mtime=now
+        ob_fresh = _add_ob(
+            env,
+            tool_pattern="Bash",
+            predicate="file_mtime_within",
+            params={"path": str(marker), "max_age_secs": 60},
+            ttl=120,
+            deny_msg="marker stale",
+        )
+        rc, out, _err = _hook_pre(
+            {"tool_name": "Bash", "tool_input": {"command": "ls"}}, env,
+        )
+        results.append(_check(
+            "2. fresh file_mtime_within -> allow",
+            rc == 0 and _is_allow(out),
+            f"rc={rc} out={out}",
+        ))
+
+        # --- Test 3: stale file_mtime_within -> deny ---
+        # Backdate the marker so the predicate fails.
+        old = time.time() - 7200
+        os.utime(marker, (old, old))
+        rc, out, _err = _hook_pre(
+            {"tool_name": "Bash", "tool_input": {"command": "ls"}}, env,
+        )
+        results.append(_check(
+            "3. stale file_mtime_within -> deny",
+            rc == 0 and _is_deny(out),
+            f"rc={rc} out={out}",
+        ))
+
+        # Clean up #2/#3
+        _run([str(CLI), "satisfy", ob_fresh], env)
+
+        # --- Test 4: TTL-expired obligation should be ignored ---
+        # ttl=1: obligation expires almost immediately. Sleep 2s, then
+        # confirm a Bash call is allowed (predicate never even checked).
+        marker2 = tmpdir / "marker-2"  # nonexistent path, would fail file_exists
+        ob_ttl = _add_ob(
+            env,
+            tool_pattern="Bash",
+            predicate="file_exists",
+            params={"path": str(marker2)},
+            ttl=1,
+            deny_msg="marker missing",
+        )
+        time.sleep(2)
+        rc, out, _err = _hook_pre(
+            {"tool_name": "Bash", "tool_input": {"command": "ls"}}, env,
+        )
+        results.append(_check(
+            "4. expired-by-TTL obligation is not enforced",
+            rc == 0 and _is_allow(out),
+            f"rc={rc} out={out}",
+        ))
+        # Best-effort cleanup (may already be auto-pruned)
+        _run([str(CLI), "satisfy", ob_ttl], env)
+
+        # --- Test 5: bypass env var ---
+        marker3 = tmpdir / "marker-3"  # also nonexistent
+        ob_bypass = _add_ob(
+            env,
+            tool_pattern="Bash",
+            predicate="file_exists",
+            params={"path": str(marker3)},
+            ttl=120,
+            deny_msg="bypass test marker missing",
+        )
+        rc, out, _err = _hook_pre(
+            {"tool_name": "Bash", "tool_input": {"command": "ls"}}, env,
+            extra_env={"OBLIGATIONS_BYPASS": "1"},
+        )
+        results.append(_check(
+            "5. OBLIGATIONS_BYPASS=1 forces allow",
+            rc == 0 and _is_allow(out),
+            f"rc={rc} out={out}",
+        ))
+        _run([str(CLI), "satisfy", ob_bypass], env)
+
+        # --- Test 6: no_pipe_pattern matching | tail -10 -> deny ---
+        ob_pipe = _add_ob(
+            env,
+            tool_pattern="Bash",
+            predicate="no_pipe_pattern",
+            params={"regex": r"\|\s*(tail|head)\s+-"},
+            ttl=0,  # non-expiring
+            deny_msg="don't pipe to tail/head",
+        )
+        rc, out, _err = _hook_pre(
+            {"tool_name": "Bash",
+             "tool_input": {"command": "cat foo.json | tail -10"}}, env,
+        )
+        results.append(_check(
+            "6. no_pipe_pattern matches tail -> deny",
+            rc == 0 and _is_deny(out),
+            f"rc={rc} out={out}",
+        ))
+
+        # --- Test 7: no_pipe_pattern non-match -> allow ---
+        rc, out, _err = _hook_pre(
+            {"tool_name": "Bash",
+             "tool_input": {"command": "ls -la /tmp"}}, env,
+        )
+        results.append(_check(
+            "7. no_pipe_pattern non-match -> allow",
+            rc == 0 and _is_allow(out),
+            f"rc={rc} out={out}",
+        ))
+
+        # --- Test 10: non-Bash tool with no_pipe_pattern -> allow ---
+        # (we'll do this BEFORE deleting ob_pipe to keep the regex installed)
+        rc, out, _err = _hook_pre(
+            {"tool_name": "Read",
+             "tool_input": {"file_path": "/some/path | tail -10"}}, env,
+        )
+        results.append(_check(
+            "10. no_pipe_pattern N/A for non-Bash tool -> allow",
+            rc == 0 and _is_allow(out),
+            f"rc={rc} out={out}",
+        ))
+
+        # --- Test 11: banner sanity ---
+        # Re-trigger #6 and inspect banner
+        rc, out, _err = _hook_pre(
+            {"tool_name": "Bash",
+             "tool_input": {"command": "cat foo | tail -3"}}, env,
+        )
+        banner = (out or {}).get("systemMessage", "")
+        wanted = ("BLOCKED", "obligations", "OBLIGATIONS_BYPASS",
+                  "obligations list", "obligations satisfy")
+        results.append(_check(
+            "11. denial banner contains workflow hints",
+            all(s in banner for s in wanted),
+            f"banner={banner!r}",
+        ))
+        _run([str(CLI), "satisfy", ob_pipe], env)
+
+        # --- Test 8: PostToolUse auto-satisfies ---
+        # Set up a marker_file_present obligation that requires the SIGNAL
+        # marker file (some path in the sandbox), with satisfied_by matching
+        # a Bash command "watcher-restart". Pre-hook denies, post-hook
+        # satisfies, pre-hook now allows.
+        marker_path = tmpdir / "wch-restart-marker"
+        ob_sat = _add_ob(
+            env,
+            tool_pattern="Bash",
+            predicate="marker_file_present",
+            params={"path": str(marker_path)},  # does not exist
+            ttl=600,
+            deny_msg="must restart watcher first",
+            satisfied_by_tool="Bash",
+            satisfied_by_cmd_regex=r"^watcher-restart\b",
+        )
+        # Pre-hook should deny because marker missing
+        rc, out, _err = _hook_pre(
+            {"tool_name": "Bash", "tool_input": {"command": "signal-send hi"}},
+            env,
+        )
+        denied_first = (rc == 0 and _is_deny(out))
+        # Now run the post-hook for a Bash command matching the satisfied_by
+        rc, _stdout, _err = _hook_post(
+            {"tool_name": "Bash",
+             "tool_input": {"command": "watcher-restart signal"}}, env,
+        )
+        # Re-run pre-hook -- should now allow because the obligation was removed
+        rc2, out2, _err = _hook_pre(
+            {"tool_name": "Bash", "tool_input": {"command": "signal-send hi"}},
+            env,
+        )
+        allowed_after = (rc2 == 0 and _is_allow(out2))
+        results.append(_check(
+            "8. PostToolUse auto-satisfies obligation",
+            denied_first and allowed_after,
+            f"denied_first={denied_first} allowed_after={allowed_after} "
+            f"first_out={out} after_out={out2}",
+        ))
+        # Cleanup -- ob_sat is gone already; defensive
+        _run([str(CLI), "satisfy", ob_sat], env)
+
+        # --- Test 12: process_alive with PID 1 (init -- always alive) -> allow ---
+        pid_file_alive = tmpdir / "alive.pid"
+        pid_file_alive.write_text("1\n")
+        ob_alive = _add_ob(
+            env,
+            tool_pattern="Bash",
+            predicate="process_alive",
+            params={"pid_file": str(pid_file_alive)},
+            ttl=120,
+            deny_msg="watcher must be running",
+        )
+        rc, out, _err = _hook_pre(
+            {"tool_name": "Bash", "tool_input": {"command": "ls"}}, env,
+        )
+        results.append(_check(
+            "12. process_alive with live PID -> allow",
+            rc == 0 and _is_allow(out),
+            f"rc={rc} out={out}",
+        ))
+        _run([str(CLI), "satisfy", ob_alive], env)
+
+        # --- Test 13: process_alive with a dead PID -> deny ---
+        pid_file_dead = tmpdir / "dead.pid"
+        # Find a PID that's almost certainly not running. Try a high number.
+        # Sanity-check: if /proc/999999 exists, fall back to a different one.
+        dead_pid = 999999
+        while os.path.isdir(f"/proc/{dead_pid}"):
+            dead_pid += 1
+        pid_file_dead.write_text(f"{dead_pid}\n")
+        ob_dead = _add_ob(
+            env,
+            tool_pattern="Bash",
+            predicate="process_alive",
+            params={"pid_file": str(pid_file_dead)},
+            ttl=120,
+            deny_msg="watcher dead -- restart it",
+        )
+        rc, out, _err = _hook_pre(
+            {"tool_name": "Bash", "tool_input": {"command": "ls"}}, env,
+        )
+        results.append(_check(
+            "13. process_alive with dead PID -> deny",
+            rc == 0 and _is_deny(out),
+            f"rc={rc} out={out}",
+        ))
+        _run([str(CLI), "satisfy", ob_dead], env)
+
+        # --- Test 14: process_alive with missing pid_file -> deny ---
+        pid_file_missing = tmpdir / "nonexistent.pid"
+        ob_missing = _add_ob(
+            env,
+            tool_pattern="Bash",
+            predicate="process_alive",
+            params={"pid_file": str(pid_file_missing)},
+            ttl=120,
+            deny_msg="watcher pid_file missing",
+        )
+        rc, out, _err = _hook_pre(
+            {"tool_name": "Bash", "tool_input": {"command": "ls"}}, env,
+        )
+        results.append(_check(
+            "14. process_alive with missing pid_file -> deny",
+            rc == 0 and _is_deny(out),
+            f"rc={rc} out={out}",
+        ))
+        _run([str(CLI), "satisfy", ob_missing], env)
+
+        # --- Test 15: process_alive with garbage pid_file -> deny ---
+        pid_file_garbage = tmpdir / "garbage.pid"
+        pid_file_garbage.write_text("not-a-pid\n")
+        ob_garbage = _add_ob(
+            env,
+            tool_pattern="Bash",
+            predicate="process_alive",
+            params={"pid_file": str(pid_file_garbage)},
+            ttl=120,
+            deny_msg="watcher pid_file is garbage",
+        )
+        rc, out, _err = _hook_pre(
+            {"tool_name": "Bash", "tool_input": {"command": "ls"}}, env,
+        )
+        results.append(_check(
+            "15. process_alive with garbage pid_file -> deny",
+            rc == 0 and _is_deny(out),
+            f"rc={rc} out={out}",
+        ))
+        _run([str(CLI), "satisfy", ob_garbage], env)
+
+        # --- Test 16: process_in_pgrep that matches the running test -> allow ---
+        # The test process itself is python3 running this file.
+        # Use 'python3' or an even more specific marker -- our own basename
+        # is in the pgrep -f surface area for the test process.
+        ob_pgrep_ok = _add_ob(
+            env,
+            tool_pattern="Bash",
+            predicate="process_in_pgrep",
+            # match the basename of this test script (definitely running)
+            params={"pattern": Path(__file__).name},
+            ttl=120,
+            deny_msg="(should not fire)",
+        )
+        rc, out, _err = _hook_pre(
+            {"tool_name": "Bash", "tool_input": {"command": "ls"}}, env,
+        )
+        results.append(_check(
+            "16. process_in_pgrep matching pattern -> allow",
+            rc == 0 and _is_allow(out),
+            f"rc={rc} out={out}",
+        ))
+        _run([str(CLI), "satisfy", ob_pgrep_ok], env)
+
+        # --- Test 17: process_in_pgrep with a no-match pattern -> deny ---
+        ob_pgrep_miss = _add_ob(
+            env,
+            tool_pattern="Bash",
+            predicate="process_in_pgrep",
+            params={"pattern": "definitely-not-a-real-process-zzzzzz-xyzzy-12345"},
+            ttl=120,
+            deny_msg="watcher process not running",
+        )
+        rc, out, _err = _hook_pre(
+            {"tool_name": "Bash", "tool_input": {"command": "ls"}}, env,
+        )
+        results.append(_check(
+            "17. process_in_pgrep with no-match pattern -> deny",
+            rc == 0 and _is_deny(out),
+            f"rc={rc} out={out}",
+        ))
+        _run([str(CLI), "satisfy", ob_pgrep_miss], env)
+
+        # --- Test 18: inform-mode never gates a tool call ---
+        # Use a predicate guaranteed to fail (file_exists on a missing path).
+        # In gate mode this would deny; in inform mode the PreToolUse hook
+        # MUST allow.
+        absent = tmpdir / "definitely-not-here"
+        ob_inform_fail = _add_ob(
+            env,
+            tool_pattern="Bash",
+            predicate="file_exists",
+            params={"path": str(absent)},
+            ttl=120,
+            enforcement="inform",
+            deny_msg="(inform-only -- should never block)",
+        )
+        rc, out, _err = _hook_pre(
+            {"tool_name": "Bash", "tool_input": {"command": "ls"}}, env,
+        )
+        results.append(_check(
+            "18. inform-mode never gates -> allow even when predicate fails",
+            rc == 0 and _is_allow(out),
+            f"rc={rc} out={out}",
+        ))
+
+        # --- Test 19: inform-mode + post-hook surfaces failure on stderr ---
+        # The same failing inform obligation should produce a stderr banner
+        # when the PostToolUse hook runs.
+        rc, _stdout, err = _hook_post(
+            {"tool_name": "Bash", "tool_input": {"command": "ls"}}, env,
+        )
+        results.append(_check(
+            "19. inform-mode + failing predicate -> post-hook prints stderr",
+            rc == 0 and "[obligations:inform]" in err and ob_inform_fail in err,
+            f"rc={rc} err={err!r}",
+        ))
+        _run([str(CLI), "satisfy", ob_inform_fail], env)
+
+        # --- Test 20: inform-mode + healthy predicate -> post-hook silent ---
+        present = tmpdir / "i-exist"
+        present.write_text("yes")
+        ob_inform_ok = _add_ob(
+            env,
+            tool_pattern="Bash",
+            predicate="file_exists",
+            params={"path": str(present)},
+            ttl=120,
+            enforcement="inform",
+            deny_msg="(should not surface)",
+        )
+        rc, _stdout, err = _hook_post(
+            {"tool_name": "Bash", "tool_input": {"command": "ls"}}, env,
+        )
+        results.append(_check(
+            "20. inform-mode + healthy predicate -> post-hook silent",
+            rc == 0 and "[obligations:inform]" not in err,
+            f"rc={rc} err={err!r}",
+        ))
+        _run([str(CLI), "satisfy", ob_inform_ok], env)
+
+        # --- Test 21: watchers_healthy default-open when CLI missing ---
+        # We strip every directory containing watcher-status from PATH so the
+        # predicate can't resolve it via shutil.which. We also need /usr/bin
+        # / /bin etc. on PATH because the obligations CLI runs through
+        # `/usr/bin/env python3`. Our HOME override (tmpdir) means
+        # ~/bin/watcher-status (a fallback path the predicate probes) also
+        # resolves into the sandbox and doesn't exist.
+        env_no_watcher = env.copy()
+        sanitized = []
+        for p in env.get("PATH", "").split(os.pathsep):
+            if not p:
+                continue
+            if os.path.exists(os.path.join(p, "watcher-status")):
+                continue
+            sanitized.append(p)
+        env_no_watcher["PATH"] = os.pathsep.join(sanitized)
+        ob_wh_gate = _add_ob(
+            env_no_watcher,
+            tool_pattern="Bash",
+            predicate="watchers_healthy",
+            params={},
+            ttl=120,
+            deny_msg="watcher gate (should not fire when CLI missing)",
+        )
+        rc, out, _err = _hook_pre(
+            {"tool_name": "Bash", "tool_input": {"command": "ls"}},
+            env_no_watcher,
+        )
+        gate_open = (rc == 0 and _is_allow(out))
+        _run([str(CLI), "satisfy", ob_wh_gate], env_no_watcher)
+
+        ob_wh_inform = _add_ob(
+            env_no_watcher,
+            tool_pattern="Bash",
+            predicate="watchers_healthy",
+            params={},
+            ttl=120,
+            enforcement="inform",
+            deny_msg="watcher inform (should not surface when CLI missing)",
+        )
+        rc, _stdout, err = _hook_post(
+            {"tool_name": "Bash", "tool_input": {"command": "ls"}},
+            env_no_watcher,
+        )
+        inform_silent = (rc == 0 and "[obligations:inform]" not in err)
+        _run([str(CLI), "satisfy", ob_wh_inform], env_no_watcher)
+        results.append(_check(
+            "21. watchers_healthy without CLI -> default-open silent",
+            gate_open and inform_silent,
+            f"gate_open={gate_open} inform_silent={inform_silent} err={err!r}",
+        ))
+
+        # ===== no_pending_watcher_outputs predicate tests =====
+        # We isolate the sidecar dir per-test by setting WATCHER_PENDING_DIR
+        # to a tmpdir-relative path, picked up by both the obligations CLI
+        # and the post-tool hook (both have a _watcher_pending_dir() that
+        # consults this env var first).
+        sidecar_dir = tmpdir / "watcher-output-pending"
+        env_npwo = env.copy()
+        env_npwo["WATCHER_PENDING_DIR"] = str(sidecar_dir)
+
+        # Register the gate. tool_pattern '*' so it tries to fire for every
+        # tool; the predicate's exemption logic guards the recovery paths.
+        ob_npwo = _add_ob(
+            env_npwo,
+            tool_pattern="*",
+            predicate="no_pending_watcher_outputs",
+            params={},
+            ttl=0,
+            deny_msg="Read the captured watcher output before proceeding",
+        )
+
+        def _write_sidecar(task_id: str, output_path: Path,
+                           registered_at: float | None = None) -> Path:
+            sidecar_dir.mkdir(parents=True, exist_ok=True)
+            sc = {
+                "task_id": task_id,
+                "command": f"watcher-ctl run sample-{task_id}",
+                "watcher_name": f"sample-{task_id}",
+                "output_file_path": str(output_path),
+                "registered_at": registered_at if registered_at is not None else time.time(),
+            }
+            sp = sidecar_dir / f"{task_id}.json"
+            sp.write_text(json.dumps(sc))
+            return sp
+
+        # --- Test 22: no sidecars -> allow ---
+        # Make sure the sidecar dir is empty.
+        if sidecar_dir.exists():
+            for f in sidecar_dir.iterdir():
+                f.unlink()
+        rc, out, _err = _hook_pre(
+            {"tool_name": "Bash", "tool_input": {"command": "ls"}}, env_npwo,
+        )
+        results.append(_check(
+            "22. no_pending_watcher_outputs no sidecars -> allow",
+            rc == 0 and _is_allow(out),
+            f"rc={rc} out={out}",
+        ))
+
+        # --- Test 23: sidecar with written output -> deny ---
+        out_file = tmpdir / "captured-1.output"
+        registered = time.time() - 10  # 10 seconds ago
+        out_file.write_text("watcher fired with content\n")
+        # Bump mtime to NOW (definitely after registered_at).
+        os.utime(out_file, (time.time(), time.time()))
+        sc1 = _write_sidecar("bsidecar1", out_file, registered_at=registered)
+        rc, out, _err = _hook_pre(
+            {"tool_name": "Bash", "tool_input": {"command": "ls"}}, env_npwo,
+        )
+        why_in_banner = (
+            "unread watcher output" in (out.get("systemMessage", "") or "")
+            and str(out_file) in (out.get("systemMessage", "") or "")
+        )
+        results.append(_check(
+            "23. no_pending_watcher_outputs unread output -> deny w/ path",
+            rc == 0 and _is_deny(out) and why_in_banner,
+            f"rc={rc} out={out}",
+        ))
+
+        # --- Test 24: sidecar with empty output -> allow ---
+        # Replace with an empty file (size 0).
+        sc1.unlink()
+        empty_out = tmpdir / "empty-out.output"
+        empty_out.write_text("")
+        sc2 = _write_sidecar("bsidecar2", empty_out, registered_at=time.time() - 10)
+        rc, out, _err = _hook_pre(
+            {"tool_name": "Bash", "tool_input": {"command": "ls"}}, env_npwo,
+        )
+        results.append(_check(
+            "24. no_pending_watcher_outputs empty output -> allow",
+            rc == 0 and _is_allow(out),
+            f"rc={rc} out={out}",
+        ))
+
+        # --- Test 25: stale sidecar (output file deleted) -> auto-clean + allow ---
+        sc2.unlink()
+        gone_out = tmpdir / "gone.output"
+        # write the sidecar pointing at a path that does NOT exist
+        sc3 = _write_sidecar("bsidecar3", gone_out, registered_at=time.time() - 10)
+        # confirm the output file truly does not exist
+        if gone_out.exists():
+            gone_out.unlink()
+        rc, out, _err = _hook_pre(
+            {"tool_name": "Bash", "tool_input": {"command": "ls"}}, env_npwo,
+        )
+        # The predicate should auto-clean the stale sidecar AND allow.
+        sidecar_gone = not sc3.exists()
+        results.append(_check(
+            "25. no_pending_watcher_outputs stale sidecar -> auto-clean + allow",
+            rc == 0 and _is_allow(out) and sidecar_gone,
+            f"rc={rc} out={out} sidecar_gone={sidecar_gone}",
+        ))
+
+        # --- Test 26: Read of sidecar output path clears sidecar ---
+        # Re-create an unread sidecar, then PostToolUse hook for a Read of
+        # the output path -> sidecar should be deleted -> next non-exempt
+        # tool should be allowed.
+        out_file2 = tmpdir / "captured-26.output"
+        out_file2.write_text("more output\n")
+        os.utime(out_file2, (time.time(), time.time()))
+        sc4 = _write_sidecar("bsidecar4", out_file2, registered_at=time.time() - 10)
+        # First confirm the gate fires (deny).
+        rc, out, _err = _hook_pre(
+            {"tool_name": "Bash", "tool_input": {"command": "ls"}}, env_npwo,
+        )
+        denied_before_read = (rc == 0 and _is_deny(out))
+        # Now simulate Reading the output via PostToolUse hook.
+        rc, _stdout, _err = _hook_post(
+            {"tool_name": "Read",
+             "tool_input": {"file_path": str(out_file2)}}, env_npwo,
+        )
+        sidecar_cleared = not sc4.exists()
+        # And the next non-exempt tool should now be allowed.
+        rc2, out2, _err2 = _hook_pre(
+            {"tool_name": "Bash", "tool_input": {"command": "ls"}}, env_npwo,
+        )
+        allowed_after_read = (rc2 == 0 and _is_allow(out2))
+        results.append(_check(
+            "26. Read of sidecar output path -> sidecar cleared, next tool allowed",
+            denied_before_read and sidecar_cleared and allowed_after_read,
+            f"denied_before={denied_before_read} sidecar_cleared={sidecar_cleared} "
+            f"allowed_after={allowed_after_read} out_before={out} out_after={out2}",
+        ))
+
+        # --- Test 27: Bash:^watcher-ctl exempt even with unread sidecar ---
+        # Re-create an unread sidecar and confirm watcher-ctl is allowed.
+        out_file3 = tmpdir / "captured-27.output"
+        out_file3.write_text("yet more\n")
+        os.utime(out_file3, (time.time(), time.time()))
+        sc5 = _write_sidecar("bsidecar5", out_file3, registered_at=time.time() - 10)
+        rc, out, _err = _hook_pre(
+            {"tool_name": "Bash",
+             "tool_input": {"command": "watcher-ctl run signal-wait-dm"}}, env_npwo,
+        )
+        results.append(_check(
+            "27. Bash:^watcher-ctl exempt -> allow even with unread sidecar",
+            rc == 0 and _is_allow(out),
+            f"rc={rc} out={out}",
+        ))
+
+        # --- Test 28: Bash:^pgrep exempt even with unread sidecar ---
+        rc, out, _err = _hook_pre(
+            {"tool_name": "Bash",
+             "tool_input": {"command": "pgrep -f signal-wait-dm"}}, env_npwo,
+        )
+        results.append(_check(
+            "28. Bash:^pgrep exempt -> allow even with unread sidecar",
+            rc == 0 and _is_allow(out),
+            f"rc={rc} out={out}",
+        ))
+
+        # --- Test 29: Read tool exempt even with unread sidecar ---
+        # (Read tool needs to be the satisfier path; gating it would deadlock.)
+        rc, out, _err = _hook_pre(
+            {"tool_name": "Read",
+             "tool_input": {"file_path": "/tmp/anything"}}, env_npwo,
+        )
+        results.append(_check(
+            "29. Read tool exempt -> allow even with unread sidecar",
+            rc == 0 and _is_allow(out),
+            f"rc={rc} out={out}",
+        ))
+        # Cleanup the test 27/28/29 sidecar so it doesn't leak.
+        if sc5.exists():
+            sc5.unlink()
+        # Done with the npwo gate.
+        _run([str(CLI), "satisfy", ob_npwo], env_npwo)
+
+        # --- Test 30: PostToolUse on Bash + run_in_background + watcher-ctl
+        # writes a sidecar. We supply a deterministic backgroundTaskId and
+        # pre-create the corresponding session-task output file so the
+        # session UUID resolver finds it.
+        # Layout: /tmp/claude-<uid>/<HOME-slug>/<uuid>/tasks/<id>.output
+        # where <HOME-slug> is HOME with `/` -> `-` and a leading `-`. We
+        # mirror the resolver in the hook (which derives the slug from $HOME
+        # at call time, so this hook is portable across users).
+        fake_uuid = "deadbeef-cafe-1234-5678-abcdef012345"
+        uid = os.geteuid()
+        home_slug = env["HOME"].replace("/", "-")
+        # Use a unique task id so we don't collide with a real Claude
+        # session. The file we create here is what makes the resolver
+        # succeed (it globs for an existing output file with this task id).
+        fake_task_id = f"btestxx30{secrets.token_hex(2)}"
+        fake_session_dir = Path(
+            f"/tmp/claude-{uid}/{home_slug}/{fake_uuid}/tasks")
+        fake_session_dir.mkdir(parents=True, exist_ok=True)
+        fake_output = fake_session_dir / f"{fake_task_id}.output"
+        fake_output.write_text("")  # exists, empty (so the predicate would allow)
+        # Re-isolate sidecar dir for this test.
+        sidecar_dir2 = tmpdir / "watcher-output-pending-2"
+        env_npwo2 = env.copy()
+        env_npwo2["WATCHER_PENDING_DIR"] = str(sidecar_dir2)
+        rc, _stdout, _err = _hook_post(
+            {
+                "tool_name": "Bash",
+                "tool_input": {
+                    "command": "watcher-ctl run signal-wait-dm",
+                    "run_in_background": True,
+                },
+                "tool_response": {
+                    "backgroundTaskId": fake_task_id,
+                },
+            },
+            env_npwo2,
+        )
+        sidecar_path = sidecar_dir2 / f"{fake_task_id}.json"
+        sidecar_appeared = sidecar_path.exists()
+        sidecar_ok = False
+        if sidecar_appeared:
+            try:
+                sc_data = json.loads(sidecar_path.read_text())
+                sidecar_ok = (
+                    sc_data.get("task_id") == fake_task_id
+                    and sc_data.get("watcher_name") == "signal-wait-dm"
+                    and sc_data.get("output_file_path") == str(fake_output)
+                    and sc_data.get("command", "").startswith("watcher-ctl run")
+                    and isinstance(sc_data.get("registered_at"), (int, float))
+                )
+            except (OSError, json.JSONDecodeError):
+                pass
+        results.append(_check(
+            "30. PostToolUse on watcher-ctl run + bg writes sidecar",
+            rc == 0 and sidecar_appeared and sidecar_ok,
+            f"rc={rc} appeared={sidecar_appeared} ok={sidecar_ok} "
+            f"sidecar={sidecar_path}",
+        ))
+        # Cleanup -- best-effort.
+        try:
+            if sidecar_path.exists():
+                sidecar_path.unlink()
+            if fake_output.exists():
+                fake_output.unlink()
+            if fake_session_dir.exists():
+                fake_session_dir.rmdir()
+            fake_session_dir.parent.rmdir()
+        except OSError:
+            pass
+
+        # ===== is_main_loop + all_of (predicate composition) tests =====
+        # Replaces the old row-level `main_loop_only` flag tests. The
+        # canonical way to scope an obligation to the main loop is now
+        # `predicate: all_of [is_main_loop, <other>]` -- the new
+        # `is_main_loop` predicate is itself a boolean that returns true
+        # iff agent_id is empty/missing in the hook payload, and `all_of`
+        # is a meta-predicate that ANDs an arbitrary list of children.
+        #
+        # SEMANTICS: standard Boolean AND. all_of is satisfied iff every
+        # child is satisfied. Empty list is trivially true. is_main_loop
+        # FAILS in subagent context (predicate returns False), so an
+        # `all_of [is_main_loop, X]` obligation will FAIL (and DENY) in
+        # subagent context unless X also happens to fail. To express
+        # "main-loop only enforce X" semantics (where subagents bypass),
+        # the natural shape is `is_main_loop {negate: true}` ORed with X
+        # -- but we don't have OR. Today's pilot use-case is the
+        # watcher-output gate, which intentionally USES the AND
+        # semantics: in the main loop the obligation actively gates;
+        # subagents would deny too, BUT subagents don't read the main
+        # loop's sidecar dir, so in practice no_pending_watcher_outputs
+        # passes vacuously for them. The is_main_loop child is included
+        # as documentation of intent + future-proofing if the predicate
+        # ever becomes ambient.
+        #
+        # The tests below verify the pure AND semantics; the live
+        # obligation refit lives in the deployment step.
+
+        # Wipe the obligations file to start clean for the composition tests.
+        proc = _run([str(CLI), "list", "--json"], env)
+        try:
+            existing = json.loads(proc.stdout).get("obligations", [])
+        except (json.JSONDecodeError, ValueError):
+            existing = []
+        for ob in existing:
+            _run([str(CLI), "satisfy", ob["id"]], env)
+
+        # --- Test 31: is_main_loop alone + main-loop (no agent_id) -> allow ---
+        ob_iml = _add_ob(
+            env,
+            tool_pattern="Bash",
+            predicate="is_main_loop",
+            params={},
+            ttl=120,
+            deny_msg="must be in main loop",
+        )
+        rc, out, _err = _hook_pre(
+            {"tool_name": "Bash", "tool_input": {"command": "ls"}},
+            env,
+        )
+        results.append(_check(
+            "31. is_main_loop alone + main-loop -> allow",
+            rc == 0 and _is_allow(out),
+            f"rc={rc} out={out}",
+        ))
+
+        # --- Test 32: is_main_loop alone + subagent context -> deny ---
+        rc, out, _err = _hook_pre(
+            {
+                "tool_name": "Bash",
+                "tool_input": {"command": "ls"},
+                "agent_id": "subagent-abc-123",
+            },
+            env,
+        )
+        results.append(_check(
+            "32. is_main_loop alone + subagent context -> deny",
+            rc == 0 and _is_deny(out),
+            f"rc={rc} out={out}",
+        ))
+
+        # Belt-and-suspenders: empty-string agent_id treated as main loop.
+        rc, out, _err = _hook_pre(
+            {
+                "tool_name": "Bash",
+                "tool_input": {"command": "ls"},
+                "agent_id": "",
+            },
+            env,
+        )
+        results.append(_check(
+            "32b. is_main_loop + agent_id='' -> allow (treated as main loop)",
+            rc == 0 and _is_allow(out),
+            f"rc={rc} out={out}",
+        ))
+        _run([str(CLI), "satisfy", ob_iml], env)
+
+        # --- Test 33: is_main_loop {negate: true} = "is subagent" ---
+        # Only enforce when inside a subagent. Used as a building block
+        # for "subagent-only" obligations.
+        ob_iml_neg = _add_ob(
+            env,
+            tool_pattern="Bash",
+            predicate="is_main_loop",
+            params={"negate": True},
+            ttl=120,
+            deny_msg="must be in subagent",
+        )
+        # subagent context -> allow (predicate satisfied: we ARE in subagent)
+        rc, out, _err = _hook_pre(
+            {
+                "tool_name": "Bash",
+                "tool_input": {"command": "ls"},
+                "agent_id": "subagent-xyz",
+            },
+            env,
+        )
+        sub_allowed = (rc == 0 and _is_allow(out))
+        # main-loop context -> deny (predicate fails)
+        rc, out, _err = _hook_pre(
+            {"tool_name": "Bash", "tool_input": {"command": "ls"}},
+            env,
+        )
+        main_denied = (rc == 0 and _is_deny(out))
+        results.append(_check(
+            "33. is_main_loop {negate:true}: subagent allow / main-loop deny",
+            sub_allowed and main_denied,
+            f"sub_allowed={sub_allowed} main_denied={main_denied}",
+        ))
+        _run([str(CLI), "satisfy", ob_iml_neg], env)
+
+        # --- Test 34: all_of [is_main_loop, file_exists(missing)] subagent
+        #     -> ALLOW. Scope-guard short-circuit: is_main_loop FAILS in
+        #     subagent context, which (inside all_of) marks the all_of as
+        #     INACTIVE -> satisfied=True -> obligation does NOT block.
+        #     This is the canonical "main-loop only enforce X" pattern.
+        absent_x = tmpdir / "absent-composition"
+        ob_aof_iml = _add_ob(
+            env,
+            tool_pattern="Bash",
+            predicate="all_of",
+            params={
+                "predicates": [
+                    {"kind": "is_main_loop", "params": {}},
+                    {"kind": "file_exists", "params": {"path": str(absent_x)}},
+                ]
+            },
+            ttl=120,
+            deny_msg="all_of [is_main_loop, file_exists(missing)]",
+        )
+        rc, out, _err = _hook_pre(
+            {
+                "tool_name": "Bash",
+                "tool_input": {"command": "ls"},
+                "agent_id": "subagent-abc-123",
+            },
+            env,
+        )
+        results.append(_check(
+            "34. all_of [is_main_loop, file_exists(missing)] subagent -> allow "
+            "(scope-guard short-circuit)",
+            rc == 0 and _is_allow(out),
+            f"rc={rc} out={out}",
+        ))
+
+        # --- Test 35: same all_of in main-loop + missing file -> deny
+        #     (is_main_loop=T, file_exists=F -> all_of=F -> deny)
+        rc, out, _err = _hook_pre(
+            {"tool_name": "Bash", "tool_input": {"command": "ls"}},
+            env,
+        )
+        results.append(_check(
+            "35. all_of [is_main_loop, file_exists(missing)] main-loop -> deny",
+            rc == 0 and _is_deny(out),
+            f"rc={rc} out={out}",
+        ))
+        _run([str(CLI), "satisfy", ob_aof_iml], env)
+
+        # --- Test 36: all_of [is_main_loop, file_exists(present)] main-loop
+        #     -> allow (both children satisfied)
+        present_x = tmpdir / "present-composition"
+        present_x.write_text("hi")
+        ob_aof_ok = _add_ob(
+            env,
+            tool_pattern="Bash",
+            predicate="all_of",
+            params={
+                "predicates": [
+                    {"kind": "is_main_loop", "params": {}},
+                    {"kind": "file_exists", "params": {"path": str(present_x)}},
+                ]
+            },
+            ttl=120,
+            deny_msg="all_of [is_main_loop, file_exists(present)]",
+        )
+        rc, out, _err = _hook_pre(
+            {"tool_name": "Bash", "tool_input": {"command": "ls"}},
+            env,
+        )
+        results.append(_check(
+            "36. all_of [is_main_loop, file_exists(present)] main-loop -> allow",
+            rc == 0 and _is_allow(out),
+            f"rc={rc} out={out}",
+        ))
+        _run([str(CLI), "satisfy", ob_aof_ok], env)
+
+        # --- Test 37: all_of [] is trivially satisfied (empty AND => true) ---
+        ob_aof_empty = _add_ob(
+            env,
+            tool_pattern="Bash",
+            predicate="all_of",
+            params={"predicates": []},
+            ttl=120,
+            deny_msg="all_of [] should never block",
+        )
+        rc, out, _err = _hook_pre(
+            {"tool_name": "Bash", "tool_input": {"command": "ls"}},
+            env,
+        )
+        results.append(_check(
+            "37. all_of [] empty list -> trivially satisfied -> allow",
+            rc == 0 and _is_allow(out),
+            f"rc={rc} out={out}",
+        ))
+        _run([str(CLI), "satisfy", ob_aof_empty], env)
+
+        # --- Test 38: inform-mode all_of [is_main_loop, file_exists(missing)],
+        #     subagent post-hook -> SILENT (scope-guard skip).
+        absent_inform = tmpdir / "absent-inform-composition"
+        ob_aof_inform = _add_ob(
+            env,
+            tool_pattern="Bash",
+            predicate="all_of",
+            params={
+                "predicates": [
+                    {"kind": "is_main_loop", "params": {}},
+                    {"kind": "file_exists", "params": {"path": str(absent_inform)}},
+                ]
+            },
+            ttl=120,
+            enforcement="inform",
+            deny_msg="composed inform (main-loop sees banner; subagent silent)",
+        )
+        proc = subprocess.run(
+            [str(POST_HOOK)],
+            capture_output=True, text=True, timeout=5, check=False, env=env,
+            input=json.dumps({
+                "tool_name": "Bash",
+                "tool_input": {"command": "ls"},
+                "agent_id": "subagent-aaa-111",
+            }),
+        )
+        results.append(_check(
+            "38. inform all_of [is_main_loop, file_exists(miss)] "
+            "subagent -> silent (scope-guard skip)",
+            proc.returncode == 0 and "[obligations:inform]" not in proc.stderr,
+            f"rc={proc.returncode} stderr={proc.stderr!r}",
+        ))
+
+        # --- Test 39: same inform obligation, main-loop post-hook -> banner
+        # (is_main_loop=T, file_exists=F -> all_of=F -> banner fires)
+        proc = subprocess.run(
+            [str(POST_HOOK)],
+            capture_output=True, text=True, timeout=5, check=False, env=env,
+            input=json.dumps({
+                "tool_name": "Bash",
+                "tool_input": {"command": "ls"},
+                # no agent_id => main loop
+            }),
+        )
+        results.append(_check(
+            "39. inform all_of [is_main_loop, file_exists(miss)] "
+            "main-loop -> banner present",
+            proc.returncode == 0 and "[obligations:inform]" in proc.stderr
+                and ob_aof_inform in proc.stderr,
+            f"rc={proc.returncode} stderr={proc.stderr!r}",
+        ))
+        _run([str(CLI), "satisfy", ob_aof_inform], env)
+
+        # --- Test 40: all_of [file_exists(missing), env_present(unset)]
+        #     main-loop -> deny. No is_main_loop => standard AND: any
+        #     failing child propagates to the all_of result.
+        absent_y = tmpdir / "absent-no-iml"
+        ob_aof_no_iml = _add_ob(
+            env,
+            tool_pattern="Bash",
+            predicate="all_of",
+            params={
+                "predicates": [
+                    {"kind": "file_exists", "params": {"path": str(absent_y)}},
+                ]
+            },
+            ttl=120,
+            deny_msg="all_of [file_exists(missing)] should deny",
+        )
+        rc, out, _err = _hook_pre(
+            {"tool_name": "Bash", "tool_input": {"command": "ls"}},
+            env,
+        )
+        results.append(_check(
+            "40. all_of [file_exists(missing)] (no is_main_loop) -> deny",
+            rc == 0 and _is_deny(out),
+            f"rc={rc} out={out}",
+        ))
+        _run([str(CLI), "satisfy", ob_aof_no_iml], env)
+
+        # --- Test 41: all_of with unknown child kind -> default-open (allow)
+        ob_aof_unknown = _add_ob(
+            env,
+            tool_pattern="Bash",
+            predicate="all_of",
+            params={
+                "predicates": [
+                    {"kind": "totally_made_up_predicate", "params": {}},
+                ]
+            },
+            ttl=120,
+            deny_msg="all_of with unknown child should default-open",
+        )
+        rc, out, _err = _hook_pre(
+            {"tool_name": "Bash", "tool_input": {"command": "ls"}},
+            env,
+        )
+        results.append(_check(
+            "41. all_of [unknown-kind] -> default-open allow",
+            rc == 0 and _is_allow(out),
+            f"rc={rc} out={out}",
+        ))
+        _run([str(CLI), "satisfy", ob_aof_unknown], env)
+
+        # ===== why-in-deny-output tests (multi-path embedding) =====
+        # These regression-guard the fix that embeds the predicate's `why`
+        # field directly in BOTH the systemMessage banner AND the
+        # permissionDecisionReason. Pre-fix, only the first unread path made
+        # it into `why`, and `why` was buried in a one-line "why: ..." in
+        # the banner only -- the visible reason just showed
+        # "<id>: <deny_message>", forcing the caller to round-trip through
+        # `obligations check --json` to enumerate all unread paths.
+        env_why = env.copy()
+        sidecar_dir_why = tmpdir / "why-watcher-output-pending"
+        env_why["WATCHER_PENDING_DIR"] = str(sidecar_dir_why)
+        sidecar_dir_why.mkdir(parents=True, exist_ok=True)
+
+        ob_why = _add_ob(
+            env_why,
+            tool_pattern="*",
+            predicate="no_pending_watcher_outputs",
+            params={},
+            ttl=0,
+            deny_msg="Read the captured watcher output before proceeding",
+        )
+
+        def _write_sidecar_why(task_id: str, output_path: Path,
+                                registered_at: float | None = None) -> Path:
+            sc = {
+                "task_id": task_id,
+                "command": f"watcher-ctl run sample-{task_id}",
+                "watcher_name": f"sample-{task_id}",
+                "output_file_path": str(output_path),
+                "registered_at": registered_at if registered_at is not None else time.time(),
+            }
+            sp = sidecar_dir_why / f"{task_id}.json"
+            sp.write_text(json.dumps(sc))
+            return sp
+
+        # --- Test 42: deny with single unread path -> path appears in BOTH
+        # systemMessage banner AND permissionDecisionReason
+        out_a = tmpdir / "why-single.output"
+        out_a.write_text("watcher fired\n")
+        os.utime(out_a, (time.time(), time.time()))
+        sc_a = _write_sidecar_why("whysingle", out_a, registered_at=time.time() - 10)
+        rc, out, _err = _hook_pre(
+            {"tool_name": "Bash", "tool_input": {"command": "ls"}}, env_why,
+        )
+        msg = (out.get("systemMessage") or "")
+        reason = ((out.get("hookSpecificOutput") or {})
+                  .get("permissionDecisionReason") or "")
+        results.append(_check(
+            "42. single unread path appears in both systemMessage and reason",
+            rc == 0 and _is_deny(out)
+            and str(out_a) in msg and str(out_a) in reason,
+            f"rc={rc} msg={msg!r} reason={reason!r}",
+        ))
+        sc_a.unlink()
+
+        # --- Test 43: deny with TWO unread paths -> BOTH paths appear in
+        # banner (one per line) AND in reason
+        out_b = tmpdir / "why-multi-1.output"
+        out_c = tmpdir / "why-multi-2.output"
+        out_b.write_text("first\n")
+        out_c.write_text("second\n")
+        os.utime(out_b, (time.time(), time.time()))
+        os.utime(out_c, (time.time(), time.time()))
+        sc_b = _write_sidecar_why("whymulti1", out_b, registered_at=time.time() - 10)
+        sc_c = _write_sidecar_why("whymulti2", out_c, registered_at=time.time() - 10)
+        rc, out, _err = _hook_pre(
+            {"tool_name": "Bash", "tool_input": {"command": "ls"}}, env_why,
+        )
+        msg = (out.get("systemMessage") or "")
+        reason = ((out.get("hookSpecificOutput") or {})
+                  .get("permissionDecisionReason") or "")
+        # Both paths appear in BOTH fields, no "+1 more" hand-waving.
+        both_in_msg = str(out_b) in msg and str(out_c) in msg
+        both_in_reason = str(out_b) in reason and str(out_c) in reason
+        no_more_handwave = "+1 more" not in msg and "+1 more" not in reason
+        # Each path renders on its own indented line in the banner.
+        bullet_b = f"!!       {out_b}" in msg
+        bullet_c = f"!!       {out_c}" in msg
+        results.append(_check(
+            "43. TWO unread paths -> all paths in banner + reason, bulleted",
+            rc == 0 and _is_deny(out) and both_in_msg and both_in_reason
+            and no_more_handwave and bullet_b and bullet_c,
+            f"both_in_msg={both_in_msg} both_in_reason={both_in_reason} "
+            f"no_more_handwave={no_more_handwave} "
+            f"bullet_b={bullet_b} bullet_c={bullet_c} "
+            f"msg={msg!r} reason={reason!r}",
+        ))
+        sc_b.unlink()
+        sc_c.unlink()
+
+        # --- Test 44: non-path-list `why` (e.g. process_alive) -> reason
+        # includes the why text inline (parenthetical fallback)
+        sidecar_dir_why_clean = sidecar_dir_why
+        # Drain any remaining sidecars to keep no_pending_watcher_outputs quiet
+        for f in sidecar_dir_why_clean.glob("*.json"):
+            f.unlink()
+        _run([str(CLI), "satisfy", ob_why], env_why)
+        # Use a process_alive obligation with a dead PID. Its `why` is
+        # narrative ("pid_file ... refers to non-existent process X"), not a
+        # comma-separated path list -> the hook should fall back to inline
+        # parenthetical embedding.
+        pid_file_why = tmpdir / "why-dead.pid"
+        # Find a dead pid
+        dead_pid_w = 999999
+        while os.path.isdir(f"/proc/{dead_pid_w}"):
+            dead_pid_w += 1
+        pid_file_why.write_text(f"{dead_pid_w}\n")
+        ob_why_pa = _add_ob(
+            env,
+            tool_pattern="Bash",
+            predicate="process_alive",
+            params={"pid_file": str(pid_file_why)},
+            ttl=120,
+            deny_msg="watcher dead -- restart it",
+        )
+        rc, out, _err = _hook_pre(
+            {"tool_name": "Bash", "tool_input": {"command": "ls"}}, env,
+        )
+        reason = ((out.get("hookSpecificOutput") or {})
+                  .get("permissionDecisionReason") or "")
+        # The reason should include "watcher dead" AND a "(why: ...)" inline,
+        # carrying the predicate's narrative explanation.
+        results.append(_check(
+            "44. non-path `why` -> reason embeds inline as (why: ...)",
+            rc == 0 and _is_deny(out)
+            and "watcher dead" in reason
+            and "(why:" in reason,
+            f"rc={rc} reason={reason!r}",
+        ))
+        _run([str(CLI), "satisfy", ob_why_pa], env)
+
+        # --- Test 45: agent_inbox_empty with missing inbox -> allow ---
+        bogus_inbox = tmpdir / "absent-inbox.json"
+        ob_aim = _add_ob(
+            env,
+            tool_pattern="Bash",
+            predicate="agent_inbox_empty",
+            params={"path": str(bogus_inbox)},
+            ttl=120,
+            deny_msg="agent inbox not empty",
+        )
+        rc, out, _err = _hook_pre(
+            {"tool_name": "Bash", "tool_input": {"command": "ls"}}, env,
+        )
+        results.append(_check(
+            "45. agent_inbox_empty missing -> allow",
+            rc == 0 and _is_allow(out),
+            f"rc={rc} out={out}",
+        ))
+        _run([str(CLI), "satisfy", ob_aim], env)
+
+        # --- Test 46: agent_inbox_empty with [] -> allow ---
+        empty_inbox = tmpdir / "empty-inbox.json"
+        empty_inbox.write_text("[]")
+        ob_aie = _add_ob(
+            env,
+            tool_pattern="Bash",
+            predicate="agent_inbox_empty",
+            params={"path": str(empty_inbox)},
+            ttl=120,
+            deny_msg="empty inbox test",
+        )
+        rc, out, _err = _hook_pre(
+            {"tool_name": "Bash", "tool_input": {"command": "ls"}}, env,
+        )
+        results.append(_check(
+            "46. agent_inbox_empty [] -> allow",
+            rc == 0 and _is_allow(out),
+            f"rc={rc} out={out}",
+        ))
+        _run([str(CLI), "satisfy", ob_aie], env)
+
+        # --- Test 47: agent_inbox_empty with messages -> deny + why has body ---
+        full_inbox = tmpdir / "full-inbox.json"
+        full_inbox.write_text(json.dumps([{
+            "from": "andrew@signal", "ts": "2026-04-28",
+            "queue_item": "q-test", "text": "hello agent please switch tasks"
+        }]))
+        ob_ain = _add_ob(
+            env,
+            tool_pattern="Bash",
+            predicate="agent_inbox_empty",
+            params={"path": str(full_inbox)},
+            ttl=120,
+            deny_msg="messages waiting",
+        )
+        rc, out, _err = _hook_pre(
+            {"tool_name": "Bash", "tool_input": {"command": "ls"}}, env,
+        )
+        reason_full = ((out.get("hookSpecificOutput") or {})
+                       .get("permissionDecisionReason") or "")
+        results.append(_check(
+            "47. agent_inbox_empty with messages -> deny + body in why",
+            rc == 0 and _is_deny(out)
+            and "hello agent" in (out.get("systemMessage") or "")
+            and "messages waiting" in reason_full,
+            f"rc={rc} systemMessage_preview={(out.get('systemMessage') or '')[:200]!r}",
+        ))
+        _run([str(CLI), "satisfy", ob_ain], env)
+
+        # --- Test 48: agent_inbox_empty inform-mode subagent scope -> banner on stderr ---
+        # Compose with all_of [is_main_loop {negate: true}, agent_inbox_empty]
+        # This is the production wiring shape. In a subagent context with
+        # messages in the inbox, the post-hook must surface the inbox.
+        inform_inbox = tmpdir / "subagent-inbox.json"
+        inform_inbox.write_text(json.dumps([{
+            "from": "main-loop", "ts": "2026-04-28",
+            "queue_item": None,
+            "text": "abandon current task; new instructions queued"
+        }]))
+        # Use the obligations CLI directly to register the all_of obligation
+        # (the _add_ob helper doesn't compose easily). Inform mode + ttl 0.
+        params_compose = {
+            "predicates": [
+                {"kind": "is_main_loop", "params": {"negate": True}},
+                {"kind": "agent_inbox_empty", "params": {"path": str(inform_inbox)}},
+            ]
+        }
+        proc = _run([
+            str(CLI), "add",
+            "--tool-pattern", "*",
+            "--predicate", "all_of",
+            "--params", json.dumps(params_compose),
+            "--ttl", "120",
+            "--enforcement", "inform",
+            "--deny-msg", "agent-msg/inbox:test",
+            "--created-by", "test",
+            "--json",
+        ], env)
+        ob_inf = json.loads(proc.stdout)["id"] if proc.returncode == 0 else None
+        # Subagent post-hook with messages -> banner present.
+        rc, _stdout, stderr = _hook_post(
+            {"tool_name": "Bash", "tool_input": {"command": "ls"},
+             "agent_id": "test-subagent-uuid"}, env,
+        )
+        sub_has_banner = ("agent-msg/inbox:test" in stderr
+                          and "abandon current task" in stderr)
+        # Main-loop post-hook (no agent_id) with same inbox -> NO banner
+        # because the is_main_loop {negate:true} scope-guard fails.
+        rc2, _stdout2, stderr2 = _hook_post(
+            {"tool_name": "Bash", "tool_input": {"command": "ls"}}, env,
+        )
+        main_silent = "agent-msg/inbox:test" not in stderr2
+        results.append(_check(
+            "48. inform all_of [is_main_loop neg, agent_inbox] subagent banner / main silent",
+            sub_has_banner and main_silent,
+            f"sub_has_banner={sub_has_banner} main_silent={main_silent} "
+            f"sub_stderr_preview={stderr[:300]!r} main_stderr_preview={stderr2[:200]!r}",
+        ))
+        if ob_inf:
+            _run([str(CLI), "satisfy", ob_inf], env)
+
+        # --- Tests 57-60: agent_inbox_empty GATE-mode (production wiring) ---
+        # The `agent-msg arm` subcommand registers a gate-mode obligation
+        # with these exempt_patterns:
+        #   Bash:^agent-msg\s+ack\b
+        #   Bash:^agent-msg\s+inbox\b
+        #   Bash:^agent-msg\s+disarm\b
+        # These tests assert the harness behavior: subagent + non-empty inbox
+        # blocks non-exempt calls with the message body in the deny banner;
+        # ack/inbox/disarm always pass; main-loop is scope-guarded out.
+        gate_inbox = tmpdir / "gate-mode-inbox.json"
+        gate_inbox.write_text(json.dumps([{
+            "from": "main-loop", "ts": "2026-04-30",
+            "queue_item": "q-test-gate",
+            "text": "switch tasks immediately - this is a gate-mode test",
+        }]))
+        params_gate = {
+            "predicates": [
+                {"kind": "is_main_loop", "params": {"negate": True}},
+                {"kind": "agent_inbox_empty", "params": {"path": str(gate_inbox)}},
+            ]
+        }
+        gate_args = [
+            str(CLI), "add",
+            "--tool-pattern", "*",
+            "--predicate", "all_of",
+            "--params", json.dumps(params_gate),
+            "--ttl", "120",
+            "--enforcement", "gate",
+            "--deny-msg", "agent-msg/inbox:gate-test",
+            "--created-by", "test",
+            "--exempt-tool-pattern", r"Bash:^agent-msg\s+ack\b",
+            "--exempt-tool-pattern", r"Bash:^agent-msg\s+inbox\b",
+            "--exempt-tool-pattern", r"Bash:^agent-msg\s+disarm\b",
+            "--json",
+        ]
+        proc_gate = _run(gate_args, env)
+        ob_gate = (json.loads(proc_gate.stdout)["id"]
+                   if proc_gate.returncode == 0 else None)
+
+        # --- Test 57: subagent + non-exempt tool -> deny + body in banner ---
+        rc, out, _err = _hook_pre(
+            {"tool_name": "Bash", "tool_input": {"command": "ls"},
+             "agent_id": "test-subagent"},
+            env,
+        )
+        sysmsg = out.get("systemMessage") or ""
+        results.append(_check(
+            "57. gate agent_inbox: subagent + non-exempt -> deny + body",
+            rc == 0 and _is_deny(out)
+            and "switch tasks immediately" in sysmsg,
+            f"rc={rc} deny={_is_deny(out)} sysmsg={sysmsg[:200]!r}",
+        ))
+
+        # --- Test 58: subagent + `agent-msg ack` -> ALLOW (exempt) ---
+        rc, out, _err = _hook_pre(
+            {"tool_name": "Bash",
+             "tool_input": {"command": "agent-msg ack test-subagent"},
+             "agent_id": "test-subagent"},
+            env,
+        )
+        results.append(_check(
+            "58. gate agent_inbox: `agent-msg ack` exempt even with full inbox",
+            rc == 0 and _is_allow(out),
+            f"rc={rc} out={out}",
+        ))
+
+        # --- Test 59: subagent + `agent-msg inbox` and `disarm` exempt ---
+        rc1, out1, _ = _hook_pre(
+            {"tool_name": "Bash",
+             "tool_input": {"command": "agent-msg inbox test-subagent"},
+             "agent_id": "test-subagent"},
+            env,
+        )
+        rc2, out2, _ = _hook_pre(
+            {"tool_name": "Bash",
+             "tool_input": {"command": "agent-msg disarm test-subagent"},
+             "agent_id": "test-subagent"},
+            env,
+        )
+        results.append(_check(
+            "59. gate agent_inbox: `inbox` and `disarm` also exempt",
+            rc1 == 0 and _is_allow(out1) and rc2 == 0 and _is_allow(out2),
+            f"rc1={rc1} out1={out1} rc2={rc2} out2={out2}",
+        ))
+
+        # --- Test 60: main-loop scope-guard fires -> ALLOW ---
+        # No agent_id in payload -> main loop. is_main_loop {negate:true}
+        # fails, all_of returns satisfied=True (scope-guard), no deny.
+        rc, out, _err = _hook_pre(
+            {"tool_name": "Bash", "tool_input": {"command": "ls"}}, env,
+        )
+        results.append(_check(
+            "60. gate agent_inbox: main-loop scope-guard short-circuits to allow",
+            rc == 0 and _is_allow(out),
+            f"rc={rc} out={out}",
+        ))
+
+        if ob_gate:
+            _run([str(CLI), "satisfy", ob_gate], env)
+
+        # --- Test 9: malformed stdin -> default-open ---
+        proc = subprocess.run(
+            [str(PRE_HOOK)], input="not json {{",
+            capture_output=True, text=True, timeout=5, check=False, env=env,
+        )
+        try:
+            out = json.loads(proc.stdout) if proc.stdout.strip() else {}
+        except json.JSONDecodeError:
+            out = {"__raw__": proc.stdout}
+        results.append(_check(
+            "9. malformed stdin -> default-open",
+            proc.returncode == 0 and _is_allow(out),
+            f"rc={proc.returncode} stdout={proc.stdout!r}",
+        ))
+
+        # ===================================================================
+        # Tests 45-48: per-obligation `exempt_patterns`
+        # ===================================================================
+        # Set up an obligation that gates ALL Bash on a missing marker file.
+        # The gate fires when predicate fails. We expect the gate to fire on
+        # `ls`, but NOT on commands matching the exempt patterns.
+        marker_missing = tmpdir / "exempt-test-marker"
+        if marker_missing.exists():
+            marker_missing.unlink()
+        ob_exempt = _add_ob(
+            env,
+            tool_pattern="Bash",
+            predicate="file_exists",
+            params={"path": str(marker_missing)},
+            ttl=120,
+            deny_msg="marker missing -- gate fires unless command is exempt",
+            exempt_tool_patterns=[
+                "Bash:^watcher-ctl run\\b",
+                "Bash:^obligations\\b",
+            ],
+        )
+
+        # --- Test 45: matching exempt_pattern bypasses gate ---
+        rc, out, _err = _hook_pre(
+            {"tool_name": "Bash",
+             "tool_input": {"command": "watcher-ctl run claude-event-watch"}},
+            env,
+        )
+        results.append(_check(
+            "45. exempt: Bash:^watcher-ctl run bypasses gate even when "
+            "predicate fails",
+            rc == 0 and _is_allow(out),
+            f"rc={rc} out={out}",
+        ))
+
+        # --- Test 46: non-matching call still gated ---
+        rc, out, _err = _hook_pre(
+            {"tool_name": "Bash", "tool_input": {"command": "ls"}}, env,
+        )
+        results.append(_check(
+            "46. exempt: non-matching call ('ls') still denied by gate",
+            rc == 0 and _is_deny(out),
+            f"rc={rc} out={out}",
+        ))
+
+        # --- Test 47: second exempt pattern also matches ---
+        rc, out, _err = _hook_pre(
+            {"tool_name": "Bash",
+             "tool_input": {"command": "obligations list"}},
+            env,
+        )
+        results.append(_check(
+            "47. exempt: second pattern (Bash:^obligations) also bypasses",
+            rc == 0 and _is_allow(out),
+            f"rc={rc} out={out}",
+        ))
+
+        _run([str(CLI), "satisfy", ob_exempt], env)
+
+        # --- Test 48: inform-mode honors exempt_patterns too ---
+        ob_exempt_inform = _add_ob(
+            env,
+            tool_pattern="Bash",
+            predicate="file_exists",
+            params={"path": str(marker_missing)},
+            ttl=120,
+            deny_msg="inform: marker missing",
+            enforcement="inform",
+            exempt_tool_patterns=["Bash:^watcher-ctl run\\b"],
+        )
+        # Inform-mode never gates the PreToolUse path, so we check the
+        # PostToolUse hook output directly: an exempt call must NOT print
+        # the inform banner; a non-exempt failing call MUST print it.
+        rc_post1, _stdout1, stderr1 = _hook_post(
+            {"tool_name": "Bash",
+             "tool_input": {"command": "watcher-ctl run x"}},
+            env,
+        )
+        rc_post2, _stdout2, stderr2 = _hook_post(
+            {"tool_name": "Bash", "tool_input": {"command": "ls"}},
+            env,
+        )
+        # The post-tool hook prints the inform banner on stdout (per the CLI
+        # spec) -- check both stdout and stderr to be safe.
+        all_post1 = (_stdout1 or "") + (stderr1 or "")
+        all_post2 = (_stdout2 or "") + (stderr2 or "")
+        results.append(_check(
+            "48. exempt: inform-mode also honors exempt_patterns (silent on "
+            "exempt call, banner on non-exempt call)",
+            (rc_post1 == 0 and "inform: marker missing" not in all_post1
+             and rc_post2 == 0
+             and "inform: marker missing" in all_post2),
+            f"rc1={rc_post1} all1={all_post1!r} rc2={rc_post2} "
+            f"all2={all_post2!r}",
+        ))
+        _run([str(CLI), "satisfy", ob_exempt_inform], env)
+
+        # ===================================================================
+        # Tests 49-56: per-call audited overrides
+        # ===================================================================
+
+        # --- Test 49: active override bypasses ALL gate-mode obligations ---
+        # Register a permanent gate-mode obligation that should always block
+        # on plain Bash. Then create an override and confirm the call passes.
+        marker_missing2 = tmpdir / "override-test-marker"
+        if marker_missing2.exists():
+            marker_missing2.unlink()
+        ob_for_ov = _add_ob(
+            env,
+            tool_pattern="*",
+            predicate="file_exists",
+            params={"path": str(marker_missing2)},
+            ttl=0,
+            deny_msg="marker missing -- always gated",
+        )
+        # Without override -> deny
+        rc, out_before, _err = _hook_pre(
+            {"tool_name": "Bash", "tool_input": {"command": "ls"}}, env,
+        )
+        denied_before = (rc == 0 and _is_deny(out_before))
+        # Create override
+        ov_id = _add_override(env, "running watcher recovery", "30s")
+        rc, out_after, _err = _hook_pre(
+            {"tool_name": "Bash", "tool_input": {"command": "ls"}}, env,
+        )
+        results.append(_check(
+            "49. override: active override bypasses gate-mode obligations",
+            denied_before
+            and rc == 0
+            and _is_allow(out_after)
+            and ov_id.startswith("ov-"),
+            f"denied_before={denied_before} rc={rc} out_after={out_after} "
+            f"ov_id={ov_id}",
+        ))
+
+        # --- Test 51: cancelled-via-satisfy does NOT bypass ---
+        # (we test 51 before 50 because we still hold a live override)
+        _run([str(CLI), "satisfy", ov_id], env)
+        rc, out_post_cancel, _err = _hook_pre(
+            {"tool_name": "Bash", "tool_input": {"command": "ls"}}, env,
+        )
+        results.append(_check(
+            "51. override: cancelled-via-satisfy does NOT bypass",
+            rc == 0 and _is_deny(out_post_cancel),
+            f"rc={rc} out={out_post_cancel}",
+        ))
+
+        # --- Test 50: expired override does NOT bypass ---
+        # Manually inject an already-expired override into the JSON state.
+        ov_state = json.loads(obligations_path.read_text())
+        ov_state.setdefault("overrides", []).append({
+            "id": "ov-test-expired",
+            "reason": "already expired",
+            "duration_secs": 30,
+            "expires_at": time.time() - 10,  # 10s in the past
+            "created_at": time.time() - 40,
+            "created_by": "test",
+        })
+        obligations_path.write_text(json.dumps(ov_state, indent=2))
+        rc, out_expired, _err = _hook_pre(
+            {"tool_name": "Bash", "tool_input": {"command": "ls"}}, env,
+        )
+        results.append(_check(
+            "50. override: expired override does NOT bypass (TTL respected)",
+            rc == 0 and _is_deny(out_expired),
+            f"rc={rc} out={out_expired}",
+        ))
+
+        # --- Test 52: invalid duration / empty reason rejected exit 2 ---
+        proc_bad_dur = _run([str(CLI), "override", "valid reason",
+                             "--duration", "0"], env)
+        proc_bad_neg = _run([str(CLI), "override", "valid reason",
+                             "--duration", "-5"], env)
+        proc_empty = _run([str(CLI), "override", "",
+                           "--duration", "30s"], env)
+        results.append(_check(
+            "52. override: invalid duration / empty reason -> exit 2",
+            (proc_bad_dur.returncode == 2
+             and proc_bad_neg.returncode == 2
+             and proc_empty.returncode == 2),
+            f"dur0={proc_bad_dur.returncode} "
+            f"durneg={proc_bad_neg.returncode} "
+            f"empty={proc_empty.returncode}",
+        ))
+
+        # --- Test 53: 24h cap enforced ---
+        proc_cap = _run([str(CLI), "override", "valid reason",
+                         "--duration", "25h"], env)
+        proc_cap_secs = _run([str(CLI), "override", "valid reason",
+                              "--duration", "86401"], env)
+        results.append(_check(
+            "53. override: 24h cap enforced",
+            (proc_cap.returncode == 2
+             and proc_cap_secs.returncode == 2
+             and "86400" in (proc_cap.stderr or proc_cap_secs.stderr)),
+            f"cap_h={proc_cap.returncode} "
+            f"cap_s={proc_cap_secs.returncode} "
+            f"stderr={(proc_cap.stderr + proc_cap_secs.stderr)!r}",
+        ))
+
+        # --- Test 54: bypass is audited to obligations-bypass.log ---
+        bypass_log = tmpdir / ".config" / "claude" / "obligations-bypass.log"
+        # Wipe the log so we measure ONLY this test's writes.
+        if bypass_log.exists():
+            bypass_log.unlink()
+        ov_audit = _add_override(env, "audit test", "30s",
+                                 created_by="test-audit")
+        # Trigger a bypass via the hook -- the obligation from earlier still
+        # gates the call.
+        _hook_pre(
+            {"tool_name": "Bash", "tool_input": {"command": "ls"}}, env,
+        )
+        log_text = bypass_log.read_text() if bypass_log.exists() else ""
+        # Expect at least 2 lines: one for override-created, one for
+        # override-applied (when the hook bypassed).
+        results.append(_check(
+            "54. override: audited to obligations-bypass.log",
+            (bypass_log.exists()
+             and "override-created" in log_text
+             and "override-applied" in log_text
+             and "audit test" in log_text
+             and "test-audit" in log_text),
+            f"exists={bypass_log.exists()} text={log_text!r}",
+        ))
+
+        # --- Test 55: shows in `obligations list` ---
+        proc_list = _run([str(CLI), "list"], env)
+        proc_list_json = _run([str(CLI), "list", "--json"], env)
+        try:
+            data_list = json.loads(proc_list_json.stdout)
+        except json.JSONDecodeError:
+            data_list = {}
+        results.append(_check(
+            "55. override: shows in `obligations list`",
+            (proc_list.returncode == 0
+             and "ACTIVE OVERRIDES" in proc_list.stdout
+             and "audit test" in proc_list.stdout
+             and ov_audit in proc_list.stdout
+             and isinstance(data_list.get("overrides"), list)
+             and any(ov.get("id") == ov_audit
+                     for ov in data_list["overrides"])),
+            f"text={proc_list.stdout!r} json_data={data_list!r}",
+        ))
+
+        # --- Test 56: does NOT silence inform-mode advisories ---
+        # An inform-mode obligation whose predicate fails should still
+        # surface in PostToolUse output even when an override is active.
+        ob_inf = _add_ob(
+            env,
+            tool_pattern="*",
+            predicate="file_exists",
+            params={"path": str(marker_missing2)},  # still missing
+            ttl=120,
+            deny_msg="advisory: marker missing -- inform-mode",
+            enforcement="inform",
+        )
+        rc_post, stdout_post, stderr_post = _hook_post(
+            {"tool_name": "Bash", "tool_input": {"command": "ls"}}, env,
+        )
+        all_post = (stdout_post or "") + (stderr_post or "")
+        results.append(_check(
+            "56. override: does NOT silence inform-mode advisories",
+            (rc_post == 0
+             and "advisory: marker missing -- inform-mode" in all_post),
+            f"rc={rc_post} all_post={all_post!r}",
+        ))
+        _run([str(CLI), "satisfy", ob_inf], env)
+        _run([str(CLI), "satisfy", ov_audit], env)
+        _run([str(CLI), "satisfy", ob_for_ov], env)
+
+        # ===================================================================
+        # Tests 57-60: state-aware recovery hint in the deny banner
+        # (q-2026-05-01-d487)
+        #
+        # The watcher-health gate now appends a Recovery line whose command
+        # depends on whether the failing watcher is DOWN or DUPLICATE. Test
+        # the helper directly (no need to spin up a fake watcher-status CLI
+        # to drive the predicate end-to-end) by importing it from the
+        # in-tree hook script.
+        # ===================================================================
+        import importlib.util
+        from importlib.machinery import SourceFileLoader
+        # The hook script has no .py extension; use SourceFileLoader to
+        # load it as a module so we can call _watcher_state_recovery
+        # directly.
+        loader = SourceFileLoader("_gate_hook_mod", str(PRE_HOOK))
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        gate_mod = importlib.util.module_from_spec(spec)
+        loader.exec_module(gate_mod)
+        watcher_state_recovery = gate_mod._watcher_state_recovery
+
+        # --- Test 57: DUPLICATE in why -> recommends watcher-restart ---
+        why_dup = (
+            "signal-wait-dm       DUPLICATE (3/1)  111 222 333\n"
+            "                     duplicate pollers: 111 222 333\n"
+            "\n"
+            "WARNING: Some watchers are down or duplicated!"
+        )
+        rec_dup = watcher_state_recovery(why_dup) or ""
+        results.append(_check(
+            "57. state-aware recovery: DUPLICATE -> watcher-restart",
+            ("Recovery for DUPLICATE state:" in rec_dup
+             and "`watcher-restart`" in rec_dup),
+            f"rec={rec_dup!r}",
+        ))
+
+        # --- Test 58: DOWN-only in why -> recommends watcher-ctl run ---
+        why_down = (
+            "claude-event-watch   DOWN      (0/1)  \n"
+            "\n"
+            "WARNING: Some watchers are down or duplicated!"
+        )
+        rec_down = watcher_state_recovery(why_down) or ""
+        results.append(_check(
+            "58. state-aware recovery: DOWN-only -> watcher-ctl run <name>",
+            ("Recovery for DOWN state:" in rec_down
+             and "`watcher-ctl run <name>`" in rec_down
+             and "claude-event-watch" in rec_down
+             and "`watcher-restart`" in rec_down),
+            f"rec={rec_down!r}",
+        ))
+
+        # --- Test 59: mixed DOWN + DUPLICATE -> DUPLICATE takes precedence ---
+        why_mixed = (
+            "claude-event-watch   DOWN      (0/1)\n"
+            "signal-wait-dm       DUPLICATE (3/1)  111 222 333\n"
+            "\n"
+            "WARNING: Some watchers are down or duplicated!"
+        )
+        rec_mixed = watcher_state_recovery(why_mixed) or ""
+        results.append(_check(
+            "59. state-aware recovery: mixed -> DUPLICATE wins",
+            ("Recovery for DUPLICATE state:" in rec_mixed
+             and "`watcher-restart`" in rec_mixed),
+            f"rec={rec_mixed!r}",
+        ))
+
+        # --- Test 60: non-watcher why (sidecar narrative) -> None ---
+        # The helper must NOT inject a Recovery line into unrelated
+        # obligations (e.g. the no_pending_watcher_outputs sidecar gate
+        # surfaces "unread watcher output: ..." paths).
+        why_unrelated = "unread watcher output: /home/x/tasks/foo.output"
+        rec_unrelated = watcher_state_recovery(why_unrelated)
+        why_garbage = "the file is missing and the marker is stale"
+        rec_garbage = watcher_state_recovery(why_garbage)
+        results.append(_check(
+            "60. state-aware recovery: non-watcher-state why -> None",
+            rec_unrelated is None and rec_garbage is None,
+            f"rec_unrelated={rec_unrelated!r} rec_garbage={rec_garbage!r}",
+        ))
+
+        # --- Test 61: end-to-end: deny banner contains the recovery line ---
+        # Use the existing test 21 pattern: register a watchers_healthy
+        # obligation, but place a fake watcher-status on PATH that prints
+        # a DUPLICATE row and exits 0. The pre-hook should DENY (predicate
+        # fails because output is non-empty) and the systemMessage banner
+        # must include the DUPLICATE recovery line.
+        fake_bin = tmpdir / "fake-bin"
+        fake_bin.mkdir(parents=True, exist_ok=True)
+        fake_status = fake_bin / "watcher-status"
+        fake_status.write_text(
+            "#!/bin/sh\n"
+            "cat <<'EOF'\n"
+            "signal-wait-dm       DUPLICATE (3/1)  111 222 333\n"
+            "                     duplicate pollers: 111 222 333\n"
+            "\n"
+            "WARNING: Some watchers are down or duplicated!\n"
+            "EOF\n"
+        )
+        fake_status.chmod(0o755)
+        env_fake = env.copy()
+        env_fake["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+        ob_wh = _add_ob(
+            env_fake,
+            tool_pattern="Bash",
+            predicate="watchers_healthy",
+            params={},
+            ttl=120,
+            deny_msg="watcher health gate (test 61)",
+        )
+        rc, out, _err = _hook_pre(
+            {"tool_name": "Bash", "tool_input": {"command": "ls"}}, env_fake,
+        )
+        banner = (out or {}).get("systemMessage", "")
+        results.append(_check(
+            "61. end-to-end: DUPLICATE deny banner shows watcher-restart "
+            "recovery line",
+            (rc == 0 and _is_deny(out)
+             and "Recovery for DUPLICATE state:" in banner
+             and "`watcher-restart`" in banner),
+            f"rc={rc} banner={banner!r}",
+        ))
+        _run([str(CLI), "satisfy", ob_wh], env_fake)
+
+        # ===================================================================
+        # Tests 62-69: hardcoded watcher-ctl run gate (cardinal-rule
+        # enforcement). The gate refuses any `watcher-ctl run` invocation
+        # that isn't a bare `watcher-ctl run <name>` (optionally with
+        # `2>&1`). Shell `&`, pipes, subshells, and compound operators all
+        # reparent the watcher to init -- it becomes orphaned from Claude
+        # Code's process tree.
+        #
+        # The gate is hardcoded in pre-tool-obligations-gate-hook itself
+        # (NOT a stored obligation row) so it can't be disabled by state
+        # corruption. We use a FRESH sandbox env (no obligations registered)
+        # so we're testing ONLY the hardcoded gate, not the obligations
+        # CLI.
+        # ===================================================================
+        with tempfile.TemporaryDirectory(
+            prefix="obligations-test-watcher-",
+        ) as td_w:
+            tmpdir_w = Path(td_w)
+            env_w, _ = _make_isolated_env(tmpdir_w)
+
+            # 62: bare watcher-ctl run -> ALLOW
+            rc, out, _err = _hook_pre(
+                {"tool_name": "Bash",
+                 "tool_input": {"command": "watcher-ctl run signal-wait-dm"}},
+                env_w,
+            )
+            results.append(_check(
+                "62. watcher-ctl gate: bare invocation -> allow",
+                rc == 0 and _is_allow(out),
+                f"rc={rc} out={out}",
+            ))
+
+            # 63: bare watcher-ctl run X 2>&1 -> ALLOW
+            rc, out, _err = _hook_pre(
+                {"tool_name": "Bash",
+                 "tool_input": {
+                     "command": "watcher-ctl run signal-wait-dm 2>&1",
+                 }},
+                env_w,
+            )
+            results.append(_check(
+                "63. watcher-ctl gate: bare with 2>&1 -> allow",
+                rc == 0 and _is_allow(out),
+                f"rc={rc} out={out}",
+            ))
+
+            # 64: trailing `2>&1 &` -> DENY (shell background reparents to init)
+            rc, out, _err = _hook_pre(
+                {"tool_name": "Bash",
+                 "tool_input": {
+                     "command": "watcher-ctl run signal-wait-dm 2>&1 &",
+                 }},
+                env_w,
+            )
+            banner = (out or {}).get("systemMessage", "")
+            results.append(_check(
+                "64. watcher-ctl gate: `2>&1 &` -> deny + cardinal banner",
+                (rc == 0 and _is_deny(out)
+                 and "watcher architecture cardinal rule" in banner
+                 and "run_in_background: true" in banner),
+                f"rc={rc} banner={banner!r}",
+            ))
+
+            # 65: trailing `&` (no 2>&1) -> DENY
+            rc, out, _err = _hook_pre(
+                {"tool_name": "Bash",
+                 "tool_input": {
+                     "command": "watcher-ctl run signal-wait-dm &",
+                 }},
+                env_w,
+            )
+            results.append(_check(
+                "65. watcher-ctl gate: trailing `&` -> deny",
+                rc == 0 and _is_deny(out),
+                f"rc={rc} out={out}",
+            ))
+
+            # 66: command separator `;` -> DENY
+            rc, out, _err = _hook_pre(
+                {"tool_name": "Bash",
+                 "tool_input": {
+                     "command": "watcher-ctl run signal-wait-dm; sleep 1",
+                 }},
+                env_w,
+            )
+            results.append(_check(
+                "66. watcher-ctl gate: `;` separator -> deny",
+                rc == 0 and _is_deny(out),
+                f"rc={rc} out={out}",
+            ))
+
+            # 67: two bg watcher-ctls in one command -> DENY
+            rc, out, _err = _hook_pre(
+                {"tool_name": "Bash",
+                 "tool_input": {
+                     "command": "watcher-ctl run X & watcher-ctl run Y &",
+                 }},
+                env_w,
+            )
+            results.append(_check(
+                "67. watcher-ctl gate: two bg watcher-ctls -> deny",
+                rc == 0 and _is_deny(out),
+                f"rc={rc} out={out}",
+            ))
+
+            # 68: bare `watcher-restart` -> ALLOW (gate doesn't apply --
+            # `watcher-restart` is a different command, not `watcher-ctl run`)
+            rc, out, _err = _hook_pre(
+                {"tool_name": "Bash",
+                 "tool_input": {"command": "watcher-restart"}},
+                env_w,
+            )
+            results.append(_check(
+                "68. watcher-ctl gate: `watcher-restart` -> allow",
+                rc == 0 and _is_allow(out),
+                f"rc={rc} out={out}",
+            ))
+
+            # 69: unrelated `ls` -> ALLOW (gate doesn't fire for non-watcher
+            # commands)
+            rc, out, _err = _hook_pre(
+                {"tool_name": "Bash",
+                 "tool_input": {"command": "ls"}},
+                env_w,
+            )
+            results.append(_check(
+                "69. watcher-ctl gate: `ls` -> allow (gate inert)",
+                rc == 0 and _is_allow(out),
+                f"rc={rc} out={out}",
+            ))
+
+            # 70: pipe `|` -> DENY
+            rc, out, _err = _hook_pre(
+                {"tool_name": "Bash",
+                 "tool_input": {
+                     "command": "watcher-ctl run X | tee /tmp/log",
+                 }},
+                env_w,
+            )
+            results.append(_check(
+                "70. watcher-ctl gate: pipe `|` -> deny",
+                rc == 0 and _is_deny(out),
+                f"rc={rc} out={out}",
+            ))
+
+            # 71: compound `&&` -> DENY
+            rc, out, _err = _hook_pre(
+                {"tool_name": "Bash",
+                 "tool_input": {
+                     "command": "cd /tmp && watcher-ctl run X",
+                 }},
+                env_w,
+            )
+            results.append(_check(
+                "71. watcher-ctl gate: `&&` compound -> deny",
+                rc == 0 and _is_deny(out),
+                f"rc={rc} out={out}",
+            ))
+
+            # 72: subshell `$(...)` in name token -> DENY
+            rc, out, _err = _hook_pre(
+                {"tool_name": "Bash",
+                 "tool_input": {
+                     "command": "watcher-ctl run $(echo X)",
+                 }},
+                env_w,
+            )
+            results.append(_check(
+                "72. watcher-ctl gate: subshell $() -> deny",
+                rc == 0 and _is_deny(out),
+                f"rc={rc} out={out}",
+            ))
+
+            # 73: OBLIGATIONS_BYPASS=1 should still bypass the hardcoded gate
+            # (audited bypass is the documented escape hatch).
+            rc, out, _err = _hook_pre(
+                {"tool_name": "Bash",
+                 "tool_input": {
+                     "command": "watcher-ctl run signal-wait-dm &",
+                 }},
+                env_w,
+                extra_env={"OBLIGATIONS_BYPASS": "1"},
+            )
+            results.append(_check(
+                "73. watcher-ctl gate: OBLIGATIONS_BYPASS=1 forces allow",
+                rc == 0 and _is_allow(out),
+                f"rc={rc} out={out}",
+            ))
+
+            # 74: gate is Bash-only -- a Read tool with a path that happens
+            # to contain `watcher-ctl run X &` text MUST NOT trip the gate.
+            rc, out, _err = _hook_pre(
+                {"tool_name": "Read",
+                 "tool_input": {
+                     "file_path": "/tmp/watcher-ctl run signal &",
+                 }},
+                env_w,
+            )
+            results.append(_check(
+                "74. watcher-ctl gate: Bash-only (Read tool not gated)",
+                rc == 0 and _is_allow(out),
+                f"rc={rc} out={out}",
+            ))
+
+        # ---------------------------------------------------------------
+        # Tests 75-88: stale_ready_queue_present predicate.
+        #
+        # Each test starts with a clean obligations sandbox and a custom
+        # queue.json fixture under tmpdir. The predicate is registered
+        # with `queue_path` overridden to point at the fixture so the
+        # tests don't touch the live queue.
+        # ---------------------------------------------------------------
+        with tempfile.TemporaryDirectory(prefix="obligations-stale-") as td_s:
+            tmpdir_s = Path(td_s)
+            env_s, _ob_s = _make_isolated_env(tmpdir_s)
+            queue_path = tmpdir_s / "queue.json"
+
+            def _write_queue(items):
+                queue_path.write_text(json.dumps({"items": items}))
+
+            def _add_stale_ob(threshold=300, exempt=None):
+                return _add_ob(
+                    env_s,
+                    tool_pattern="*",
+                    predicate="stale_ready_queue_present",
+                    params={
+                        "queue_path": str(queue_path),
+                        "threshold_secs": threshold,
+                    },
+                    ttl=600,
+                    deny_msg="dispatch the stale queue item before unrelated work",
+                    exempt_tool_patterns=exempt,
+                )
+
+            now_ts = time.time()
+
+            def _iso(offset_secs):
+                from datetime import datetime as _dt, timezone as _tz
+                return _dt.fromtimestamp(now_ts + offset_secs,
+                                         tz=_tz.utc).isoformat()
+
+            # --- 75: empty queue -> allow ---
+            _write_queue([])
+            ob = _add_stale_ob()
+            rc, out, _err = _hook_pre(
+                {"tool_name": "Bash", "tool_input": {"command": "ls"}},
+                env_s,
+            )
+            results.append(_check(
+                "75. stale_ready_queue_present: empty queue -> allow",
+                rc == 0 and _is_allow(out),
+                f"rc={rc} out={out}",
+            ))
+            _run([str(CLI), "satisfy", ob], env_s)
+
+            # --- 76: queue file missing -> allow (default-open) ---
+            queue_path.unlink(missing_ok=True)
+            ob = _add_stale_ob()
+            rc, out, _err = _hook_pre(
+                {"tool_name": "Bash", "tool_input": {"command": "ls"}},
+                env_s,
+            )
+            results.append(_check(
+                "76. stale_ready_queue_present: queue missing -> allow (default-open)",
+                rc == 0 and _is_allow(out),
+                f"rc={rc} out={out}",
+            ))
+            _run([str(CLI), "satisfy", ob], env_s)
+
+            # --- 77: malformed queue.json -> allow (default-open) ---
+            queue_path.write_text("{not json")
+            ob = _add_stale_ob()
+            rc, out, _err = _hook_pre(
+                {"tool_name": "Bash", "tool_input": {"command": "ls"}},
+                env_s,
+            )
+            results.append(_check(
+                "77. stale_ready_queue_present: malformed -> allow (default-open)",
+                rc == 0 and _is_allow(out),
+                f"rc={rc} out={out}",
+            ))
+            _run([str(CLI), "satisfy", ob], env_s)
+
+            # --- 78: ready+pending fresh (1 min old) -> allow ---
+            _write_queue([{
+                "id": "q-fresh",
+                "status": "pending",
+                "group_id": "g-1",
+                "priority": 5,
+                "created_at": _iso(-60),
+                "summary": "fresh item",
+            }])
+            ob = _add_stale_ob()
+            rc, out, _err = _hook_pre(
+                {"tool_name": "Bash", "tool_input": {"command": "ls"}},
+                env_s,
+            )
+            results.append(_check(
+                "78. stale_ready_queue_present: fresh ready -> allow",
+                rc == 0 and _is_allow(out),
+                f"rc={rc} out={out}",
+            ))
+            _run([str(CLI), "satisfy", ob], env_s)
+
+            # --- 79: ready+pending stale (10 min) -> deny + id in why ---
+            _write_queue([{
+                "id": "q-stale-79",
+                "status": "pending",
+                "group_id": "g-1",
+                "priority": 5,
+                "created_at": _iso(-600),
+                "summary": "stale item",
+            }])
+            ob = _add_stale_ob()
+            rc, out, _err = _hook_pre(
+                {"tool_name": "Bash", "tool_input": {"command": "ls"}},
+                env_s,
+            )
+            denied = _is_deny(out)
+            reason = (out.get("hookSpecificOutput") or {}).get(
+                "permissionDecisionReason", ""
+            )
+            banner = out.get("systemMessage", "")
+            results.append(_check(
+                "79. stale_ready_queue_present: stale ready -> deny + id in why",
+                rc == 0 and denied
+                and ("q-stale-79" in reason or "q-stale-79" in banner),
+                f"rc={rc} reason={reason!r}",
+            ))
+            _run([str(CLI), "satisfy", ob], env_s)
+
+            # --- 80: status=running NOT counted (only pending) ---
+            _write_queue([{
+                "id": "q-run",
+                "status": "running",
+                "group_id": "g-1",
+                "priority": 5,
+                "created_at": _iso(-600),
+                "summary": "running item",
+            }])
+            ob = _add_stale_ob()
+            rc, out, _err = _hook_pre(
+                {"tool_name": "Bash", "tool_input": {"command": "ls"}},
+                env_s,
+            )
+            results.append(_check(
+                "80. stale_ready_queue_present: running item not counted -> allow",
+                rc == 0 and _is_allow(out),
+                f"rc={rc} out={out}",
+            ))
+            _run([str(CLI), "satisfy", ob], env_s)
+
+            # --- 81: pending blocked by running peer in same group -> allow ---
+            _write_queue([
+                {"id": "q-running-head", "status": "running", "group_id": "g-1",
+                 "priority": 5, "created_at": _iso(-1200), "summary": "head"},
+                {"id": "q-blocked", "status": "pending", "group_id": "g-1",
+                 "priority": 5, "created_at": _iso(-600), "summary": "blocked"},
+            ])
+            ob = _add_stale_ob()
+            rc, out, _err = _hook_pre(
+                {"tool_name": "Bash", "tool_input": {"command": "ls"}},
+                env_s,
+            )
+            results.append(_check(
+                "81. stale_ready_queue_present: blocked-by-running-peer -> allow",
+                rc == 0 and _is_allow(out),
+                f"rc={rc} out={out}",
+            ))
+            _run([str(CLI), "satisfy", ob], env_s)
+
+            # --- 82: non-head pending in group (lower priority) -> allow ---
+            _write_queue([
+                # Higher priority pending item is the head; lower-priority
+                # entry is not ready_now even though both are stale.
+                {"id": "q-head-pending", "status": "pending", "group_id": "g-1",
+                 "priority": 7, "created_at": _iso(-1200), "summary": "head"},
+                {"id": "q-tail-pending", "status": "pending", "group_id": "g-1",
+                 "priority": 5, "created_at": _iso(-1200), "summary": "tail"},
+            ])
+            ob = _add_stale_ob()
+            rc, out, _err = _hook_pre(
+                {"tool_name": "Bash", "tool_input": {"command": "ls"}},
+                env_s,
+            )
+            denied = _is_deny(out)
+            reason = (out.get("hookSpecificOutput") or {}).get(
+                "permissionDecisionReason", ""
+            ) + " " + out.get("systemMessage", "")
+            # Head should be flagged; tail should NOT.
+            results.append(_check(
+                "82. stale_ready_queue_present: non-head pending NOT counted",
+                rc == 0 and denied
+                and "q-head-pending" in reason
+                and "q-tail-pending" not in reason,
+                f"rc={rc} reason={reason!r}",
+            ))
+            _run([str(CLI), "satisfy", ob], env_s)
+
+            # --- 83: custom threshold honored (60s; 90s old item triggers) ---
+            _write_queue([{
+                "id": "q-90s", "status": "pending", "group_id": "g-1",
+                "priority": 5, "created_at": _iso(-90), "summary": "90s old",
+            }])
+            # threshold=60 => 90s item DOES qualify; threshold=120 => doesn't.
+            ob_low = _add_stale_ob(threshold=60)
+            rc, out, _err = _hook_pre(
+                {"tool_name": "Bash", "tool_input": {"command": "ls"}},
+                env_s,
+            )
+            denied_low = _is_deny(out)
+            _run([str(CLI), "satisfy", ob_low], env_s)
+            ob_high = _add_stale_ob(threshold=120)
+            rc, out, _err = _hook_pre(
+                {"tool_name": "Bash", "tool_input": {"command": "ls"}},
+                env_s,
+            )
+            allowed_high = _is_allow(out)
+            _run([str(CLI), "satisfy", ob_high], env_s)
+            results.append(_check(
+                "83. stale_ready_queue_present: custom threshold honored",
+                denied_low and allowed_high,
+                f"denied_low={denied_low} allowed_high={allowed_high}",
+            ))
+
+            # --- 84: multiple stale items, oldest first ---
+            _write_queue([
+                {"id": "q-old-30m", "status": "pending", "group_id": "g-1",
+                 "priority": 5, "created_at": _iso(-1800), "summary": "30m old"},
+                {"id": "q-mid-10m", "status": "pending", "group_id": "g-2",
+                 "priority": 5, "created_at": _iso(-600), "summary": "10m old"},
+            ])
+            ob = _add_stale_ob()
+            rc, out, _err = _hook_pre(
+                {"tool_name": "Bash", "tool_input": {"command": "ls"}},
+                env_s,
+            )
+            banner = out.get("systemMessage", "")
+            reason = (out.get("hookSpecificOutput") or {}).get(
+                "permissionDecisionReason", ""
+            )
+            combined = banner + " " + reason
+            # Both ids should appear; oldest first ordering: q-old-30m before q-mid-10m
+            i_old = combined.find("q-old-30m")
+            i_mid = combined.find("q-mid-10m")
+            results.append(_check(
+                "84. stale_ready_queue_present: multiple stale, oldest first",
+                rc == 0 and _is_deny(out)
+                and i_old != -1 and i_mid != -1 and i_old < i_mid,
+                f"i_old={i_old} i_mid={i_mid} combined={combined[:300]!r}",
+            ))
+            _run([str(CLI), "satisfy", ob], env_s)
+
+            # --- 85: exempt Agent tool allowed even when stale items present ---
+            _write_queue([{
+                "id": "q-stale-85", "status": "pending", "group_id": "g-1",
+                "priority": 5, "created_at": _iso(-600), "summary": "stale",
+            }])
+            ob = _add_stale_ob(exempt=["Agent"])
+            rc, out, _err = _hook_pre(
+                {"tool_name": "Agent",
+                 "tool_input": {"prompt": "Queue item: q-stale-85\nDo X"}},
+                env_s,
+            )
+            results.append(_check(
+                "85. stale_ready_queue_present: Agent exempt -> allow",
+                rc == 0 and _is_allow(out),
+                f"rc={rc} out={out}",
+            ))
+            # Sanity: a non-exempt Bash call IS denied with the same obligation.
+            rc2, out2, _e2 = _hook_pre(
+                {"tool_name": "Bash", "tool_input": {"command": "ls"}}, env_s,
+            )
+            results.append(_check(
+                "85b. stale_ready_queue_present: non-exempt Bash still denied",
+                rc2 == 0 and _is_deny(out2),
+                f"rc={rc2} out={out2}",
+            ))
+            _run([str(CLI), "satisfy", ob], env_s)
+
+            # --- 86: exempt session-task queue register/spawn-check allowed ---
+            ob = _add_stale_ob(exempt=[
+                "Bash:^session-task queue (register|spawn-check|add|abandon|done)\\b",
+            ])
+            rc, out, _err = _hook_pre(
+                {"tool_name": "Bash",
+                 "tool_input": {"command":
+                                "session-task queue register q-stale-85"}},
+                env_s,
+            )
+            results.append(_check(
+                "86. stale_ready_queue_present: session-task queue register exempt",
+                rc == 0 and _is_allow(out),
+                f"rc={rc} out={out}",
+            ))
+            _run([str(CLI), "satisfy", ob], env_s)
+
+            # --- 87: scope-guard subagent bypass via all_of[is_main_loop, X] ---
+            # Register an obligation that's main-loop-only via all_of.
+            proc_add = _run([
+                str(CLI), "add",
+                "--tool-pattern", "*",
+                "--predicate", "all_of",
+                "--params", json.dumps({"predicates": [
+                    {"kind": "is_main_loop", "params": {}},
+                    {"kind": "stale_ready_queue_present",
+                     "params": {"queue_path": str(queue_path)}},
+                ]}),
+                "--ttl", "600",
+                "--deny-msg", "dispatch stale queue item",
+                "--created-by", "test",
+                "--json",
+            ], env_s)
+            ob_id = json.loads(proc_add.stdout)["id"]
+            # Subagent call (agent_id present) -> scope-guard inactive -> allow
+            rc, out, _err = _hook_pre(
+                {"tool_name": "Bash", "tool_input": {"command": "ls"},
+                 "agent_id": "subagent-xyz"},
+                env_s,
+            )
+            sub_allow = _is_allow(out)
+            # Main-loop call (no agent_id) -> predicate fires -> deny
+            rc2, out2, _e2 = _hook_pre(
+                {"tool_name": "Bash", "tool_input": {"command": "ls"}}, env_s,
+            )
+            main_deny = _is_deny(out2)
+            results.append(_check(
+                "87. stale_ready_queue_present: scope-guard "
+                "(subagent allow / main-loop deny)",
+                sub_allow and main_deny,
+                f"sub_allow={sub_allow} main_deny={main_deny}",
+            ))
+            _run([str(CLI), "satisfy", ob_id], env_s)
+
+            # --- 88: override bypasses gate ---
+            ob = _add_stale_ob()
+            ov_id = _add_override(env_s, "test bypass for stale", 60)
+            rc, out, _err = _hook_pre(
+                {"tool_name": "Bash", "tool_input": {"command": "ls"}},
+                env_s,
+            )
+            results.append(_check(
+                "88. stale_ready_queue_present: override bypasses gate",
+                rc == 0 and _is_allow(out),
+                f"rc={rc} out={out}",
+            ))
+            _run([str(CLI), "satisfy", ov_id], env_s)
+            _run([str(CLI), "satisfy", ob], env_s)
+
+            # --- 89: override calls pingme (when not suppressed) ---
+            # Install a fake pingme on PATH that records its argv to a file.
+            pingme_log = tmpdir_s / "pingme.log"
+            fake_bin = tmpdir_s / "fake-bin"
+            fake_bin.mkdir(parents=True, exist_ok=True)
+            fake_pingme = fake_bin / "pingme"
+            fake_pingme.write_text(
+                "#!/usr/bin/env bash\n"
+                f"echo \"$@\" >> {pingme_log}\n"
+                "exit 0\n"
+            )
+            fake_pingme.chmod(0o755)
+            env_pm = env_s.copy()
+            env_pm["PATH"] = f"{fake_bin}:{env_s.get('PATH','')}"
+            # Make sure the suppression is OFF for this test (it's set in
+            # the outer test invocation env, but we want to actively
+            # exercise the call path here).
+            env_pm.pop("OBLIGATIONS_DISABLE_PINGME", None)
+            # Create the override.
+            proc = _run([
+                str(CLI), "override", "test pingme override",
+                "--duration", "120",
+                "--created-by", "test",
+                "--json",
+            ], env_pm)
+            ov_pm_id = (json.loads(proc.stdout)["id"]
+                        if proc.returncode == 0 else "")
+            pingme_called = (
+                pingme_log.exists()
+                and ov_pm_id in pingme_log.read_text()
+                and "test pingme override" in pingme_log.read_text()
+            )
+            results.append(_check(
+                "89. override: pingme called with override id + reason + duration",
+                proc.returncode == 0 and pingme_called,
+                f"rc={proc.returncode} pingme_log_exists={pingme_log.exists()} "
+                f"contents={pingme_log.read_text() if pingme_log.exists() else None!r}",
+            ))
+            if ov_pm_id:
+                _run([str(CLI), "satisfy", ov_pm_id], env_pm)
+
+            # --- 90: override pingme suppressed by env flag ---
+            pingme_log.unlink(missing_ok=True)
+            env_pm_off = env_pm.copy()
+            env_pm_off["OBLIGATIONS_DISABLE_PINGME"] = "1"
+            proc = _run([
+                str(CLI), "override", "suppressed override",
+                "--duration", "120",
+                "--created-by", "test",
+                "--json",
+            ], env_pm_off)
+            ov_off_id = (json.loads(proc.stdout)["id"]
+                         if proc.returncode == 0 else "")
+            results.append(_check(
+                "90. override: pingme suppressed by OBLIGATIONS_DISABLE_PINGME",
+                proc.returncode == 0 and not pingme_log.exists(),
+                f"rc={proc.returncode} pingme_log_exists={pingme_log.exists()}",
+            ))
+            if ov_off_id:
+                _run([str(CLI), "satisfy", ov_off_id], env_pm_off)
+
+    total = len(results)
+    passed = sum(1 for r in results if r)
+    print()
+    print(f"RESULT: {passed}/{total} passed")
+    return 0 if passed == total else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

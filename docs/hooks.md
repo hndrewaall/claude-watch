@@ -1,0 +1,183 @@
+# Hooks + obligations gate
+
+Claude Code hooks let the harness intercept tool invocations and either DENY
+them (PreToolUse) or react after they finish (PostToolUse). The
+`tools/hooks/` directory ships a set of canonical hook scripts that wire
+into the obligations gate (`tools/obligations/`) and the session-task queue
+(`tools/session-task/`).
+
+## Wiring
+
+In `~/.claude/settings.json` (after `make install` puts the binaries in
+`~/bin/`):
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Agent",
+        "hooks": [
+          {"type": "command", "command": "~/bin/pre-agent-queue-gate-hook", "timeout": 5}
+        ]
+      },
+      {
+        "matcher": "*",
+        "hooks": [
+          {"type": "command", "command": "~/bin/pre-tool-obligations-gate-hook", "timeout": 5}
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Read",
+        "hooks": [
+          {"type": "command", "command": "~/bin/post-tool-mark-attachment-read-hook", "timeout": 5}
+        ]
+      },
+      {
+        "matcher": "*",
+        "hooks": [
+          {"type": "command", "command": "~/bin/post-tool-obligations-update-hook", "timeout": 5}
+        ]
+      }
+    ]
+  }
+}
+```
+
+## Hook scripts
+
+| Script | Hook event | Matcher | Purpose |
+|--------|------------|---------|---------|
+| `pre-agent-queue-gate-hook` | PreToolUse | `Agent` | Refuses `Agent` spawns missing a `Queue item: q-XXXX` marker, or whose marker isn't `running` in the queue. |
+| `pre-tool-obligations-gate-hook` | PreToolUse | `*` | Calls `obligations check`; denies when a gate-mode obligation's predicate is unsatisfied. Also enforces a built-in cardinal rule against bare `watcher-ctl run` (must be invoked via the harness `run_in_background:true`). |
+| `post-tool-obligations-update-hook` | PostToolUse | `*` | Runs `obligations post-tool` (satisfy-by-completion + inform-mode advisories) and manages a sidecar registry for `no_pending_watcher_outputs`. |
+| `post-tool-mark-attachment-read-hook` | PostToolUse | `Read` | Auto-marks Signal attachments as read via `signal-mark-read` when Claude opens a file under `~/signal-queue/attachments/` (host-specific; safe no-op elsewhere). |
+
+All hooks default-open on internal error. A broken hook must NEVER blackhole
+the loop.
+
+## Obligations gate
+
+`obligations` is a generic "must do X before Y" enforcement layer for the
+harness — the structural fix for "I'll always X" verbal commitments that
+evaporate from context. State at `~/.config/claude/obligations.json` (0600,
+fcntl.flock-protected).
+
+CLI: `obligations add | list | show | satisfy | override | prune | check |
+post-satisfy | inform-check | post-tool` (`obligations --help` for full
+surface).
+
+### Predicate vocabulary (BOUNDED)
+
+| Predicate | Meaning |
+|-----------|---------|
+| `file_mtime_within {path, max_age_secs}` | file was modified recently |
+| `file_exists {path, negate?}` | file is/isn't present |
+| `marker_file_present {path, negate?}` | alias of `file_exists` |
+| `env_present {var, value?}` | env var set (and optionally equals value) |
+| `queue_status {id, status}` | queue item in expected state |
+| `no_pipe_pattern {regex}` | BAN regex against Bash command |
+| `process_alive {pid_file}` | PID in file is alive |
+| `process_in_pgrep {pattern}` | pattern matches via `pgrep -f` |
+| `watchers_healthy {}` | `watcher-status --unhealthy-only` is empty |
+| `is_main_loop {negate?}` | main-loop call vs subagent (scope guard) |
+| `agent_inbox_empty {path}` | `agent-msg` inbox has no unread messages |
+| `stale_ready_queue_present {threshold_secs?, queue_path?}` | BAN — true iff NO ready-now queue item has been waiting `>= threshold_secs` (default 300s). Failure carries the offending ids in `why`. |
+| `all_of {predicates: [...]}` | meta-predicate (logical AND, with `is_main_loop` scope-guard short-circuit) |
+| `no_pending_watcher_outputs {}` | every `tasks/*.output` sidecar has been Read |
+
+Extend the CLI when you need more — don't shoehorn.
+
+### Tool patterns
+
+`*` | `Bash` | `Bash:<regex>` (Bash whose command matches regex) | `<ToolName>`.
+
+### Enforcement modes
+
+- `gate` (default): PreToolUse hook DENIES the matching tool call when the
+  predicate is unsatisfied. The classic obligation: "must do X before Y".
+- `inform`: PreToolUse never blocks. Instead, PostToolUse evaluates the
+  predicate after every matching tool call and prints a single-line
+  stderr banner if it's unsatisfied. Use for soft surfacing ("watcher
+  health is degraded") that should be visible without blocking forward
+  progress.
+
+Pass `--enforcement inform` on `obligations add` to register a non-blocking
+advisory.
+
+### Predicate composition
+
+To scope an obligation to the main loop only, register
+`predicate: all_of [is_main_loop {}, <other>]` — the `is_main_loop` child
+acts as a scope-guard.
+
+`all_of` semantics: standard logical AND, with one short-circuit. If any
+child is `is_main_loop` and that child FAILS (context doesn't match), the
+entire `all_of` returns satisfied=True ("scope-guard inactive"); the
+obligation does not block. The natural "main-loop only enforce X" pattern.
+
+Detection signal: per Claude Code's hook contract, the PreToolUse /
+PostToolUse JSON payload carries an `agent_id` field ONLY when the call is
+from inside a subagent; main-loop calls have no `agent_id` (or empty).
+Both hooks extract `payload.agent_id` and forward it to the obligations CLI
+via `--agent-id`.
+
+### Auto-satisfaction
+
+Pass `--satisfied-by-tool X --satisfied-by-cmd-regex Y` to `obligations add`,
+and the PostToolUse hook removes the obligation as soon as a matching tool
+call completes.
+
+### `exempt_patterns`
+
+Each obligation may carry an `exempt_patterns` list (same syntax as
+`tool_pattern`). The obligation applies iff its `tool_pattern` matches AND
+no entry in `exempt_patterns` matches. Use to encode "this gate exists but
+the recovery path must always be allowed even when the predicate is
+failing". Pass `--exempt-tool-pattern <pat>` (repeatable) on `add`.
+
+### Audited overrides
+
+```
+obligations override "<reason>" --duration <60|5m|1h>
+```
+
+Short-TTL bypass that disables ALL gate-mode obligations for the duration
+(hard cap 24h). Self-clears via TTL; cancel early via
+`obligations satisfy <ov-id>`. Audited at create time AND on every call it
+bypasses to `~/.config/claude/obligations-bypass.log`. Surfaces in
+`obligations list` as "ACTIVE OVERRIDES". Inform-mode advisories are NOT
+silenced (overrides gate forward progress, not visibility).
+
+Override creation also fires a low-priority Pushover notification via
+`pingme` (when present on `$PATH`) carrying `<ov-id> (<duration>): <reason>`,
+so an audited bypass surfaces on the operator's phone in addition to the
+log. Suppress in tests / CI via `OBLIGATIONS_DISABLE_PINGME=1`.
+
+### Emergency bypass (legacy)
+
+- `OBLIGATIONS_BYPASS=1` — allows any tool call, audited to
+  `~/.config/claude/obligations-bypass.log`.
+- `QUEUE_GATE_BYPASS=1` — bypasses the `pre-agent-queue-gate-hook`,
+  audited to `~/.config/claude/queue-gate-bypass.log`.
+
+Prefer `obligations override` — scoped TTL + audit reason, vs always-on
+env-var pollution.
+
+### Default-open
+
+If the `obligations` CLI is missing, JSON parse fails, or any internal
+error happens, the hook logs to `~/.config/claude/obligations-hook-errors.log`
+and allows the call. Same semantics for `watchers_healthy` if
+`watcher-status` is missing or hangs.
+
+## Tests
+
+```
+make test-hooks            # 70+ cases covering every predicate,
+                           # enforcement mode, exempt-patterns,
+                           # overrides, and the watcher-ctl cardinal-rule
+                           # gate. Runs against an isolated $HOME tmpdir.
+```

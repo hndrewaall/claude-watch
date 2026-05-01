@@ -119,22 +119,45 @@ Claude ignored the conversational hint.
 
 claude-watch monitors the session and recovers from failures, but it has no memory of what Claude was working on. It can detect "Claude is idle" or "Claude is stuck," but it can't tell Claude *what to resume*.
 
-**You need a separate memory/session continuity system** to make recovery useful. Such a system would:
+The repo also ships a set of supporting CLIs and hook scripts under
+`tools/` that together with the daemon form a more complete session-
+continuity layer. They live here because they're tightly coupled to the
+daemon's contract (queue + obligation predicates + claude-event bus +
+watcher lifecycle), and shipping them in the same public repo makes
+fresh deployments self-contained.
 
-- Save what Claude should resume before context clears
-- Gather full session state on startup (watchers, pending work, message history)
-- Track completed work across clears to prevent re-doing finished tasks
-- Log session events for debugging
+| Subsystem | Path | Purpose |
+|-----------|------|---------|
+| `session-task` | [`tools/session-task/`](tools/session-task/) | Cross-session work-queue + resume-action CLI. See [`docs/queue.md`](docs/queue.md). |
+| `obligations` | [`tools/obligations/`](tools/obligations/) | Generic "must do X before Y" gate; bounded predicate vocabulary. |
+| Hook scripts | [`tools/hooks/`](tools/hooks/) | PreToolUse / PostToolUse hooks that wire the queue + obligations gate into Claude Code's hook contract. See [`docs/hooks.md`](docs/hooks.md). |
+| `agent-msg` | [`tools/agent-msg/`](tools/agent-msg/) | Async-messaging CLI for delivering inbox messages to running subagents via the obligations gate. See [`docs/agent-msg.md`](docs/agent-msg.md). |
+| `claude-event` + `claude-event-tail` | [`tools/claude-event/`](tools/claude-event/) | Source-agnostic JSON event bus (emitter + ring-buffer reader). See [`docs/events.md`](docs/events.md). |
+| `claude-event-watch` + `self-clear` | [`tools/watchers/`](tools/watchers/) | Watcher script (inotify-blocking event surfacer) and the `/clear` + resume-prompt injector. See [`docs/watchers.md`](docs/watchers.md). |
 
-Without something like this, claude-watch can inject "resume" into a fresh session, but Claude won't know what it was doing. The memory system is the bridge between "session is alive" (claude-watch's job) and "session knows what to do" (the memory system's job). This is beyond the scope of claude-watch itself.
+`make install` builds the daemon and copies all of the above into
+`$BIN_DIR` (default `~/bin/`). Each subsystem has its own README, tests
+under `tests/`, and a public-facing reference doc in `docs/`.
+
+What the daemon plus tools still don't cover by design: a host-specific
+resume checklist, a request tracker, signal/messaging integrations, and
+any other site-specific surface. Those belong in your own dotfiles or
+ops repo and call into these tools as primitives.
 
 ## Build & run
 
 ```bash
-make test           # run all tests (~960 tests, <1s unit, ~16s e2e)
-make build          # release build
-make deploy         # build + systemctl restart
-make install-hooks  # install the git pre-commit hook (warnings + tests)
+make test                # all Rust tests in parallel
+make test-session-task   # session-task pytest suite
+make test-hooks          # obligations + queue PreToolUse hook tests
+make test-agent-msg      # agent-msg embedded --test (38 cases)
+make test-claude-event   # claude-event + claude-event-tail unit tests
+make test-watchers       # claude-event-watch fast-path + self-clear config
+
+make build               # release build
+make install             # build + copy daemon + tools into $BIN_DIR (default ~/bin/)
+make deploy              # build + systemctl restart
+make install-hooks       # install the git pre-commit hook (warnings + tests)
 ```
 
 ### Pre-commit hook
