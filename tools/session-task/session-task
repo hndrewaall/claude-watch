@@ -73,6 +73,40 @@ COMPLETED_FILE = Path.home() / ".config" / "session" / "completed-tasks.jsonl"
 QUEUE_FILE = Path.home() / ".config" / "session" / "queue.json"
 QUEUE_SCHEMA_VERSION = 2
 
+# Agent-transcript archive directory. At queue-done / queue-abandon time the
+# spawning subagent's JSONL transcript (if locatable) is copied here so it
+# remains visible after /tmp cleanup, session restart, or claude-watch state
+# rotation. Surfaced in queue viewer UIs as a "View log" button on Done
+# entries (archive-mode replay through the same SSE viewer used for live
+# tails).
+QUEUE_LOG_ARCHIVE_DIR = Path(
+    os.environ.get(
+        "QUEUE_LOG_ARCHIVE_DIR",
+        str(Path.home() / ".config" / "session" / "queue-logs"),
+    )
+)
+
+# claude-watch active-agents JSON — maps queue_id -> agent_id (and liveness).
+# Source-of-truth for the queue-id-to-agent-id join used by downstream tools
+# and the archive-on-done helper. Default is the standard claude-watch state
+# file location; container deploys override.
+CLAUDE_AGENTS_STATE = Path(
+    os.environ.get(
+        "CLAUDE_AGENTS_STATE",
+        "/var/lib/claude-watch/active-agents.json",
+    )
+)
+
+# Root of `~/.claude/projects/<host-token>/` (per-session subagent transcript
+# trees). The archive-on-done helper walks `<root>/<session-uuid>/subagents/
+# agent-<id>.jsonl`. Container deploys override.
+CLAUDE_AGENTS_JSONL_ROOT = Path(
+    os.environ.get(
+        "CLAUDE_AGENTS_JSONL_ROOT",
+        str(Path.home() / ".claude" / "projects"),
+    )
+)
+
 # Placeholder used when a queue item is added without --summary (soft-required
 # as of 2026-04-19). Pingme notifications display this verbatim so the operator
 # immediately notices the missing headline.
@@ -838,6 +872,176 @@ def _elapsed_seconds(started_at_iso):
     return max(0, int(delta.total_seconds()))
 
 
+def _agent_id_for_queue(queue_id):
+    """Look up the spawned agent_id for a queue item via claude-watch state.
+
+    Returns the agent_id string, or None if the state file is missing /
+    unreadable / has no record for ``queue_id``. Mirrors the dedup rule
+    in ``claude_agents.agents_by_queue_id`` (live > stale, smaller jsonl
+    age wins) but inlined here so this script stays stdlib-only.
+    """
+    try:
+        with open(CLAUDE_AGENTS_STATE, "r") as f:
+            state = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(state, dict):
+        return None
+    best = None
+    for rec in state.get("agents", []) or []:
+        if not isinstance(rec, dict):
+            continue
+        if rec.get("queue_id") != queue_id:
+            continue
+        if best is None:
+            best = rec
+            continue
+        b_alive = bool(best.get("alive"))
+        r_alive = bool(rec.get("alive"))
+        if r_alive and not b_alive:
+            best = rec
+            continue
+        if r_alive == b_alive:
+            b_age = best.get("jsonl_age_seconds")
+            r_age = rec.get("jsonl_age_seconds")
+            if r_age is not None and (b_age is None or r_age < b_age):
+                best = rec
+    if best is None:
+        return None
+    aid = best.get("agent_id")
+    return aid if isinstance(aid, str) and aid else None
+
+
+def _find_agent_jsonl(agent_id):
+    """Locate the most-recent JSONL transcript for ``agent_id``.
+
+    Layout::
+        <CLAUDE_AGENTS_JSONL_ROOT>/<session-uuid>/subagents/agent-<id>.jsonl
+
+    Returns a ``Path`` or None. Path-traversal-safe: agent_id is matched
+    against a strict regex before any filesystem walk. Multiple project
+    roots (e.g. one per cwd token) are supported by setting
+    ``CLAUDE_AGENTS_JSONL_ROOT`` to the parent — we walk one level deep
+    looking for ``subagents/`` containers.
+    """
+    if not isinstance(agent_id, str):
+        return None
+    if not re.match(r"^[a-z0-9-]{4,64}$", agent_id):
+        return None
+    root = CLAUDE_AGENTS_JSONL_ROOT
+    if not root.is_dir():
+        return None
+    needle = f"agent-{agent_id}.jsonl"
+    best = None  # (mtime, path)
+    # Two-level walk: <root>/<host-token>/<session>/subagents/<file>, OR
+    # <root>/<session>/subagents/<file> (the gomorrah deploy mounts the
+    # host-token level directly so the session is one level down). Try
+    # both shapes — first hit wins per session-uuid, then we rank by mtime.
+    candidates_dirs = [root]
+    try:
+        for child in root.iterdir():
+            if child.is_dir():
+                candidates_dirs.append(child)
+    except OSError:
+        return None
+    seen = set()
+    for d in candidates_dirs:
+        try:
+            sessions = list(d.iterdir())
+        except OSError:
+            continue
+        for sess in sessions:
+            candidate = sess / "subagents" / needle
+            if candidate in seen:
+                continue
+            seen.add(candidate)
+            try:
+                mt = candidate.stat().st_mtime
+            except OSError:
+                continue
+            if best is None or mt > best[0]:
+                best = (mt, candidate)
+    return best[1] if best else None
+
+
+def _archive_agent_transcript(item, *, reason="done"):
+    """Best-effort archive of the spawning subagent's JSONL transcript.
+
+    Called from cmd_queue_done / cmd_queue_abandon BEFORE the queue write
+    is finalized, so the resulting ``log_archive_path`` field is persisted
+    into queue.json alongside the status transition. Failures are non-
+    fatal: missing claude-watch state, missing JSONL, or copy errors all
+    log to stderr and return None — the lifecycle transition completes
+    regardless. We never raise from inside here.
+
+    Idempotent: if the archive file already exists for this queue id we
+    leave it alone (the first archive wins) and return its relative
+    path. Subsequent calls are a no-op.
+
+    Returns the relative-to-archive-dir filename (e.g. "q-XXXX.jsonl") on
+    success, or None on failure. The caller stores this on the item as
+    ``log_archive_path`` so a queue viewer UI can detect that an archive
+    exists and offer a "View log" affordance.
+    """
+    qid = item.get("id")
+    if not isinstance(qid, str) or not qid:
+        return None
+
+    if not re.match(r"^q-[a-z0-9-]{4,64}$", qid):
+        return None
+
+    archive_name = f"{qid}.jsonl"
+    dest = QUEUE_LOG_ARCHIVE_DIR / archive_name
+
+    # Idempotent: never overwrite. The first archive (typically created
+    # at done-time) wins; a later abandon would otherwise clobber the
+    # canonical transcript with a partial copy if the agent dirtied the
+    # file between transitions.
+    if dest.exists():
+        return archive_name
+
+    aid = _agent_id_for_queue(qid)
+    if aid is None:
+        print(
+            f"[archive] no agent record for {qid}; skipping transcript archive ({reason})",
+            file=sys.stderr,
+        )
+        return None
+
+    src = _find_agent_jsonl(aid)
+    if src is None:
+        print(
+            f"[archive] no transcript file found for {qid} agent={aid}; "
+            f"checked {CLAUDE_AGENTS_JSONL_ROOT} ({reason})",
+            file=sys.stderr,
+        )
+        return None
+
+    try:
+        QUEUE_LOG_ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        print(
+            f"[archive] failed to create {QUEUE_LOG_ARCHIVE_DIR}: {exc}",
+            file=sys.stderr,
+        )
+        return None
+
+    try:
+        shutil.copyfile(src, dest)
+    except OSError as exc:
+        print(
+            f"[archive] copy failed {src} -> {dest}: {exc}",
+            file=sys.stderr,
+        )
+        return None
+
+    print(
+        f"[archive] {qid} -> {archive_name} (from agent={aid}, reason={reason})",
+        file=sys.stderr,
+    )
+    return archive_name
+
+
 def cmd_queue_add(args):
     scope_raw = args.scope or []
     if not scope_raw:
@@ -1221,6 +1425,14 @@ def cmd_queue_done(args):
         target["status"] = "done"
         target["completed_at"] = _fmt_ts()
         target["group_head"] = False
+        # Archive the spawning subagent's transcript while we still
+        # have the lock. Best-effort: failures don't block the done
+        # transition. The path lands on the item as `log_archive_path`
+        # so a queue viewer UI can offer a "View log" affordance on
+        # Done entries.
+        archive_path = _archive_agent_transcript(target, reason="done")
+        if archive_path:
+            target["log_archive_path"] = archive_path
         _recompute_group_heads(items)
         next_head = _group_head(items, target["group_id"])
         _queue_write_and_unlock(fh, data)
@@ -1294,6 +1506,12 @@ def cmd_queue_abandon(args):
         if args.reason:
             target["abandon_reason"] = args.reason
         target["group_head"] = False
+        # Archive the spawning subagent's transcript (if any). Pending
+        # items abandoned before spawn won't have a record — the helper
+        # silently skips that case.
+        archive_path = _archive_agent_transcript(target, reason="abandon")
+        if archive_path:
+            target["log_archive_path"] = archive_path
         _recompute_group_heads(items)
         _queue_write_and_unlock(fh, data)
     except Exception:
