@@ -36,6 +36,8 @@ Usage:
     session-task queue register <id> [--pid N]   # claim item for spawn (gated)
     session-task queue heartbeat <id> [--pid N]  # refresh liveness on running item
     session-task queue spawn-check <id> [--json] # "am I clear to spawn?" check
+    session-task queue force-start <id> --reason TEXT  # MANUAL OVERRIDE: promote
+                                                       # blocked-pending to running
     session-task queue promote <id>
     session-task queue set-summary <id> "text"   # edit one-line summary
     session-task queue prune [--older-than DURATION] [-n/--dry-run]
@@ -111,6 +113,18 @@ CLAUDE_AGENTS_JSONL_ROOT = Path(
 # as of 2026-04-19). Pingme notifications display this verbatim so the operator
 # immediately notices the missing headline.
 DEFAULT_SUMMARY = "(no summary)"
+
+# Audit log for `queue force-start` overrides. Every successful force-start
+# appends a JSONL row recording who/when/why and which scope-conflict
+# blockers were overridden. The override is rare and intentionally noisy in
+# its bookkeeping — the log is what makes the bypass auditable after the
+# fact. Container deploys can override via env var.
+QUEUE_FORCE_START_LOG = Path(
+    os.environ.get(
+        "QUEUE_FORCE_START_LOG",
+        str(Path.home() / ".config" / "claude" / "queue-force-start.log"),
+    )
+)
 
 
 # ---------------------------------------------------------------------------
@@ -1946,6 +1960,205 @@ def cmd_queue_register(args):
         print("  next  : spawn the agent. call `queue done` when it finishes.")
 
 
+def cmd_queue_force_start(args):
+    """Atomically promote a pending item to running, bypassing scope blockers.
+
+    This is the manual override for the spawn-gate's serialization rules.
+    Use ONLY when an operator has consciously decided to override scope-
+    conflict serialization — e.g. because the running blocker is wedged,
+    or because the work genuinely is independent and the scope tokens
+    were mis-set.
+
+    Refuses if:
+      * --reason is missing or empty (force-start is auditable; an
+        unattributed override defeats the audit log).
+      * the item does not exist.
+      * the item is not in status=pending (already running, done, or
+        abandoned items can't be force-started).
+
+    On success:
+      * status flips to running, started_at + registered_at + heartbeat
+        are stamped (same as `register`).
+      * `force_started_at` (epoch seconds, unix int) and
+        `force_started_reason` are written to the queue record so the
+        item carries its own provenance.
+      * `force_started_blockers_overridden` is the list of running
+        items whose scope overlapped this one (the conflicts that the
+        normal register path would have refused on).
+      * an audit row is appended to QUEUE_FORCE_START_LOG.
+      * a `queue-running` claude-event is emitted with
+        force_started=true so downstream consumers can distinguish the
+        override path from a normal register.
+
+    Same atomic flock-on-queue.json discipline as register/done.
+    """
+    raw_reason = (args.reason or "").strip()
+    if not raw_reason:
+        print(
+            "ERROR: --reason is required for force-start (override is auditable).",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    fh, data = _queue_open_locked("rw")
+    try:
+        items = data["items"]
+        target = next((it for it in items if it["id"] == args.id), None)
+        if target is None:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+            fh.close()
+            print(
+                f"ERROR: queue item {args.id!r} not found.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        status = target.get("status")
+        if status != "pending":
+            fcntl.flock(fh, fcntl.LOCK_UN)
+            fh.close()
+            print(
+                f"ERROR: force-start refused: {args.id} status={status!r} "
+                f"(must be pending; running/done/abandoned items cannot be "
+                f"force-started).",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        # Capture the blockers we are overriding so the audit log + queue
+        # record carry the provenance. We do NOT bail on overlaps — that's
+        # the entire point of force-start.
+        scope = target.get("scope", [])
+        gid = target.get("group_id")
+        cross_blockers = _running_scope_conflicts(
+            items, scope, exclude_id=target.get("id"),
+        )
+        # Same-group not-yet-running peers (the FIFO blockers within this
+        # group) — they don't strictly "conflict" via overlapping scope
+        # but they do block readiness. Captured for the audit log.
+        same_group_pending_peers = [
+            it for it in items
+            if it.get("group_id") == gid
+            and it.get("id") != target.get("id")
+            and it.get("status") == "pending"
+        ]
+
+        blockers_overridden = []
+        for c in cross_blockers:
+            blockers_overridden.append({
+                "id": c["id"],
+                "group_id": c.get("group_id"),
+                "status": c.get("status"),
+                "scope": c.get("scope", []),
+                "reason": "running scope overlap",
+            })
+        for p in same_group_pending_peers:
+            blockers_overridden.append({
+                "id": p["id"],
+                "group_id": p.get("group_id"),
+                "status": p.get("status"),
+                "scope": p.get("scope", []),
+                "reason": "same-group pending peer (FIFO blocker)",
+            })
+
+        now_iso = _fmt_ts()
+        target["status"] = "running"
+        target["started_at"] = now_iso
+        target["registered_at"] = now_iso
+        target["last_heartbeat_at"] = now_iso
+        target["pid"] = None  # ephemeral-shell PID is not useful here
+        target["force_started_at"] = int(datetime.now(timezone.utc).timestamp())
+        target["force_started_reason"] = raw_reason
+        target["force_started_blockers_overridden"] = blockers_overridden
+
+        _recompute_group_heads(items)
+        promoted = dict(target)
+        _queue_write_and_unlock(fh, data)
+    except Exception:
+        fcntl.flock(fh, fcntl.LOCK_UN)
+        fh.close()
+        raise
+
+    # Audit log: append a JSONL row. Best-effort — never block the
+    # promotion on a log write failure.
+    try:
+        QUEUE_FORCE_START_LOG.parent.mkdir(parents=True, exist_ok=True)
+        audit_row = {
+            "timestamp": promoted["force_started_at"],
+            "timestamp_iso": now_iso,
+            "queue_id": promoted["id"],
+            "reason": raw_reason,
+            "scope": promoted.get("scope", []),
+            "group_id": promoted.get("group_id"),
+            "summary": _item_summary(promoted),
+            "blockers_overridden": blockers_overridden,
+        }
+        with open(QUEUE_FORCE_START_LOG, "a") as logf:
+            logf.write(json.dumps(audit_row) + "\n")
+    except OSError as exc:
+        print(
+            f"WARNING: failed to append to {QUEUE_FORCE_START_LOG}: {exc}",
+            file=sys.stderr,
+        )
+
+    # Lifecycle pingme — same shape as register, with the override called
+    # out so it's visually distinct in the notification stream.
+    _pingme_notify(
+        title=f"queue force-started: {promoted['id']}",
+        message=(
+            f"{_item_summary(promoted)}\n"
+            f"scope: {','.join(promoted.get('scope', []))} "
+            f"| priority: {promoted.get('priority', 5)}\n"
+            f"force-started, blockers overridden: {len(blockers_overridden)}\n"
+            f"reason: {raw_reason}"
+        ),
+        priority="normal",
+        silent=getattr(args, "silent", False),
+    )
+
+    # Claude-event emit: queue-running with force_started=true so consumers
+    # can branch on the override path (alerting, exporter labels, etc.).
+    _claude_event_notify(
+        tag="queue-running",
+        message=(
+            f"queue running (force-started): {promoted['id']} "
+            f"({_item_summary(promoted)})"
+        ),
+        data={
+            "queue_id": promoted["id"],
+            "group_id": promoted.get("group_id"),
+            "scope": promoted.get("scope", []),
+            "summary": _item_summary(promoted),
+            "created_by": promoted.get("created_by", ""),
+            "force_started": True,
+            "force_started_reason": raw_reason,
+            "force_started_blockers_overridden": [
+                b["id"] for b in blockers_overridden
+            ],
+        },
+        priority="low",
+        silent=getattr(args, "silent", False),
+    )
+
+    if args.json:
+        print(json.dumps(promoted, indent=2))
+    else:
+        print(f"force-started: {args.id} (now running)")
+        print(f"  group   : {promoted.get('group_id')}")
+        print(f"  scope   : {','.join(promoted.get('scope', []))}")
+        print(f"  reason  : {raw_reason}")
+        if blockers_overridden:
+            print(f"  blockers overridden: {len(blockers_overridden)}")
+            for b in blockers_overridden:
+                print(
+                    f"    - {b['id']} ({b['reason']}; "
+                    f"scope={','.join(b.get('scope', []))})"
+                )
+        else:
+            print("  blockers overridden: none "
+                  "(item was already ready — force-start was a no-op gate skip)")
+
+
 def cmd_queue_heartbeat(args):
     """Refresh the liveness timestamp (and optionally PID) on a running item.
 
@@ -2554,6 +2767,29 @@ def build_parser():
     q_spawn.add_argument("id")
     q_spawn.add_argument("--json", action="store_true")
 
+    q_force_start = qsub.add_parser(
+        "force-start",
+        help=(
+            "Manually promote a pending item to running, bypassing scope-"
+            "conflict serialization. AUDITABLE: --reason is required and the "
+            "override is appended to ~/.config/claude/queue-force-start.log."
+        ),
+    )
+    q_force_start.add_argument("id")
+    q_force_start.add_argument(
+        "--reason",
+        required=True,
+        help=(
+            "Why are you overriding scope serialization? Recorded on the item "
+            "as `force_started_reason` and appended to the audit log."
+        ),
+    )
+    q_force_start.add_argument("--json", action="store_true")
+    q_force_start.add_argument(
+        "--silent", action="store_true",
+        help="Suppress the pingme lifecycle notification for this operation.",
+    )
+
     q_promote = qsub.add_parser("promote", help="Bump item priority to group head")
     q_promote.add_argument("id")
 
@@ -2622,6 +2858,7 @@ def main():
             "register": cmd_queue_register,
             "heartbeat": cmd_queue_heartbeat,
             "spawn-check": cmd_queue_spawn_check,
+            "force-start": cmd_queue_force_start,
             "promote": cmd_queue_promote,
             "set-summary": cmd_queue_set_summary,
             "prune": cmd_queue_prune,
