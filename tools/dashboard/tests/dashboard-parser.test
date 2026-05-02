@@ -1,0 +1,285 @@
+#!/usr/bin/env python3
+"""Tests for dashboard-lib.sh — the INI parser used by the `dashboard` script.
+
+Exercises conf_get, conf_windows, has_split, and expected_panes against a
+fixture set covering:
+  - missing config file (defaults only)
+  - empty config file
+  - [main] keys: top_left only / top_right only / both
+  - sidebar_width / claude_percent override
+  - [windows] section with single-pane and multi-pane (///) entries
+  - INI hygiene: leading/trailing whitespace, comments, blank lines
+  - section isolation (a key in [windows] doesn't bleed into [main])
+  - has_split / expected_panes math
+
+We invoke the parser by `source`ing dashboard-lib.sh in a bash subshell and
+calling the function we want, capturing stdout. This mirrors how the real
+`dashboard` script uses the lib.
+
+Run:  ./dashboard-parser.test
+"""
+
+from __future__ import annotations
+
+import subprocess
+import sys
+import tempfile
+import textwrap
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+LIB = HERE.parent.parent.parent / "dashboard-lib.sh"
+
+if not LIB.exists():
+    print(f"FAIL: cannot locate dashboard-lib.sh at {LIB}", file=sys.stderr)
+    sys.exit(2)
+
+
+def run_lib(call: str, conf_text: str | None, env: dict | None = None) -> tuple[int, str, str]:
+    """Source dashboard-lib.sh in a bash -c, then run `call`.
+
+    `conf_text=None` means write no file at all (tests the missing-file
+    branch). `conf_text=""` means write an empty file.
+    """
+    tmpdir = tempfile.mkdtemp(prefix="dashboard-parser-test-")
+    conf_path = Path(tmpdir) / "layout.conf"
+    if conf_text is not None:
+        conf_path.write_text(conf_text)
+    # CONF must be set in the current shell, not just in the env for the
+    # source-builtin call (`VAR=val . file` only injects VAR for the source
+    # subprocess; `conf_get` reads $CONF later from the current shell, where
+    # it would be unset). Use a normal assignment instead.
+    script = f'CONF="{conf_path}"; . "{LIB}"; {call}'
+    proc = subprocess.run(
+        ["bash", "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        env=env,
+        check=False,
+    )
+    return proc.returncode, proc.stdout, proc.stderr
+
+
+PASSES = 0
+FAILS: list[str] = []
+
+
+def check(name: str, actual, expected) -> None:
+    global PASSES
+    if actual == expected:
+        PASSES += 1
+        print(f"  ok  {name}")
+    else:
+        FAILS.append(f"{name}: expected {expected!r}, got {actual!r}")
+        print(f"  FAIL {name}: expected {expected!r}, got {actual!r}")
+
+
+# ----------------------------------------------------------------------------
+# conf_get — missing file
+# ----------------------------------------------------------------------------
+print("# conf_get: missing file -> defaults")
+
+# When CONF doesn't exist, conf_get must return the default. The test harness
+# writes nothing when conf_text=None, but the path string still points to a
+# nonexistent file (tempdir exists; layout.conf does not).
+rc, out, _ = run_lib('conf_get top_left "" main', None)
+check("missing file empty default", out.strip(), "")
+
+rc, out, _ = run_lib('conf_get sidebar_width 25 main', None)
+check("missing file numeric default", out.strip(), "25")
+
+rc, out, _ = run_lib('conf_get claude_percent 45 main', None)
+check("missing file claude_percent default", out.strip(), "45")
+
+# ----------------------------------------------------------------------------
+# conf_get — empty / whitespace file
+# ----------------------------------------------------------------------------
+print("# conf_get: empty file -> defaults")
+rc, out, _ = run_lib('conf_get top_left "" main', "")
+check("empty file empty default", out.strip(), "")
+
+rc, out, _ = run_lib('conf_get sidebar_width 25 main', "\n\n# only comments\n\n")
+check("comments-only file default", out.strip(), "25")
+
+# ----------------------------------------------------------------------------
+# conf_get — basic key/value lookup
+# ----------------------------------------------------------------------------
+print("# conf_get: basic [main] lookup")
+basic_main = textwrap.dedent("""
+    [main]
+    top_left = htop
+    top_right = sidebar
+    sidebar_width = 30
+    claude_percent = 50
+""")
+rc, out, _ = run_lib('conf_get top_left "" main', basic_main)
+check("top_left lookup", out.strip(), "htop")
+
+rc, out, _ = run_lib('conf_get top_right "" main', basic_main)
+check("top_right lookup", out.strip(), "sidebar")
+
+rc, out, _ = run_lib('conf_get sidebar_width 25 main', basic_main)
+check("sidebar_width override", out.strip(), "30")
+
+rc, out, _ = run_lib('conf_get claude_percent 45 main', basic_main)
+check("claude_percent override", out.strip(), "50")
+
+# Missing key falls through to default
+rc, out, _ = run_lib('conf_get nonexistent "fallback" main', basic_main)
+check("missing key falls back", out.strip(), "fallback")
+
+# ----------------------------------------------------------------------------
+# conf_get — whitespace handling
+# ----------------------------------------------------------------------------
+print("# conf_get: whitespace / comment hygiene")
+whitespace_conf = textwrap.dedent("""
+    # leading comment
+    [main]
+       top_left   =    htop --no-batch
+
+    # blank line above
+    top_right=sidebar
+""")
+rc, out, _ = run_lib('conf_get top_left "" main', whitespace_conf)
+check("whitespace around equals", out.strip(), "htop --no-batch")
+
+rc, out, _ = run_lib('conf_get top_right "" main', whitespace_conf)
+check("no spaces around equals", out.strip(), "sidebar")
+
+# ----------------------------------------------------------------------------
+# conf_get — section isolation
+# ----------------------------------------------------------------------------
+print("# conf_get: section isolation")
+multi_section = textwrap.dedent("""
+    [main]
+    top_left = htop
+
+    [windows]
+    monitor = gl
+    top_left = should-not-leak-into-main
+""")
+rc, out, _ = run_lib('conf_get top_left "" main', multi_section)
+check("[main] top_left wins over later [windows] same key", out.strip(), "htop")
+
+rc, out, _ = run_lib('conf_get top_left "" windows', multi_section)
+check("[windows] section read explicitly", out.strip(), "should-not-leak-into-main")
+
+# ----------------------------------------------------------------------------
+# conf_windows — empty
+# ----------------------------------------------------------------------------
+print("# conf_windows: empty / missing file")
+rc, out, _ = run_lib('conf_windows', None)
+check("missing file -> no windows", out.strip(), "")
+
+rc, out, _ = run_lib('conf_windows', "")
+check("empty file -> no windows", out.strip(), "")
+
+main_only = textwrap.dedent("""
+    [main]
+    top_left = htop
+""")
+rc, out, _ = run_lib('conf_windows', main_only)
+check("[main]-only file -> no windows", out.strip(), "")
+
+# ----------------------------------------------------------------------------
+# conf_windows — single and multi-pane
+# ----------------------------------------------------------------------------
+print("# conf_windows: single + multi-pane entries")
+windows_conf = textwrap.dedent("""
+    [main]
+    top_right = sidebar
+
+    [windows]
+    monitor = gl /// sudo htop
+    logs = journalctl -u claude-watch -f
+""")
+rc, out, _ = run_lib('conf_windows', windows_conf)
+# Each line is "name<TAB>cmd", order matches file order
+lines = out.strip().split("\n")
+check("two windows in order", len(lines), 2)
+check("monitor name", lines[0].split("\t")[0], "monitor")
+check("monitor command", lines[0].split("\t")[1], "gl /// sudo htop")
+check("logs name", lines[1].split("\t")[0], "logs")
+check("logs command", lines[1].split("\t")[1], "journalctl -u claude-watch -f")
+
+# ----------------------------------------------------------------------------
+# conf_windows — comments / blanks ignored
+# ----------------------------------------------------------------------------
+print("# conf_windows: comment + blank lines ignored")
+commented = textwrap.dedent("""
+    [windows]
+    # this is a comment
+    monitor = gl
+
+    # blank above
+    logs = journalctl -f
+""")
+rc, out, _ = run_lib('conf_windows', commented)
+lines = [l for l in out.strip().split("\n") if l]
+check("comment+blank skipped", len(lines), 2)
+check("first window monitor", lines[0].split("\t")[0], "monitor")
+check("second window logs", lines[1].split("\t")[0], "logs")
+
+# ----------------------------------------------------------------------------
+# has_split / expected_panes
+# ----------------------------------------------------------------------------
+print("# has_split / expected_panes")
+
+# No top keys -> single pane
+rc, out, _ = run_lib(
+    'TOP_LEFT=""; TOP_RIGHT=""; '
+    'has_split && echo split || echo nosplit; '
+    'expected_panes',
+    None,
+)
+parts = out.strip().split("\n")
+check("no top keys -> nosplit", parts[0], "nosplit")
+check("no top keys -> 1 pane", parts[1], "1")
+
+# Sidebar only
+rc, out, _ = run_lib(
+    'TOP_LEFT=""; TOP_RIGHT="sidebar"; '
+    'has_split && echo split || echo nosplit; '
+    'expected_panes',
+    None,
+)
+parts = out.strip().split("\n")
+check("right only -> split", parts[0], "split")
+check("right only -> 2 panes", parts[1], "2")
+
+# Both top panes
+rc, out, _ = run_lib(
+    'TOP_LEFT="htop"; TOP_RIGHT="sidebar"; '
+    'has_split && echo split || echo nosplit; '
+    'expected_panes',
+    None,
+)
+parts = out.strip().split("\n")
+check("both top -> split", parts[0], "split")
+check("both top -> 3 panes", parts[1], "3")
+
+# Left only
+rc, out, _ = run_lib(
+    'TOP_LEFT="htop"; TOP_RIGHT=""; '
+    'has_split && echo split || echo nosplit; '
+    'expected_panes',
+    None,
+)
+parts = out.strip().split("\n")
+check("left only -> split", parts[0], "split")
+check("left only -> 2 panes", parts[1], "2")
+
+
+# ----------------------------------------------------------------------------
+# Summary
+# ----------------------------------------------------------------------------
+total = PASSES + len(FAILS)
+print()
+if FAILS:
+    print(f"FAILED: {len(FAILS)} of {total}")
+    for f in FAILS:
+        print(f"  - {f}")
+    sys.exit(1)
+print(f"OK: {PASSES}/{total} tests passed")
+sys.exit(0)

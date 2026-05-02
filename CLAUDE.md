@@ -62,34 +62,52 @@ claude-watch monitors Claude Code by capturing its tmux pane. The `dashboard` an
 
 ### `dashboard`
 
-Creates a tmux session called `dashboard` with Claude Code and optional companion panes (system monitor sidebar, extra windows). The layout is configured via `~/.config/dashboard/layout.conf`:
+Creates a tmux session called `dashboard` with Claude Code in window 0 ("main").
+
+**Default layout (no config file): one window, one full-screen pane running
+Claude Code.** Nothing else. Quiet by design — claude-watch only needs the
+pane to exist; everything else is opt-in.
+
+To add companion panes / windows, drop a config file at
+`~/.config/dashboard/layout.conf` (INI). Full schema in
+[docs/dashboard-layout.md](docs/dashboard-layout.md). Quick example:
 
 ```ini
 [main]
-top_left = htop              # command for left pane (optional)
-top_right = sidebar          # command for right pane (optional)
-sidebar_width = 25           # right pane width in columns
-claude_percent = 45          # claude pane height % (when using top/bottom split)
+top_right = sidebar          # add a fixed-width pane to the right of claude
+sidebar_width = 25
+claude_percent = 45          # only used when top_left is also set
 
 [windows]
-monitor = glances /// sudo htop   # window with 2 panes (split by ///)
-logs = journalctl -f              # single-pane window
+monitor = glances /// sudo htop   # extra window, two panes (split by ///)
+logs = journalctl -f              # extra window, single pane
 ```
 
 **Layout modes** (determined by which `[main]` keys are present):
-- No `top_left` or `top_right`: Claude Code only (single full-screen pane)
-- `top_right` only: Side-by-side — Claude Code on the left, sidebar on the right
-- Both `top_left` and `top_right`: Three panes — two on top, Claude Code below
+- *Neither* `top_left` *nor* `top_right`: Claude Code only (single full-screen pane). **This is the default.**
+- *Only* `top_right`: side-by-side — Claude Code left, sidebar right (full height).
+- *Both* `top_left` and `top_right`: three panes — two on top, Claude Code below.
 
 **Usage:**
 ```bash
 dashboard                # create layout or refit+attach if it exists
 dashboard --recreate     # kill and rebuild the session (restarts Claude Code)
+dashboard --no-attach    # build but don't attach (headless / test invocations)
 dashboard --attach       # read-write attach (SSH / phone)
 dashboard --attach --cc  # read-write attach (iTerm2 -CC mode)
 dashboard --read-only    # safe monitoring attach
 dashboard --detach       # headless start for systemd (no layout, just Claude Code)
 ```
+
+**Env overrides** (mostly for tests):
+- `DASHBOARD_SESSION` — tmux session name (default `dashboard`).
+- `DASHBOARD_CONF` — layout config path.
+
+### `dashboard-lib.sh`
+
+Pure-parsing INI helpers (`conf_get`, `conf_windows`, `has_split`,
+`expected_panes`) sourced by `dashboard`. No side effects. Sourced
+directly by `tools/dashboard/tests/dashboard-parser.test` (33 cases).
 
 ### `dashboard-refit`
 

@@ -1,4 +1,4 @@
-.PHONY: test test-verbose test-unit test-e2e test-live test-session-task test-hooks test-agent-msg test-claude-event test-self-clear test-watchers build deploy install install-hooks clean
+.PHONY: test test-verbose test-unit test-e2e test-live test-session-task test-hooks test-agent-msg test-claude-event test-self-clear test-watchers test-dashboard build deploy install install-hooks clean
 
 # Default: run all tests in parallel via nextest (preferred) or cargo test
 test:
@@ -64,6 +64,12 @@ test-self-clear:
 # Run the claude-event-watch fast-path smoke test.
 test-watchers: test-self-clear
 	tools/watchers/tests/test_claude_event_watch.sh
+
+# Run the dashboard parser tests (sources dashboard-lib.sh in a bash
+# subshell and exercises conf_get / conf_windows / has_split / expected_panes
+# against fixtures). 33 cases, ~1s.
+test-dashboard:
+	tools/dashboard/tests/dashboard-parser.test
 
 # Release build
 build:
