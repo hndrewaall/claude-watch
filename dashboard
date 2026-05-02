@@ -3,13 +3,19 @@
 # Recreates the monitoring layout in one shot
 #
 # Usage:
-#   dashboard            — create layout (or refit+attach if exists)
-#   dashboard --detach   — start claude in a bare tmux session (for systemd)
-#   dashboard --recreate — kill and recreate the session
-#   dashboard --fresh    — start Claude without resuming old context
+#   dashboard              — create layout (or refit+attach if exists)
+#   dashboard --detach     — start claude in a bare tmux session (for systemd)
+#   dashboard --recreate   — kill and recreate the session
+#   dashboard --fresh      — start Claude without resuming old context
+#   dashboard --no-attach  — build/refit but don't attach (headless / test)
 #   dashboard --attach     — RW multi-client attach (SSH / phone)
 #   dashboard --attach --cc — RW attach (iTerm2 -CC mode / laptop)
-#   dashboard --read-only — RO attach (safe monitoring)
+#   dashboard --read-only  — RO attach (safe monitoring)
+#
+# Env overrides (mostly for tests):
+#   DASHBOARD_SESSION    — tmux session name (default: dashboard)
+#   DASHBOARD_CONF       — layout config path
+#                          (default: ${XDG_CONFIG_HOME:-$HOME/.config}/dashboard/layout.conf)
 #
 # Claude Code context:
 #   By default, dashboard resumes the most recent conversation context.
@@ -28,70 +34,21 @@
 #   monitor = gl /// sudo htop           # window with 2 panes (split by ///)
 #   logs = journalctl -u claude-watch -f # single-pane window
 
-SESSION="dashboard"
-CONF="${XDG_CONFIG_HOME:-$HOME/.config}/dashboard/layout.conf"
-REFIT="$(dirname "$(readlink -f "$0")")/dashboard-refit"
+SESSION="${DASHBOARD_SESSION:-dashboard}"
+CONF="${DASHBOARD_CONF:-${XDG_CONFIG_HOME:-$HOME/.config}/dashboard/layout.conf}"
+SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
+REFIT="$SCRIPT_DIR/dashboard-refit"
 
-# Parse config file (INI-style, simple key = value)
-conf_get() {
-    local key="$1" default="$2" section="${3:-main}"
-    if [ -f "$CONF" ]; then
-        val=$(awk -v k="$key" -v sect="$section" '
-            /^\[/ { gsub(/[\[\]]/, ""); current = $0; gsub(/^[[:space:]]+|[[:space:]]+$/, "", current); next }
-            /^#/ { next }
-            /^$/ { next }
-            current == sect {
-              idx = index($0, "=")
-              if (idx == 0) next
-              key_part = substr($0, 1, idx - 1)
-              gsub(/^[[:space:]]+|[[:space:]]+$/, "", key_part)
-              if (key_part == k) {
-                  val = substr($0, idx + 1)
-                  gsub(/^[[:space:]]+|[[:space:]]+$/, "", val)
-                  print val
-                  exit
-              }
-            }' "$CONF")
-        [ -n "$val" ] && echo "$val" || echo "$default"
-    else
-        echo "$default"
-    fi
-}
-
-# Parse [windows] section: returns "name<TAB>command" lines
-# Commands can contain /// to split into multiple panes
-conf_windows() {
-    [ -f "$CONF" ] || return
-    awk '
-        /^\[/ { gsub(/[\[\]]/, ""); section = $0; gsub(/^[[:space:]]+|[[:space:]]+$/, "", section); next }
-        /^#/ { next }
-        /^$/ { next }
-        section == "windows" {
-            idx = index($0, "=")
-            if (idx == 0) next
-            key = substr($0, 1, idx - 1)
-            val = substr($0, idx + 1)
-            gsub(/^[[:space:]]+|[[:space:]]+$/, "", key)
-            gsub(/^[[:space:]]+|[[:space:]]+$/, "", val)
-            if (key != "" && val != "") print key "\t" val
-        }
-    ' "$CONF"
-}
+# Parser helpers (conf_get, conf_windows, has_split, expected_panes) live in
+# dashboard-lib.sh so the test harness can source them in isolation.
+# shellcheck source=dashboard-lib.sh
+. "$SCRIPT_DIR/dashboard-lib.sh"
 
 # Read layout config (defaults: claude only, no extra panes)
 TOP_LEFT=$(conf_get top_left "" main)
 TOP_RIGHT=$(conf_get top_right "" main)
 SIDEBAR_W=$(conf_get sidebar_width 25 main)
 CLAUDE_PCT=$(conf_get claude_percent 45 main)
-
-# How many panes in window 0?
-has_split() { [ -n "$TOP_LEFT" ] || [ -n "$TOP_RIGHT" ]; }
-expected_panes() {
-    local n=1  # claude always
-    [ -n "$TOP_LEFT" ] && n=$((n+1))
-    [ -n "$TOP_RIGHT" ] && n=$((n+1))
-    echo "$n"
-}
 
 # --detach (systemd boot): start claude in a bare session, no layout.
 # The full layout gets built on first interactive `dashboard` call.
@@ -152,13 +109,15 @@ if [ "$1" = "--attach" ] || [ "$1" = "--read-only" ]; then
     fi
 fi
 
-# Parse --fresh/--recreate flags for the main (non-detach) path
+# Parse --fresh/--recreate/--no-attach flags for the main (non-detach) path
 CONTINUE=1
 RECREATE=0
+NO_ATTACH=0
 for arg in "$@"; do
     case "$arg" in
         --fresh) CONTINUE=0 ;;
         --recreate) RECREATE=1 ;;
+        --no-attach) NO_ATTACH=1 ;;
     esac
 done
 
@@ -181,6 +140,9 @@ if [ "$PANE_COUNT" -ge "$EXPECTED" ] 2>/dev/null && [ "$RECREATE" != 1 ]; then
         echo "$REFIT_CLAUDE" > /var/run/claude/pane-id
     fi
     [ -f "$REFIT" ] && "$REFIT"
+    if [ "$NO_ATTACH" = 1 ]; then
+        exit 0
+    fi
     if [ -n "$TMUX" ]; then
         tmux switch-client -t "$SESSION"
     else
@@ -278,7 +240,10 @@ fi
 tmux select-window -t "$SESSION:0"
 tmux select-pane -t "$CLAUDE"
 
-# Attach
+# Attach (skip with --no-attach for headless / test invocations)
+if [ "$NO_ATTACH" = 1 ]; then
+    exit 0
+fi
 if [ -n "$TMUX" ]; then
     tmux switch-client -t "$SESSION"
 else
