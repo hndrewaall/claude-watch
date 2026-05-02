@@ -138,6 +138,42 @@ no entry in `exempt_patterns` matches. Use to encode "this gate exists but
 the recovery path must always be allowed even when the predicate is
 failing". Pass `--exempt-tool-pattern <pat>` (repeatable) on `add`.
 
+### Universal recovery exempts (deadlock floor)
+
+Per-obligation `exempt_patterns` is opt-in: an author can forget to list a
+recovery surface, and two such obligations whose exempt sets do not
+overlap form a deadlock-in-waiting. To prevent this structurally, the
+framework applies a fixed list of `UNIVERSAL_RECOVERY_EXEMPT_PATTERNS`
+BEFORE per-obligation evaluation. Tools matching this list are allowed
+past every active obligation regardless of per-row configuration.
+
+The universal recovery surface:
+
+- `Bash:^obligations\b` — the escape hatch itself (override/satisfy/prune/
+  list/show/check/post-tool). MUST always work to break a deadlock.
+- `Bash:^session-task\b` — the dispatcher's queue control surface (queue
+  register/spawn-check/done/abandon/add/promote/heartbeat/show/list/
+  banner/prune/set-summary plus the layer-1 set/clear/get helpers).
+- `Agent` — spawning subagents is the dispatcher's primary recovery
+  action.
+- `Bash:^watcher-(ctl|status|restart)\b` — watcher-health recovery.
+- `Bash:^(pgrep|pkill|ps)\b` — process diagnosis.
+- `Read:tasks/[^"]+\.output` — captured-watcher-output Read (the
+  satisfier for `no_pending_watcher_outputs`).
+- `Bash:^self-clear\b` — controlled context-clear path.
+
+Inform-mode obligations honor the universal exempts too: when the caller
+is on the recovery path, repeating "watcher X is DOWN" is noise. Per-row
+overrides (audited overrides) are still the preferred targeted bypass
+when something OUTSIDE the recovery surface needs to fire while a gate
+is active.
+
+Design rule for any new obligation: the row-level `exempt_patterns` is
+about ROW-SPECIFIC accommodations (e.g. "the SATISFIER for THIS gate is
+Bash:^foo"). The universal recovery floor handles the cross-cutting
+escape hatch + dispatcher + watcher recovery cases. Don't duplicate them
+on every row.
+
 ### Audited overrides
 
 ```
