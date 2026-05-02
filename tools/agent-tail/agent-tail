@@ -1,0 +1,1058 @@
+#!/usr/bin/env python3
+"""agent-tail: stream a Claude Code subagent's JSONL transcript.
+
+Each spawned subagent writes a JSONL transcript at:
+
+    ~/.claude/projects/<project-slug>/<session-uuid>/subagents/agent-<id>.jsonl
+
+This CLI resolves an agent id (or short prefix) to the right path under
+that tree, then either dumps it once or follows it like `tail -f`.
+
+Records are pretty-printed by default:
+  - user message            -> "USER: <text>" (or "USER: [tool_result toolu_...] <preview>")
+  - assistant text          -> "ASSISTANT: <text>"
+  - assistant tool_use      -> "TOOL_CALL <Name>(<one-line-args>)  [toolu_...]"
+  - tool_result             -> "TOOL_RESULT [toolu_...]  <preview>" (truncated)
+  - system / unknown        -> "SYSTEM: <repr>"
+
+`--json` emits the original JSONL lines verbatim (one per line) for
+downstream consumers like queue-minisite SSE.
+
+Resolution order for the agent id argument:
+  1. Exact match on `agent-<arg>.jsonl` somewhere under ~/.claude/projects/.
+  2. Glob match on `agent-<arg>*.jsonl` (lets you type a short prefix).
+  3. If still ambiguous after the projects scan, prefer the most recently
+     modified candidate (working assumption: that's the one you mean).
+
+Resolution can also use `claude-watch active-agents --json` to enumerate
+the active session's agent ids first; we still fall back to the full
+projects walk if that command isn't available or returned nothing.
+
+Usage:
+    agent-tail <agent_id>                         # one-shot dump
+    agent-tail <agent_id> --follow                # stream new appends
+    agent-tail <agent_id> --since 5m              # only events newer than 5m
+    agent-tail <agent_id> --json                  # raw JSONL passthrough
+    agent-tail <agent_id> --truncate-tool-result 10  # cap tool-result preview
+    agent-tail <agent_id> --path                  # print the resolved path
+    agent-tail --list                             # list active agents w/ paths
+    agent-tail --test                             # run embedded test suite
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sys
+import time
+from pathlib import Path
+from typing import Any, Iterator, Optional
+
+# ---------------------------------------------------------------------------
+# Paths / constants
+# ---------------------------------------------------------------------------
+
+PROJECTS_DIR_DEFAULT = Path.home() / ".claude" / "projects"
+
+DURATION_RE = re.compile(r"^\s*(\d+)\s*([smhdw])\s*$")
+DURATION_UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}
+
+DEFAULT_TOOL_RESULT_MAX_LINES = 20
+DEFAULT_TOOL_RESULT_MAX_CHARS = 2000
+
+
+# ---------------------------------------------------------------------------
+# Pure helpers
+# ---------------------------------------------------------------------------
+
+
+def parse_duration(s: str) -> int:
+    """Parse '5m' / '1h' / '1d' / '2w' into seconds. Raises ValueError on bad input."""
+    m = DURATION_RE.match(s)
+    if not m:
+        raise ValueError(f"bad duration: {s!r} (expected like 5m, 1h, 1d, 7d)")
+    return int(m.group(1)) * DURATION_UNITS[m.group(2)]
+
+
+def parse_iso_ts(s: str) -> Optional[float]:
+    """Parse an ISO8601 timestamp into a UNIX epoch float. Returns None on failure."""
+    if not s:
+        return None
+    try:
+        # Python <3.11 doesn't accept trailing Z; normalise.
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        from datetime import datetime
+        return datetime.fromisoformat(s).timestamp()
+    except (ValueError, TypeError):
+        return None
+
+
+def truncate_lines(text: str, max_lines: int, max_chars: int) -> str:
+    """Truncate ``text`` to at most ``max_lines`` lines and ``max_chars`` chars.
+
+    Pure: no I/O. If truncation occurs, append a marker line summarising what
+    was cut. Newline at end is preserved iff it was in the original.
+    """
+    if max_lines <= 0 and max_chars <= 0:
+        return text
+    truncated = False
+    if max_chars > 0 and len(text) > max_chars:
+        text = text[:max_chars]
+        truncated = True
+    lines = text.split("\n")
+    if max_lines > 0 and len(lines) > max_lines:
+        kept = lines[:max_lines]
+        cut = len(lines) - max_lines
+        lines = kept + [f"... [{cut} more line(s) truncated]"]
+        truncated = True
+    elif truncated:
+        lines.append("... [truncated]")
+    return "\n".join(lines)
+
+
+def one_line_args(args: Any, max_chars: int = 200) -> str:
+    """Render a tool-call ``input`` dict as a compact single-line string."""
+    if args is None:
+        return ""
+    try:
+        s = json.dumps(args, separators=(",", ":"), ensure_ascii=False, sort_keys=True)
+    except (TypeError, ValueError):
+        s = repr(args)
+    s = s.replace("\n", "\\n")
+    if max_chars > 0 and len(s) > max_chars:
+        s = s[:max_chars] + "...(+{})".format(len(s) - max_chars)
+    return s
+
+
+# ---------------------------------------------------------------------------
+# Resolution
+# ---------------------------------------------------------------------------
+
+
+def projects_dir() -> Path:
+    """Return the projects dir, honoring CLAUDE_PROJECTS_DIR for tests."""
+    override = os.environ.get("CLAUDE_PROJECTS_DIR")
+    if override:
+        return Path(override)
+    return PROJECTS_DIR_DEFAULT
+
+
+def list_agent_jsonls(root: Optional[Path] = None) -> list[Path]:
+    """Walk ``root``/<project>/<session>/subagents/ and return every agent-*.jsonl.
+
+    Sorted by mtime descending so callers can break ties on "most recent".
+    """
+    base = root if root is not None else projects_dir()
+    out: list[tuple[float, Path]] = []
+    if not base.is_dir():
+        return []
+    for project_entry in base.iterdir():
+        if not project_entry.is_dir():
+            continue
+        for session_entry in project_entry.iterdir():
+            if not session_entry.is_dir():
+                continue
+            subagents = session_entry / "subagents"
+            if not subagents.is_dir():
+                continue
+            try:
+                children = list(subagents.iterdir())
+            except OSError:
+                continue
+            for child in children:
+                if not child.is_file():
+                    continue
+                name = child.name
+                if not name.startswith("agent-") or not name.endswith(".jsonl"):
+                    continue
+                try:
+                    mt = child.stat().st_mtime
+                except OSError:
+                    mt = 0.0
+                out.append((mt, child))
+    out.sort(key=lambda x: x[0], reverse=True)
+    return [p for (_, p) in out]
+
+
+def resolve_agent_id(
+    agent_id: str, root: Optional[Path] = None
+) -> tuple[Optional[Path], list[Path]]:
+    """Resolve ``agent_id`` (full id or short prefix) to a JSONL path.
+
+    Returns (chosen_path, all_candidates). ``chosen_path`` is None when there
+    are no candidates. When several candidates match a prefix, the most
+    recently modified one wins (sorted that way already by ``list_agent_jsonls``).
+
+    Accepts either ``a194312241cc25f9c`` or ``agent-a194312241cc25f9c``.
+    """
+    needle = agent_id.strip()
+    if needle.startswith("agent-"):
+        needle = needle[len("agent-"):]
+    all_jsonls = list_agent_jsonls(root)
+
+    # Phase 1: exact match
+    exact: list[Path] = []
+    target_name = f"agent-{needle}.jsonl"
+    for p in all_jsonls:
+        if p.name == target_name:
+            exact.append(p)
+    if exact:
+        return exact[0], exact
+
+    # Phase 2: prefix match
+    prefix = f"agent-{needle}"
+    pref: list[Path] = [p for p in all_jsonls if p.name.startswith(prefix)]
+    if pref:
+        return pref[0], pref
+
+    return None, []
+
+
+# ---------------------------------------------------------------------------
+# Pretty printing
+# ---------------------------------------------------------------------------
+
+
+class FormatOpts:
+    __slots__ = ("max_lines", "max_chars", "show_ts")
+
+    def __init__(
+        self,
+        max_lines: int = DEFAULT_TOOL_RESULT_MAX_LINES,
+        max_chars: int = DEFAULT_TOOL_RESULT_MAX_CHARS,
+        show_ts: bool = True,
+    ) -> None:
+        self.max_lines = max_lines
+        self.max_chars = max_chars
+        self.show_ts = show_ts
+
+
+def _format_ts(obj: dict[str, Any]) -> str:
+    ts = obj.get("timestamp")
+    if not isinstance(ts, str):
+        return ""
+    # Compact: drop the date if it's today; else keep ISO date+time. We
+    # print whatever the JSONL says; downstream tools can reformat.
+    return ts
+
+
+def _content_to_text(content: Any) -> str:
+    """Flatten an assistant `content` array of {type: text, text: ...} into one string."""
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+    parts: list[str] = []
+    for c in content:
+        if not isinstance(c, dict):
+            continue
+        if c.get("type") == "text":
+            parts.append(str(c.get("text", "")))
+    return "\n".join(parts)
+
+
+def format_record(obj: dict[str, Any], opts: FormatOpts) -> Iterator[str]:
+    """Yield zero or more pretty-printed lines for one JSONL record.
+
+    Pure: no I/O.
+    """
+    rtype = obj.get("type")
+    msg = obj.get("message")
+    msg = msg if isinstance(msg, dict) else {}
+    ts_prefix = ""
+    if opts.show_ts:
+        ts = _format_ts(obj)
+        if ts:
+            ts_prefix = f"[{ts}] "
+
+    if rtype == "user":
+        # User content is either a bare string (the spawn prompt) or a list
+        # of {type: tool_result, ...} blocks (model handing back tool output).
+        content = msg.get("content")
+        if isinstance(content, str):
+            text = truncate_lines(content, opts.max_lines, opts.max_chars)
+            yield f"{ts_prefix}USER: {text}"
+            return
+        if isinstance(content, list):
+            for c in content:
+                if not isinstance(c, dict):
+                    continue
+                if c.get("type") == "tool_result":
+                    tu_id = c.get("tool_use_id", "?")
+                    inner = c.get("content")
+                    is_error = bool(c.get("is_error"))
+                    body = _tool_result_body(inner)
+                    body = truncate_lines(body, opts.max_lines, opts.max_chars)
+                    tag = "TOOL_RESULT" + (" [error]" if is_error else "")
+                    yield f"{ts_prefix}{tag} [{tu_id}]"
+                    for ln in body.split("\n"):
+                        yield f"  {ln}"
+                else:
+                    yield f"{ts_prefix}USER[{c.get('type', '?')}]: {one_line_args(c)}"
+            return
+        # Fallback: dump repr.
+        yield f"{ts_prefix}USER: {one_line_args(msg)}"
+        return
+
+    if rtype == "assistant":
+        content = msg.get("content")
+        if not isinstance(content, list):
+            yield f"{ts_prefix}ASSISTANT: {one_line_args(msg)}"
+            return
+        for c in content:
+            if not isinstance(c, dict):
+                continue
+            ct = c.get("type")
+            if ct == "text":
+                text = str(c.get("text", ""))
+                text = truncate_lines(text, opts.max_lines, opts.max_chars)
+                yield f"{ts_prefix}ASSISTANT: {text}"
+            elif ct == "tool_use":
+                name = c.get("name", "?")
+                tu_id = c.get("id", "?")
+                args = one_line_args(c.get("input"))
+                yield f"{ts_prefix}TOOL_CALL {name}({args})  [{tu_id}]"
+            elif ct == "thinking":
+                text = str(c.get("thinking", ""))
+                text = truncate_lines(text, opts.max_lines, opts.max_chars)
+                yield f"{ts_prefix}THINKING: {text}"
+            else:
+                yield f"{ts_prefix}ASSISTANT[{ct or '?'}]: {one_line_args(c)}"
+        return
+
+    # System events / unknown shapes — dump a one-line repr.
+    yield f"{ts_prefix}{(rtype or 'EVENT').upper()}: {one_line_args(obj)}"
+
+
+def _tool_result_body(inner: Any) -> str:
+    """Tool results can be a bare string or a list of {type: text, text: ...} blocks."""
+    if isinstance(inner, str):
+        return inner
+    if isinstance(inner, list):
+        parts: list[str] = []
+        for sub in inner:
+            if isinstance(sub, dict):
+                if sub.get("type") == "text":
+                    parts.append(str(sub.get("text", "")))
+                else:
+                    parts.append(one_line_args(sub))
+            else:
+                parts.append(str(sub))
+        return "\n".join(parts)
+    return one_line_args(inner)
+
+
+# ---------------------------------------------------------------------------
+# Reading + filtering
+# ---------------------------------------------------------------------------
+
+
+def iter_lines_with_ts(
+    path: Path, since_epoch: Optional[float] = None
+) -> Iterator[tuple[dict[str, Any], str]]:
+    """Stream parsed records from ``path``; tolerate torn lines.
+
+    Yields (parsed_obj, raw_line). When ``since_epoch`` is not None, drops
+    records whose ``timestamp`` parses to an earlier epoch. Records with no
+    parseable timestamp are kept (we'd rather over-include than silently
+    swallow them).
+    """
+    with path.open("r", encoding="utf-8", errors="replace") as f:
+        for raw in f:
+            stripped = raw.strip()
+            if not stripped:
+                continue
+            try:
+                obj = json.loads(stripped)
+            except json.JSONDecodeError:
+                continue
+            if since_epoch is not None:
+                ts_epoch = parse_iso_ts(obj.get("timestamp", "")) if isinstance(obj, dict) else None
+                if ts_epoch is not None and ts_epoch < since_epoch:
+                    continue
+            if not isinstance(obj, dict):
+                continue
+            yield obj, raw.rstrip("\n")
+
+
+def follow_file(
+    path: Path,
+    poll_interval: float = 0.5,
+    stop_after: Optional[float] = None,
+) -> Iterator[tuple[dict[str, Any], str]]:
+    """Generator: yield records as the file grows, like ``tail -f``.
+
+    Handles file truncation/rotation via three signals:
+      - inode change           -> file replaced (atomic write, mv, etc.)
+      - size shrinks           -> in-place truncation we caught on the dip
+      - byte at pos-1 != '\\n'  -> we lost the line boundary (catches the
+                                   "open(w) + immediate rewrite past pos"
+                                   case where size never dipped low enough
+                                   for us to notice)
+
+    Stops after ``stop_after`` seconds of wall-clock time when given (test hook).
+    """
+    start = time.time()
+    pos = 0
+    inode: Optional[int] = None
+    last_seen_size = 0
+    pending = ""
+    while True:
+        try:
+            st = path.stat()
+        except FileNotFoundError:
+            if stop_after is not None and (time.time() - start) >= stop_after:
+                return
+            time.sleep(poll_interval)
+            continue
+        rotated = False
+        if inode is None:
+            inode = st.st_ino
+        elif st.st_ino != inode:
+            rotated = True
+            inode = st.st_ino
+        truncated = st.st_size < pos or st.st_size < last_seen_size
+        if rotated or truncated:
+            pos = 0
+            pending = ""
+        if st.st_size > pos:
+            with path.open("rb") as f:
+                # Sanity-check the line boundary at our resume offset. If
+                # pos > 0 but the previous byte is not '\n', the file was
+                # truncated-and-rewritten beneath us — start over.
+                if pos > 0:
+                    f.seek(pos - 1)
+                    prev = f.read(1)
+                    if prev != b"\n":
+                        pos = 0
+                        pending = ""
+                        f.seek(0)
+                else:
+                    f.seek(0)
+                chunk_b = f.read()
+                pos = f.tell()
+            try:
+                chunk = chunk_b.decode("utf-8")
+            except UnicodeDecodeError:
+                chunk = chunk_b.decode("utf-8", errors="replace")
+            pending += chunk
+            while "\n" in pending:
+                line, pending = pending.split("\n", 1)
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                try:
+                    obj = json.loads(stripped)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(obj, dict):
+                    yield obj, line.rstrip("\r")
+        last_seen_size = st.st_size
+        if stop_after is not None and (time.time() - start) >= stop_after:
+            return
+        time.sleep(poll_interval)
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+
+def cmd_list(args: argparse.Namespace) -> int:
+    paths = list_agent_jsonls()
+    if not paths:
+        print("(no agent transcripts under {})".format(projects_dir()), file=sys.stderr)
+        return 0
+    for p in paths:
+        # mtime as ISO without microseconds for readability
+        try:
+            mt = p.stat().st_mtime
+            from datetime import datetime, timezone
+            mt_iso = datetime.fromtimestamp(mt, tz=timezone.utc).isoformat(timespec="seconds")
+        except OSError:
+            mt_iso = "?"
+        agent_id = p.name[len("agent-"):-len(".jsonl")]
+        print(f"{agent_id}\t{mt_iso}\t{p}")
+    return 0
+
+
+def cmd_tail(args: argparse.Namespace) -> int:
+    chosen, candidates = resolve_agent_id(args.agent_id)
+    if chosen is None:
+        print(
+            f"agent-tail: no transcript found for {args.agent_id!r} under {projects_dir()}",
+            file=sys.stderr,
+        )
+        return 2
+    if len(candidates) > 1 and not args.quiet:
+        print(
+            f"agent-tail: {len(candidates)} candidates matched {args.agent_id!r}; "
+            f"using most recent: {chosen}",
+            file=sys.stderr,
+        )
+
+    if args.path:
+        print(chosen)
+        return 0
+
+    since_epoch: Optional[float] = None
+    if args.since:
+        try:
+            since_epoch = time.time() - parse_duration(args.since)
+        except ValueError as e:
+            print(f"agent-tail: {e}", file=sys.stderr)
+            return 2
+
+    opts = FormatOpts(
+        max_lines=args.truncate_tool_result if args.truncate_tool_result is not None else DEFAULT_TOOL_RESULT_MAX_LINES,
+        max_chars=args.truncate_chars if args.truncate_chars is not None else DEFAULT_TOOL_RESULT_MAX_CHARS,
+        show_ts=not args.no_ts,
+    )
+
+    # Phase 1: dump existing content (filtered by --since).
+    last_size = 0
+    for obj, raw in iter_lines_with_ts(chosen, since_epoch=since_epoch):
+        if args.json:
+            print(raw)
+        else:
+            for ln in format_record(obj, opts):
+                print(ln)
+    try:
+        last_size = chosen.stat().st_size
+    except OSError:
+        last_size = 0
+
+    if not args.follow:
+        return 0
+
+    # Phase 2: follow. Re-implement inline so we can seed pos at the
+    # current EOF (Phase 1 already drained existing content) and route
+    # through the same pretty/JSON formatting.
+    pos = last_size
+    inode: Optional[int] = None
+    last_seen_size = last_size
+    pending = ""
+    poll = args.poll_interval
+    try:
+        while True:
+            try:
+                st = chosen.stat()
+            except FileNotFoundError:
+                time.sleep(poll)
+                continue
+            rotated = False
+            if inode is None:
+                inode = st.st_ino
+            elif st.st_ino != inode:
+                rotated = True
+                inode = st.st_ino
+            truncated = st.st_size < pos or st.st_size < last_seen_size
+            if rotated or truncated:
+                pos = 0
+                pending = ""
+            if st.st_size > pos:
+                with chosen.open("rb") as f:
+                    if pos > 0:
+                        f.seek(pos - 1)
+                        prev = f.read(1)
+                        if prev != b"\n":
+                            pos = 0
+                            pending = ""
+                            f.seek(0)
+                    else:
+                        f.seek(0)
+                    chunk_b = f.read()
+                    pos = f.tell()
+                try:
+                    chunk = chunk_b.decode("utf-8")
+                except UnicodeDecodeError:
+                    chunk = chunk_b.decode("utf-8", errors="replace")
+                pending += chunk
+                while "\n" in pending:
+                    line, pending = pending.split("\n", 1)
+                    stripped = line.strip()
+                    if not stripped:
+                        continue
+                    try:
+                        obj = json.loads(stripped)
+                    except json.JSONDecodeError:
+                        continue
+                    if not isinstance(obj, dict):
+                        continue
+                    if args.json:
+                        print(line.rstrip("\r"), flush=True)
+                    else:
+                        for ln in format_record(obj, opts):
+                            print(ln, flush=True)
+            last_seen_size = st.st_size
+            time.sleep(poll)
+    except KeyboardInterrupt:
+        return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="agent-tail",
+        description=(
+            "Stream a Claude Code subagent's JSONL transcript. Resolves the "
+            "agent id (full or short prefix) to a path under "
+            "~/.claude/projects/<slug>/<session>/subagents/, then dumps or "
+            "follows the file. Default output is pretty-printed; use --json "
+            "for the raw JSONL."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument(
+        "agent_id",
+        nargs="?",
+        help="agent id (or short prefix). Optional when using --list / --test.",
+    )
+    p.add_argument(
+        "-f",
+        "--follow",
+        action="store_true",
+        help="stream new lines as they are appended (tail -f).",
+    )
+    p.add_argument(
+        "--since",
+        metavar="DURATION",
+        help="only show records newer than this (e.g. 5m, 1h, 1d).",
+    )
+    p.add_argument(
+        "--json",
+        action="store_true",
+        help="emit raw JSONL passthrough (one line per record).",
+    )
+    p.add_argument(
+        "--truncate-tool-result",
+        type=int,
+        metavar="LINES",
+        default=None,
+        help=f"cap tool-result preview at LINES lines (default {DEFAULT_TOOL_RESULT_MAX_LINES}; 0 = no cap).",
+    )
+    p.add_argument(
+        "--truncate-chars",
+        type=int,
+        metavar="CHARS",
+        default=None,
+        help=f"cap each rendered text block at CHARS chars (default {DEFAULT_TOOL_RESULT_MAX_CHARS}; 0 = no cap).",
+    )
+    p.add_argument(
+        "--no-ts",
+        action="store_true",
+        help="omit the leading [timestamp] prefix.",
+    )
+    p.add_argument(
+        "--path",
+        action="store_true",
+        help="print the resolved JSONL path and exit.",
+    )
+    p.add_argument(
+        "--poll-interval",
+        type=float,
+        default=0.5,
+        metavar="SECS",
+        help="follow-mode poll interval (default 0.5s).",
+    )
+    p.add_argument(
+        "-q",
+        "--quiet",
+        action="store_true",
+        help="suppress informational stderr (e.g. multi-candidate notices).",
+    )
+    p.add_argument(
+        "--list",
+        action="store_true",
+        help="list every agent transcript under ~/.claude/projects/, newest first.",
+    )
+    p.add_argument(
+        "--test",
+        action="store_true",
+        help="run the embedded test suite and exit.",
+    )
+    return p
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.test:
+        return _run_embedded_tests()
+    if args.list:
+        return cmd_list(args)
+    if not args.agent_id:
+        parser.error("agent_id is required (or use --list / --test)")
+    return cmd_tail(args)
+
+
+# ---------------------------------------------------------------------------
+# Embedded test suite (`agent-tail --test`)
+# ---------------------------------------------------------------------------
+
+
+def _run_embedded_tests() -> int:
+    import unittest
+
+    class TestPureHelpers(unittest.TestCase):
+        def test_parse_duration_basic(self):
+            self.assertEqual(parse_duration("5m"), 300)
+            self.assertEqual(parse_duration("1h"), 3600)
+            self.assertEqual(parse_duration("2d"), 2 * 86400)
+            self.assertEqual(parse_duration("1w"), 604800)
+            self.assertEqual(parse_duration("30s"), 30)
+
+        def test_parse_duration_bad(self):
+            with self.assertRaises(ValueError):
+                parse_duration("foo")
+            with self.assertRaises(ValueError):
+                parse_duration("5x")
+            with self.assertRaises(ValueError):
+                parse_duration("")
+
+        def test_parse_iso_ts_round_trip(self):
+            # 2026-04-30T23:25:42.871Z -> finite epoch
+            self.assertIsInstance(parse_iso_ts("2026-04-30T23:25:42.871Z"), float)
+            # Bad -> None
+            self.assertIsNone(parse_iso_ts("not-a-date"))
+            self.assertIsNone(parse_iso_ts(""))
+            # Plus offset works
+            self.assertIsInstance(parse_iso_ts("2026-04-30T23:25:42+00:00"), float)
+
+        def test_truncate_lines_under_cap(self):
+            t = "a\nb\nc"
+            self.assertEqual(truncate_lines(t, 10, 1000), t)
+
+        def test_truncate_lines_line_cap(self):
+            t = "\n".join(str(i) for i in range(50))
+            out = truncate_lines(t, 5, 0)
+            self.assertEqual(out.split("\n")[:5], ["0", "1", "2", "3", "4"])
+            self.assertIn("more line(s) truncated", out.split("\n")[-1])
+
+        def test_truncate_lines_char_cap(self):
+            t = "a" * 100
+            out = truncate_lines(t, 0, 20)
+            # Char cap kicks in; we keep a marker.
+            self.assertTrue(out.startswith("a" * 20))
+            self.assertIn("truncated", out)
+
+        def test_truncate_lines_zero_caps_passthrough(self):
+            t = "x\ny\nz"
+            self.assertEqual(truncate_lines(t, 0, 0), t)
+
+        def test_one_line_args_basic(self):
+            self.assertEqual(one_line_args({"a": 1}), '{"a":1}')
+            self.assertEqual(one_line_args(None), "")
+            self.assertIn("\\n", one_line_args({"x": "a\nb"}))
+
+        def test_one_line_args_truncates(self):
+            big = {"text": "x" * 5000}
+            out = one_line_args(big, max_chars=50)
+            self.assertLessEqual(len(out), 80)
+            self.assertIn("...(+", out)
+
+    class TestFormatRecord(unittest.TestCase):
+        def setUp(self) -> None:
+            self.opts = FormatOpts(max_lines=10, max_chars=400, show_ts=False)
+
+        def test_user_string_prompt(self):
+            obj = {
+                "type": "user",
+                "message": {"role": "user", "content": "Hello world\nLine 2"},
+                "timestamp": "2026-04-30T23:25:42.871Z",
+            }
+            lines = list(format_record(obj, self.opts))
+            self.assertEqual(len(lines), 1)
+            self.assertTrue(lines[0].startswith("USER: "))
+            self.assertIn("Hello world", lines[0])
+
+        def test_user_tool_result(self):
+            obj = {
+                "type": "user",
+                "message": {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_X",
+                            "content": "1777591546",
+                            "is_error": False,
+                        }
+                    ],
+                },
+            }
+            lines = list(format_record(obj, self.opts))
+            self.assertTrue(any("TOOL_RESULT [toolu_X]" in ln for ln in lines))
+            self.assertTrue(any("1777591546" in ln for ln in lines))
+
+        def test_user_tool_result_error(self):
+            obj = {
+                "type": "user",
+                "message": {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_E",
+                            "content": "boom",
+                            "is_error": True,
+                        }
+                    ],
+                },
+            }
+            lines = list(format_record(obj, self.opts))
+            self.assertTrue(any("TOOL_RESULT [error]" in ln for ln in lines))
+
+        def test_user_tool_result_list_content(self):
+            obj = {
+                "type": "user",
+                "message": {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_L",
+                            "content": [{"type": "text", "text": "hello\nworld"}],
+                        }
+                    ],
+                },
+            }
+            lines = list(format_record(obj, self.opts))
+            joined = "\n".join(lines)
+            self.assertIn("hello", joined)
+            self.assertIn("world", joined)
+
+        def test_assistant_text(self):
+            obj = {
+                "type": "assistant",
+                "message": {
+                    "content": [{"type": "text", "text": "I'll start now."}],
+                },
+            }
+            lines = list(format_record(obj, self.opts))
+            self.assertEqual(len(lines), 1)
+            self.assertTrue(lines[0].startswith("ASSISTANT: "))
+
+        def test_assistant_tool_use(self):
+            obj = {
+                "type": "assistant",
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_A",
+                            "name": "Bash",
+                            "input": {"command": "ls", "description": "list"},
+                        }
+                    ],
+                },
+            }
+            lines = list(format_record(obj, self.opts))
+            self.assertEqual(len(lines), 1)
+            self.assertIn("TOOL_CALL Bash(", lines[0])
+            self.assertIn("toolu_A", lines[0])
+
+        def test_assistant_thinking(self):
+            obj = {
+                "type": "assistant",
+                "message": {
+                    "content": [{"type": "thinking", "thinking": "hmmmm"}],
+                },
+            }
+            lines = list(format_record(obj, self.opts))
+            self.assertTrue(any("THINKING:" in ln for ln in lines))
+
+        def test_unknown_type(self):
+            obj = {"type": "weirdo", "details": "x"}
+            lines = list(format_record(obj, self.opts))
+            self.assertEqual(len(lines), 1)
+            self.assertTrue(lines[0].startswith("WEIRDO:"))
+
+        def test_show_ts_true(self):
+            opts = FormatOpts(show_ts=True)
+            obj = {
+                "type": "user",
+                "message": {"content": "hi"},
+                "timestamp": "2026-04-30T23:25:42.871Z",
+            }
+            lines = list(format_record(obj, opts))
+            self.assertTrue(lines[0].startswith("[2026-04-30T23:25:42.871Z] "))
+
+        def test_truncation_in_assistant_text(self):
+            opts = FormatOpts(max_lines=2, max_chars=0, show_ts=False)
+            obj = {
+                "type": "assistant",
+                "message": {
+                    "content": [{"type": "text", "text": "a\nb\nc\nd\ne"}],
+                },
+            }
+            lines = list(format_record(obj, opts))
+            joined = "\n".join(lines)
+            self.assertIn("more line(s) truncated", joined)
+
+    class TestResolution(unittest.TestCase):
+        """Tests that build a fake projects tree under a tmpdir."""
+
+        def setUp(self) -> None:
+            import tempfile
+            self.tmp = tempfile.mkdtemp(prefix="agent-tail-test-")
+            os.environ["CLAUDE_PROJECTS_DIR"] = self.tmp
+            self.root = Path(self.tmp)
+
+        def tearDown(self) -> None:
+            os.environ.pop("CLAUDE_PROJECTS_DIR", None)
+            import shutil
+            shutil.rmtree(self.tmp, ignore_errors=True)
+
+        def _make_agent(
+            self, project: str, session: str, agent_id: str, mtime: Optional[float] = None
+        ) -> Path:
+            d = self.root / project / session / "subagents"
+            d.mkdir(parents=True, exist_ok=True)
+            f = d / f"agent-{agent_id}.jsonl"
+            f.write_text(
+                json.dumps({"type": "user", "message": {"content": "hi"}}) + "\n",
+                encoding="utf-8",
+            )
+            if mtime is not None:
+                os.utime(f, (mtime, mtime))
+            return f
+
+        def test_no_candidates(self):
+            chosen, cands = resolve_agent_id("nonesuch")
+            self.assertIsNone(chosen)
+            self.assertEqual(cands, [])
+
+        def test_exact_match(self):
+            f = self._make_agent("-proj1", "sess-A", "abcdef1234567890")
+            chosen, cands = resolve_agent_id("abcdef1234567890")
+            self.assertEqual(chosen, f)
+            self.assertEqual(len(cands), 1)
+
+        def test_exact_match_with_prefix_arg(self):
+            f = self._make_agent("-proj1", "sess-A", "abcdef1234567890")
+            chosen, _ = resolve_agent_id("agent-abcdef1234567890")
+            self.assertEqual(chosen, f)
+
+        def test_prefix_match_picks_newest(self):
+            old = self._make_agent("-proj1", "sess-A", "ab12cd34", mtime=1000.0)
+            new = self._make_agent("-proj2", "sess-B", "ab12cd99", mtime=9999999999.0)
+            chosen, cands = resolve_agent_id("ab12")
+            self.assertEqual(chosen, new)
+            self.assertEqual(set(cands), {old, new})
+
+        def test_list_agent_jsonls_returns_newest_first(self):
+            self._make_agent("-p", "s1", "aaa", mtime=1000.0)
+            mid = self._make_agent("-p", "s2", "bbb", mtime=5000.0)
+            new = self._make_agent("-p", "s3", "ccc", mtime=9000.0)
+            paths = list_agent_jsonls()
+            self.assertEqual(paths[0], new)
+            self.assertEqual(paths[1], mid)
+
+        def test_iter_lines_with_ts_filter(self):
+            # Build a transcript with two records, one old + one new.
+            d = self.root / "-p" / "s" / "subagents"
+            d.mkdir(parents=True)
+            f = d / "agent-x.jsonl"
+            with f.open("w") as fh:
+                fh.write(json.dumps({
+                    "type": "user",
+                    "message": {"content": "old"},
+                    "timestamp": "2020-01-01T00:00:00Z",
+                }) + "\n")
+                fh.write(json.dumps({
+                    "type": "user",
+                    "message": {"content": "new"},
+                    "timestamp": "2099-01-01T00:00:00Z",
+                }) + "\n")
+            # since = "now"
+            since = time.time()
+            kept = list(iter_lines_with_ts(f, since_epoch=since))
+            self.assertEqual(len(kept), 1)
+            self.assertEqual(kept[0][0]["message"]["content"], "new")
+
+        def test_iter_lines_torn_line_tolerated(self):
+            d = self.root / "-p" / "s" / "subagents"
+            d.mkdir(parents=True)
+            f = d / "agent-x.jsonl"
+            with f.open("w") as fh:
+                fh.write('{"type":"user","message":{"content":"a"}}\n')
+                fh.write("garbage not json\n")
+                fh.write('{"type":"user","message":{"content":"b"}}\n')
+            kept = list(iter_lines_with_ts(f))
+            self.assertEqual(len(kept), 2)
+
+    class TestFollow(unittest.TestCase):
+        def setUp(self) -> None:
+            import tempfile
+            self.tmp = tempfile.mkdtemp(prefix="agent-tail-follow-")
+            self.path = Path(self.tmp) / "agent-x.jsonl"
+            self.path.write_text("", encoding="utf-8")
+
+        def tearDown(self) -> None:
+            import shutil
+            shutil.rmtree(self.tmp, ignore_errors=True)
+
+        def test_follow_picks_up_new_lines(self):
+            import threading
+            collected: list[dict] = []
+
+            def writer():
+                time.sleep(0.05)
+                with self.path.open("a") as f:
+                    f.write(json.dumps({"type": "user", "message": {"content": "x"}}) + "\n")
+                    f.flush()
+                time.sleep(0.05)
+                with self.path.open("a") as f:
+                    f.write(json.dumps({"type": "assistant", "message": {"content": [{"type": "text", "text": "ok"}]}}) + "\n")
+                    f.flush()
+
+            t = threading.Thread(target=writer)
+            t.start()
+            try:
+                for obj, _raw in follow_file(self.path, poll_interval=0.05, stop_after=0.5):
+                    collected.append(obj)
+                    if len(collected) >= 2:
+                        break
+            finally:
+                t.join()
+            self.assertGreaterEqual(len(collected), 2)
+            self.assertEqual(collected[0]["message"]["content"], "x")
+
+        def test_follow_handles_truncation(self):
+            # Pre-fill, then truncate while follow is reading.
+            with self.path.open("w") as f:
+                f.write(json.dumps({"type": "user", "message": {"content": "first"}}) + "\n")
+            import threading
+            collected: list[dict] = []
+
+            def truncator():
+                time.sleep(0.1)
+                # Truncate to empty, then write a new line.
+                with self.path.open("w") as f:
+                    f.write(json.dumps({"type": "user", "message": {"content": "after-trunc"}}) + "\n")
+
+            t = threading.Thread(target=truncator)
+            t.start()
+            try:
+                for obj, _raw in follow_file(self.path, poll_interval=0.05, stop_after=0.6):
+                    collected.append(obj)
+                    if any(c.get("message", {}).get("content") == "after-trunc" for c in collected):
+                        break
+            finally:
+                t.join()
+            self.assertTrue(any(c.get("message", {}).get("content") == "after-trunc" for c in collected))
+
+    # Build & run.
+    loader = unittest.TestLoader()
+    suite = unittest.TestSuite()
+    for cls in (TestPureHelpers, TestFormatRecord, TestResolution, TestFollow):
+        suite.addTests(loader.loadTestsFromTestCase(cls))
+    runner = unittest.TextTestRunner(verbosity=2)
+    result = runner.run(suite)
+    return 0 if result.wasSuccessful() else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
