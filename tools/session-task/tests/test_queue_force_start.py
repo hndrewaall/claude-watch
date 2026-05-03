@@ -774,6 +774,167 @@ def test_force_start_repo_snapshot_captured_in_bundle():
 
 
 # ---------------------------------------------------------------------------
+# 10. End-to-end: force-start + Agent spawn via hook clears the obligation
+# ---------------------------------------------------------------------------
+
+
+def test_force_start_then_hook_clears_obligation():
+    """Regression: the bug where dispatched subagents got blocked by their
+    own force-start obligation because claude-watch's once-a-minute
+    active-agents poller hadn't refreshed yet.
+
+    Flow:
+      1. Force-start a blocked-pending queue item -- registers a
+         `force_started_unspawned` obligation that DENIES `*`.
+      2. Confirm a Bash tool call is denied by the obligations gate
+         (pre-tool-obligations-gate-hook).
+      3. Run the pre-agent-queue-gate-hook with a valid `Queue item: q-X`
+         marker -- it writes a pending-spawn record at the configured
+         path.
+      4. Re-run the Bash tool call against the obligations gate -- the
+         predicate now sees the fresh pending-spawn entry and ALLOWS,
+         even though active-agents.json hasn't been refreshed yet.
+
+    This covers the q-X dispatch race that previously required manual
+    `obligations override --duration` workarounds.
+    """
+    repo_root = Path(__file__).resolve().parent.parent.parent.parent
+    pre_agent_hook = repo_root / "tools" / "hooks" / "pre-agent-queue-gate-hook"
+    pre_obligations_hook = (
+        repo_root / "tools" / "hooks" / "pre-tool-obligations-gate-hook"
+    )
+    obligations_cli = repo_root / "tools" / "obligations" / "obligations"
+    assert pre_agent_hook.exists(), pre_agent_hook
+    assert pre_obligations_hook.exists(), pre_obligations_hook
+    assert obligations_cli.exists(), obligations_cli
+
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _env_for_tmp(tmp)
+        # Direct the pending-spawns sidecar into the temp HOME so the
+        # test can both write it (via the agent hook) and read it (via
+        # the predicate).
+        pending_path = Path(tmp) / ".config" / "claude" / "pending-spawns.json"
+        env["CLAUDE_PENDING_SPAWNS_PATH"] = str(pending_path)
+        # Make sure the hook subprocesses see HOME-isolated session-task
+        # state (queue.json + obligations.json live under HOME/.config).
+        # The hook also needs `session-task` on PATH; we already have it
+        # via the parent env but it doesn't hurt to also point at the
+        # repo copy via SESSION_TASK_PATH if the hook honours it. The
+        # current hook shells `session-task` directly, so we rely on
+        # whatever the test runner has on PATH (the repo's
+        # tools/session-task/session-task is symlinked into ~/bin).
+
+        # 1. Force-start a blocked-pending item.
+        r1 = _add(env, "blocker", ["scope:e2e"])
+        d1 = json.loads(r1.stdout)
+        _register(env, d1["id"], "--json")
+        r2 = _add(env, "blocked", ["scope:e2e"], "--force-enqueue")
+        d2 = json.loads(r2.stdout)
+        target_qid = d2["id"]
+
+        rs = _run(
+            env, "queue", "force-start", target_qid,
+            "--reason", "e2e-clear-test", "--json",
+        )
+        assert rs.returncode == 0, rs.stderr
+
+        # The obligation should have been registered.
+        ob_path = Path(tmp) / ".config" / "claude" / "obligations.json"
+        assert ob_path.exists(), "obligation row must be written"
+
+        # 2. Run the pre-tool-obligations-gate-hook for a Bash call --
+        # expect DENY because no agent has been observed yet and there's
+        # no pending-spawn record.
+        bash_payload = {
+            "tool_name": "Bash",
+            "tool_input": {"command": "ls"},
+        }
+        proc = subprocess.run(
+            [sys.executable, str(pre_obligations_hook)],
+            input=json.dumps(bash_payload),
+            capture_output=True, text=True, env=env, timeout=10,
+        )
+        assert proc.returncode == 0, proc.stderr
+        try:
+            decision = json.loads(proc.stdout) if proc.stdout.strip() else {}
+        except json.JSONDecodeError:
+            decision = {}
+        hso = decision.get("hookSpecificOutput", {}) or {}
+        assert hso.get("permissionDecision") == "deny", (
+            f"expected DENY pre-spawn, got: {decision}"
+        )
+        assert target_qid in (
+            hso.get("permissionDecisionReason", "")
+            + decision.get("systemMessage", "")
+        ), "deny banner should name the queue id"
+
+        # 3. Run the pre-agent-queue-gate-hook to simulate an Agent
+        # spawn for the target queue id. This writes the pending-spawn
+        # record.
+        agent_payload = {
+            "tool_name": "Agent",
+            "tool_input": {
+                "subagent_type": "general-purpose",
+                "prompt": (
+                    f"Investigate the thing.\n\nQueue item: {target_qid}\n"
+                ),
+            },
+        }
+        proc = subprocess.run(
+            [sys.executable, str(pre_agent_hook)],
+            input=json.dumps(agent_payload),
+            capture_output=True, text=True, env=env, timeout=10,
+        )
+        assert proc.returncode == 0, proc.stderr
+        try:
+            agent_decision = (
+                json.loads(proc.stdout) if proc.stdout.strip() else {}
+            )
+        except json.JSONDecodeError:
+            agent_decision = {}
+        # Agent spawn must be allowed (no decision override).
+        assert agent_decision.get("hookSpecificOutput", {}).get(
+            "permissionDecision"
+        ) != "deny", f"Agent spawn was blocked: {agent_decision}"
+
+        # Sidecar file should now hold a pending-spawn record for the qid.
+        assert pending_path.exists(), (
+            f"pending-spawns sidecar not written at {pending_path}"
+        )
+        sidecar = json.loads(pending_path.read_text())
+        pending_entries = sidecar.get("pending", []) if isinstance(
+            sidecar, dict
+        ) else []
+        matching = [
+            e for e in pending_entries if e.get("queue_id") == target_qid
+        ]
+        assert matching, (
+            f"expected a pending-spawn entry for {target_qid!r}, got: {sidecar}"
+        )
+
+        # 4. Re-run the obligations gate hook for a Bash call -- now
+        # expect ALLOW because the predicate sees the fresh pending-spawn
+        # record.
+        proc = subprocess.run(
+            [sys.executable, str(pre_obligations_hook)],
+            input=json.dumps(bash_payload),
+            capture_output=True, text=True, env=env, timeout=10,
+        )
+        assert proc.returncode == 0, proc.stderr
+        try:
+            decision_after = (
+                json.loads(proc.stdout) if proc.stdout.strip() else {}
+            )
+        except json.JSONDecodeError:
+            decision_after = {}
+        hso_after = decision_after.get("hookSpecificOutput", {}) or {}
+        assert hso_after.get("permissionDecision") != "deny", (
+            f"expected ALLOW after pending-spawn record was written, got: "
+            f"{decision_after}"
+        )
+
+
+# ---------------------------------------------------------------------------
 # Entry point for direct invocation
 # ---------------------------------------------------------------------------
 
@@ -798,6 +959,7 @@ def _all_tests():
         test_force_start_audit_log_records_autostopped_peers,
         test_force_start_obligation_message_includes_bundle_path,
         test_force_start_repo_snapshot_captured_in_bundle,
+        test_force_start_then_hook_clears_obligation,
     ]
 
 
