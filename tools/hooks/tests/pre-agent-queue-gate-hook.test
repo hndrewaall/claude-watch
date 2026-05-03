@@ -11,6 +11,9 @@ Also verifies:
   - Non-Agent tool payloads pass through (allow)
   - QUEUE_GATE_BYPASS=1 skips enforcement
   - Malformed JSON on stdin defaults open
+  - Allowed Agent spawn writes a pending-spawn record (closes the
+    cron-cadence race with the `force_started_unspawned` predicate).
+  - Denied Agent spawn does NOT write a pending-spawn record.
 
 Uses the real session-task queue tool. We create test queue items with
 disjoint scopes (repo:queue-gate-hook-test) to avoid colliding with the
@@ -25,6 +28,8 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
+import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -273,6 +278,122 @@ def main() -> int:
         all(s in banner for s in ("BLOCKED", "Queue item: q-XXXX", "queue add", "queue register", "QUEUE_GATE_BYPASS")),
         f"banner={banner!r}",
     ))
+
+    print("=== Pending-spawn sidecar tests ===")
+
+    # 9. Allowed Agent spawn writes a pending-spawn record at the
+    # configured path. This closes the cron-cadence race with the
+    # `force_started_unspawned` obligations predicate -- the predicate
+    # accepts a fresh pending-spawn entry as proof of dispatch.
+    with tempfile.TemporaryDirectory(prefix="pending-spawns-test-") as td:
+        pending_path = Path(td) / "pending-spawns.json"
+        payload = {
+            "tool_name": "Agent",
+            "tool_input": {
+                "prompt": f"Do the thing.\n\nQueue item: {running_id}\n",
+            },
+        }
+        rc, out, _err = _run_hook(
+            payload,
+            extra_env={"CLAUDE_PENDING_SPAWNS_PATH": str(pending_path)},
+        )
+        ok = rc == 0 and _is_allow(out) and pending_path.exists()
+        entry_ok = False
+        if ok:
+            try:
+                data = json.loads(pending_path.read_text())
+                pending = data.get("pending", []) if isinstance(data, dict) else []
+                for e in pending:
+                    if (e.get("queue_id") == running_id
+                            and isinstance(e.get("registered_at"), int)
+                            and abs(int(time.time()) - e["registered_at"]) < 5):
+                        entry_ok = True
+                        break
+            except (json.JSONDecodeError, OSError, ValueError, TypeError):
+                entry_ok = False
+        results.append(_check(
+            "9. allowed spawn writes fresh pending-spawn record",
+            ok and entry_ok,
+            f"rc={rc} allow={_is_allow(out)} exists={pending_path.exists()} entry_ok={entry_ok}",
+        ))
+
+    # 10. Denied Agent spawn (no marker) must NOT write a pending-spawn
+    # record. The hook records a dispatch only after queue-discipline
+    # has cleared.
+    with tempfile.TemporaryDirectory(prefix="pending-spawns-test-") as td:
+        pending_path = Path(td) / "pending-spawns.json"
+        payload = {
+            "tool_name": "Agent",
+            "tool_input": {"prompt": "no marker here at all"},
+        }
+        rc, out, _err = _run_hook(
+            payload,
+            extra_env={"CLAUDE_PENDING_SPAWNS_PATH": str(pending_path)},
+        )
+        results.append(_check(
+            "10. denied spawn writes no pending-spawn record",
+            rc == 0 and _is_deny(out) and not pending_path.exists(),
+            f"rc={rc} deny={_is_deny(out)} exists={pending_path.exists()}",
+        ))
+
+    # 11. Re-spawning the same queue id REPLACES the prior entry (does
+    # not duplicate). The hook's prune+upsert logic is idempotent.
+    with tempfile.TemporaryDirectory(prefix="pending-spawns-test-") as td:
+        pending_path = Path(td) / "pending-spawns.json"
+        payload = {
+            "tool_name": "Agent",
+            "tool_input": {
+                "prompt": f"first spawn.\n\nQueue item: {running_id}\n",
+            },
+        }
+        env = {"CLAUDE_PENDING_SPAWNS_PATH": str(pending_path)}
+        _run_hook(payload, extra_env=env)
+        # Second invocation with the same qid.
+        _run_hook(payload, extra_env=env)
+        try:
+            data = json.loads(pending_path.read_text())
+            pending = data.get("pending", []) if isinstance(data, dict) else []
+            same_qid = [e for e in pending if e.get("queue_id") == running_id]
+            results.append(_check(
+                "11. re-spawn replaces (not appends) per queue_id",
+                len(same_qid) == 1,
+                f"same_qid={same_qid!r}",
+            ))
+        except (json.JSONDecodeError, OSError, ValueError, TypeError) as exc:
+            results.append(_check(
+                "11. re-spawn replaces (not appends) per queue_id",
+                False,
+                f"failed to read: {exc}",
+            ))
+
+    # 12. Allow with a writable but pre-corrupted pending-spawns.json:
+    # the hook treats it as "start fresh" -- it must overwrite the
+    # corrupt content with a valid file containing the new entry, NOT
+    # crash and NOT block the spawn.
+    with tempfile.TemporaryDirectory(prefix="pending-spawns-test-") as td:
+        pending_path = Path(td) / "pending-spawns.json"
+        pending_path.write_text("not json {{{")
+        payload = {
+            "tool_name": "Agent",
+            "tool_input": {
+                "prompt": f"first spawn.\n\nQueue item: {running_id}\n",
+            },
+        }
+        rc, out, _err = _run_hook(
+            payload,
+            extra_env={"CLAUDE_PENDING_SPAWNS_PATH": str(pending_path)},
+        )
+        try:
+            data = json.loads(pending_path.read_text())
+            pending = data.get("pending", []) if isinstance(data, dict) else []
+            recovered = any(e.get("queue_id") == running_id for e in pending)
+        except (json.JSONDecodeError, OSError, ValueError, TypeError):
+            recovered = False
+        results.append(_check(
+            "12. allow with corrupt pending file recovers + writes entry",
+            rc == 0 and _is_allow(out) and recovered,
+            f"rc={rc} allow={_is_allow(out)} recovered={recovered}",
+        ))
 
     total = len(results)
     passed = sum(1 for r in results if r)
