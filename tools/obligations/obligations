@@ -325,6 +325,24 @@ VALID_PREDICATE_KINDS = {
     "all_of",
 }
 
+# Predicates that are ALWAYS treated as mandatory regardless of the
+# explicit ``--mandatory`` flag passed at registration. A mandatory
+# obligation cannot be bypassed by ``obligations override`` -- the
+# operator must dispatch / abandon the underlying work (or use
+# ``obligations satisfy`` with the row id) instead.
+#
+# Rationale (Andrew DM 2026-05-03 05:16 ET): event-queueing
+# obligations exist to force the main loop to dispatch a ready+pending
+# queue item that has gone stale. An override defeats the purpose --
+# the row pile-up was caused by repeatedly overriding instead of
+# dispatching. Marking the predicate auto-mandatory makes the gate
+# structurally non-bypassable.
+#
+# New event-queueing predicates land here as we identify them.
+AUTO_MANDATORY_PREDICATE_KINDS = {
+    "stale_ready_queue_present",
+}
+
 # Default location of the session-task queue file. Override via the
 # ``queue_path`` predicate param (mostly for tests).
 DEFAULT_QUEUE_PATH = Path.home() / ".config" / "session" / "queue.json"
@@ -564,6 +582,68 @@ def _active_override(data, now=None):
         if exp > now:
             return ov
     return None
+
+
+def _predicate_kinds_in_tree(pred):
+    """Return the set of predicate ``kind`` strings present anywhere in
+    a predicate tree (including nested ``all_of`` children).
+
+    Used to detect AUTO_MANDATORY_PREDICATE_KINDS membership for
+    composed predicates: cron-queue-check registers ``all_of
+    [is_main_loop, stale_ready_queue_present]``, and the
+    ``stale_ready_queue_present`` leaf must still trigger the
+    auto-mandatory path even though the row's top-level kind is
+    ``all_of``.
+    """
+    if not isinstance(pred, dict):
+        return set()
+    kind = pred.get("kind")
+    out = set()
+    if isinstance(kind, str) and kind:
+        out.add(kind)
+    if kind == "all_of":
+        params = pred.get("params") or {}
+        children = params.get("predicates") if isinstance(params, dict) else None
+        if isinstance(children, list):
+            for child in children:
+                out |= _predicate_kinds_in_tree(child)
+    return out
+
+
+def _is_obligation_mandatory(ob):
+    """Return True if the obligation row is mandatory (override-refusing).
+
+    An obligation is mandatory when EITHER:
+      - it carries ``mandatory: true`` (set via ``--mandatory`` at add
+        time), OR
+      - any predicate kind in its tree (recursive walk through
+        ``all_of`` children) is a member of
+        ``AUTO_MANDATORY_PREDICATE_KINDS``.
+    """
+    if not isinstance(ob, dict):
+        return False
+    if ob.get("mandatory") is True:
+        return True
+    pred = ob.get("predicate") or {}
+    kinds = _predicate_kinds_in_tree(pred)
+    return bool(kinds & AUTO_MANDATORY_PREDICATE_KINDS)
+
+
+def _active_mandatory_obligations(data, now=None):
+    """Return the list of non-expired mandatory obligations.
+
+    Used by ``cmd_override`` to refuse the override when any active row
+    is mandatory. Expired rows are skipped (they would not gate anyway).
+    """
+    if now is None:
+        now = _now()
+    out = []
+    for ob in data.get("obligations", []) or []:
+        if _is_expired(ob, now):
+            continue
+        if _is_obligation_mandatory(ob):
+            out.append(ob)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -1409,6 +1489,17 @@ def cmd_add(args):
     # leaves None when the flag was never passed.
     exempt_patterns = list(args.exempt_tool_pattern or [])
 
+    # Mandatory flag: explicit --mandatory OR auto-mandatory because a
+    # predicate kind in the tree is in AUTO_MANDATORY_PREDICATE_KINDS.
+    # We persist the EFFECTIVE flag (auto OR explicit) so downstream
+    # introspection (`obligations list`, `show`) reflects what the
+    # gate / override layer actually sees.
+    pred_for_check = {"kind": args.predicate, "params": params}
+    auto_mandatory = bool(
+        _predicate_kinds_in_tree(pred_for_check) & AUTO_MANDATORY_PREDICATE_KINDS
+    )
+    mandatory = bool(getattr(args, "mandatory", False)) or auto_mandatory
+
     fh, data = _open_locked()
     try:
         _prune_expired(data, now)
@@ -1429,6 +1520,7 @@ def cmd_add(args):
             "created_by": args.created_by,
             "satisfied_by": satisfied_by,
             "deny_message": args.deny_msg,
+            "mandatory": mandatory,
         }
         data["obligations"].append(ob)
         _write_unlock(fh, data)
@@ -1448,6 +1540,10 @@ def cmd_add(args):
         print(f"  ttl:             {ttl}s ({'non-expiring' if ttl == 0 else f'expires at {expires_at}'})")
         if satisfied_by:
             print(f"  satisfied_by:    {satisfied_by}")
+        if mandatory:
+            origin = "auto" if auto_mandatory else "explicit"
+            print(f"  mandatory:       True ({origin}; "
+                  f"`obligations override` will refuse to bypass)")
     return 0
 
 
@@ -1491,7 +1587,8 @@ def cmd_list(args):
             f"expires in {int(exp - now)}s" if exp > now else "EXPIRED"
         )
         enforcement = ob.get("enforcement", "gate")
-        print(f"  {ob.get('id')} [{when}] enforcement={enforcement}")
+        mandatory_tag = " MANDATORY" if _is_obligation_mandatory(ob) else ""
+        print(f"  {ob.get('id')} [{when}] enforcement={enforcement}{mandatory_tag}")
         print(f"    tool_pattern: {ob.get('tool_pattern')}")
         if ob.get("exempt_patterns"):
             print(f"    exempt_patterns: {ob['exempt_patterns']}")
@@ -1590,6 +1687,33 @@ def cmd_override(args):
     fh, data = _open_locked()
     try:
         _prune_expired(data, now)
+
+        # Mandatory-obligation refusal: if ANY active obligation is
+        # mandatory (explicit --mandatory at add time OR predicate kind
+        # in AUTO_MANDATORY_PREDICATE_KINDS), refuse to register the
+        # override. The operator must dispatch / abandon the underlying
+        # work (or `obligations satisfy <id>` with proof) instead.
+        # Exit 4 distinguishes this from generic CLI errors (exit 2).
+        mandatory_rows = _active_mandatory_obligations(data, now)
+        if mandatory_rows:
+            _write_unlock(fh, data)
+            ids = ", ".join(ob.get("id", "?") for ob in mandatory_rows)
+            kinds = sorted({
+                k for ob in mandatory_rows
+                for k in _predicate_kinds_in_tree(ob.get("predicate") or {})
+            })
+            print(
+                "ERROR: refusing to register override -- "
+                f"{len(mandatory_rows)} active MANDATORY obligation(s) cannot "
+                f"be bypassed: {ids} (predicate kinds: {', '.join(kinds)}). "
+                "Dispatch or abandon the underlying work instead "
+                "(`session-task queue done|abandon <id>`), or run "
+                "`obligations satisfy <ob-id>` if the obligation is genuinely "
+                "resolved.",
+                file=sys.stderr,
+            )
+            return 4
+
         ov_id = _new_override_id()
         existing = {ov.get("id") for ov in data.get("overrides", [])}
         while ov_id in existing:
@@ -2016,6 +2140,18 @@ def build_parser():
                        help="command regex for auto-satisfy")
     p_add.add_argument("--created-by", default="manual",
                        help="audit string (e.g. 'main-loop', 'andrew')")
+    p_add.add_argument("--mandatory", action="store_true",
+                       help="mark this obligation as MANDATORY: "
+                            "`obligations override` will REFUSE (exit 4) "
+                            "to register a bypass while this row is active. "
+                            "Use for event-queueing / dispatch obligations "
+                            "where a bypass would defeat the purpose -- the "
+                            "operator must dispatch / abandon the underlying "
+                            "work (or `obligations satisfy <id>`) instead. "
+                            "Some predicates (currently "
+                            "`stale_ready_queue_present`, including when "
+                            "nested under `all_of`) are AUTO-mandatory and "
+                            "ignore this flag.")
     p_add.add_argument("--json", action="store_true", help="emit JSON")
     p_add.set_defaults(func=cmd_add)
 
