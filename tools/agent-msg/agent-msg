@@ -77,7 +77,23 @@ Subcommand surface:
   agent-msg inbox <id>             — read inbox; default UNREAD only (--all shows read too)
   agent-msg ack <id>               — flip every UNREAD message to read=true (keeps body)
   agent-msg gc <id>                — drop read messages older than the TTL
+  agent-msg gc-dead                — satisfy inbox obligations for agents no longer alive
   agent-msg --test                 — run embedded test suite
+
+Auto-disarm note (2026-05-03):
+    Claude Code's PostToolUse hook for the Agent tool fires only on the
+    synchronous-launch reply (status="async_launched"), never on actual
+    subagent termination. Subagents in this codebase are async-launched,
+    so the disarm path of post-tool-agent-arm-hook never runs and inbox
+    obligations leak until the 4h TTL expires. q-0162 (PR #82) made the
+    leaks harmless via agent_id scoping on the agent_inbox_empty leaf,
+    but the rows still bloat the obligations DB. `agent-msg gc-dead`
+    sweeps them: it cross-references each inbox obligation's owning
+    agent_id against `claude-watch active-agents --json` and satisfies
+    obligations whose owner is no longer alive. It also fires
+    opportunistically (rate-limited) at the top of every CLI invocation
+    via _maybe_implicit_gc_dead so the cleanup happens organically; an
+    explicit cron is optional.
 
 The inbox path is overridable via --inbox-dir for testing; the default
 location is ~/.config/claude/agent-inbox/.
@@ -97,6 +113,7 @@ import re
 import secrets
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -439,6 +456,11 @@ def _maybe_implicit_gc(args=None) -> None:
     Runs at the top of every CLI invocation so an agent that's been
     quiet for a while still trims its own inbox. Errors are swallowed
     -- GC must never block a send/ack/inbox call.
+
+    Also opportunistically calls ``_maybe_implicit_gc_dead`` to sweep
+    obligation rows belonging to no-longer-alive subagents (rate-limited
+    via a debounce file so the claude-watch shell-out doesn't fire on
+    every CLI call).
     """
     try:
         d = _inbox_dir(args)
@@ -452,7 +474,241 @@ def _maybe_implicit_gc(args=None) -> None:
             except Exception:
                 continue
     except Exception:
+        pass
+    # Rate-limited dead-agent sweep. Errors swallowed.
+    try:
+        _maybe_implicit_gc_dead(args)
+    except Exception:
         return
+
+
+# Debounce / rate-limit for the dead-agent obligation sweep. The sweep
+# shells out to claude-watch (not free), so we cap it to once per
+# AGENT_MSG_GC_DEAD_INTERVAL_SECS (default 300s = 5 min). Override via
+# env var for tests / tighter cadence. Set to <= 0 to disable the
+# implicit sweep entirely (explicit `agent-msg gc-dead` still works).
+DEFAULT_GC_DEAD_INTERVAL_SECS = 300
+
+# Inbox-dir-relative debounce stamp file. Living in the inbox dir keeps
+# it isolated when tests override AGENT_MSG_INBOX_DIR.
+GC_DEAD_STAMP_FILENAME = ".gc-dead.stamp"
+
+
+def _gc_dead_interval_secs() -> int:
+    raw = os.environ.get("AGENT_MSG_GC_DEAD_INTERVAL_SECS", "").strip()
+    if not raw:
+        return DEFAULT_GC_DEAD_INTERVAL_SECS
+    try:
+        return int(float(raw))
+    except ValueError:
+        return DEFAULT_GC_DEAD_INTERVAL_SECS
+
+
+def _maybe_implicit_gc_dead(args=None) -> None:
+    """If enough time has passed since the last sweep, run gc-dead."""
+    interval = _gc_dead_interval_secs()
+    if interval <= 0:
+        return
+    try:
+        d = _inbox_dir(args)
+        d.mkdir(parents=True, exist_ok=True)
+        stamp = d / GC_DEAD_STAMP_FILENAME
+        now = time.time()
+        try:
+            last = stamp.stat().st_mtime
+        except FileNotFoundError:
+            last = 0.0
+        if (now - last) < interval:
+            return
+        # Touch first so a long sweep doesn't pile up parallel callers.
+        stamp.touch()
+        try:
+            os.utime(stamp, (now, now))
+        except OSError:
+            pass
+        _gc_dead_obligations(dry_run=False, args=args)
+    except Exception:
+        return
+
+
+# ----------------------------------------------------------------------
+# Dead-agent obligation sweeper
+# ----------------------------------------------------------------------
+
+
+def _claude_watch_cli() -> str | None:
+    """Resolve claude-watch CLI path. Tests override via env var."""
+    override = os.environ.get("AGENT_MSG_CLAUDE_WATCH_CLI", "").strip()
+    if override:
+        return override if os.path.exists(override) else None
+    import shutil
+    found = shutil.which("claude-watch")
+    return found  # may be None
+
+
+def _alive_agent_ids() -> set[str] | None:
+    """Query claude-watch active-agents and return the set of alive agent_ids.
+
+    Returns None if the CLI is unavailable or returns malformed output.
+    Callers MUST treat None as "can't determine" and refuse to GC -- a
+    transient claude-watch outage must never silently nuke live
+    obligations.
+    """
+    cli = _claude_watch_cli()
+    if not cli:
+        return None
+    try:
+        proc = subprocess.run(
+            [cli, "active-agents", "--json"],
+            capture_output=True, text=True, timeout=10, check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return None
+    if proc.returncode != 0:
+        return None
+    try:
+        data = json.loads(proc.stdout)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    agents = data.get("agents") if isinstance(data, dict) else None
+    if not isinstance(agents, list):
+        return None
+    alive: set[str] = set()
+    for entry in agents:
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("alive") is True:
+            aid = entry.get("agent_id")
+            if isinstance(aid, str) and aid:
+                alive.add(aid)
+    return alive
+
+
+def _agent_id_from_obligation(ob: dict) -> str | None:
+    """Pull agent_id from an inbox-style obligation row.
+
+    Two sources, in priority order:
+      1. ``deny_message`` shape ``agent-msg/inbox:<agent_id>``.
+      2. ``predicate.params.predicates[*].params.agent_id`` on the
+         ``agent_inbox_empty`` leaf (q-0162's scoping field).
+
+    Returns None if neither is present / parseable.
+    """
+    deny = ob.get("deny_message") or ""
+    if isinstance(deny, str) and deny.startswith(OBLIGATION_TAG_PREFIX):
+        candidate = deny[len(OBLIGATION_TAG_PREFIX):].strip()
+        if candidate:
+            return candidate
+    pred = ob.get("predicate") or {}
+    if isinstance(pred, dict):
+        params = pred.get("params") or {}
+        leaves = params.get("predicates") if isinstance(params, dict) else None
+        if isinstance(leaves, list):
+            for leaf in leaves:
+                if not isinstance(leaf, dict):
+                    continue
+                if leaf.get("kind") != "agent_inbox_empty":
+                    continue
+                lp = leaf.get("params") or {}
+                if isinstance(lp, dict):
+                    aid = lp.get("agent_id")
+                    if isinstance(aid, str) and aid:
+                        return aid
+    return None
+
+
+def _is_inbox_obligation(ob: dict) -> bool:
+    """True iff this obligation is one of ours (created by `agent-msg arm`)."""
+    deny = ob.get("deny_message") or ""
+    return isinstance(deny, str) and deny.startswith(OBLIGATION_TAG_PREFIX)
+
+
+def _gc_dead_obligations(dry_run: bool = False,
+                          args=None) -> dict:
+    """Walk every inbox obligation; satisfy any whose owning agent is dead.
+
+    Default-open contract: if claude-watch can't be queried, return early
+    with reason="claude-watch-unavailable" and DO NOT touch any
+    obligations. The 4h TTL safety belt remains the backstop.
+
+    Returns a dict shape:
+        {
+          "ok": bool,
+          "reason": str | None,            # None on success
+          "alive_count": int,              # alive agent_ids known
+          "checked": int,                  # inbox obligations inspected
+          "dead": [
+            {"agent_id": "...", "obligation_id": "...",
+             "satisfied": bool, "inbox_removed": bool}
+          ],
+          "skipped_unparseable": int,      # obs we couldn't extract agent_id from
+          "dry_run": bool,
+        }
+    """
+    alive = _alive_agent_ids()
+    if alive is None:
+        return {
+            "ok": False,
+            "reason": "claude-watch-unavailable",
+            "alive_count": 0,
+            "checked": 0,
+            "dead": [],
+            "skipped_unparseable": 0,
+            "dry_run": dry_run,
+        }
+    obligations = _list_obligations()
+    cli = _obligations_cli()
+    dead_records: list[dict] = []
+    skipped = 0
+    checked = 0
+    for ob in obligations:
+        if not isinstance(ob, dict) or not _is_inbox_obligation(ob):
+            continue
+        checked += 1
+        agent_id = _agent_id_from_obligation(ob)
+        if not agent_id:
+            skipped += 1
+            continue
+        if agent_id in alive:
+            continue
+        ob_id = ob.get("id")
+        record = {
+            "agent_id": agent_id,
+            "obligation_id": ob_id,
+            "satisfied": False,
+            "inbox_removed": False,
+        }
+        if not dry_run and cli and ob_id:
+            try:
+                proc = subprocess.run(
+                    [cli, "satisfy", ob_id],
+                    capture_output=True, text=True, timeout=10, check=False,
+                )
+                if proc.returncode == 0:
+                    record["satisfied"] = True
+            except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+                pass
+            # Best-effort: also unlink the inbox file (matches what
+            # cmd_disarm would have done if the disarm path actually
+            # ran). Errors swallowed -- inbox files for dead agents
+            # are bookkeeping; their removal is not required.
+            try:
+                inbox_path = _inbox_path(agent_id, args)
+                if inbox_path.exists():
+                    inbox_path.unlink()
+                    record["inbox_removed"] = True
+            except OSError:
+                pass
+        dead_records.append(record)
+    return {
+        "ok": True,
+        "reason": None,
+        "alive_count": len(alive),
+        "checked": checked,
+        "dead": dead_records,
+        "skipped_unparseable": skipped,
+        "dry_run": dry_run,
+    }
 
 
 # ----------------------------------------------------------------------
@@ -883,6 +1139,42 @@ def cmd_gc(args) -> int:
     return 0
 
 
+def cmd_gc_dead(args) -> int:
+    """Walk inbox obligations; satisfy any whose owning agent is dead.
+
+    Backstop for the broken auto-disarm path: Claude Code's PostToolUse
+    hook for the Agent tool fires only on the synchronous-launch reply
+    (status="async_launched"), never on actual subagent termination.
+    Subagents are async-launched in this codebase, so the disarm branch
+    of post-tool-agent-arm-hook never runs and inbox obligations leak
+    until the 4h TTL expires. q-0162 made the leaks harmless via
+    agent_id scoping, but they still bloat the obligations DB. This
+    subcommand sweeps them periodically (cron and/or implicit-on-CLI).
+    """
+    dry_run = bool(getattr(args, "dry_run", False))
+    result = _gc_dead_obligations(dry_run=dry_run, args=args)
+    if args.json:
+        print(json.dumps(result, indent=2))
+    else:
+        if not result["ok"]:
+            print(f"gc-dead: skipped ({result['reason']})", file=sys.stderr)
+            return 0
+        n_dead = len(result["dead"])
+        n_satisfied = sum(1 for d in result["dead"] if d["satisfied"])
+        n_inbox_removed = sum(1 for d in result["dead"] if d["inbox_removed"])
+        prefix = "DRY-RUN " if dry_run else ""
+        print(f"{prefix}gc-dead: alive={result['alive_count']} "
+              f"checked={result['checked']} dead={n_dead} "
+              f"satisfied={n_satisfied} inbox_removed={n_inbox_removed} "
+              f"skipped_unparseable={result['skipped_unparseable']}")
+        for d in result["dead"]:
+            mark = "would-satisfy" if dry_run else (
+                "satisfied" if d["satisfied"] else "satisfy-failed")
+            print(f"  agent_id={d['agent_id']} ob={d['obligation_id']} {mark}"
+                  + (" (inbox removed)" if d["inbox_removed"] else ""))
+    return 0
+
+
 # ----------------------------------------------------------------------
 # Subcommand: arm / disarm  -- per-agent obligation lifecycle
 # ----------------------------------------------------------------------
@@ -993,6 +1285,8 @@ def _make_args(**kwargs):
         "message_id": None,
         "all_history": False,
         "ttl_hours": None,
+        # gc-dead default
+        "command": None,
     }
     defaults.update(kwargs)
     return argparse.Namespace(**defaults)
@@ -2229,6 +2523,305 @@ def test_gate_subagent_real_ack_clears_with_bodies_kept():
     return True
 
 
+# ----------------------------------------------------------------------
+# gc-dead tests (sweeper for leaked inbox obligations)
+# ----------------------------------------------------------------------
+
+
+def _make_fake_claude_watch(tmpdir: Path, alive_ids: list[str],
+                              *, exit_code: int = 0,
+                              malformed: bool = False) -> Path:
+    """Write a tiny shell script that mimics `claude-watch active-agents --json`.
+
+    The agent-msg gc-dead path shells out to `claude-watch active-agents
+    --json` and parses the {"agents":[{"agent_id":..., "alive":bool}]}
+    shape. For unit tests we fake this with a script whose path is
+    pinned via AGENT_MSG_CLAUDE_WATCH_CLI.
+    """
+    cw = tmpdir / "fake-claude-watch"
+    if malformed:
+        body = "#!/bin/sh\necho 'not json'\n"
+    elif exit_code != 0:
+        body = f"#!/bin/sh\nexit {exit_code}\n"
+    else:
+        agents = [{"agent_id": aid, "alive": True,
+                   "queue_id": None, "jsonl_age_seconds": 0}
+                  for aid in alive_ids]
+        payload = json.dumps({
+            "subagents": [],
+            "workloads": [],
+            "agents": agents,
+        })
+        body = f"#!/bin/sh\ncat <<'EOJ'\n{payload}\nEOJ\n"
+    cw.write_text(body)
+    cw.chmod(0o755)
+    return cw
+
+
+def test_gc_dead_extracts_agent_id_from_deny_message():
+    """_agent_id_from_obligation pulls agent_id from the tagged deny_message."""
+    aid = _agent_id_from_obligation({
+        "deny_message": f"{OBLIGATION_TAG_PREFIX}aDEAD0000",
+    })
+    assert aid == "aDEAD0000"
+    return True
+
+
+def test_gc_dead_extracts_agent_id_from_predicate_params():
+    """Predicate-leaf agent_id is a fallback when deny_message is missing."""
+    aid = _agent_id_from_obligation({
+        "deny_message": "",
+        "predicate": {"kind": "all_of", "params": {"predicates": [
+            {"kind": "is_main_loop", "params": {"negate": True}},
+            {"kind": "agent_inbox_empty", "params": {
+                "path": "/tmp/x.json", "agent_id": "aFROMPRED",
+            }},
+        ]}},
+    })
+    assert aid == "aFROMPRED"
+    return True
+
+
+def test_gc_dead_returns_none_when_unparseable():
+    """Obligation with no agent-msg/inbox tag and no params -> None."""
+    aid = _agent_id_from_obligation({
+        "deny_message": "watcher-health-gate",
+        "predicate": {"kind": "watcher_alive", "params": {}},
+    })
+    assert aid is None
+    return True
+
+
+def test_gc_dead_satisfies_dead_agent_obligations():
+    """Regression test (a): leaked obligation for dead agent gets GC'd."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        tmpdir = Path(td)
+        inbox_dir = tmpdir / "inbox"
+        # Two agents: alive and dead. Both armed.
+        alive_id = "aALIVE0000"
+        dead_id = "aDEAD00000"
+        env = _isolated_test_env(tmpdir)
+        # Use a real obligations CLI for end-to-end -- need it to be the
+        # tools/obligations/obligations sibling of this script.
+        cli = _obligations_cli()
+        if not cli:
+            return True  # default-open
+        # Arm both via the real path so the obligation is registered.
+        proc_env = {**os.environ,
+                    "HOME": str(tmpdir),
+                    "AGENT_MSG_INBOX_DIR": str(inbox_dir),
+                    # Make claude-watch report only `alive_id` as alive.
+                    "AGENT_MSG_CLAUDE_WATCH_CLI": str(_make_fake_claude_watch(
+                        tmpdir, alive_ids=[alive_id])),
+                    # Disable the implicit gc-dead so we can exercise it
+                    # explicitly without races on the debounce stamp.
+                    "AGENT_MSG_GC_DEAD_INTERVAL_SECS": "0"}
+        # Use the script binary directly so cmd_arm hits the real obligations CLI.
+        script = str(Path(__file__).resolve())
+        for aid in (alive_id, dead_id):
+            r = subprocess.run(
+                [sys.executable, script, "arm", aid,
+                 "--inbox-dir", str(inbox_dir), "--ttl", "300", "--json"],
+                capture_output=True, text=True, timeout=15, env=proc_env, check=False,
+            )
+            assert r.returncode == 0, f"arm {aid}: rc={r.returncode} stderr={r.stderr}"
+        # Pre-conditions: two of our obligations exist.
+        obs_before = json.loads(subprocess.run(
+            [cli, "list", "--json"], capture_output=True, text=True,
+            timeout=10, env=proc_env, check=False).stdout)
+        ours_before = [o for o in obs_before.get("obligations", [])
+                       if (o.get("deny_message") or "").startswith(OBLIGATION_TAG_PREFIX)
+                       and _agent_id_from_obligation(o) in (alive_id, dead_id)]
+        assert len(ours_before) == 2, ours_before
+        # Run gc-dead.
+        r = subprocess.run(
+            [sys.executable, script, "gc-dead",
+             "--inbox-dir", str(inbox_dir), "--json"],
+            capture_output=True, text=True, timeout=15, env=proc_env, check=False,
+        )
+        assert r.returncode == 0, f"gc-dead failed: {r.stderr}"
+        out = json.loads(r.stdout)
+        assert out["ok"] is True, out
+        assert out["alive_count"] == 1
+        # Exactly one dead obligation reaped.
+        dead_records = out["dead"]
+        assert len(dead_records) == 1, dead_records
+        assert dead_records[0]["agent_id"] == dead_id
+        assert dead_records[0]["satisfied"] is True
+        # Post-condition (a): dead agent's obligation gone.
+        # Post-condition (b): alive agent's obligation untouched.
+        obs_after = json.loads(subprocess.run(
+            [cli, "list", "--json"], capture_output=True, text=True,
+            timeout=10, env=proc_env, check=False).stdout)
+        remaining_ids = [_agent_id_from_obligation(o)
+                         for o in obs_after.get("obligations", [])
+                         if (o.get("deny_message") or "").startswith(OBLIGATION_TAG_PREFIX)]
+        assert alive_id in remaining_ids, remaining_ids
+        assert dead_id not in remaining_ids, remaining_ids
+        # Cleanup the alive obligation we just registered for the test.
+        for o in obs_after.get("obligations", []):
+            if _agent_id_from_obligation(o) == alive_id and o.get("id"):
+                subprocess.run(
+                    [cli, "satisfy", o["id"]],
+                    capture_output=True, text=True, timeout=5,
+                    env=proc_env, check=False)
+    return True
+
+
+def test_gc_dead_default_open_when_claude_watch_unavailable():
+    """If claude-watch CLI is missing, gc-dead must be a no-op (default-open)."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        tmpdir = Path(td)
+        # Point AGENT_MSG_CLAUDE_WATCH_CLI at a non-existent path.
+        env = {**os.environ,
+               "AGENT_MSG_CLAUDE_WATCH_CLI": str(tmpdir / "no-such-binary"),
+               "AGENT_MSG_GC_DEAD_INTERVAL_SECS": "0"}
+        # Force PATH so `claude-watch` lookup also fails, isolating the test.
+        env["PATH"] = str(tmpdir / "empty-path")
+        # Patch via direct call (we can't easily fork-with-env in unit-test
+        # context, but the helper function takes its env from os.environ
+        # so we monkey-patch it for the duration of this test).
+        old_env = os.environ.copy()
+        try:
+            os.environ.update(env)
+            result = _gc_dead_obligations(dry_run=False)
+            assert result["ok"] is False
+            assert result["reason"] == "claude-watch-unavailable"
+            assert result["dead"] == []
+        finally:
+            os.environ.clear()
+            os.environ.update(old_env)
+    return True
+
+
+def test_gc_dead_default_open_on_malformed_output():
+    """If claude-watch returns malformed JSON, gc-dead must be a no-op."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        tmpdir = Path(td)
+        cw = _make_fake_claude_watch(tmpdir, alive_ids=[], malformed=True)
+        old_env = os.environ.copy()
+        try:
+            os.environ["AGENT_MSG_CLAUDE_WATCH_CLI"] = str(cw)
+            os.environ["AGENT_MSG_GC_DEAD_INTERVAL_SECS"] = "0"
+            result = _gc_dead_obligations(dry_run=False)
+            assert result["ok"] is False
+            assert result["reason"] == "claude-watch-unavailable"
+        finally:
+            os.environ.clear()
+            os.environ.update(old_env)
+    return True
+
+
+def test_gc_dead_dry_run_takes_no_action():
+    """--dry-run reports dead-agent obligations but doesn't satisfy them."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        tmpdir = Path(td)
+        cli = _obligations_cli()
+        if not cli:
+            return True
+        inbox_dir = tmpdir / "inbox"
+        dead_id = "aDRYRUN000"
+        proc_env = {**os.environ,
+                    "HOME": str(tmpdir),
+                    "AGENT_MSG_INBOX_DIR": str(inbox_dir),
+                    "AGENT_MSG_CLAUDE_WATCH_CLI": str(_make_fake_claude_watch(
+                        tmpdir, alive_ids=[])),
+                    "AGENT_MSG_GC_DEAD_INTERVAL_SECS": "0"}
+        script = str(Path(__file__).resolve())
+        r = subprocess.run(
+            [sys.executable, script, "arm", dead_id,
+             "--inbox-dir", str(inbox_dir), "--ttl", "300", "--json"],
+            capture_output=True, text=True, timeout=15, env=proc_env, check=False,
+        )
+        assert r.returncode == 0
+        # Dry-run.
+        r = subprocess.run(
+            [sys.executable, script, "gc-dead",
+             "--inbox-dir", str(inbox_dir), "--dry-run", "--json"],
+            capture_output=True, text=True, timeout=15, env=proc_env, check=False,
+        )
+        assert r.returncode == 0
+        out = json.loads(r.stdout)
+        assert out["ok"] is True
+        assert out["dry_run"] is True
+        assert len(out["dead"]) == 1
+        assert out["dead"][0]["agent_id"] == dead_id
+        assert out["dead"][0]["satisfied"] is False
+        # Obligation still present.
+        obs = json.loads(subprocess.run(
+            [cli, "list", "--json"], capture_output=True, text=True,
+            timeout=10, env=proc_env, check=False).stdout)
+        ids = [_agent_id_from_obligation(o)
+               for o in obs.get("obligations", [])
+               if (o.get("deny_message") or "").startswith(OBLIGATION_TAG_PREFIX)]
+        assert dead_id in ids, ids
+        # Cleanup.
+        for o in obs.get("obligations", []):
+            if _agent_id_from_obligation(o) == dead_id and o.get("id"):
+                subprocess.run(
+                    [cli, "satisfy", o["id"]],
+                    capture_output=True, text=True, timeout=5,
+                    env=proc_env, check=False)
+    return True
+
+
+def test_gc_dead_implicit_runs_respects_rate_limit():
+    """_maybe_implicit_gc_dead writes a stamp and skips re-runs within interval."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        tmpdir = Path(td)
+        inbox_dir = tmpdir / "inbox"
+        inbox_dir.mkdir(parents=True, exist_ok=True)
+        old_env = os.environ.copy()
+        try:
+            cw = _make_fake_claude_watch(tmpdir, alive_ids=[])
+            os.environ["AGENT_MSG_CLAUDE_WATCH_CLI"] = str(cw)
+            os.environ["AGENT_MSG_INBOX_DIR"] = str(inbox_dir)
+            # 60 second debounce for the test.
+            os.environ["AGENT_MSG_GC_DEAD_INTERVAL_SECS"] = "60"
+            args = _make_args(inbox_dir=str(inbox_dir))
+            stamp = inbox_dir / GC_DEAD_STAMP_FILENAME
+            assert not stamp.exists()
+            _maybe_implicit_gc_dead(args)
+            assert stamp.exists()
+            mtime1 = stamp.stat().st_mtime
+            # Immediate re-run should not update mtime (rate-limited).
+            time.sleep(0.05)
+            _maybe_implicit_gc_dead(args)
+            mtime2 = stamp.stat().st_mtime
+            assert mtime2 == mtime1, "rate-limit should prevent re-touch"
+        finally:
+            os.environ.clear()
+            os.environ.update(old_env)
+    return True
+
+
+def test_gc_dead_implicit_disabled_when_interval_zero():
+    """Setting AGENT_MSG_GC_DEAD_INTERVAL_SECS=0 disables the implicit sweep."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        tmpdir = Path(td)
+        inbox_dir = tmpdir / "inbox"
+        inbox_dir.mkdir(parents=True, exist_ok=True)
+        old_env = os.environ.copy()
+        try:
+            os.environ["AGENT_MSG_INBOX_DIR"] = str(inbox_dir)
+            os.environ["AGENT_MSG_GC_DEAD_INTERVAL_SECS"] = "0"
+            args = _make_args(inbox_dir=str(inbox_dir))
+            stamp = inbox_dir / GC_DEAD_STAMP_FILENAME
+            assert not stamp.exists()
+            _maybe_implicit_gc_dead(args)
+            assert not stamp.exists(), "interval=0 must skip the sweep"
+        finally:
+            os.environ.clear()
+            os.environ.update(old_env)
+    return True
+
+
 def run_tests():
     tests = [
         ("send_writes_correct_json", test_send_writes_correct_json),
@@ -2278,6 +2871,25 @@ def run_tests():
          test_gate_cross_agent_isolation_regression),
         ("arm_registers_gate_mode_with_exempt_patterns",
          test_arm_registers_gate_mode_with_exempt_patterns),
+        # gc-dead tests (q-d25e, 2026-05-03):
+        ("gc_dead_extract_from_deny_msg",
+         test_gc_dead_extracts_agent_id_from_deny_message),
+        ("gc_dead_extract_from_predicate_params",
+         test_gc_dead_extracts_agent_id_from_predicate_params),
+        ("gc_dead_unparseable_returns_none",
+         test_gc_dead_returns_none_when_unparseable),
+        ("gc_dead_satisfies_dead_agent_obligations",
+         test_gc_dead_satisfies_dead_agent_obligations),
+        ("gc_dead_default_open_when_claude_watch_unavailable",
+         test_gc_dead_default_open_when_claude_watch_unavailable),
+        ("gc_dead_default_open_on_malformed_output",
+         test_gc_dead_default_open_on_malformed_output),
+        ("gc_dead_dry_run_takes_no_action",
+         test_gc_dead_dry_run_takes_no_action),
+        ("gc_dead_implicit_runs_respects_rate_limit",
+         test_gc_dead_implicit_runs_respects_rate_limit),
+        ("gc_dead_implicit_disabled_when_interval_zero",
+         test_gc_dead_implicit_disabled_when_interval_zero),
     ]
     passed = 0
     failed = 0
@@ -2363,6 +2975,16 @@ def build_parser():
                            f"{DEFAULT_READ_TTL_HOURS}); <=0 disables GC")
     p_gc.add_argument("--json", action="store_true")
 
+    # gc-dead -- sweep inbox obligations whose owning agent is no longer alive
+    p_gcd = sub.add_parser(
+        "gc-dead",
+        help="satisfy inbox obligations whose owning agent is no longer alive "
+             "(backstop for broken PostToolUse disarm path)")
+    p_gcd.add_argument("--inbox-dir", default=None)
+    p_gcd.add_argument("--dry-run", action="store_true",
+                       help="show what would be satisfied without taking action")
+    p_gcd.add_argument("--json", action="store_true")
+
     # arm
     p_arm = sub.add_parser("arm", help="initialise inbox + register gate-mode obligation")
     p_arm.add_argument("agent_id")
@@ -2423,6 +3045,8 @@ def main(argv=None):
         return cmd_ack(args)
     if args.command == "gc":
         return cmd_gc(args)
+    if args.command == "gc-dead":
+        return cmd_gc_dead(args)
     if args.command == "arm":
         return cmd_arm(args)
     if args.command == "disarm":
