@@ -298,6 +298,146 @@ def test_force_start_emits_claude_event():
 
 
 # ---------------------------------------------------------------------------
+# 7. Dedicated `force-start` claude-event emitted alongside `queue-running`
+# ---------------------------------------------------------------------------
+
+
+def test_force_start_emits_dedicated_force_start_event():
+    """A force-start should emit BOTH a `queue-running` event (for the
+    standard lifecycle bus) AND a dedicated `force-start` event so
+    `claude-event-watch` surfaces force-starts to the main loop with a
+    distinct tag (Andrew DM 2026-05-02 19:54 ET: "force starting should
+    both emit an event AND add a hard obligation to spawn").
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _env_for_tmp(tmp)
+        events_dir = Path(tmp) / "claude-events"
+
+        r1 = _add(env, "blocker", ["scope:fs"])
+        d1 = json.loads(r1.stdout)
+        _register(env, d1["id"], "--json")
+        # Drain register's events.
+        for f in events_dir.iterdir():
+            f.unlink()
+
+        r2 = _add(env, "blocked", ["scope:fs"], "--force-enqueue")
+        d2 = json.loads(r2.stdout)
+
+        rs = _run(
+            env, "queue", "force-start", d2["id"],
+            "--reason", "fs-event-test", "--json",
+        )
+        assert rs.returncode == 0, rs.stderr
+
+        emitted = []
+        for f in sorted(events_dir.iterdir()):
+            try:
+                emitted.append(json.loads(f.read_text()))
+            except (OSError, ValueError):
+                continue
+
+        force_events = [e for e in emitted if e.get("tag") == "force-start"]
+        assert force_events, (
+            f"expected a `force-start` event, got tags="
+            f"{[e.get('tag') for e in emitted]}"
+        )
+        ev = force_events[0]
+        data = ev.get("data") or {}
+        assert data.get("queue_id") == d2["id"]
+        assert data.get("force_started_reason") == "fs-event-test"
+
+
+# ---------------------------------------------------------------------------
+# 8. Force-start registers a `force_started_unspawned` obligation
+# ---------------------------------------------------------------------------
+
+
+def test_force_start_registers_obligation():
+    """Force-start should register a hard-gate obligation that DENIES every
+    non-exempt main-loop tool call until an Agent has been dispatched for
+    the promoted queue id. Verified by inspecting the per-test
+    obligations.json (HOME-isolated -- the live ~/.config/claude/
+    obligations.json is never touched).
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _env_for_tmp(tmp)
+
+        r1 = _add(env, "blocker", ["scope:obx"])
+        d1 = json.loads(r1.stdout)
+        _register(env, d1["id"], "--json")
+        r2 = _add(env, "blocked", ["scope:obx"], "--force-enqueue")
+        d2 = json.loads(r2.stdout)
+
+        rs = _run(
+            env, "queue", "force-start", d2["id"],
+            "--reason", "obligation-test", "--json",
+        )
+        assert rs.returncode == 0, rs.stderr
+
+        ob_path = Path(tmp) / ".config" / "claude" / "obligations.json"
+        assert ob_path.exists(), (
+            f"expected obligations.json at {ob_path}, but it was not written"
+        )
+        ob_data = json.loads(ob_path.read_text())
+        matching = [
+            ob for ob in ob_data.get("obligations", [])
+            if ob.get("predicate", {}).get("kind") == "force_started_unspawned"
+            and ob.get("predicate", {}).get("params", {}).get("queue_id")
+                == d2["id"]
+        ]
+        assert matching, (
+            f"expected a force_started_unspawned obligation for {d2['id']!r}, "
+            f"got {[ob.get('predicate') for ob in ob_data.get('obligations',[])]}"
+        )
+        ob = matching[0]
+        assert ob.get("tool_pattern") == "*"
+        assert ob.get("enforcement", "gate") == "gate"
+        assert ob.get("created_by", "").startswith("force-start:")
+        assert ob.get("ttl_secs", 0) > 0  # has a TTL safety net
+
+
+def test_force_start_obligation_suppressed_by_env():
+    """`OBLIGATIONS_FORCE_START=0` skips the obligation register call.
+    Used by upstream test harnesses (e.g. queue-minisite) that exercise
+    the force-start endpoint without wanting to mutate obligations state.
+    The claude-event still emits and the queue still flips -- ONLY the
+    obligation register is suppressed.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _env_for_tmp(tmp)
+        env["OBLIGATIONS_FORCE_START"] = "0"
+
+        r1 = _add(env, "blocker", ["scope:obx2"])
+        d1 = json.loads(r1.stdout)
+        _register(env, d1["id"], "--json")
+        r2 = _add(env, "blocked", ["scope:obx2"], "--force-enqueue")
+        d2 = json.loads(r2.stdout)
+
+        rs = _run(
+            env, "queue", "force-start", d2["id"],
+            "--reason", "ob-suppressed", "--json",
+        )
+        assert rs.returncode == 0, rs.stderr
+
+        ob_path = Path(tmp) / ".config" / "claude" / "obligations.json"
+        # File may exist from an unrelated read, but must not contain a
+        # force_started_unspawned row for d2.
+        if ob_path.exists():
+            ob_data = json.loads(ob_path.read_text())
+            matching = [
+                ob for ob in ob_data.get("obligations", [])
+                if (ob.get("predicate", {}).get("kind")
+                    == "force_started_unspawned")
+                and ob.get("predicate", {}).get("params", {}).get("queue_id")
+                    == d2["id"]
+            ]
+            assert not matching, (
+                f"expected NO obligation registered when "
+                f"OBLIGATIONS_FORCE_START=0, got {matching}"
+            )
+
+
+# ---------------------------------------------------------------------------
 # Entry point for direct invocation
 # ---------------------------------------------------------------------------
 
@@ -311,6 +451,9 @@ def _all_tests():
         test_force_start_refuses_not_found,
         test_force_start_writes_audit_log,
         test_force_start_emits_claude_event,
+        test_force_start_emits_dedicated_force_start_event,
+        test_force_start_registers_obligation,
+        test_force_start_obligation_suppressed_by_env,
     ]
 
 
