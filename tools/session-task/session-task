@@ -24,7 +24,7 @@ Usage:
 
     session-task queue add "desc" --scope file:~/foo --scope repo:bar \\
         [--summary "~10 word headline"] [--priority N] [--context JSON] \\
-        [--created-by WHO]
+        [--created-by WHO] [--depends-on q-AAA,q-BBB]
     session-task queue list [--ready] [--all] [--group g-X] [--json]
     session-task queue show <id>
     session-task queue scope <id>
@@ -40,6 +40,8 @@ Usage:
                                                        # blocked-pending to running
     session-task queue promote <id>
     session-task queue set-summary <id> "text"   # edit one-line summary
+    session-task queue depend <id> [--add q-AAA[,q-BBB]] [--remove q-CCC]
+                                   [--clear] [--json]
     session-task queue prune [--older-than DURATION] [-n/--dry-run]
     session-task queue banner
     session-task queue migrate --from FILE [--yes]
@@ -721,7 +723,77 @@ def _item_is_ready(items, item):
     members = _group_members(items, item["group_id"])
     if any(m.get("status") == "running" for m in members):
         return False
+    # Explicit interjob deps (added 2026-05-02): every dep id must resolve to
+    # an item with status=done. Targets that are missing, abandoned, or part
+    # of a dependency cycle are treated as permanent blockers (the item stays
+    # not-ready until a human edits the deps). This is the lazy read-time
+    # compute path — no transitive-closure cache. Andrew 2026-05-02:
+    #   "see if you can avoid having to recompute the tree every time a new
+    #    job is added or an existing one is modified. that would be bad lol"
+    # Direct-only check is O(direct-deps-count). Cycle detection: see
+    # _has_dep_cycle.
+    deps = item.get("depends_on") or []
+    if deps:
+        if _has_dep_cycle(items, item["id"]):
+            return False
+        items_by_id = {it.get("id"): it for it in items if it.get("id")}
+        for dep_id in deps:
+            dep = items_by_id.get(dep_id)
+            if dep is None:
+                # Dangling dep — treat as a permanent blocker. Operator must
+                # remove it explicitly via `queue depend ... --remove`.
+                return False
+            if dep.get("status") != "done":
+                return False
     return True
+
+
+def _has_dep_cycle(items, root_id):
+    """Detect a dependency cycle reachable from root_id.
+
+    Lazy DFS, computed at read time only when an item has any deps. We do
+    NOT block writes on cycle detection (per the architecture brief —
+    "Don't block writes on cycle check") to keep `queue depend` cheap;
+    instead, ready_now flips False the moment a cycle becomes reachable.
+
+    Bounded by the active item count (the call site walks a single
+    item's dep graph), so worst case O(N) per ready_now call where N is
+    the queue size. For the typical ≤50-item queue this is trivially
+    fast.
+    """
+    by_id = {it.get("id"): it for it in items if it.get("id")}
+    visited = set()
+    stack = [root_id]
+    on_path = set()
+
+    # Iterative DFS using an explicit (node, child-iter) stack so we
+    # can detect back-edges without recursion blowing the stack.
+    walk = [(root_id, iter((by_id.get(root_id, {}).get("depends_on") or [])))]
+    on_path.add(root_id)
+    while walk:
+        _node, it_children = walk[-1]
+        try:
+            child = next(it_children)
+        except StopIteration:
+            popped, _ = walk.pop()
+            on_path.discard(popped)
+            visited.add(popped)
+            continue
+        if not isinstance(child, str):
+            continue
+        if child in on_path:
+            return True
+        if child in visited:
+            continue
+        child_item = by_id.get(child)
+        if child_item is None:
+            # Dangling — not a cycle (just a dead edge). The caller's
+            # ready check will treat it as a permanent blocker.
+            visited.add(child)
+            continue
+        on_path.add(child)
+        walk.append((child, iter(child_item.get("depends_on") or [])))
+    return False
 
 
 def _gc_groups(items):
@@ -1224,6 +1296,34 @@ def cmd_queue_add(args):
         while new_id in existing_ids:
             new_id = _new_id()
 
+        # Parse --depends-on (comma-separated) and validate the targets
+        # exist NOW. Self-deps and unknown ids are rejected at write time;
+        # cycle detection is lazy (read-time) per the architecture brief.
+        deps_raw = getattr(args, "depends_on", None) or []
+        deps_split: list[str] = []
+        seen_dep = set()
+        for raw in deps_raw:
+            for piece in str(raw).split(","):
+                piece = piece.strip()
+                if not piece:
+                    continue
+                if piece in seen_dep:
+                    continue
+                seen_dep.add(piece)
+                deps_split.append(piece)
+        if deps_split:
+            existing_ids_now = {it["id"] for it in items}
+            unknown = [d for d in deps_split if d not in existing_ids_now]
+            if unknown:
+                fcntl.flock(fh, fcntl.LOCK_UN)
+                fh.close()
+                print(
+                    f"ERROR: --depends-on references unknown queue id(s): "
+                    f"{','.join(unknown)}",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+
         item = {
             "id": new_id,
             "description": args.description,
@@ -1236,6 +1336,10 @@ def cmd_queue_add(args):
             "created_at": _fmt_ts(),
             "created_by": args.created_by or "main-loop",
         }
+        # Self-deps are always rejected at this point (the new id can't be
+        # in existing_ids), so deps_split is safe to attach verbatim.
+        if deps_split:
+            item["depends_on"] = list(deps_split)
         if context is not None:
             item["context"] = context
         items.append(item)
@@ -1263,16 +1367,30 @@ def cmd_queue_add(args):
             pass
         raise
 
+    # Surface unmet dependencies separately from scope-serialized blockers
+    # so the main loop / UI can distinguish "wait for queue head" from
+    # "wait for explicit dep". depends_on is the operator-declared edge.
+    dep_blockers: list[str] = []
+    if deps_split:
+        items_by_id_now = {it["id"]: it for it in items}
+        for d in deps_split:
+            tgt = items_by_id_now.get(d)
+            if tgt is None or tgt.get("status") != "done":
+                dep_blockers.append(d)
+
     # Build spawn_instruction string for the main loop to read literally.
     if ready_now:
         spawn_instruction = f"READY: register-and-spawn (session-task queue register {new_id})"
     else:
-        blockers = serialized_after or []
-        spawn_instruction = (
-            "BLOCKED: do not spawn, wait for " + ",".join(blockers)
-            if blockers
-            else "BLOCKED: do not spawn (no head visible)"
-        )
+        parts: list[str] = []
+        if dep_blockers:
+            parts.append("deps: " + ",".join(dep_blockers))
+        if serialized_after:
+            parts.append("queue: " + ",".join(serialized_after))
+        if parts:
+            spawn_instruction = "BLOCKED: do not spawn, wait for " + " | ".join(parts)
+        else:
+            spawn_instruction = "BLOCKED: do not spawn (no head visible)"
 
     # Print result. running_conflicts is only populated via --force-enqueue
     # now, since without it we would have already exited above.
@@ -1288,6 +1406,8 @@ def cmd_queue_add(args):
             "position": position,
             "ready_now": ready_now,
             "serialized_after": serialized_after,
+            "depends_on": deps_split,
+            "dep_blockers": dep_blockers,
             "scope": scope,
             "running_scope_conflicts": running_conflict_info,
             "spawn_instruction": spawn_instruction,
@@ -1295,6 +1415,8 @@ def cmd_queue_add(args):
     else:
         print(f"added: {new_id}")
         print(f"assigned: group={group_id}, position={position}, ready_now={'true' if ready_now else 'false'}, serialized_after={serialized_after}")
+        if deps_split:
+            print(f"depends_on: {deps_split} (unmet: {dep_blockers})")
         print(f"spawn_instruction: {spawn_instruction}")
         if running_conflicts:
             # Only reachable via --force-enqueue. Still scream.
@@ -1409,6 +1531,35 @@ def cmd_queue_show(args):
             out = dict(it)
             out["ready_now"] = ready
             out["group_scope"] = _group_scope(items, it["group_id"])
+            # Surface dep state + dependents so a single `queue show` is
+            # enough to inspect the dependency edges in / out of this item
+            # without re-reading queue.json.
+            deps = list(out.get("depends_on") or [])
+            by_id = {x.get("id"): x for x in items if x.get("id")}
+            dep_status = []
+            unmet = []
+            for d in deps:
+                tgt = by_id.get(d)
+                if tgt is None:
+                    dep_status.append({"id": d, "status": "missing"})
+                    unmet.append(d)
+                else:
+                    s = tgt.get("status") or "?"
+                    dep_status.append({"id": d, "status": s})
+                    if s != "done":
+                        unmet.append(d)
+            out["depends_on_status"] = dep_status
+            out["dep_blockers"] = unmet
+            out["dep_cycle"] = _has_dep_cycle(items, it["id"]) if deps else False
+            # Reverse-edges: items that name THIS item in their depends_on.
+            dependents = [
+                x.get("id")
+                for x in items
+                if x.get("id")
+                and isinstance(x.get("depends_on"), list)
+                and it["id"] in x.get("depends_on", [])
+            ]
+            out["dependents"] = dependents
             print(json.dumps(out, indent=2))
             return
     print(f"not found: {args.id}", file=sys.stderr)
@@ -2375,6 +2526,148 @@ def cmd_queue_set_summary(args):
     print(f"  new: {new_summary}")
 
 
+def cmd_queue_depend(args):
+    """Edit explicit interjob dependencies on an existing queue item.
+
+    `session-task queue depend <id> [--add q-AAA] [--remove q-BBB] [--clear]`
+
+    Adjacency-list storage: each pending/running item has ``depends_on:
+    list[str]`` — a set of queue ids it's blocked on. ``ready_now()``
+    flips True only when every dep is ``done``. Cross-group deps are
+    allowed (Andrew 2026-05-02: "explicit specific interjob dependencies
+    (human or bot defined)").
+
+    Architecture (per Andrew's perf brief): WRITE is just a set
+    add/remove on the dragged item. NO transitive-closure cache, NO
+    cascade work. Cycles are detected lazily on READ via
+    ``_has_dep_cycle``.
+
+    --add / --remove accept comma-separated id lists. --clear wipes the
+    set. Done/abandoned items can't acquire new deps (the deps would be
+    moot — the item is already terminal).
+    """
+    add_raw = list(getattr(args, "add", None) or [])
+    remove_raw = list(getattr(args, "remove", None) or [])
+    do_clear = bool(getattr(args, "clear", False))
+
+    if not (add_raw or remove_raw or do_clear):
+        print(
+            "ERROR: pass at least one of --add, --remove, --clear",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    def _flatten(raw):
+        out: list[str] = []
+        seen = set()
+        for piece_raw in raw:
+            for p in str(piece_raw).split(","):
+                p = p.strip()
+                if not p or p in seen:
+                    continue
+                seen.add(p)
+                out.append(p)
+        return out
+
+    to_add = _flatten(add_raw)
+    to_remove = _flatten(remove_raw)
+
+    if args.id in to_add:
+        print(
+            f"ERROR: an item cannot depend on itself ({args.id})",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    fh, data = _queue_open_locked("rw")
+    try:
+        items = data["items"]
+        target = next((it for it in items if it["id"] == args.id), None)
+        if target is None:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+            fh.close()
+            print(f"not found: {args.id}", file=sys.stderr)
+            sys.exit(1)
+        if target.get("status") not in ("pending", "running"):
+            fcntl.flock(fh, fcntl.LOCK_UN)
+            fh.close()
+            print(
+                f"ERROR: cannot edit deps on {target.get('status')} item",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        existing_ids = {it["id"] for it in items}
+        unknown = [d for d in to_add if d not in existing_ids]
+        if unknown:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+            fh.close()
+            print(
+                "ERROR: --add references unknown queue id(s): "
+                + ",".join(unknown),
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        before = list(target.get("depends_on") or [])
+        if do_clear:
+            after: list[str] = []
+        else:
+            after = list(before)
+
+        # Removes first, then adds — so `--add x --remove x` is a no-op
+        # rather than a delete (callers passing both for the same id is
+        # almost certainly a mistake but we don't bake in surprises).
+        if to_remove:
+            after = [d for d in after if d not in set(to_remove)]
+        for a in to_add:
+            if a not in after:
+                after.append(a)
+
+        target["depends_on"] = after
+        target["depends_on_updated_at"] = _fmt_ts()
+        _queue_write_and_unlock(fh, data)
+    except Exception:
+        try:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+            fh.close()
+        except Exception:
+            pass
+        raise
+
+    # Re-read to compute ready_now under the new edge set.
+    fh2, data2 = _queue_open_locked("r")
+    items2 = list(data2["items"])
+    _queue_unlock_readonly(fh2)
+    fresh = next((it for it in items2 if it["id"] == args.id), None)
+    ready = _item_is_ready(items2, fresh) if fresh else False
+    cycle = _has_dep_cycle(items2, args.id) if (fresh and fresh.get("depends_on")) else False
+
+    if getattr(args, "json", False):
+        print(json.dumps(
+            {
+                "id": args.id,
+                "depends_on": after,
+                "added": to_add,
+                "removed": to_remove,
+                "cleared": do_clear,
+                "ready_now": ready,
+                "dep_cycle": cycle,
+            },
+            indent=2,
+        ))
+    else:
+        print(f"deps updated: {args.id}")
+        print(f"  before : {before}")
+        print(f"  after  : {after}")
+        if cycle:
+            print(
+                "  WARNING: dependency cycle reachable from this item; "
+                "ready_now will stay false until the cycle is broken.",
+                file=sys.stderr,
+            )
+
+
 def cmd_queue_promote(args):
     fh, data = _queue_open_locked("rw")
     try:
@@ -2745,6 +3038,17 @@ def build_parser():
     q_add.add_argument("--priority", type=int, default=5)
     q_add.add_argument("--context")
     q_add.add_argument("--created-by")
+    q_add.add_argument(
+        "--depends-on",
+        action="append",
+        default=[],
+        help=(
+            "Queue id(s) this new item is blocked on. Adjacency-set storage "
+            "(no transitive closure). Each dep must be a known queue id at "
+            "add time; ready_now flips True only when every dep is 'done'. "
+            "Comma-separated values and repeated flags both work."
+        ),
+    )
     q_add.add_argument("--json", action="store_true")
     q_add.add_argument(
         "--force-enqueue",
@@ -2900,6 +3204,41 @@ def build_parser():
     q_setsum.add_argument("id")
     q_setsum.add_argument("summary", help="New summary text (~10 words)")
 
+    q_depend = qsub.add_parser(
+        "depend",
+        help=(
+            "Edit explicit interjob dependencies on a queue item. "
+            "depends_on is an adjacency set of queue ids; ready_now flips "
+            "True only when every dep is in 'done' state. "
+            "Cross-group deps allowed."
+        ),
+    )
+    q_depend.add_argument("id")
+    q_depend.add_argument(
+        "--add",
+        action="append",
+        default=[],
+        help=(
+            "Queue id(s) to add as dependencies. Comma-separated values "
+            "and repeated --add flags both work."
+        ),
+    )
+    q_depend.add_argument(
+        "--remove",
+        action="append",
+        default=[],
+        help=(
+            "Queue id(s) to remove from depends_on. Comma-separated values "
+            "and repeated --remove flags both work."
+        ),
+    )
+    q_depend.add_argument(
+        "--clear",
+        action="store_true",
+        help="Remove ALL deps from this item (applied before --add).",
+    )
+    q_depend.add_argument("--json", action="store_true")
+
     q_prune = qsub.add_parser("prune", help="Remove done/abandoned items")
     q_prune.add_argument("--older-than", help="e.g. 7d, 24h, 30m")
     q_prune.add_argument("-n", "--dry-run", action="store_true")
@@ -2960,6 +3299,7 @@ def main():
             "force-start": cmd_queue_force_start,
             "promote": cmd_queue_promote,
             "set-summary": cmd_queue_set_summary,
+            "depend": cmd_queue_depend,
             "prune": cmd_queue_prune,
             "banner": cmd_queue_banner,
             "migrate": cmd_queue_migrate,
