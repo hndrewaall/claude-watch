@@ -58,11 +58,14 @@ auditing.
 from __future__ import annotations
 
 import datetime as _dt
+import errno
+import fcntl
 import json
 import os
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 # Match both 'Agent' (modern) and 'Task' (legacy) internal tool names. Andrew
@@ -77,6 +80,18 @@ QUEUE_MARKER_RE = re.compile(r"Queue\s+item\s*:\s*(q-[0-9a-zA-Z][0-9a-zA-Z-]*)")
 
 BYPASS_LOG_DIR = Path(os.path.expanduser("~/.config/claude"))
 BYPASS_LOG_PATH = BYPASS_LOG_DIR / "queue-gate-bypass.log"
+
+# Pending-spawns sidecar: written here at PreToolUse:Agent time so the
+# `force_started_unspawned` obligations predicate can flip to satisfied
+# immediately, without waiting for the once-a-minute claude-watch
+# active-agents poller to refresh ``active-agents.json``. Path can be
+# overridden via ``CLAUDE_PENDING_SPAWNS_PATH`` (used by the test suite
+# to keep its writes out of /var/lib).
+DEFAULT_PENDING_SPAWNS_PATH = Path("/var/lib/claude-watch/pending-spawns.json")
+# Records older than this are pruned on every write. Matches the default
+# `pending_spawn_max_age_secs` in the obligations predicate so a stale
+# entry can never out-live what the predicate considers "fresh".
+PENDING_SPAWN_PRUNE_AGE_SECS = 600
 
 
 def _allow() -> dict:
@@ -144,6 +159,126 @@ def _log_bypass(tool_name: str, prompt_preview: str) -> None:
             pass
     except (OSError, ValueError):
         pass
+
+
+def _pending_spawns_path() -> Path:
+    """Resolve the pending-spawns sidecar path.
+
+    Honours ``CLAUDE_PENDING_SPAWNS_PATH`` so tests (and any operator
+    debugging) can redirect writes off ``/var/lib`` without root.
+    """
+    override = os.environ.get("CLAUDE_PENDING_SPAWNS_PATH", "").strip()
+    if override:
+        return Path(os.path.expanduser(override))
+    return DEFAULT_PENDING_SPAWNS_PATH
+
+
+def _record_pending_spawn(queue_id: str) -> None:
+    """Upsert a pending-spawn record for ``queue_id``.
+
+    Called from the hook AFTER all queue-discipline checks pass and the
+    Agent spawn is about to be allowed through. Atomically writes the
+    JSON via tmp-file + rename, with an fcntl lock against the parent
+    dir to serialise concurrent writers (same hook running for two
+    spawns in flight). Prunes any entries older than
+    ``PENDING_SPAWN_PRUNE_AGE_SECS`` so the file size stays bounded.
+
+    Best-effort: any failure (no permission to write the dir, lock
+    contention beyond the timeout, etc.) is swallowed. The fallback is
+    that the predicate will simply wait for claude-watch's active-agents
+    poller to notice the spawned agent (up to ~60s). The hook MUST never
+    block the spawn it has already approved.
+    """
+    path = _pending_spawns_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        # Can't even create the dir (e.g. /var/lib not writable); give up.
+        return
+
+    now_ts = int(time.time())
+    new_entry = {
+        "queue_id": queue_id,
+        "registered_at": now_ts,
+        "registered_at_iso": _dt.datetime.fromtimestamp(
+            now_ts, tz=_dt.timezone.utc
+        ).isoformat(),
+        "pid": os.getpid(),
+    }
+
+    # Lock file in the same dir; lock-then-read-then-write keeps two
+    # concurrent hook invocations from clobbering each other's records.
+    lock_path = path.with_suffix(path.suffix + ".lock")
+    lock_fh = None
+    try:
+        try:
+            lock_fh = open(lock_path, "a+")
+        except OSError:
+            return
+        try:
+            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
+        except OSError:
+            return
+
+        # Read current state (default: empty list).
+        existing: list[dict] = []
+        if path.exists():
+            try:
+                raw = path.read_text(encoding="utf-8")
+                if raw.strip():
+                    data = json.loads(raw)
+                    if isinstance(data, dict):
+                        existing = list(data.get("pending", []))
+                    elif isinstance(data, list):
+                        existing = list(data)
+            except (OSError, json.JSONDecodeError, ValueError):
+                # Corrupt file: start fresh. We do not propagate the
+                # error -- the spawn must proceed regardless.
+                existing = []
+
+        # Prune stale entries + any prior record for this same queue_id
+        # (we replace, not append, so a re-spawn refreshes the timestamp).
+        cutoff = now_ts - PENDING_SPAWN_PRUNE_AGE_SECS
+        kept: list[dict] = []
+        for e in existing:
+            if not isinstance(e, dict):
+                continue
+            if e.get("queue_id") == queue_id:
+                continue
+            try:
+                reg_at = int(e.get("registered_at", 0))
+            except (TypeError, ValueError):
+                continue
+            if reg_at >= cutoff:
+                kept.append(e)
+        kept.append(new_entry)
+
+        out_obj = {"pending": kept}
+        tmp_path = path.with_suffix(path.suffix + ".tmp")
+        try:
+            tmp_path.write_text(
+                json.dumps(out_obj, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            os.replace(str(tmp_path), str(path))
+        except OSError:
+            # Atomic write failed: drop the tmp file if it's there.
+            try:
+                tmp_path.unlink()
+            except OSError as unlink_exc:
+                if unlink_exc.errno != errno.ENOENT:
+                    pass
+            return
+    finally:
+        if lock_fh is not None:
+            try:
+                fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+            try:
+                lock_fh.close()
+            except OSError:
+                pass
 
 
 def _queue_status(queue_id: str) -> tuple[str | None, bool]:
@@ -243,7 +378,12 @@ def main() -> int:
         print(json.dumps(_deny(reason, _banner(reason))))
         return 0
 
-    # Valid marker + running status -> allow.
+    # Valid marker + running status -> allow. Record a pending-spawn
+    # entry so the `force_started_unspawned` obligations predicate sees
+    # this dispatch immediately, without waiting for claude-watch's
+    # once-a-minute active-agents poller. Best-effort: failures here
+    # are swallowed inside the helper.
+    _record_pending_spawn(queue_id)
     print(json.dumps(_allow()))
     return 0
 
