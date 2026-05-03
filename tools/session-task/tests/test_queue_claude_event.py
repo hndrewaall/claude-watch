@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Tests for claude-event lifecycle emission on session-task queue ops.
 
-Covers the 2026-04-24 addition:
+Covers the 2026-04-24 addition (minus the ``queue-added`` emit, which
+was intentionally dropped 2026-04-27 -- ``queue add`` is task creation,
+not a state transition, and the main loop already holds the return
+value, so the event was double-handling and noisy):
 
-  * `queue add` emits a ``queue-added`` claude-event.
   * `queue register <id>` emits a ``queue-running`` claude-event.
   * `queue done <id>` emits a ``queue-done`` claude-event with an
     ``elapsed_sec`` data field populated from ``started_at``.
@@ -11,8 +13,8 @@ Covers the 2026-04-24 addition:
     claude-event with ``elapsed_sec`` + ``reason`` populated.
   * A failing ``claude-event`` shim does NOT fail the underlying queue op
     (same invariant as pingme).
-  * ``--silent`` on any of the four suppresses the claude-event emit (and
-    the pingme emit as before).
+  * ``--silent`` on any of the three suppresses the claude-event emit
+    (and the pingme emit as before).
   * ``CLAUDE_EVENT_SESSION_TASK=0`` env var suppresses emission.
 
 The tests install a fake ``claude-event`` shim that records invocations
@@ -175,11 +177,17 @@ def _parse_claude_event_argv(argv):
 
 
 # ---------------------------------------------------------------------------
-# 1. queue add emits queue-added
+# 1. queue add does NOT emit a claude-event (queue-added removed 2026-04-27)
 # ---------------------------------------------------------------------------
 
 
-def test_add_emits_queue_added_event():
+def test_add_does_not_emit_claude_event():
+    """``queue add`` is task creation, not a state transition.
+
+    The ``queue-added`` emit was dropped 2026-04-27 ("too noisy" --
+    Andrew). Verify ``queue add`` no longer shells out to claude-event
+    so this regression doesn't sneak back in.
+    """
     with tempfile.TemporaryDirectory() as tmp:
         bin_dir = Path(tmp) / "bin"
         ev_log = Path(tmp) / "claude-event.log"
@@ -187,27 +195,13 @@ def test_add_emits_queue_added_event():
         _install_fake_pingme(bin_dir)
         env = _env_for_tmp(tmp, bin_dir=bin_dir)
 
-        summary = "test add emits queue-added event"
-        r1 = _add(env, "add-test", ["repo:ce-add"], "--summary", summary)
-        d1 = json.loads(r1.stdout)
+        summary = "test add emits no claude-event"
+        _add(env, "add-test", ["repo:ce-add"], "--summary", summary)
 
         calls = _read_shim_log(ev_log)
-        assert len(calls) == 1, calls
-        parsed = _parse_claude_event_argv(calls[0])
-        assert parsed["source"] == "queue"
-        assert parsed["tag"] == "queue-added"
-        assert parsed["priority"] == "low"
-        assert d1["id"] in parsed["message"]
-        assert summary in parsed["message"]
-
-        # Structured data round-trips.
-        assert parsed["data"]["queue_id"] == d1["id"]
-        assert parsed["data"]["group_id"] == d1["group_id"]
-        assert parsed["data"]["summary"] == summary
-        # scope is JSON-encoded because it's a list.
-        assert json.loads(parsed["data"]["scope"]) == d1["scope"]
-        # ready_now is surfaced as a stringified bool.
-        assert parsed["data"]["ready_now"] in ("True", "true")
+        assert calls == [], (
+            f"queue add should NOT emit a claude-event; got {calls}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -226,15 +220,16 @@ def test_register_emits_queue_running_event():
         r1 = _add(env, "reg-test", ["repo:ce-reg"], "--summary",
                   "reg test summary")
         d1 = json.loads(r1.stdout)
-        # First event is queue-added; clear it so we assert on register alone.
-        assert len(_read_shim_log(ev_log)) == 1
+        # queue add no longer emits an event (queue-added removed
+        # 2026-04-27). The shim log should still be empty here.
+        assert _read_shim_log(ev_log) == []
 
         _run(env, "queue", "register", d1["id"], "--json", check=True)
 
         calls = _read_shim_log(ev_log)
-        # two total: add + register
-        assert len(calls) == 2, calls
-        parsed = _parse_claude_event_argv(calls[1])
+        # one total: register
+        assert len(calls) == 1, calls
+        parsed = _parse_claude_event_argv(calls[0])
         assert parsed["source"] == "queue"
         assert parsed["tag"] == "queue-running"
         assert parsed["priority"] == "low"
@@ -263,9 +258,9 @@ def test_done_emits_queue_done_event_with_elapsed_sec():
         _run(env, "queue", "done", d1["id"], check=True)
 
         calls = _read_shim_log(ev_log)
-        # add + register + done
-        assert len(calls) == 3, calls
-        parsed = _parse_claude_event_argv(calls[2])
+        # register + done (queue add does not emit since 2026-04-27)
+        assert len(calls) == 2, calls
+        parsed = _parse_claude_event_argv(calls[1])
         assert parsed["source"] == "queue"
         assert parsed["tag"] == "queue-done"
         assert parsed["data"]["queue_id"] == d1["id"]
@@ -295,9 +290,9 @@ def test_abandon_emits_queue_abandoned_event():
              "agent crashed in testing", check=True)
 
         calls = _read_shim_log(ev_log)
-        # add + register + abandon
-        assert len(calls) == 3, calls
-        parsed = _parse_claude_event_argv(calls[2])
+        # register + abandon (queue add does not emit since 2026-04-27)
+        assert len(calls) == 2, calls
+        parsed = _parse_claude_event_argv(calls[1])
         assert parsed["source"] == "queue"
         assert parsed["tag"] == "queue-abandoned"
         assert parsed["data"]["queue_id"] == d1["id"]
@@ -334,9 +329,11 @@ def test_failing_claude_event_does_not_block_queue_op():
         assert rd.returncode == 0, rd.stderr
 
         # The shim still recorded every invocation despite exit 17.
+        # queue add does not emit a claude-event since 2026-04-27, so
+        # only register + done land in the shim log.
         calls = _read_shim_log(ev_log)
         tags = [_parse_claude_event_argv(c)["tag"] for c in calls]
-        assert tags == ["queue-added", "queue-running", "queue-done"], tags
+        assert tags == ["queue-running", "queue-done"], tags
 
 
 # ---------------------------------------------------------------------------
@@ -370,7 +367,7 @@ def test_env_var_suppresses_claude_event():
 
 def _all_tests():
     return [
-        test_add_emits_queue_added_event,
+        test_add_does_not_emit_claude_event,
         test_register_emits_queue_running_event,
         test_done_emits_queue_done_event_with_elapsed_sec,
         test_abandon_emits_queue_abandoned_event,
