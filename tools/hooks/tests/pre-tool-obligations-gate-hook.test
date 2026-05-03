@@ -88,7 +88,7 @@ Test cases (PreToolUse):
  85. stale_ready_queue_present: exempt Agent allows even when stale present
  86. stale_ready_queue_present: exempt session-task queue register allows
  87. stale_ready_queue_present: scope-guard subagent bypasses (all_of with is_main_loop)
- 88. stale_ready_queue_present: override bypasses gate
+ 88. stale_ready_queue_present: auto-mandatory refuses override (exit 4)
  89. override: pingme called when override created
  90. override: pingme suppressed by OBLIGATIONS_DISABLE_PINGME=1
  91. universal recovery: `obligations override` allowed even with row-level deny
@@ -101,6 +101,15 @@ Test cases (PreToolUse):
      leave the universal recovery surface allowed (smoke test against the
      three currently-deployed long-lived obligations + stale_ready)
  98. inform-mode: universal recovery suppresses inform advisories too
+110. obligations add --mandatory persists the flag in state
+111. override against an explicitly --mandatory row -> exit 4 + MANDATORY
+112. override against a non-mandatory row still works (regression)
+113. stale_ready_queue_present is AUTO-MANDATORY (no --mandatory flag);
+     persisted as mandatory + override refused
+114. nested all_of[is_main_loop, stale_ready_queue_present] inherits
+     auto-mandatory + override refused (production cron shape)
+115. cron-queue-check parity: production add invocation
+     yields a mandatory row; override refused
 
 Each test uses a SEPARATE OBLIGATIONS_FILE path (not the live ~/.config/claude/
 one) by overriding via environment + an isolated state dir, so we never touch
@@ -2540,19 +2549,36 @@ def main() -> int:
             ))
             _run([str(CLI), "satisfy", ob_id], env_s)
 
-            # --- 88: override bypasses gate ---
+            # --- 88: stale_ready_queue_present is auto-mandatory ---
+            # Per Andrew DM 2026-05-03 05:16 ET, event-queueing
+            # obligations (stale-ready, ...) are AUTO-MANDATORY:
+            # `obligations override` MUST refuse (exit 4) while a
+            # mandatory row is active. The operator must dispatch /
+            # abandon the underlying work (or `obligations satisfy
+            # <id>`) instead. The hook should still DENY (override
+            # never landed).
             ob = _add_stale_ob()
-            ov_id = _add_override(env_s, "test bypass for stale", 60)
+            ov_proc = subprocess.run(
+                [str(CLI), "override", "test bypass for stale",
+                 "--duration", "60", "--created-by", "test"],
+                env=env_s, capture_output=True, text=True,
+            )
+            override_refused = (
+                ov_proc.returncode == 4
+                and "MANDATORY" in ov_proc.stderr
+            )
             rc, out, _err = _hook_pre(
                 {"tool_name": "Bash", "tool_input": {"command": "ls"}},
                 env_s,
             )
+            still_denied = _is_deny(out)
             results.append(_check(
-                "88. stale_ready_queue_present: override bypasses gate",
-                rc == 0 and _is_allow(out),
-                f"rc={rc} out={out}",
+                "88. stale_ready_queue_present: auto-mandatory refuses override",
+                override_refused and still_denied,
+                f"override_rc={ov_proc.returncode} "
+                f"override_stderr={ov_proc.stderr!r} "
+                f"hook_out={out!r}",
             ))
-            _run([str(CLI), "satisfy", ov_id], env_s)
             _run([str(CLI), "satisfy", ob], env_s)
 
             # --- 89: override calls pingme (when not suppressed) ---
@@ -3308,6 +3334,275 @@ def main() -> int:
                 f"rc={rc} out={out}",
             ))
             _run([str(CLI), "satisfy", ob_109], env_fs)
+
+        # ===========================================================
+        # Tests 110-115: --mandatory flag + AUTO_MANDATORY_PREDICATE_KINDS
+        # (Andrew DM 2026-05-03 05:16 ET: event-queueing obligations
+        # must be non-bypassable. `obligations override` must refuse
+        # exit-4 when any active mandatory row exists.)
+        # ===========================================================
+        with tempfile.TemporaryDirectory(prefix="obligations-mand-") as td_m:
+            tmpdir_m = Path(td_m)
+            env_m, ob_path_m = _make_isolated_env(tmpdir_m)
+
+            # --- 110: `obligations add --mandatory` persists the flag ---
+            proc_add = _run([
+                str(CLI), "add",
+                "--tool-pattern", "Bash",
+                "--predicate", "file_exists",
+                "--params", json.dumps({"path": "/nonexistent/path-110"}),
+                "--ttl", "60",
+                "--deny-msg", "explicit mandatory test",
+                "--mandatory",
+                "--created-by", "test",
+                "--json",
+            ], env_m)
+            ob_110 = (json.loads(proc_add.stdout)["id"]
+                      if proc_add.returncode == 0 else None)
+            persisted_mandatory = False
+            if ob_110:
+                state = json.loads(ob_path_m.read_text())
+                for ob in state.get("obligations", []):
+                    if ob.get("id") == ob_110:
+                        persisted_mandatory = bool(ob.get("mandatory"))
+                        break
+            results.append(_check(
+                "110. obligations add --mandatory persists mandatory=true",
+                proc_add.returncode == 0 and persisted_mandatory,
+                f"rc={proc_add.returncode} persisted={persisted_mandatory} "
+                f"stdout={proc_add.stdout[:200]!r} "
+                f"stderr={proc_add.stderr[:200]!r}",
+            ))
+
+            # --- 111: override against mandatory row -> exit 4 ---
+            ov_proc_111 = _run([
+                str(CLI), "override",
+                "explicit mandatory bypass attempt",
+                "--duration", "60", "--created-by", "test",
+            ], env_m)
+            results.append(_check(
+                "111. override against --mandatory row -> exit 4 + MANDATORY",
+                (ov_proc_111.returncode == 4
+                 and "MANDATORY" in ov_proc_111.stderr),
+                f"rc={ov_proc_111.returncode} "
+                f"stderr={ov_proc_111.stderr!r}",
+            ))
+            if ob_110:
+                _run([str(CLI), "satisfy", ob_110], env_m)
+
+            # --- 112: override against non-mandatory row -> still works ---
+            # (regression: legacy gate-mode rows continue to be bypassable.)
+            ob_112 = _add_ob(
+                env_m,
+                tool_pattern="Bash",
+                predicate="file_exists",
+                params={"path": "/nonexistent/path-112"},
+                ttl=60,
+                deny_msg="non-mandatory test",
+            )
+            ov_proc_112 = _run([
+                str(CLI), "override", "non-mandatory bypass test",
+                "--duration", "60", "--created-by", "test",
+                "--json",
+            ], env_m)
+            ov_112_id = ""
+            if ov_proc_112.returncode == 0:
+                try:
+                    ov_112_id = json.loads(ov_proc_112.stdout).get("id", "")
+                except json.JSONDecodeError:
+                    pass
+            results.append(_check(
+                "112. override against non-mandatory row still works",
+                (ov_proc_112.returncode == 0
+                 and ov_112_id.startswith("ov-")),
+                f"rc={ov_proc_112.returncode} "
+                f"stdout={ov_proc_112.stdout[:200]!r} "
+                f"stderr={ov_proc_112.stderr[:200]!r}",
+            ))
+            if ov_112_id:
+                _run([str(CLI), "satisfy", ov_112_id], env_m)
+            _run([str(CLI), "satisfy", ob_112], env_m)
+
+            # --- 113: stale_ready_queue_present is AUTO-MANDATORY even
+            # without --mandatory at registration. Provide a queue file
+            # with one stale ready+pending item so the predicate is
+            # active. Override must refuse exit-4. ---
+            qfile_113 = tmpdir_m / "mand-113-queue.json"
+            stale_ts = time.time() - 600  # 10 min ago
+            iso_stale = (
+                __import__("datetime").datetime
+                .fromtimestamp(stale_ts,
+                               tz=__import__("datetime").timezone.utc)
+                .isoformat()
+            )
+            qfile_113.write_text(json.dumps({
+                "items": [{
+                    "id": "q-mand-113",
+                    "scope": "test",
+                    "summary": "test stale ready",
+                    "status": "pending",
+                    "created_at": iso_stale,
+                    "updated_at": iso_stale,
+                    "group_id": "g-113",
+                }],
+            }))
+            ob_113 = _add_ob(
+                env_m,
+                tool_pattern="*",
+                predicate="stale_ready_queue_present",
+                params={
+                    "queue_path": str(qfile_113),
+                    "threshold_secs": 300,
+                },
+                ttl=600,
+                deny_msg="dispatch stale item",
+            )
+            # Verify the row was AUTO-marked mandatory in state.
+            state_113 = json.loads(ob_path_m.read_text())
+            row_113 = next((ob for ob in state_113.get("obligations", [])
+                            if ob.get("id") == ob_113), None)
+            auto_mand_persisted = bool(
+                row_113 and row_113.get("mandatory") is True
+            )
+            ov_proc_113 = _run([
+                str(CLI), "override", "stale-ready bypass attempt",
+                "--duration", "60", "--created-by", "test",
+            ], env_m)
+            results.append(_check(
+                "113. stale_ready_queue_present auto-mandatory: "
+                "persisted + override refused",
+                (auto_mand_persisted
+                 and ov_proc_113.returncode == 4
+                 and "MANDATORY" in ov_proc_113.stderr),
+                f"auto_persisted={auto_mand_persisted} "
+                f"rc={ov_proc_113.returncode} "
+                f"stderr={ov_proc_113.stderr!r}",
+            ))
+            _run([str(CLI), "satisfy", ob_113], env_m)
+
+            # --- 114: nested all_of [is_main_loop,
+            # stale_ready_queue_present] still inherits auto-mandatory.
+            # This mirrors the predicate cron-queue-check actually
+            # registers in production. ---
+            qfile_114 = tmpdir_m / "mand-114-queue.json"
+            qfile_114.write_text(json.dumps({
+                "items": [{
+                    "id": "q-mand-114",
+                    "scope": "test",
+                    "summary": "test stale ready nested",
+                    "status": "pending",
+                    "created_at": iso_stale,
+                    "updated_at": iso_stale,
+                    "group_id": "g-114",
+                }],
+            }))
+            ob_114 = _add_ob(
+                env_m,
+                tool_pattern="*",
+                predicate="all_of",
+                params={"predicates": [
+                    {"kind": "is_main_loop", "params": {}},
+                    {"kind": "stale_ready_queue_present", "params": {
+                        "queue_path": str(qfile_114),
+                        "threshold_secs": 300,
+                    }},
+                ]},
+                ttl=600,
+                deny_msg="dispatch stale item (nested)",
+            )
+            state_114 = json.loads(ob_path_m.read_text())
+            row_114 = next((ob for ob in state_114.get("obligations", [])
+                            if ob.get("id") == ob_114), None)
+            nested_auto_persisted = bool(
+                row_114 and row_114.get("mandatory") is True
+            )
+            ov_proc_114 = _run([
+                str(CLI), "override", "nested all_of bypass attempt",
+                "--duration", "60", "--created-by", "test",
+            ], env_m)
+            results.append(_check(
+                "114. nested all_of[..,stale_ready_queue_present] "
+                "inherits auto-mandatory + override refused",
+                (nested_auto_persisted
+                 and ov_proc_114.returncode == 4
+                 and "MANDATORY" in ov_proc_114.stderr),
+                f"nested_persisted={nested_auto_persisted} "
+                f"rc={ov_proc_114.returncode} "
+                f"stderr={ov_proc_114.stderr!r}",
+            ))
+            _run([str(CLI), "satisfy", ob_114], env_m)
+
+            # --- 115: cron-queue-check parity: the exact obligation
+            # shape that bin/cron-queue-check registers in production
+            # (all_of[is_main_loop, stale_ready_queue_present] with
+            # production exempt patterns) MUST be auto-mandatory and
+            # MUST refuse override. Pure shape-check test. ---
+            qfile_115 = tmpdir_m / "mand-115-queue.json"
+            qfile_115.write_text(json.dumps({
+                "items": [{
+                    "id": "q-mand-115",
+                    "scope": "test",
+                    "summary": "cron-queue-check parity",
+                    "status": "pending",
+                    "created_at": iso_stale,
+                    "updated_at": iso_stale,
+                    "group_id": "g-115",
+                }],
+            }))
+            # Replicate cron-queue-check's add invocation as faithfully
+            # as possible (modulo the queue_path override for test
+            # isolation). The shape mirrors register_stale_ready_obligation.
+            cron_params = json.dumps({
+                "predicates": [
+                    {"kind": "is_main_loop", "params": {}},
+                    {
+                        "kind": "stale_ready_queue_present",
+                        "params": {
+                            "threshold_secs": 300,
+                            "queue_path": str(qfile_115),
+                        },
+                    },
+                ]
+            })
+            proc_cron = _run([
+                str(CLI), "add",
+                "--tool-pattern", "*",
+                "--predicate", "all_of",
+                "--params", cron_params,
+                "--ttl", "360",
+                "--deny-msg",
+                "dispatch the stale ready+pending queue item before "
+                "unrelated work",
+                "--created-by", "cron-queue-check",
+                "--mandatory",  # cron-queue-check passes this explicitly
+                "--json",
+            ], env_m)
+            cron_ob_id = (json.loads(proc_cron.stdout)["id"]
+                          if proc_cron.returncode == 0 else None)
+            state_115 = json.loads(ob_path_m.read_text())
+            row_115 = next((ob for ob in state_115.get("obligations", [])
+                            if ob.get("id") == cron_ob_id), None)
+            cron_persisted = bool(
+                row_115 and row_115.get("mandatory") is True
+            )
+            ov_proc_115 = _run([
+                str(CLI), "override", "cron-queue-check parity bypass",
+                "--duration", "60", "--created-by", "test",
+            ], env_m)
+            results.append(_check(
+                "115. cron-queue-check parity: production obligation "
+                "shape is mandatory + override refused",
+                (proc_cron.returncode == 0
+                 and cron_persisted
+                 and ov_proc_115.returncode == 4
+                 and "MANDATORY" in ov_proc_115.stderr),
+                f"add_rc={proc_cron.returncode} "
+                f"persisted={cron_persisted} "
+                f"ov_rc={ov_proc_115.returncode} "
+                f"stderr={ov_proc_115.stderr!r}",
+            ))
+            if cron_ob_id:
+                _run([str(CLI), "satisfy", cron_ob_id], env_m)
 
     total = len(results)
     passed = sum(1 for r in results if r)
