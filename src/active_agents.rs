@@ -482,6 +482,7 @@ mod tests {
                 command: "sleep 100".to_string(),
                 output: "/tmp/a.output".to_string(),
                 started_at: "2026-05-01T00:00:00".to_string(),
+                queue_id: None,
             },
         );
         state.insert(
@@ -491,6 +492,7 @@ mod tests {
                 command: "echo hi".to_string(),
                 output: "/tmp/b.output".to_string(),
                 started_at: "2026-05-01T00:00:01".to_string(),
+                queue_id: None,
             },
         );
 
@@ -511,6 +513,7 @@ mod tests {
                     command: String::new(),
                     output: String::new(),
                     started_at: String::new(),
+                    queue_id: None,
                 },
             );
         }
@@ -534,6 +537,7 @@ mod tests {
                 command: String::new(),
                 output: String::new(),
                 started_at: String::new(),
+                queue_id: None,
             },
         );
         assert!(running_workload_labels(&state, |_| false).is_empty());

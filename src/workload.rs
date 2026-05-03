@@ -52,6 +52,15 @@ pub struct WorkloadEntry {
     pub output: String,
     #[serde(default)]
     pub started_at: String,
+    /// Queue id this workload is bound to (`workload run --queue-id
+    /// q-X`). When set, the wrapper-side `emit_done` carries the qid
+    /// into the `workload-done` event AND transitions the queue item
+    /// to done/abandoned via `session-task` — first-class workload
+    /// model (Andrew DM 2026-05-03 05:23 ET). Backward compatible:
+    /// existing state.json entries without the field deserialize as
+    /// None.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue_id: Option<String>,
 }
 
 pub type WorkloadState = BTreeMap<String, WorkloadEntry>;
@@ -105,6 +114,34 @@ fn rebalance() {
     let _ = Command::new("tmux")
         .args(["select-layout", "-t", SESSION, "even-vertical"])
         .output();
+}
+
+/// Best-effort PATH walk for the `session-task` CLI. Used by
+/// `transition_queue_item_for_workload` to mark the queue item
+/// done/abandoned after a workload-bound (`--queue-id`) workload
+/// exits. Honours an explicit override via the `SESSION_TASK_CLI`
+/// env var (used by tests to point at a per-test stub).
+fn find_session_task_cli() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("SESSION_TASK_CLI") {
+        let pb = PathBuf::from(p);
+        if pb.exists() {
+            return Some(pb);
+        }
+    }
+    let path = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path) {
+        let candidate = dir.join("session-task");
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    let home = std::env::var("HOME").ok()?;
+    let candidate = PathBuf::from(home).join("bin/session-task");
+    if candidate.is_file() {
+        Some(candidate)
+    } else {
+        None
+    }
 }
 
 fn read_exit_code(label: &str) -> Option<i32> {
@@ -209,8 +246,16 @@ fn get_descendants(pid: &str) -> Vec<String> {
     out
 }
 
-/// CLI: `workload run <label> -- <command...>`
-pub fn cmd_run(label: &str, cmd_args: &[String]) -> i32 {
+/// CLI: `workload run <label> [--queue-id q-X] -- <command...>`
+///
+/// When `queue_id` is `Some(...)` the workload is bound to a queue
+/// item: on completion the `workload-done` event carries the qid AND
+/// the queue item is transitioned to done/abandoned via `session-task`.
+/// Workloads-as-first-class-queue-items model — Andrew DM 2026-05-03
+/// 05:23 ET. Resolves the q-2026-05-03-1e7d orphaned-workload bug by
+/// making workload exit equivalent to queue completion (no agent
+/// respawn dance).
+pub fn cmd_run(label: &str, cmd_args: &[String], queue_id: Option<&str>) -> i32 {
     if cmd_args.is_empty() {
         eprintln!("No command specified");
         return 1;
@@ -269,6 +314,15 @@ pub fn cmd_run(label: &str, cmd_args: &[String]) -> i32 {
         .and_then(|p| p.to_str().map(str::to_string))
         .unwrap_or_else(|| "claude-watch".to_string());
     let exe_q = shell_quote(&exe_path);
+    // When --queue-id is set, append it to the emit-done call so the
+    // wrapper-side emit carries the qid into the workload-done event
+    // AND triggers the queue done/abandon transition. The flag stays
+    // optional — bare workloads emit the legacy event with no qid and
+    // no queue side effect (regression safety).
+    let queue_id_emit_arg = match queue_id {
+        Some(qid) => format!(" --queue-id {}", shell_quote(qid)),
+        None => String::new(),
+    };
     let script = format!(
         "#!/bin/bash\n\
          # Trap SIGINT/SIGTERM — fatfinger-proof against accidental Ctrl-C\n\
@@ -286,7 +340,7 @@ pub fn cmd_run(label: &str, cmd_args: &[String]) -> i32 {
          # Emit claude-event for the main loop. Default-open: any failure\n\
          # here is silently swallowed — the exit-file write above is the\n\
          # source of truth for `workload wait`.\n\
-         {exe_q} workload emit-done --label {label_q} --exit-code \"$EC\" --log-path {out_q} >/dev/null 2>&1 || true\n\
+         {exe_q} workload emit-done --label {label_q} --exit-code \"$EC\" --log-path {out_q}{queue_id_emit_arg} >/dev/null 2>&1 || true\n\
          sleep 30\n",
         // The "Command: " line gets the unquoted version for readability;
         // escape single quotes for the heredoc context.
@@ -337,6 +391,7 @@ pub fn cmd_run(label: &str, cmd_args: &[String]) -> i32 {
             command: command.clone(),
             output: out_path.to_string_lossy().to_string(),
             started_at,
+            queue_id: queue_id.map(str::to_string),
         },
     );
     let _ = save_state(&state);
@@ -509,6 +564,7 @@ pub fn cmd_kill(label: &str) -> i32 {
                 exit_code: -15,
                 killed: true,
                 log_path: &info.output,
+                queue_id: info.queue_id.as_deref(),
             });
         }
         kill_pane_tree(&info.pane_id);
@@ -525,22 +581,181 @@ pub fn cmd_kill(label: &str) -> i32 {
     0
 }
 
-/// CLI (hidden): `workload emit-done --label X --exit-code N --log-path P [--killed]`.
+/// CLI (hidden): `workload emit-done --label X --exit-code N --log-path P [--killed] [--queue-id q-X]`.
 /// Invoked by the wrapper script after the workload exits. Keeps the
 /// emit logic in Rust (testable, dep-free) instead of in bash.
-pub fn cmd_emit_done(label: &str, exit_code: i32, log_path: &str, killed: bool) -> i32 {
+///
+/// When `queue_id` is set, the workload is treated as a FIRST-CLASS
+/// queue item (Andrew DM 2026-05-03 05:23 ET). On exit:
+///   * the `workload-done` event carries the qid in `data.queue_id`;
+///   * the queue item is transitioned to `done` (rc==0 + not killed)
+///     or `abandoned` (non-zero rc OR killed) via `session-task`.
+///
+/// No respawn-event or mandatory-obligation: workload completion IS
+/// queue completion. The main loop sees the canonical `queue-done` /
+/// `queue-abandoned` claude-event when `session-task` performs the
+/// transition.
+///
+/// The queue-transition step is best-effort: failure (CLI not on
+/// PATH, session-task non-zero) is logged at warn level and
+/// swallowed. The `workload-done` event is emitted regardless.
+/// Suppression knob: `WORKLOAD_QUEUE_TRANSITION=0` (env) skips the
+/// queue call entirely (used by tests).
+pub fn cmd_emit_done(
+    label: &str,
+    exit_code: i32,
+    log_path: &str,
+    killed: bool,
+    queue_id: Option<&str>,
+) -> i32 {
     emit_workload_done(&WorkloadDoneEvent {
         label,
         exit_code,
         killed,
         log_path,
+        queue_id,
     });
+    if let Some(qid) = queue_id {
+        transition_queue_item_for_workload(qid, label, exit_code, killed, log_path);
+    }
     0
+}
+
+/// Mark the queue item bound to this workload as `done` (clean exit)
+/// or `abandoned` (non-zero rc / killed). Best-effort; never fails the
+/// caller. Suppression knob: `WORKLOAD_QUEUE_TRANSITION=0`. CLI
+/// override: `SESSION_TASK_CLI` (used by tests to point at a stub).
+///
+/// Mapping rationale:
+///   * rc==0 && !killed → `session-task queue done <qid>` (success)
+///   * killed           → `session-task queue abandon <qid> --reason ...`
+///   * other rc != 0    → `session-task queue abandon <qid> --reason ...`
+///
+/// `session-task queue done` already emits the `queue-done` claude-
+/// event; `queue abandon` emits `queue-abandoned`. Either way the main
+/// loop sees the canonical lifecycle event without us inventing a new
+/// tag. First-class workload model — Andrew DM 2026-05-03 05:23 ET.
+fn transition_queue_item_for_workload(
+    queue_id: &str,
+    label: &str,
+    exit_code: i32,
+    killed: bool,
+    log_path: &str,
+) {
+    if std::env::var("WORKLOAD_QUEUE_TRANSITION")
+        .ok()
+        .as_deref()
+        == Some("0")
+    {
+        return;
+    }
+    let cli = match find_session_task_cli() {
+        Some(p) => p,
+        None => {
+            tracing::warn!(
+                queue_id = %queue_id,
+                label = %label,
+                "workload queue transition: session-task CLI not found, skipping"
+            );
+            return;
+        }
+    };
+
+    let args: Vec<String> = if exit_code == 0 && !killed {
+        vec![
+            "queue".to_string(),
+            "done".to_string(),
+            queue_id.to_string(),
+            "--silent".to_string(),
+        ]
+    } else {
+        let reason = if killed {
+            format!("workload {label} killed (rc={exit_code}, log={log_path})")
+        } else {
+            format!(
+                "workload {label} exited non-zero rc={exit_code} (log={log_path})"
+            )
+        };
+        vec![
+            "queue".to_string(),
+            "abandon".to_string(),
+            queue_id.to_string(),
+            "--reason".to_string(),
+            reason,
+            "--silent".to_string(),
+        ]
+    };
+
+    let result = std::process::Command::new(&cli)
+        .args(&args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            use std::time::{Duration, Instant};
+            // 15s timeout — session-task queue done/abandon is
+            // normally <500ms but file-locking under load can stretch.
+            // A wedged CLI must not stall the wrapper.
+            let deadline = Instant::now() + Duration::from_secs(15);
+            loop {
+                match child.try_wait() {
+                    Ok(Some(status)) => return Ok(status),
+                    Ok(None) => {
+                        if Instant::now() >= deadline {
+                            let _ = child.kill();
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::TimedOut,
+                                "session-task queue transition timed out (15s)",
+                            ));
+                        }
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+        });
+
+    match result {
+        Ok(status) if status.success() => {
+            tracing::info!(
+                queue_id = %queue_id,
+                label = %label,
+                exit_code = exit_code,
+                killed = killed,
+                "workload queue transition succeeded"
+            );
+        }
+        Ok(status) => {
+            tracing::warn!(
+                queue_id = %queue_id,
+                label = %label,
+                rc = ?status.code(),
+                "workload queue transition exited non-zero"
+            );
+        }
+        Err(e) => {
+            tracing::warn!(
+                queue_id = %queue_id,
+                label = %label,
+                error = %e,
+                "workload queue transition failed"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Serializes tests that mutate process-global env vars (CLAUDE_EVENT_QUEUE,
+    // SESSION_TASK_CLI, WORKLOAD_QUEUE_TRANSITION). Without it, parallel test
+    // execution interleaves env-var sets and the wrong tempdir / stub path is
+    // observed by the function under test. Same pattern as `task_watch::tests`'
+    // WORKLOAD_ENV_LOCK. Acquire BEFORE setting any env var; hold for the
+    // entire body so the restore-on-drop window is exclusive.
+    use std::sync::Mutex;
+    static WORKLOAD_TEST_ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn shell_quote_plain() {
@@ -562,12 +777,47 @@ mod tests {
                 command: "sleep 10".to_string(),
                 output: "/tmp/claude-workloads/foo.output".to_string(),
                 started_at: "2026-01-01T00:00:00".to_string(),
+                queue_id: None,
             },
         );
         let j = serde_json::to_string(&s).unwrap();
         let parsed: WorkloadState = serde_json::from_str(&j).unwrap();
         assert_eq!(parsed["foo"].pane_id, "%3");
         assert_eq!(parsed["foo"].command, "sleep 10");
+        assert_eq!(parsed["foo"].queue_id, None);
+    }
+
+    #[test]
+    fn state_roundtrip_with_queue_id() {
+        // First-class workload model: when `workload run --queue-id`
+        // is used, the qid is persisted in state.json so `cmd_kill`'s
+        // synthesised event also carries it.
+        let mut s = WorkloadState::new();
+        s.insert(
+            "scoped".to_string(),
+            WorkloadEntry {
+                pane_id: "%4".to_string(),
+                command: "sleep 99".to_string(),
+                output: "/tmp/claude-workloads/scoped.output".to_string(),
+                started_at: "2026-05-03T05:00:00".to_string(),
+                queue_id: Some("q-2026-05-03-test".to_string()),
+            },
+        );
+        let j = serde_json::to_string(&s).unwrap();
+        let parsed: WorkloadState = serde_json::from_str(&j).unwrap();
+        assert_eq!(
+            parsed["scoped"].queue_id.as_deref(),
+            Some("q-2026-05-03-test")
+        );
+    }
+
+    #[test]
+    fn state_loads_legacy_entry_without_queue_id_field() {
+        // Existing /tmp/claude-workloads/state.json files predate the
+        // queue_id field — must deserialize cleanly with queue_id=None.
+        let raw = r#"{"foo":{"pane_id":"%5","command":"x","output":"/tmp/x","started_at":"2026"}}"#;
+        let parsed: WorkloadState = serde_json::from_str(raw).expect("legacy parse");
+        assert_eq!(parsed["foo"].queue_id, None);
     }
 
     #[test]
@@ -609,15 +859,16 @@ mod tests {
     fn cmd_emit_done_writes_event_file() {
         // Point CLAUDE_EVENT_QUEUE at a tempdir; cmd_emit_done should
         // produce exactly one workload-done event with the right shape.
+        let _lock = WORKLOAD_TEST_ENV_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().expect("tempdir");
         let prev = std::env::var("CLAUDE_EVENT_QUEUE").ok();
-        // SAFETY: same justification as the event_bus tests — these are
-        // not concurrently mutating the env var with peers.
+        // SAFETY: lock above serializes against peer tests touching
+        // the same process-global env vars.
         unsafe {
             std::env::set_var("CLAUDE_EVENT_QUEUE", tmp.path());
         }
 
-        let rc = cmd_emit_done("test-task", 0, "/tmp/foo.output", false);
+        let rc = cmd_emit_done("test-task", 0, "/tmp/foo.output", false, None);
         assert_eq!(rc, 0);
 
         // Restore env first so any panic below doesn't leak.
@@ -646,16 +897,19 @@ mod tests {
         assert_eq!(v["data"]["exit_code"], 0);
         assert_eq!(v["data"]["killed"], false);
         assert_eq!(v["data"]["log_path"], "/tmp/foo.output");
+        // Without --queue-id, no queue_id field in event data.
+        assert!(v["data"].get("queue_id").is_none());
     }
 
     #[test]
     fn cmd_emit_done_killed_marker() {
+        let _lock = WORKLOAD_TEST_ENV_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().expect("tempdir");
         let prev = std::env::var("CLAUDE_EVENT_QUEUE").ok();
         unsafe {
             std::env::set_var("CLAUDE_EVENT_QUEUE", tmp.path());
         }
-        let rc = cmd_emit_done("killed-task", -15, "/tmp/k.output", true);
+        let rc = cmd_emit_done("killed-task", -15, "/tmp/k.output", true, None);
         assert_eq!(rc, 0);
         unsafe {
             match prev {
@@ -682,5 +936,307 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("workload killed-task killed"));
+    }
+
+    #[test]
+    fn cmd_emit_done_with_queue_id_carries_qid_in_event() {
+        // First-class workload model: --queue-id puts data.queue_id in
+        // the event. Suppress the queue transition (no session-task on
+        // PATH in CI) — that path is exercised in the stub-CLI test.
+        let _lock = WORKLOAD_TEST_ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let prev_q = std::env::var("CLAUDE_EVENT_QUEUE").ok();
+        let prev_t = std::env::var("WORKLOAD_QUEUE_TRANSITION").ok();
+        unsafe {
+            std::env::set_var("CLAUDE_EVENT_QUEUE", tmp.path());
+            std::env::set_var("WORKLOAD_QUEUE_TRANSITION", "0");
+        }
+
+        let rc = cmd_emit_done(
+            "qa-task",
+            0,
+            "/tmp/qa.output",
+            false,
+            Some("q-2026-05-03-test"),
+        );
+        assert_eq!(rc, 0);
+
+        unsafe {
+            match prev_q {
+                Some(v) => std::env::set_var("CLAUDE_EVENT_QUEUE", v),
+                None => std::env::remove_var("CLAUDE_EVENT_QUEUE"),
+            }
+            match prev_t {
+                Some(v) => std::env::set_var("WORKLOAD_QUEUE_TRANSITION", v),
+                None => std::env::remove_var("WORKLOAD_QUEUE_TRANSITION"),
+            }
+        }
+
+        let entries: Vec<_> = std::fs::read_dir(tmp.path())
+            .expect("read tempdir")
+            .filter_map(Result::ok)
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .ends_with("_workload-done.json")
+            })
+            .collect();
+        assert_eq!(entries.len(), 1, "expected one workload-done event");
+        let body = std::fs::read_to_string(entries[0].path()).expect("read");
+        let v: serde_json::Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(v["tag"], "workload-done");
+        assert_eq!(v["data"]["queue_id"], "q-2026-05-03-test");
+    }
+
+    #[test]
+    fn cmd_emit_done_calls_session_task_queue_done_on_clean_exit() {
+        // Stub session-task as a recording bash script. Verify it was
+        // invoked with `queue done <qid>` when exit_code=0 and
+        // killed=false. SESSION_TASK_CLI overrides PATH lookup.
+        let _lock = WORKLOAD_TEST_ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let prev_q = std::env::var("CLAUDE_EVENT_QUEUE").ok();
+        let prev_cli = std::env::var("SESSION_TASK_CLI").ok();
+        let prev_t = std::env::var("WORKLOAD_QUEUE_TRANSITION").ok();
+
+        let recording = tmp.path().join("session-task.recording");
+        let stub_path = tmp.path().join("session-task-stub");
+        let stub = format!(
+            "#!/bin/bash\nprintf '%s\\n' \"$@\" > {rec}\nexit 0\n",
+            rec = shell_quote(&recording.to_string_lossy()),
+        );
+        std::fs::write(&stub_path, stub).expect("write stub");
+        let _ = std::fs::set_permissions(
+            &stub_path,
+            std::fs::Permissions::from_mode(0o755),
+        );
+
+        unsafe {
+            std::env::set_var("CLAUDE_EVENT_QUEUE", tmp.path());
+            std::env::set_var("SESSION_TASK_CLI", &stub_path);
+            std::env::remove_var("WORKLOAD_QUEUE_TRANSITION");
+        }
+
+        let rc = cmd_emit_done(
+            "stub-task",
+            0,
+            "/tmp/stub.output",
+            false,
+            Some("q-2026-05-03-stub"),
+        );
+
+        unsafe {
+            match prev_q {
+                Some(v) => std::env::set_var("CLAUDE_EVENT_QUEUE", v),
+                None => std::env::remove_var("CLAUDE_EVENT_QUEUE"),
+            }
+            match prev_cli {
+                Some(v) => std::env::set_var("SESSION_TASK_CLI", v),
+                None => std::env::remove_var("SESSION_TASK_CLI"),
+            }
+            match prev_t {
+                Some(v) => std::env::set_var("WORKLOAD_QUEUE_TRANSITION", v),
+                None => std::env::remove_var("WORKLOAD_QUEUE_TRANSITION"),
+            }
+        }
+
+        assert_eq!(rc, 0);
+        assert!(recording.exists(), "stub session-task should have been invoked");
+        let recorded = std::fs::read_to_string(&recording).expect("read recording");
+        assert!(
+            recorded.contains("queue\ndone\nq-2026-05-03-stub"),
+            "expected `queue done <qid>` invocation in {recorded}"
+        );
+        assert!(
+            recorded.contains("--silent"),
+            "expected --silent flag in {recorded}"
+        );
+    }
+
+    #[test]
+    fn cmd_emit_done_calls_queue_abandon_on_failure() {
+        // Stub session-task. Verify `queue abandon <qid> --reason ...`
+        // when the workload exits non-zero. Reason should mention the
+        // exit code so post-mortem inspection is straightforward.
+        let _lock = WORKLOAD_TEST_ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let prev_q = std::env::var("CLAUDE_EVENT_QUEUE").ok();
+        let prev_cli = std::env::var("SESSION_TASK_CLI").ok();
+        let prev_t = std::env::var("WORKLOAD_QUEUE_TRANSITION").ok();
+
+        let recording = tmp.path().join("session-task.recording");
+        let stub_path = tmp.path().join("session-task-stub");
+        let stub = format!(
+            "#!/bin/bash\nprintf '%s\\n' \"$@\" > {rec}\nexit 0\n",
+            rec = shell_quote(&recording.to_string_lossy()),
+        );
+        std::fs::write(&stub_path, stub).expect("write stub");
+        let _ = std::fs::set_permissions(
+            &stub_path,
+            std::fs::Permissions::from_mode(0o755),
+        );
+
+        unsafe {
+            std::env::set_var("CLAUDE_EVENT_QUEUE", tmp.path());
+            std::env::set_var("SESSION_TASK_CLI", &stub_path);
+            std::env::remove_var("WORKLOAD_QUEUE_TRANSITION");
+        }
+
+        let rc = cmd_emit_done(
+            "fail-task",
+            7,
+            "/tmp/fail.output",
+            false,
+            Some("q-2026-05-03-fail"),
+        );
+
+        unsafe {
+            match prev_q {
+                Some(v) => std::env::set_var("CLAUDE_EVENT_QUEUE", v),
+                None => std::env::remove_var("CLAUDE_EVENT_QUEUE"),
+            }
+            match prev_cli {
+                Some(v) => std::env::set_var("SESSION_TASK_CLI", v),
+                None => std::env::remove_var("SESSION_TASK_CLI"),
+            }
+            match prev_t {
+                Some(v) => std::env::set_var("WORKLOAD_QUEUE_TRANSITION", v),
+                None => std::env::remove_var("WORKLOAD_QUEUE_TRANSITION"),
+            }
+        }
+
+        assert_eq!(rc, 0);
+        assert!(recording.exists(), "stub should have been invoked");
+        let recorded = std::fs::read_to_string(&recording).expect("read recording");
+        assert!(
+            recorded.contains("queue\nabandon\nq-2026-05-03-fail"),
+            "expected `queue abandon <qid>` in {recorded}"
+        );
+        assert!(recorded.contains("--reason"));
+        assert!(
+            recorded.contains("rc=7"),
+            "abandon reason must mention exit code: {recorded}"
+        );
+    }
+
+    #[test]
+    fn cmd_emit_done_calls_queue_abandon_on_kill() {
+        // Killed workloads transition to abandoned with a reason
+        // mentioning the kill — symmetric with non-zero exit handling.
+        let _lock = WORKLOAD_TEST_ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let prev_q = std::env::var("CLAUDE_EVENT_QUEUE").ok();
+        let prev_cli = std::env::var("SESSION_TASK_CLI").ok();
+        let prev_t = std::env::var("WORKLOAD_QUEUE_TRANSITION").ok();
+
+        let recording = tmp.path().join("session-task.recording");
+        let stub_path = tmp.path().join("session-task-stub");
+        let stub = format!(
+            "#!/bin/bash\nprintf '%s\\n' \"$@\" > {rec}\nexit 0\n",
+            rec = shell_quote(&recording.to_string_lossy()),
+        );
+        std::fs::write(&stub_path, stub).expect("write stub");
+        let _ = std::fs::set_permissions(
+            &stub_path,
+            std::fs::Permissions::from_mode(0o755),
+        );
+
+        unsafe {
+            std::env::set_var("CLAUDE_EVENT_QUEUE", tmp.path());
+            std::env::set_var("SESSION_TASK_CLI", &stub_path);
+            std::env::remove_var("WORKLOAD_QUEUE_TRANSITION");
+        }
+
+        let rc = cmd_emit_done(
+            "killed-task",
+            -15,
+            "/tmp/killed.output",
+            true,
+            Some("q-2026-05-03-killed"),
+        );
+
+        unsafe {
+            match prev_q {
+                Some(v) => std::env::set_var("CLAUDE_EVENT_QUEUE", v),
+                None => std::env::remove_var("CLAUDE_EVENT_QUEUE"),
+            }
+            match prev_cli {
+                Some(v) => std::env::set_var("SESSION_TASK_CLI", v),
+                None => std::env::remove_var("SESSION_TASK_CLI"),
+            }
+            match prev_t {
+                Some(v) => std::env::set_var("WORKLOAD_QUEUE_TRANSITION", v),
+                None => std::env::remove_var("WORKLOAD_QUEUE_TRANSITION"),
+            }
+        }
+
+        assert_eq!(rc, 0);
+        let recorded = std::fs::read_to_string(&recording).expect("read recording");
+        assert!(
+            recorded.contains("queue\nabandon\nq-2026-05-03-killed"),
+            "killed → abandon expected: {recorded}"
+        );
+        assert!(
+            recorded.contains("killed"),
+            "reason must mention kill: {recorded}"
+        );
+    }
+
+    #[test]
+    fn cmd_emit_done_queue_transition_skipped_by_env() {
+        // WORKLOAD_QUEUE_TRANSITION=0 must skip the session-task call
+        // entirely (regression safety + test-harness escape hatch).
+        let _lock = WORKLOAD_TEST_ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let prev_q = std::env::var("CLAUDE_EVENT_QUEUE").ok();
+        let prev_cli = std::env::var("SESSION_TASK_CLI").ok();
+        let prev_t = std::env::var("WORKLOAD_QUEUE_TRANSITION").ok();
+
+        let recording = tmp.path().join("session-task.recording");
+        let stub_path = tmp.path().join("session-task-stub");
+        let stub = format!(
+            "#!/bin/bash\nprintf '%s\\n' \"$@\" > {rec}\nexit 0\n",
+            rec = shell_quote(&recording.to_string_lossy()),
+        );
+        std::fs::write(&stub_path, stub).expect("write stub");
+        let _ = std::fs::set_permissions(
+            &stub_path,
+            std::fs::Permissions::from_mode(0o755),
+        );
+
+        unsafe {
+            std::env::set_var("CLAUDE_EVENT_QUEUE", tmp.path());
+            std::env::set_var("SESSION_TASK_CLI", &stub_path);
+            std::env::set_var("WORKLOAD_QUEUE_TRANSITION", "0");
+        }
+
+        let rc = cmd_emit_done(
+            "skip-task",
+            0,
+            "/tmp/skip.output",
+            false,
+            Some("q-2026-05-03-skip"),
+        );
+
+        unsafe {
+            match prev_q {
+                Some(v) => std::env::set_var("CLAUDE_EVENT_QUEUE", v),
+                None => std::env::remove_var("CLAUDE_EVENT_QUEUE"),
+            }
+            match prev_cli {
+                Some(v) => std::env::set_var("SESSION_TASK_CLI", v),
+                None => std::env::remove_var("SESSION_TASK_CLI"),
+            }
+            match prev_t {
+                Some(v) => std::env::set_var("WORKLOAD_QUEUE_TRANSITION", v),
+                None => std::env::remove_var("WORKLOAD_QUEUE_TRANSITION"),
+            }
+        }
+
+        assert_eq!(rc, 0);
+        assert!(
+            !recording.exists(),
+            "stub must NOT be invoked when WORKLOAD_QUEUE_TRANSITION=0"
+        );
     }
 }
