@@ -128,6 +128,20 @@ QUEUE_FORCE_START_LOG = Path(
     )
 )
 
+# Per-force-start recovery bundle directory. When `queue force-start q-X`
+# autostops one or more overlapping running peers, the bundle keyed on q-X
+# captures everything the new agent needs to triage what was abandoned:
+# the original prompts, transcript paths, queue summaries, and per-repo
+# git status/diff snapshots. The spawning agent reads this file to decide
+# whether to resume, integrate, stash, or abandon the leftovers.
+# Container deploys override via env var.
+FORCE_START_BUNDLE_DIR = Path(
+    os.environ.get(
+        "FORCE_START_BUNDLE_DIR",
+        str(Path.home() / ".config" / "session-task" / "force-start-bundles"),
+    )
+)
+
 
 # ---------------------------------------------------------------------------
 # Layer 1: resume-action.json (single "top-of-mind" slot)
@@ -920,7 +934,8 @@ def _claude_event_notify(tag, message, data, priority="low", silent=False):
     return cmd
 
 
-def _obligations_register_force_start(queue_id, summary, reason, ttl_secs=900):
+def _obligations_register_force_start(queue_id, summary, reason, ttl_secs=900,
+                                       bundle_path=None, autostopped_count=0):
     """Register a `force_started_unspawned` obligation on the queue id.
 
     Wired by `cmd_queue_force_start` after a successful pending->running
@@ -942,16 +957,34 @@ def _obligations_register_force_start(queue_id, summary, reason, ttl_secs=900):
     deadlocking forever; this matches Andrew's "short" guidance in the
     spec. Bump or pass a larger value if that proves too tight in
     practice.
+
+    ``bundle_path`` (when present) is woven into the deny banner so the
+    main loop sees the recovery context location at gate-fire time. The
+    spawned Agent is expected to read that file as its FIRST action so
+    it can triage the autostopped peers' uncommitted work.
     """
     if os.environ.get("OBLIGATIONS_FORCE_START") == "0":
         return None
     cli = shutil.which("obligations")
     if not cli:
         return None
+    bundle_hint = ""
+    if bundle_path:
+        if autostopped_count:
+            bundle_hint = (
+                f" Autostopped {autostopped_count} running peer(s); "
+                f"the recovery bundle at {bundle_path} contains their "
+                f"prompts, transcript paths, and uncommitted git state — "
+                f"the spawning Agent must read it and triage."
+            )
+        else:
+            bundle_hint = (
+                f" Recovery bundle at {bundle_path} (no peers autostopped)."
+            )
     deny_msg = (
         f"FORCE-START: q={queue_id} ({summary}) was force-started but no "
         f"Agent has been spawned for it yet. Dispatch the agent before "
-        f"running any other tool. Reason: {reason}"
+        f"running any other tool. Reason: {reason}.{bundle_hint}"
     )
     params = json.dumps({"queue_id": queue_id})
     cmd = [
@@ -1189,6 +1222,409 @@ def _archive_agent_transcript(item, *, reason="done"):
         file=sys.stderr,
     )
     return archive_name
+
+
+# ---------------------------------------------------------------------------
+# Force-start autostop + recovery bundle (added 2026-05-02)
+# ---------------------------------------------------------------------------
+#
+# When `queue force-start q-X` flips a blocked-pending item to running, any
+# OTHER running item whose scope overlaps q-X's scope is now (per Andrew's
+# 2026-05-02 21:10 UTC directive) auto-abandoned and its recovery context
+# captured for the new agent to triage. The interrupter (the new agent)
+# decides resume/integrate/stash/abandon — we do NOT auto-stash. We just
+# bundle up the breadcrumbs so the next operator has the full picture.
+
+
+def _extract_repo_paths_from_scope(scope_tokens):
+    """Map scope tokens to local git-repo working-tree paths (best effort).
+
+    Scope tokens we know how to map:
+        ``repo:NAME``    -> ``~/repos/NAME`` (if present and a git repo)
+        ``file:PATH``    -> nearest enclosing git repo root for PATH
+
+    Tokens that don't resolve are silently dropped — the recovery bundle
+    is always best-effort.
+    """
+    home = Path.home()
+    repos_root = home / "repos"
+    out = []
+    seen = set()
+
+    def _git_root(path):
+        # Walk up looking for a `.git` directory. Capped at 8 levels to
+        # avoid pathological filesystems eating cycles.
+        p = Path(path)
+        for _ in range(8):
+            if (p / ".git").exists():
+                return p
+            if p.parent == p:
+                return None
+            p = p.parent
+        return None
+
+    for token in scope_tokens or []:
+        if not isinstance(token, str):
+            continue
+        if token.startswith("repo:"):
+            name = token[len("repo:"):].strip()
+            if not name:
+                continue
+            cand = repos_root / name
+            if (cand / ".git").exists() or cand.is_dir():
+                if str(cand) in seen:
+                    continue
+                seen.add(str(cand))
+                out.append(cand)
+        elif token.startswith("file:"):
+            raw = token[len("file:"):].strip()
+            if not raw:
+                continue
+            # Expand ~ if present (scope tokens can include user-home paths).
+            try:
+                p = Path(os.path.expanduser(raw))
+            except Exception:
+                continue
+            if not p.exists():
+                # The path itself may be gone; still try to walk up the
+                # parent chain to find a repo root.
+                p = p.parent
+            root = _git_root(p)
+            if root is None:
+                continue
+            if str(root) in seen:
+                continue
+            seen.add(str(root))
+            out.append(root)
+        # `resource:` tokens are abstract (e.g. resource:hardware) — no
+        # local working tree to snapshot. Skipped.
+
+    return out
+
+
+def _git_status_and_diff(repo_path, *, max_diff_chars=200_000):
+    """Capture porcelain status + unified diff for a git repo, best-effort.
+
+    Returns a dict ``{"path": str, "status": str, "diff": str,
+    "diff_truncated": bool}`` or None on hard failure (not a repo).
+
+    The diff is capped at ``max_diff_chars`` so a runaway uncommitted
+    binary blob can't blow up the bundle file. ``diff_truncated`` flags
+    truncation.
+    """
+    repo_path = Path(repo_path)
+    git_dir = repo_path / ".git"
+    if not git_dir.exists():
+        return None
+
+    def _run_git(*argv):
+        try:
+            r = subprocess.run(
+                ["git", "-C", str(repo_path), *argv],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            if r.returncode != 0:
+                return ""
+            return r.stdout
+        except Exception:
+            return ""
+
+    status = _run_git("status", "--porcelain=v1", "--untracked-files=normal")
+    diff = _run_git("diff", "--no-color")
+    truncated = False
+    if len(diff) > max_diff_chars:
+        diff = diff[:max_diff_chars]
+        truncated = True
+
+    return {
+        "path": str(repo_path),
+        "status": status,
+        "diff": diff,
+        "diff_truncated": truncated,
+    }
+
+
+def _agent_jsonl_path_for_queue(queue_id):
+    """Resolve the live ``agent-<id>.jsonl`` path for a running queue item.
+
+    Returns ``Path`` or None. This is the live (in-progress) transcript
+    of the agent that owns the queue id, distinct from the archived copy
+    at QUEUE_LOG_ARCHIVE_DIR/<qid>.jsonl that lands at done/abandon time.
+    """
+    aid = _agent_id_for_queue(queue_id)
+    if aid is None:
+        return None
+    return _find_agent_jsonl(aid)
+
+
+def _read_first_user_prompt_from_jsonl(jsonl_path, *, max_chars=20_000):
+    """Pull the FIRST user message out of an agent's JSONL transcript.
+
+    The first non-sidechain user record is the original Agent-tool prompt
+    (the prompt the main loop dispatched the subagent with). We walk
+    forward until we find a record where ``message.role == "user"`` and
+    ``message.content`` is a string (or a list of content blocks we can
+    flatten to text). Returns the text, capped at ``max_chars``, or None
+    if the file is missing / unreadable / has no user message.
+    """
+    if jsonl_path is None:
+        return None
+    try:
+        with open(jsonl_path, "r") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+                msg = rec.get("message")
+                if not isinstance(msg, dict):
+                    continue
+                if msg.get("role") != "user":
+                    continue
+                content = msg.get("content")
+                text = None
+                if isinstance(content, str):
+                    text = content
+                elif isinstance(content, list):
+                    pieces = []
+                    for blk in content:
+                        if isinstance(blk, dict) and blk.get("type") == "text":
+                            t = blk.get("text")
+                            if isinstance(t, str):
+                                pieces.append(t)
+                    if pieces:
+                        text = "\n".join(pieces)
+                if text is None:
+                    continue
+                truncated = False
+                if len(text) > max_chars:
+                    text = text[:max_chars]
+                    truncated = True
+                return {"text": text, "truncated": truncated}
+    except OSError:
+        return None
+    return None
+
+
+def _capture_recovery_for_item(item):
+    """Build the recovery dict for one autostopped peer queue item.
+
+    Captures: queue id/group/desc/summary/scope, the agent's live JSONL
+    path, the original prompt (best-effort extracted), the
+    /tmp/claude-1000/.../tasks/<aid>.output path (if any), and per-repo
+    git status + diff for every repo we can resolve from the item's
+    scope tokens. None of these are required — every field defaults to
+    None or [] on failure so the bundle is always serialisable.
+    """
+    qid = item.get("id")
+    aid = _agent_id_for_queue(qid) if qid else None
+
+    jsonl_path = _find_agent_jsonl(aid) if aid else None
+    prompt = _read_first_user_prompt_from_jsonl(jsonl_path) if jsonl_path else None
+
+    # Best-effort guess at the .output path — the harness writes one per
+    # task at /tmp/claude-1000/-home-<user>/<session-uuid>/tasks/<aid>.output
+    # but the agent_id we resolve here uses claude-watch's `a*` form. The
+    # task-id is the same string post-prefix. We surface the directory we
+    # think it lives in rather than asserting — the new agent can ls it.
+    task_output_path = None
+    if aid:
+        candidates = []
+        try:
+            user = os.environ.get("USER", "hndrewaall")
+            uid = os.environ.get("UID") or os.getuid()
+            roots = [
+                Path(f"/tmp/claude-{uid}/-home-{user}"),
+            ]
+            for r in roots:
+                if not r.is_dir():
+                    continue
+                # Look for <session>/tasks/<aid>.output and tasks/<aid>.output
+                for sess in [r] + list(r.iterdir()):
+                    if not sess.is_dir():
+                        continue
+                    cand = sess / "tasks" / f"{aid}.output"
+                    if cand.exists():
+                        candidates.append(cand)
+        except Exception:
+            candidates = []
+        if candidates:
+            # Most-recent wins
+            candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+            task_output_path = str(candidates[0])
+
+    repos = _extract_repo_paths_from_scope(item.get("scope", []))
+    repo_snapshots = []
+    for r in repos:
+        snap = _git_status_and_diff(r)
+        if snap is not None:
+            repo_snapshots.append(snap)
+
+    return {
+        "queue_id": qid,
+        "group_id": item.get("group_id"),
+        "scope": list(item.get("scope", [])),
+        "summary": _item_summary(item),
+        "description": item.get("description", ""),
+        "agent_id": aid,
+        "agent_jsonl_path": str(jsonl_path) if jsonl_path else None,
+        "task_output_path": task_output_path,
+        "original_prompt": prompt,
+        "repo_snapshots": repo_snapshots,
+        "started_at": item.get("started_at"),
+        "registered_at": item.get("registered_at"),
+        "created_by": item.get("created_by", ""),
+    }
+
+
+def _agent_kill_best_effort(agent_id):
+    """Try to kill the agent process tree for ``agent_id`` via claude-watch.
+
+    Returns a dict describing the outcome (success, missing tool, no live
+    process, error). Never raises. Agents between API calls (no live
+    bash child) silently no-op — the obligations gate + abandoned queue
+    row are sufficient to neutralise them on their next tool call.
+    """
+    if not isinstance(agent_id, str) or not agent_id:
+        return {"ok": False, "reason": "no agent_id"}
+    cli = shutil.which("claude-watch") or shutil.which("agent-ctl")
+    if not cli:
+        return {"ok": False, "reason": "claude-watch CLI not on PATH"}
+    try:
+        r = subprocess.run(
+            [cli, "agent", "kill", agent_id],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        return {
+            "ok": r.returncode == 0,
+            "exit_code": r.returncode,
+            "stdout": r.stdout[-500:],
+            "stderr": r.stderr[-500:],
+        }
+    except Exception as exc:  # noqa: BLE001 -- best-effort
+        return {"ok": False, "reason": f"exception: {exc.__class__.__name__}: {exc}"}
+
+
+def _autostop_overlapping_peers(items, target, *, raw_reason):
+    """Mark every running scope-overlapping peer of ``target`` as abandoned.
+
+    Mutates ``items`` in place: each conflicting peer's status flips to
+    ``abandoned`` with a clear ``abandon_reason`` explaining the override.
+    Recovery bundles are captured BEFORE the mutation so we still have
+    access to the running-state agent_id. Returns a list of bundle dicts
+    (one per autostopped peer); callers persist them into the q-X bundle
+    file and emit them in the claude-event.
+
+    Best-effort agent kill is attempted for each abandoned peer. Failures
+    are recorded inside the bundle (``agent_kill_outcome``) but never
+    block the queue write — the abandon row + the obligations gate are
+    sufficient to halt the agent on its next tool call regardless.
+
+    Same atomic semantics as the surrounding flock — the caller (cmd_queue
+    _force_start) holds the queue lock for this entire window.
+    """
+    target_id = target.get("id")
+    target_scope = target.get("scope", [])
+    abandoned_at = _fmt_ts()
+    bundles = []
+    for peer in items:
+        if peer is target:
+            continue
+        if peer.get("id") == target_id:
+            continue
+        if peer.get("status") != "running":
+            continue
+        if not _scope_sets_overlap(peer.get("scope", []), target_scope):
+            continue
+
+        # Capture BEFORE mutating: _agent_id_for_queue uses claude-watch's
+        # active-agents.json which is keyed on queue_id, so the lookup
+        # works either way, but we want to snapshot the running state for
+        # downstream debugging.
+        bundle = _capture_recovery_for_item(peer)
+
+        # Best-effort kill (recorded in the bundle, never fatal).
+        if bundle.get("agent_id"):
+            bundle["agent_kill_outcome"] = _agent_kill_best_effort(
+                bundle["agent_id"],
+            )
+        else:
+            bundle["agent_kill_outcome"] = {
+                "ok": False,
+                "reason": "no agent_id resolved from active-agents.json",
+            }
+
+        # Mutate the peer record. Mirror the abandon-reason convention
+        # used by cmd_queue_abandon so anything reading abandoned_reason
+        # gets a uniform shape.
+        peer["status"] = "abandoned"
+        peer["abandoned_at"] = abandoned_at
+        peer["abandon_reason"] = (
+            f"autostopped by force-start of {target_id}: {raw_reason}"
+        )
+        peer["group_head"] = False
+        peer["autostopped_by_force_start"] = target_id
+
+        # Archive the spawning subagent's transcript inside the queue lock
+        # window so the archive landed BEFORE the queue.json write that
+        # transitions the row to abandoned. _archive_agent_transcript is
+        # idempotent and best-effort.
+        archive_path = _archive_agent_transcript(peer, reason="autostop-force-start")
+        if archive_path:
+            peer["log_archive_path"] = archive_path
+
+        bundle["abandoned_at"] = abandoned_at
+        bundle["abandon_reason"] = peer["abandon_reason"]
+        bundle["log_archive_path"] = peer.get("log_archive_path")
+
+        bundles.append(bundle)
+
+    return bundles
+
+
+def _write_force_start_bundle(target_id, target_summary, raw_reason,
+                              autostop_bundles):
+    """Persist the per-force-start recovery bundle file.
+
+    Path: ``FORCE_START_BUNDLE_DIR / <target_id>.json``. Idempotent: if
+    the file already exists (rare — same q-X being force-started twice)
+    we overwrite. The new agent's prompt should reference this path.
+
+    Returns the path string on success, None on failure. Best-effort:
+    failures log to stderr but never block the force-start.
+    """
+    if not isinstance(target_id, str) or not target_id:
+        return None
+    payload = {
+        "schema_version": 1,
+        "force_started_queue_id": target_id,
+        "force_started_summary": target_summary,
+        "force_started_reason": raw_reason,
+        "force_started_at": _fmt_ts(),
+        "autostopped_peers": autostop_bundles,
+    }
+    try:
+        FORCE_START_BUNDLE_DIR.mkdir(parents=True, exist_ok=True)
+        dest = FORCE_START_BUNDLE_DIR / f"{target_id}.json"
+        # Atomic write via tmp+rename so a partial bundle never leaves a
+        # corrupted file behind.
+        tmp = dest.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(payload, indent=2) + "\n")
+        os.replace(tmp, dest)
+        return str(dest)
+    except OSError as exc:
+        print(
+            f"[force-start] failed to write recovery bundle for {target_id}: {exc}",
+            file=sys.stderr,
+        )
+        return None
 
 
 def cmd_queue_add(args):
@@ -2275,6 +2711,19 @@ def cmd_queue_force_start(args):
                 "reason": "same-group pending peer (FIFO blocker)",
             })
 
+        # Autostop overlapping running peers (Andrew 2026-05-02 21:10 UTC):
+        # any RUNNING item whose scope OVERLAPS the force-started item is
+        # auto-abandoned, its recovery context captured, and (best-effort)
+        # its agent process killed. The interrupter (the new agent) will
+        # decide what to do with the leftovers — we never auto-stash.
+        # Capture happens BEFORE `target` flips to running so the autostop
+        # routine doesn't accidentally include `target` in its scope-
+        # overlap walk (the running-status filter would catch it anyway,
+        # but we belt-and-suspenders by running this first).
+        autostop_bundles = _autostop_overlapping_peers(
+            items, target, raw_reason=raw_reason,
+        )
+
         now_iso = _fmt_ts()
         target["status"] = "running"
         target["started_at"] = now_iso
@@ -2284,6 +2733,9 @@ def cmd_queue_force_start(args):
         target["force_started_at"] = int(datetime.now(timezone.utc).timestamp())
         target["force_started_reason"] = raw_reason
         target["force_started_blockers_overridden"] = blockers_overridden
+        target["force_started_autostopped_peers"] = [
+            b["queue_id"] for b in autostop_bundles
+        ]
 
         _recompute_group_heads(items)
         promoted = dict(target)
@@ -2306,6 +2758,7 @@ def cmd_queue_force_start(args):
             "group_id": promoted.get("group_id"),
             "summary": _item_summary(promoted),
             "blockers_overridden": blockers_overridden,
+            "autostopped_peers": [b["queue_id"] for b in autostop_bundles],
         }
         with open(QUEUE_FORCE_START_LOG, "a") as logf:
             logf.write(json.dumps(audit_row) + "\n")
@@ -2314,6 +2767,20 @@ def cmd_queue_force_start(args):
             f"WARNING: failed to append to {QUEUE_FORCE_START_LOG}: {exc}",
             file=sys.stderr,
         )
+
+    # Recovery bundle: persist a per-force-start JSON file containing the
+    # full recovery context (prompts, transcript paths, git status/diff,
+    # queue summaries) for every autostopped peer. The new agent reads
+    # this to decide resume/integrate/stash/abandon for each leftover.
+    # The file is always written, even when there are zero autostopped
+    # peers — the empty-list case is a useful "you're force-starting in
+    # the clear" signal for downstream consumers.
+    bundle_path = _write_force_start_bundle(
+        target_id=promoted["id"],
+        target_summary=_item_summary(promoted),
+        raw_reason=raw_reason,
+        autostop_bundles=autostop_bundles,
+    )
 
     # Lifecycle pingme — same shape as register, with the override called
     # out so it's visually distinct in the notification stream.
@@ -2360,12 +2827,21 @@ def cmd_queue_force_start(args):
     # signal-via-bus layer requested by Andrew (2026-05-02 19:54 ET):
     # "force starting should both emit an event AND add a hard obligation
     # to spawn." Routed in claude-event-routing.md.
+    #
+    # Recovery bundle path is included so the main loop can paste it into
+    # the spawned Agent's prompt verbatim — the Agent reads the file to
+    # see what was autostopped and triages.
     _claude_event_notify(
         tag="force-start",
         message=(
             f"queue force-started: {promoted['id']} "
             f"({_item_summary(promoted)}) -- main loop must dispatch "
             f"Agent before any other tool call"
+            + (
+                f" | autostopped {len(autostop_bundles)} running peer(s); "
+                f"recovery bundle: {bundle_path}"
+                if autostop_bundles else ""
+            )
         ),
         data={
             "queue_id": promoted["id"],
@@ -2374,6 +2850,8 @@ def cmd_queue_force_start(args):
             "summary": _item_summary(promoted),
             "created_by": promoted.get("created_by", ""),
             "force_started_reason": raw_reason,
+            "autostopped_peers": [b["queue_id"] for b in autostop_bundles],
+            "recovery_bundle_path": bundle_path,
         },
         priority="normal",
         silent=getattr(args, "silent", False),
@@ -2388,10 +2866,21 @@ def cmd_queue_force_start(args):
         queue_id=promoted["id"],
         summary=_item_summary(promoted),
         reason=raw_reason,
+        bundle_path=bundle_path,
+        autostopped_count=len(autostop_bundles),
     )
 
     if args.json:
-        print(json.dumps(promoted, indent=2))
+        # Surface the recovery bundle path in JSON output too — UIs
+        # (queue-minisite Force-Start button) want to thread the path
+        # through to the next agent's prompt without re-running force-
+        # start to fish it out.
+        promoted_out = dict(promoted)
+        promoted_out["force_started_recovery_bundle_path"] = bundle_path
+        promoted_out["force_started_autostopped_peers"] = [
+            b["queue_id"] for b in autostop_bundles
+        ]
+        print(json.dumps(promoted_out, indent=2))
     else:
         print(f"force-started: {args.id} (now running)")
         print(f"  group   : {promoted.get('group_id')}")
@@ -2407,6 +2896,26 @@ def cmd_queue_force_start(args):
         else:
             print("  blockers overridden: none "
                   "(item was already ready — force-start was a no-op gate skip)")
+        if autostop_bundles:
+            print(f"  autostopped running peers: {len(autostop_bundles)}")
+            for b in autostop_bundles:
+                kill_outcome = b.get("agent_kill_outcome") or {}
+                kill_str = (
+                    "killed" if kill_outcome.get("ok")
+                    else f"kill skipped ({kill_outcome.get('reason') or kill_outcome.get('exit_code')})"
+                )
+                print(
+                    f"    - {b['queue_id']} (agent={b.get('agent_id') or 'n/a'}, "
+                    f"{kill_str}; scope={','.join(b.get('scope', []))})"
+                )
+            if bundle_path:
+                print(f"  recovery bundle: {bundle_path}")
+                print(
+                    "  NOTE: pass this path to the spawned Agent so it can "
+                    "triage (resume/integrate/stash/abandon)."
+                )
+        elif bundle_path:
+            print(f"  recovery bundle: {bundle_path} (no peers autostopped)")
 
 
 def cmd_queue_heartbeat(args):
