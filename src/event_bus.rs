@@ -207,6 +207,13 @@ pub fn emit(alert: &ClaudeWatchAlert<'_>) {
 /// terminates it). Surfaced to the main loop via `claude-event-watch`
 /// as `EVENT[workload/workload-done] ...`, replacing the "fire a
 /// `workload wait` background task and poll" pattern.
+///
+/// First-class workload model (Andrew DM 2026-05-03 05:23 ET): when
+/// the workload was launched with `workload run --queue-id q-X`, the
+/// queue id is carried into ``data.queue_id`` AND `cmd_emit_done`
+/// transitions the queue item to done/abandoned in the same step.
+/// Workload completion IS queue completion; no separate respawn-
+/// obligation handshake.
 #[derive(Debug, Clone)]
 pub struct WorkloadDoneEvent<'a> {
     pub label: &'a str,
@@ -220,6 +227,11 @@ pub struct WorkloadDoneEvent<'a> {
     /// Path to the workload's output log so the main loop can `Read`
     /// the tail without re-deriving paths.
     pub log_path: &'a str,
+    /// Optional queue id the workload was tied to (`workload run
+    /// --queue-id q-X`). When present, included in the event's
+    /// ``data.queue_id`` field so consumers can correlate without
+    /// round-tripping through the workload state file.
+    pub queue_id: Option<&'a str>,
 }
 
 /// Build the JSON event body for a workload-done event. Public for
@@ -253,6 +265,16 @@ pub fn build_workload_done_json(ev: &WorkloadDoneEvent<'_>) -> serde_json::Value
     // alert).
     let priority = if ev.exit_code == 0 { "low" } else { "normal" };
 
+    let mut data = serde_json::json!({
+        "label": ev.label,
+        "exit_code": ev.exit_code,
+        "killed": ev.killed,
+        "log_path": ev.log_path,
+    });
+    if let Some(qid) = ev.queue_id {
+        data["queue_id"] = serde_json::Value::String(qid.to_string());
+    }
+
     serde_json::json!({
         "timestamp": now,
         "timestamp_iso": now_iso,
@@ -262,12 +284,7 @@ pub fn build_workload_done_json(ev: &WorkloadDoneEvent<'_>) -> serde_json::Value
         "tag": "workload-done",
         "priority": priority,
         "message": message,
-        "data": {
-            "label": ev.label,
-            "exit_code": ev.exit_code,
-            "killed": ev.killed,
-            "log_path": ev.log_path,
-        },
+        "data": data,
         "pid": pid,
         "user": user,
     })
@@ -498,6 +515,7 @@ mod tests {
             exit_code: 0,
             killed: false,
             log_path: "/tmp/claude-workloads/ebook-twilight.output",
+            queue_id: None,
         };
         let v = build_workload_done_json(&ev);
 
@@ -517,6 +535,9 @@ mod tests {
             data["log_path"],
             "/tmp/claude-workloads/ebook-twilight.output"
         );
+        // Without --queue-id, no queue_id key appears in data.
+        assert!(data.get("queue_id").is_none(),
+            "queue_id must be absent when not bound");
     }
 
     #[test]
@@ -526,6 +547,7 @@ mod tests {
             exit_code: 2,
             killed: false,
             log_path: "/tmp/claude-workloads/broken-task.output",
+            queue_id: None,
         };
         let v = build_workload_done_json(&ev);
         assert_eq!(v["priority"], "normal"); // non-zero exit → normal
@@ -540,6 +562,7 @@ mod tests {
             exit_code: -15,
             killed: true,
             log_path: "/tmp/claude-workloads/dead-task.output",
+            queue_id: None,
         };
         let v = build_workload_done_json(&ev);
         assert_eq!(v["priority"], "normal");
@@ -549,6 +572,24 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("workload dead-task killed"));
+    }
+
+    #[test]
+    fn build_workload_done_with_queue_id_includes_field() {
+        // First-class workload model: when --queue-id was passed at
+        // `workload run`, the event's data.queue_id mirrors it so the
+        // main loop can correlate the workload exit with the queue
+        // item without round-tripping state.json.
+        let ev = WorkloadDoneEvent {
+            label: "stv-promote-Akudama",
+            exit_code: 0,
+            killed: false,
+            log_path: "/tmp/claude-workloads/stv-promote-Akudama.output",
+            queue_id: Some("q-2026-05-03-test"),
+        };
+        let v = build_workload_done_json(&ev);
+        assert_eq!(v["tag"], "workload-done");
+        assert_eq!(v["data"]["queue_id"], "q-2026-05-03-test");
     }
 
     #[test]
@@ -566,6 +607,7 @@ mod tests {
             exit_code: 0,
             killed: false,
             log_path: "/tmp/claude-workloads/translate-book.output",
+            queue_id: None,
         };
         emit_workload_done(&ev);
 
