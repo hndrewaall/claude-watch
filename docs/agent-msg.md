@@ -68,11 +68,12 @@ spawned subagent ─── tool ─▶  │ PreToolUse: pre-tool-obligations-  �
 | `agent-msg inbox <id>` | read inbox (default UNREAD only; `--all` = full) |
 | `agent-msg ack <id>` | flip unread → read; KEEPS bodies on disk |
 | `agent-msg gc <id>` | drop already-read messages older than the TTL |
+| `agent-msg gc-dead [--dry-run]` | satisfy inbox obligations whose owner is no longer alive |
 | `agent-msg list` | show agent index |
 | `agent-msg show <id>` | show one agent's index entry |
 | `agent-msg index register <id>` | add to index |
 | `agent-msg index done <id>` | drop from index |
-| `agent-msg --test` | embedded test suite (38 cases) |
+| `agent-msg --test` | embedded test suite |
 
 All commands accept `--inbox-dir <path>` for sandboxed testing.
 
@@ -141,10 +142,41 @@ Subagent prompts should mention:
 - Does NOT inject into the agent's context window. We surface messages
   as harness-emitted stderr banners in the tool-result stream.
 
+## Auto-disarm leak (and the `gc-dead` backstop)
+
+The `disarm` step (#6 above) is meant to fire from a `PostToolUse` hook
+on the `Agent` tool when `tool_response.status == "completed"`. Empirical
+evidence (1292 `async_launched` vs 0 `completed` for async-launched
+Agent calls across recorded transcripts, 2026-05-03) shows Claude Code
+**never emits `completed` from PostToolUse on `Agent` for the
+async-launched form** — that status is only seen for synchronous Agent
+calls. Subagent termination only surfaces via the separate
+`SubagentStop` lifecycle hook, which is not currently wired (and is a
+distinct event from PostToolUse).
+
+Result: the disarm path is dead code in practice; every armed agent's
+inbox obligation leaks into the registry until its 4h TTL expires.
+PR #82 / commit 7ff4fd8 made the leaks harmless via per-agent_id
+predicate scoping (so a leaked obligation only fires for its own dead
+owner, by definition impossible). The remaining issue is DB bloat —
+~28 stale rows on a typical session.
+
+`agent-msg gc-dead` is the backstop. It cross-references each
+`agent-msg/inbox:*` obligation against `claude-watch active-agents
+--json` and satisfies any whose owner is no longer alive (also unlinks
+the corresponding inbox file). Default-open if claude-watch is
+unavailable. Runs:
+
+- **Implicitly** at the top of every `agent-msg` CLI invocation,
+  rate-limited via a stamp file (`AGENT_MSG_GC_DEAD_INTERVAL_SECS`,
+  default 300s; set 0 to disable).
+- **Explicitly** via `agent-msg gc-dead [--dry-run] [--json]` — useful
+  for cron / one-shot operator runs.
+
 ## Tests
 
 ```
-make test-agent-msg        # 38 cases via embedded --test
+make test-agent-msg        # via embedded --test
 ```
 
 Coverage includes: schema-v2 envelope writes, v1 auto-migration, dry-run,
@@ -152,4 +184,8 @@ multi-append, ack flips read=true keeping bodies, ack by message id, inbox
 default-unread + `--all` history, GC drops aged read entries, GC keeps
 unread regardless of age, implicit GC on every invocation, predicate v2
 envelope, atomic concurrency, send-ack-send cycle, index ops, Unicode,
-gate-mode end-to-end with real ack clearing the gate.
+gate-mode end-to-end with real ack clearing the gate, `gc-dead`
+extracting agent_id from deny_message and predicate params, gc-dead
+satisfying dead-agent obligations while sparing live ones, gc-dead
+default-open when claude-watch is unavailable / malformed, gc-dead
+dry-run, and the implicit `gc-dead` rate-limit + disable knobs.
