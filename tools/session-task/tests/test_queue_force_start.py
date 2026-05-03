@@ -41,6 +41,10 @@ def _env_for_tmp(tmp):
     env["QUEUE_FORCE_START_LOG"] = str(
         Path(tmp) / ".config" / "claude" / "queue-force-start.log"
     )
+    # Force the per-force-start recovery bundle dir into temp too.
+    env["FORCE_START_BUNDLE_DIR"] = str(
+        Path(tmp) / ".config" / "session-task" / "force-start-bundles"
+    )
     # Disable pingme noise during tests.
     env["PINGME_DISABLE"] = "1"
     return env
@@ -438,6 +442,338 @@ def test_force_start_obligation_suppressed_by_env():
 
 
 # ---------------------------------------------------------------------------
+# 9. Autostop overlapping running peers + recovery bundle
+# ---------------------------------------------------------------------------
+
+
+def test_force_start_autostops_overlapping_running_peer():
+    """A force-start must abandon every RUNNING item whose scope OVERLAPS
+    the force-started item's scope, with a clear abandon_reason. Andrew
+    2026-05-02 21:10 UTC: "force-start should ALSO autostop any RUNNING
+    work whose scope OVERLAPS the force-started item".
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _env_for_tmp(tmp)
+
+        # Establish a running item that holds scope:foo. This is the peer
+        # that should get autostopped.
+        r1 = _add(env, "the-running-peer", ["scope:foo"])
+        d1 = json.loads(r1.stdout)
+        assert _register(env, d1["id"], "--json").returncode == 0
+
+        # Force-enqueue a blocked-pending sibling on the same scope.
+        r2 = _add(env, "the-interrupter", ["scope:foo"], "--force-enqueue")
+        d2 = json.loads(r2.stdout)
+
+        # Force-start: should autostop d1.
+        rs = _run(
+            env, "queue", "force-start", d2["id"],
+            "--reason", "interrupting", "--json",
+        )
+        assert rs.returncode == 0, rs.stderr
+
+        # d1 should now be abandoned with the autostop reason.
+        d1_after = _show(env, d1["id"])
+        assert d1_after["status"] == "abandoned", d1_after
+        assert "autostopped by force-start" in (
+            d1_after.get("abandon_reason", "")
+        ), d1_after.get("abandon_reason")
+        assert d1_after.get("autostopped_by_force_start") == d2["id"]
+
+        # The promoted record should reference its autostopped peers.
+        promoted_out = json.loads(rs.stdout)
+        assert d1["id"] in promoted_out.get(
+            "force_started_autostopped_peers", []
+        ), promoted_out
+
+
+def test_force_start_does_not_touch_disjoint_running_peer():
+    """A running peer whose scope does NOT overlap the force-started item
+    must be left RUNNING. The autostop is scope-overlap-driven.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _env_for_tmp(tmp)
+
+        # Running peer on a disjoint scope.
+        r1 = _add(env, "unrelated", ["scope:other"])
+        d1 = json.loads(r1.stdout)
+        assert _register(env, d1["id"], "--json").returncode == 0
+
+        # Running peer on a SECOND disjoint scope, just for good measure.
+        r2 = _add(env, "also-unrelated", ["scope:third"])
+        d2 = json.loads(r2.stdout)
+        assert _register(env, d2["id"], "--json").returncode == 0
+
+        # Force-start a fresh item on scope:foo (overlaps neither).
+        r3 = _add(env, "interrupter", ["scope:foo"])
+        d3 = json.loads(r3.stdout)
+
+        rs = _run(
+            env, "queue", "force-start", d3["id"],
+            "--reason", "no-conflict", "--json",
+        )
+        assert rs.returncode == 0, rs.stderr
+
+        # Both unrelated peers should still be running.
+        assert _show(env, d1["id"])["status"] == "running"
+        assert _show(env, d2["id"])["status"] == "running"
+
+        # Promoted record's autostopped-peers list is empty.
+        promoted_out = json.loads(rs.stdout)
+        assert promoted_out.get("force_started_autostopped_peers", []) == []
+
+
+def test_force_start_writes_recovery_bundle_with_autostop():
+    """When a peer is autostopped, the recovery bundle JSON must be written
+    at FORCE_START_BUNDLE_DIR/<q-X>.json with the peer's queue context.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _env_for_tmp(tmp)
+
+        r1 = _add(env, "running-peer", ["scope:bundle"])
+        d1 = json.loads(r1.stdout)
+        _register(env, d1["id"], "--json")
+        r2 = _add(env, "interrupter", ["scope:bundle"], "--force-enqueue")
+        d2 = json.loads(r2.stdout)
+
+        rs = _run(
+            env, "queue", "force-start", d2["id"],
+            "--reason", "bundle-write", "--json",
+        )
+        assert rs.returncode == 0, rs.stderr
+
+        bundle_dir = Path(env["FORCE_START_BUNDLE_DIR"])
+        bundle_path = bundle_dir / f"{d2['id']}.json"
+        assert bundle_path.exists(), (
+            f"expected bundle at {bundle_path}, dir contents = "
+            f"{list(bundle_dir.iterdir()) if bundle_dir.exists() else 'no dir'}"
+        )
+
+        bundle = json.loads(bundle_path.read_text())
+        assert bundle["force_started_queue_id"] == d2["id"]
+        assert bundle["force_started_reason"] == "bundle-write"
+        peers = bundle["autostopped_peers"]
+        assert len(peers) == 1, peers
+        peer = peers[0]
+        assert peer["queue_id"] == d1["id"]
+        assert peer["summary"]
+        assert peer["scope"] == ["scope:bundle"]
+        assert peer["abandon_reason"].startswith("autostopped by force-start")
+        # Repo snapshots and prompt are best-effort and may be empty in
+        # the test sandbox (no claude-watch active-agents.json), but the
+        # keys must exist.
+        assert "repo_snapshots" in peer
+        assert "original_prompt" in peer
+        assert "agent_kill_outcome" in peer
+
+        # Promoted JSON should also surface the bundle path.
+        promoted_out = json.loads(rs.stdout)
+        assert promoted_out.get("force_started_recovery_bundle_path") == \
+            str(bundle_path), promoted_out
+
+
+def test_force_start_writes_empty_bundle_when_no_autostop():
+    """Bundle is always written (per spec — empty-list case is a useful
+    "force-started in the clear" signal). Verify the empty-peers shape.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _env_for_tmp(tmp)
+        r1 = _add(env, "lonely", ["scope:empty"])
+        d1 = json.loads(r1.stdout)
+
+        rs = _run(
+            env, "queue", "force-start", d1["id"],
+            "--reason", "empty-bundle", "--json",
+        )
+        assert rs.returncode == 0, rs.stderr
+
+        bundle_dir = Path(env["FORCE_START_BUNDLE_DIR"])
+        bundle_path = bundle_dir / f"{d1['id']}.json"
+        assert bundle_path.exists()
+        bundle = json.loads(bundle_path.read_text())
+        assert bundle["autostopped_peers"] == []
+
+
+def test_force_start_event_carries_recovery_bundle_path():
+    """The dedicated `force-start` claude-event's data must include both
+    `recovery_bundle_path` and `autostopped_peers` so the main loop can
+    paste them into the spawned Agent's prompt.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _env_for_tmp(tmp)
+        events_dir = Path(tmp) / "claude-events"
+
+        r1 = _add(env, "blocker", ["scope:evt"])
+        d1 = json.loads(r1.stdout)
+        _register(env, d1["id"], "--json")
+        for f in events_dir.iterdir():
+            f.unlink()
+
+        r2 = _add(env, "blocked", ["scope:evt"], "--force-enqueue")
+        d2 = json.loads(r2.stdout)
+
+        rs = _run(
+            env, "queue", "force-start", d2["id"],
+            "--reason", "evt-test", "--json",
+        )
+        assert rs.returncode == 0, rs.stderr
+
+        emitted = []
+        for f in sorted(events_dir.iterdir()):
+            try:
+                emitted.append(json.loads(f.read_text()))
+            except (OSError, ValueError):
+                continue
+
+        force_events = [e for e in emitted if e.get("tag") == "force-start"]
+        assert force_events, [e.get("tag") for e in emitted]
+        ev = force_events[0]
+        data = ev.get("data") or {}
+        # claude-event flattens list/None values via str() so we assert by
+        # presence + truthy-substring rather than direct typed equality.
+        bundle_path = data.get("recovery_bundle_path")
+        assert bundle_path, data
+        assert d2["id"] in str(bundle_path), data
+        assert d1["id"] in str(data.get("autostopped_peers")), data
+
+
+def test_force_start_audit_log_records_autostopped_peers():
+    """The QUEUE_FORCE_START_LOG row must include the autostopped peers'
+    queue ids so post-incident auditors can reconstruct the override.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _env_for_tmp(tmp)
+        log_path = Path(env["QUEUE_FORCE_START_LOG"])
+
+        r1 = _add(env, "blocker", ["scope:audit"])
+        d1 = json.loads(r1.stdout)
+        _register(env, d1["id"], "--json")
+        r2 = _add(env, "blocked", ["scope:audit"], "--force-enqueue")
+        d2 = json.loads(r2.stdout)
+
+        rs = _run(
+            env, "queue", "force-start", d2["id"],
+            "--reason", "audit-autostop", "--json",
+        )
+        assert rs.returncode == 0, rs.stderr
+
+        rows = [
+            json.loads(line)
+            for line in log_path.read_text().splitlines() if line.strip()
+        ]
+        assert rows
+        row = rows[-1]
+        assert row["queue_id"] == d2["id"]
+        assert d1["id"] in row.get("autostopped_peers", []), row
+
+
+def test_force_start_obligation_message_includes_bundle_path():
+    """The deny banner persisted in obligations.json should reference the
+    recovery bundle path so the main loop sees it on the gate fire.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _env_for_tmp(tmp)
+
+        r1 = _add(env, "blocker", ["scope:obmsg"])
+        d1 = json.loads(r1.stdout)
+        _register(env, d1["id"], "--json")
+        r2 = _add(env, "blocked", ["scope:obmsg"], "--force-enqueue")
+        d2 = json.loads(r2.stdout)
+
+        rs = _run(
+            env, "queue", "force-start", d2["id"],
+            "--reason", "deny-banner", "--json",
+        )
+        assert rs.returncode == 0, rs.stderr
+
+        ob_path = Path(tmp) / ".config" / "claude" / "obligations.json"
+        assert ob_path.exists(), "obligations.json not written"
+        ob_data = json.loads(ob_path.read_text())
+        matching = [
+            ob for ob in ob_data.get("obligations", [])
+            if ob.get("predicate", {}).get("kind") == "force_started_unspawned"
+            and ob.get("predicate", {}).get("params", {}).get("queue_id") == d2["id"]
+        ]
+        assert matching, "force_started_unspawned obligation not registered"
+        # The obligations CLI stores the deny banner under `deny_message`
+        # (writable via `obligations add --deny-msg ...`). Older deploys
+        # may have used `deny_msg`; fall back gracefully.
+        ob = matching[0]
+        deny_msg = (
+            ob.get("deny_message")
+            or ob.get("deny_msg")
+            or ob.get("message", "")
+        )
+        assert d2["id"] in deny_msg, f"deny_msg missing q-id: {deny_msg!r}"
+        # Bundle path mentions the queue id (deterministic filename).
+        assert f"{d2['id']}.json" in deny_msg, deny_msg
+
+
+def test_force_start_repo_snapshot_captured_in_bundle():
+    """When a scope token resolves to a real git repo, the bundle should
+    capture `git status` / `git diff` for that working tree. We seed a
+    tiny git repo under HOME=tmp and assert the snapshot lands.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _env_for_tmp(tmp)
+        # Make ~/repos/myrepo a real git working tree with a dirty file.
+        repos_dir = Path(tmp) / "repos" / "myrepo"
+        repos_dir.mkdir(parents=True)
+        subprocess.run(
+            ["git", "init", "-q", str(repos_dir)],
+            check=True, capture_output=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(repos_dir), "config", "user.email", "t@t"],
+            check=True, capture_output=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(repos_dir), "config", "user.name", "t"],
+            check=True, capture_output=True,
+        )
+        # Initial commit so HEAD exists.
+        (repos_dir / "README.md").write_text("hello\n")
+        subprocess.run(
+            ["git", "-C", str(repos_dir), "add", "README.md"],
+            check=True, capture_output=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(repos_dir), "commit", "-q", "-m", "init"],
+            check=True, capture_output=True,
+        )
+        # Now leave a dirty modification + an untracked file.
+        (repos_dir / "README.md").write_text("hello\nworld\n")
+        (repos_dir / "scratch.txt").write_text("uncommitted\n")
+
+        # Running peer scoped to that repo.
+        r1 = _add(env, "peer", ["repo:myrepo"])
+        d1 = json.loads(r1.stdout)
+        _register(env, d1["id"], "--json")
+        r2 = _add(env, "interrupter", ["repo:myrepo"], "--force-enqueue")
+        d2 = json.loads(r2.stdout)
+
+        rs = _run(
+            env, "queue", "force-start", d2["id"],
+            "--reason", "repo-snap", "--json",
+        )
+        assert rs.returncode == 0, rs.stderr
+
+        bundle_path = Path(env["FORCE_START_BUNDLE_DIR"]) / f"{d2['id']}.json"
+        bundle = json.loads(bundle_path.read_text())
+        peers = bundle["autostopped_peers"]
+        assert len(peers) == 1
+        snaps = peers[0]["repo_snapshots"]
+        assert snaps, "expected at least one repo snapshot"
+        snap = snaps[0]
+        assert "myrepo" in snap["path"]
+        # Untracked + modified files should both surface in porcelain status.
+        assert "scratch.txt" in snap["status"]
+        assert "README.md" in snap["status"]
+        # Diff carries the README.md edit.
+        assert "world" in snap["diff"], snap["diff"]
+
+
+# ---------------------------------------------------------------------------
 # Entry point for direct invocation
 # ---------------------------------------------------------------------------
 
@@ -454,6 +790,14 @@ def _all_tests():
         test_force_start_emits_dedicated_force_start_event,
         test_force_start_registers_obligation,
         test_force_start_obligation_suppressed_by_env,
+        test_force_start_autostops_overlapping_running_peer,
+        test_force_start_does_not_touch_disjoint_running_peer,
+        test_force_start_writes_recovery_bundle_with_autostop,
+        test_force_start_writes_empty_bundle_when_no_autostop,
+        test_force_start_event_carries_recovery_bundle_path,
+        test_force_start_audit_log_records_autostopped_peers,
+        test_force_start_obligation_message_includes_bundle_path,
+        test_force_start_repo_snapshot_captured_in_bundle,
     ]
 
 
