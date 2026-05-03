@@ -158,6 +158,17 @@ enum WorkloadAction {
     Run {
         /// Short label for the workload
         label: String,
+        /// Optional queue id this workload is bound to (`q-XXXX`).
+        ///
+        /// First-class workload model (Andrew DM 2026-05-03 05:23 ET):
+        /// when set, the `workload-done` event carries the queue id
+        /// AND on workload exit the queue item is transitioned to
+        /// `done` (clean rc=0) or `abandoned` (non-zero rc / killed)
+        /// via `session-task`. Workload completion IS queue
+        /// completion — no separate respawn dance. Resolves the
+        /// q-2026-05-03-1e7d orphaned-workload bug.
+        #[arg(long = "queue-id")]
+        queue_id: Option<String>,
         /// Command to run (after --)
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
         cmd: Vec<String>,
@@ -215,6 +226,11 @@ enum WorkloadAction {
         /// Set if this exit was synthesised by `workload kill`
         #[arg(long)]
         killed: bool,
+        /// Queue id this workload was bound to. Baked into the
+        /// wrapper script by `cmd_run` when `workload run --queue-id`
+        /// was passed; empty / absent for legacy / unbound runs.
+        #[arg(long = "queue-id")]
+        queue_id: Option<String>,
     },
 }
 
@@ -1066,12 +1082,16 @@ async fn run_watcher(action: WatcherAction) {
 
 fn run_workload(action: WorkloadAction) -> i32 {
     match action {
-        WorkloadAction::Run { label, mut cmd } => {
+        WorkloadAction::Run {
+            label,
+            queue_id,
+            mut cmd,
+        } => {
             // Strip leading '--' from command remainder (shell passes it through)
             if cmd.first().map(|s| s.as_str()) == Some("--") {
                 cmd.remove(0);
             }
-            workload::cmd_run(&label, &cmd)
+            workload::cmd_run(&label, &cmd, queue_id.as_deref())
         }
         WorkloadAction::List => workload::cmd_list(),
         WorkloadAction::Wait {
@@ -1090,7 +1110,14 @@ fn run_workload(action: WorkloadAction) -> i32 {
             exit_code,
             log_path,
             killed,
-        } => workload::cmd_emit_done(&label, exit_code, &log_path, killed),
+            queue_id,
+        } => workload::cmd_emit_done(
+            &label,
+            exit_code,
+            &log_path,
+            killed,
+            queue_id.as_deref(),
+        ),
     }
 }
 
