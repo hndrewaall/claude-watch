@@ -1048,17 +1048,28 @@ def _eval_predicate(pred, tool_name, command_string, agent_id=None):
         return (False, "\n".join(lines))
 
     if kind == "force_started_unspawned":
-        # Satisfied (=allow) iff EITHER:
+        # Satisfied (=allow) iff ANY of:
         #   (a) the queue item is no longer ``running`` (already finished /
         #       abandoned -- nothing to enforce against), OR
         #   (b) there exists at least one record in the claude-watch
         #       active-agents JSON whose ``queue_id`` matches AND ``alive``
-        #       is true (i.e. the main loop has spawned a live subagent for
-        #       this force-started item).
-        # Failure (=deny) means the item is still running but no live
-        # subagent has been observed yet -- i.e. the main loop force-started
-        # but hasn't dispatched. The deny banner names the queue id so the
-        # operator knows exactly which item to spawn for.
+        #       is true (i.e. claude-watch's poller has observed a live
+        #       subagent for this force-started item), OR
+        #   (c) there is a recent ``pending-spawns.json`` entry for this
+        #       queue id (written by the pre-agent-queue-gate-hook the
+        #       moment a `Queue item: q-X` Agent spawn passes the gate).
+        # The (c) clause closes the race between "Agent spawned" and
+        # "claude-watch's once-a-minute poller has refreshed
+        # active-agents.json": the JSONL transcript exists immediately on
+        # spawn, but the poller may take up to 60s to notice. The hook
+        # writes a synthetic pending-spawn record at PreToolUse:Agent time
+        # so the predicate can flip to satisfied without waiting on cron.
+        #
+        # Failure (=deny) means the item is still running, no live agent
+        # has been observed, AND no pending-spawn record exists -- i.e.
+        # the main loop force-started but hasn't dispatched. The deny
+        # banner names the queue id so the operator knows which item to
+        # spawn for.
         #
         # Default-open on any IO / parse error: a broken state file must
         # never blackhole the loop. Same posture as every other predicate.
@@ -1067,6 +1078,17 @@ def _eval_predicate(pred, tool_name, command_string, agent_id=None):
             return (True, "missing queue_id (allow)")
         queue_path_param = params.get("queue_path")
         agents_state_path_param = params.get("agents_state_path")
+        pending_spawns_path_param = params.get("pending_spawns_path")
+        # `pending_spawn_max_age_secs`: how recent a pending-spawn entry
+        # has to be to count as proof of dispatch. Default 300s = 5min,
+        # comfortably larger than the 60s active-agents cron cadence so
+        # the poller has time to take over before the pending entry
+        # expires. Tests override to <1s to exercise the staleness path.
+        pending_max_age = params.get("pending_spawn_max_age_secs", 300)
+        try:
+            pending_max_age = int(pending_max_age)
+        except (TypeError, ValueError):
+            pending_max_age = 300
         queue_path = (
             Path(os.path.expanduser(str(queue_path_param)))
             if queue_path_param else DEFAULT_QUEUE_PATH
@@ -1076,6 +1098,28 @@ def _eval_predicate(pred, tool_name, command_string, agent_id=None):
         ) if agents_state_path_param else Path(
             "/var/lib/claude-watch/active-agents.json"
         )
+        if pending_spawns_path_param:
+            pending_spawns_path = Path(
+                os.path.expanduser(str(pending_spawns_path_param))
+            )
+        else:
+            # Honour the same env override the pre-agent-queue-gate-hook
+            # honours (``CLAUDE_PENDING_SPAWNS_PATH``) so test harnesses
+            # and operator-debug runs that redirect the sidecar off
+            # /var/lib don't have to plumb the path through every
+            # obligation row. The hard-coded /var/lib path remains the
+            # production default.
+            env_override = os.environ.get(
+                "CLAUDE_PENDING_SPAWNS_PATH", "",
+            ).strip()
+            if env_override:
+                pending_spawns_path = Path(
+                    os.path.expanduser(env_override)
+                )
+            else:
+                pending_spawns_path = Path(
+                    "/var/lib/claude-watch/pending-spawns.json"
+                )
 
         # 1. Queue check. If the item isn't running anymore, the obligation
         # is moot -- allow.
@@ -1108,38 +1152,77 @@ def _eval_predicate(pred, tool_name, command_string, agent_id=None):
         # 2. Active-agents check. The state file is written by claude-watch's
         # active-agents poller. It maps each subagent's first user-message
         # ``queue_id`` marker to the agent record + liveness.
+        agents_seen = False
         try:
-            if not agents_state_path.exists():
-                # No state file yet => no agents observed. Treat as "no live
-                # agent for this queue id" => deny.
-                summary = target.get("summary") or "(no summary)"
-                return (False,
-                        f"queue {qid} ({summary}) was force-started but "
-                        f"active-agents state file {agents_state_path} does "
-                        f"not exist -- spawn an Agent for q={qid} before "
-                        f"doing anything else.")
-            sraw = agents_state_path.read_text(encoding="utf-8")
-            sdata = json.loads(sraw) if sraw.strip() else {}
+            if agents_state_path.exists():
+                sraw = agents_state_path.read_text(encoding="utf-8")
+                sdata = json.loads(sraw) if sraw.strip() else {}
+                agents = sdata.get("agents", []) if isinstance(sdata, dict) else []
+                agents_seen = True
+                for a in agents:
+                    if not isinstance(a, dict):
+                        continue
+                    if a.get("queue_id") == qid and bool(a.get("alive")):
+                        return (True,
+                                f"queue {qid} has live agent "
+                                f"{a.get('agent_id', '?')!r}")
         except (OSError, json.JSONDecodeError, ValueError) as e:
             # Default-open: a broken state file must not blackhole the loop.
             return (True,
                     f"active-agents {agents_state_path} unreadable "
                     f"(default-open): {e}")
-        agents = sdata.get("agents", []) if isinstance(sdata, dict) else []
-        for a in agents:
-            if not isinstance(a, dict):
-                continue
-            if a.get("queue_id") == qid and bool(a.get("alive")):
-                return (True,
-                        f"queue {qid} has live agent "
-                        f"{a.get('agent_id', '?')!r}")
-        # No live agent record for this queue id => the dispatch hasn't
-        # happened yet. DENY.
+
+        # 3. Pending-spawns check. Closes the cron-cadence race: the
+        # pre-agent-queue-gate-hook upserts an entry here at PreToolUse:Agent
+        # time, so the predicate flips immediately even though
+        # active-agents.json hasn't been refreshed yet.
+        try:
+            if pending_spawns_path.exists():
+                praw = pending_spawns_path.read_text(encoding="utf-8")
+                if praw.strip():
+                    pdata = json.loads(praw)
+                    if isinstance(pdata, dict):
+                        pending = pdata.get("pending", [])
+                    elif isinstance(pdata, list):
+                        pending = pdata
+                    else:
+                        pending = []
+                    now_ts = int(time.time())
+                    for entry in pending:
+                        if not isinstance(entry, dict):
+                            continue
+                        if entry.get("queue_id") != qid:
+                            continue
+                        try:
+                            reg_at = int(entry.get("registered_at", 0))
+                        except (TypeError, ValueError):
+                            continue
+                        age = now_ts - reg_at
+                        if 0 <= age <= pending_max_age:
+                            return (True,
+                                    f"queue {qid} has pending-spawn "
+                                    f"record age={age}s (<= "
+                                    f"{pending_max_age}s window)")
+        except (OSError, json.JSONDecodeError, ValueError) as e:
+            # Default-open: a broken pending-spawns file must not blackhole.
+            return (True,
+                    f"pending-spawns {pending_spawns_path} unreadable "
+                    f"(default-open): {e}")
+
+        # No live agent + no fresh pending-spawn => dispatch hasn't
+        # happened (or hasn't happened recently enough). DENY.
         summary = target.get("summary") or "(no summary)"
+        if not agents_seen:
+            return (False,
+                    f"queue {qid} ({summary}) was force-started but "
+                    f"active-agents state file {agents_state_path} does "
+                    f"not exist -- spawn an Agent for q={qid} before "
+                    f"doing anything else.")
         return (False,
                 f"queue {qid} ({summary}) was force-started but no live "
-                f"subagent has been observed in {agents_state_path} -- "
-                f"spawn an Agent for q={qid} before doing anything else.")
+                f"subagent has been observed in {agents_state_path} and "
+                f"no fresh pending-spawn record in {pending_spawns_path} "
+                f"-- spawn an Agent for q={qid} before doing anything else.")
 
     if kind == "is_main_loop":
         # Satisfied iff the call is from the main loop (no agent_id).
