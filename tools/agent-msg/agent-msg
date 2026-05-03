@@ -512,10 +512,24 @@ def _register_inbox_obligation(agent_id: str, inbox_path: Path,
     if not cli:
         return False, "obligations CLI not found"
     deny_msg = deny_msg_tag or f"{OBLIGATION_TAG_PREFIX}{agent_id}"
+    # Belt-and-suspenders agent scoping: the obligation row is only
+    # meaningful for THIS agent. Without an `agent_id` param on the
+    # `agent_inbox_empty` leaf, a leaked obligation row from a past
+    # agent (PostToolUse hook never sees `status=completed`, so the
+    # disarm path is dead -- the row just sits at TTL until expiry)
+    # would deny every NEW subagent's first tool call with the prior
+    # agent's banner (cross-agent leak, 2026-05-03 -- agent A's STOP
+    # message surfaced in agent B's deny banner, even though A and B
+    # had completely different agent ids). Scoping the leaf via
+    # agent_id makes leaked rows benign: they only fire for their
+    # owning agent, which by definition has already exited.
     predicate_params = {
         "predicates": [
             {"kind": "is_main_loop", "params": {"negate": True}},
-            {"kind": "agent_inbox_empty", "params": {"path": str(inbox_path)}},
+            {"kind": "agent_inbox_empty", "params": {
+                "path": str(inbox_path),
+                "agent_id": agent_id,
+            }},
         ]
     }
     args = [
@@ -1485,11 +1499,28 @@ def test_send_default_from_label():
 
 
 def _gate_hook_path():
-    """Resolve pre-tool-obligations-gate-hook sibling. Tests skip if missing."""
+    """Resolve pre-tool-obligations-gate-hook. Tests skip if missing.
+
+    Search order:
+      1. Sibling next to this script (in-tree dev layout, used to be the
+         only path)
+      2. Sibling in ``tools/hooks/`` of the same repo (canonical layout
+         after the 2026-05-01 reorganization split obligations + hooks
+         into separate top-level dirs under ``tools/``)
+      3. ``~/bin/pre-tool-obligations-gate-hook`` (installed-via-make path)
+    """
     here = Path(__file__).resolve().parent
-    candidate = here / "pre-tool-obligations-gate-hook"
-    if candidate.exists() and os.access(candidate, os.X_OK):
-        return str(candidate)
+    candidates = [
+        here / "pre-tool-obligations-gate-hook",
+        here.parent / "hooks" / "pre-tool-obligations-gate-hook",
+        Path.home() / "bin" / "pre-tool-obligations-gate-hook",
+    ]
+    for candidate in candidates:
+        try:
+            if candidate.exists() and os.access(candidate, os.X_OK):
+                return str(candidate)
+        except OSError:
+            continue
     return None
 
 
@@ -1737,6 +1768,88 @@ def test_gate_after_ack_inbox_empty_allows():
         )
         assert rc == 0, f"rc={rc} out={out}"
         assert not _is_deny(out), f"after ack inbox is empty -> allow; got {out}"
+    return True
+
+
+def test_gate_cross_agent_isolation_regression():
+    """REGRESSION: agent A's unread inbox must NOT gate agent B's tool calls.
+
+    Bug shape (2026-05-03 cross-agent leak):
+        Agent A was armed; main loop sent a STOP message to A's inbox.
+        A exited without disarming (PostToolUse hook never receives
+        status=completed in practice -- the disarm path is dead code).
+        The obligation row for A was left in the obligations DB.
+        Later, agent B (a totally unrelated agent_id) was spawned for an
+        unrelated queue item. On B's first non-exempt tool call, the
+        still-active obligation for A's inbox path was evaluated:
+            is_main_loop {negate: true}        -> True  (B is a subagent)
+            agent_inbox_empty {path: A.json}   -> False (A had unread)
+        The all_of returned False, B was denied with A's STOP message in
+        the banner. B (correctly) interpreted this as "main loop wants me
+        to abort" and exited.
+
+    Fix (2026-05-03):
+        agent_inbox_empty now accepts an `agent_id` param. When the
+        registered agent_id != the current call's agent_id, the predicate
+        auto-satisfies (returns True). agent-msg's _register_inbox_obligation
+        passes the owning agent_id, so leaked rows from past agents are
+        scoped to those agents and harmless to new ones.
+    """
+    hook = _gate_hook_path()
+    if not hook:
+        return True
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        tmpdir = Path(td)
+        # Arm agent A under a sandboxed HOME. This registers the obligation
+        # row that, pre-fix, would leak across agents.
+        setup_a = _gate_test_setup(tmpdir, "ga-leakA")
+        if not setup_a:
+            return True
+        env, inbox_a_path, _ob_a = setup_a
+        # Populate A's inbox so the predicate would fail for any subagent.
+        inbox_a_path.write_text(json.dumps([{
+            "from": "main-loop", "ts": _now_iso(),
+            "queue_item": "q-A", "text": "STOP message intended for agent A only",
+        }]))
+        # SANITY CHECK: agent A IS still gated on its own calls -- the fix
+        # narrows scope but must not break the per-agent gate.
+        rc, out, _err = _run_pre_hook(
+            hook,
+            {"tool_name": "Bash", "tool_input": {"command": "ls"},
+             "agent_id": "ga-leakA"},
+            env,
+        )
+        assert rc == 0, f"rc={rc} out={out}"
+        assert _is_deny(out), (
+            f"agent A must STILL be denied while its own inbox has unread; "
+            f"got {out}"
+        )
+        sysmsg = out.get("systemMessage") or ""
+        assert "STOP message intended for agent A" in sysmsg, (
+            f"A's banner must contain A's message: {sysmsg!r}"
+        )
+        # CORE REGRESSION CHECK: agent B (a different subagent id) MUST NOT
+        # be denied. Its agent_id does not match the agent_id baked into
+        # A's obligation row, so the predicate auto-satisfies for B.
+        rc, out, _err = _run_pre_hook(
+            hook,
+            {"tool_name": "Bash", "tool_input": {"command": "ls"},
+             "agent_id": "gb-leakB"},
+            env,
+        )
+        assert rc == 0, f"rc={rc} out={out}"
+        assert not _is_deny(out), (
+            f"agent B must NOT be denied by agent A's leaked obligation row "
+            f"(cross-agent leak regression); got {out}"
+        )
+        # Also: agent B must not see A's message anywhere in the deny payload
+        # (in case some other unrelated obligation fires -- belt and braces).
+        sysmsg_b = out.get("systemMessage") or ""
+        assert "STOP message intended for agent A" not in sysmsg_b, (
+            f"agent B saw agent A's message in its banner -- the leak is "
+            f"NOT closed: {sysmsg_b!r}"
+        )
     return True
 
 
@@ -2161,6 +2274,8 @@ def run_tests():
         ("gate_after_ack_inbox_empty_allows", test_gate_after_ack_inbox_empty_allows),
         ("gate_subagent_real_ack_clears_with_bodies_kept",
          test_gate_subagent_real_ack_clears_with_bodies_kept),
+        ("gate_cross_agent_isolation_regression",
+         test_gate_cross_agent_isolation_regression),
         ("arm_registers_gate_mode_with_exempt_patterns",
          test_arm_registers_gate_mode_with_exempt_patterns),
     ]

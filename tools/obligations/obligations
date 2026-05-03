@@ -115,7 +115,7 @@ Predicate vocabulary (BOUNDED -- not Turing complete):
         Read, Bash:^watcher-ctl, Bash:^(pgrep|pkill|ps), Bash:^cat, and
         Bash:^obligations from the gate to avoid self-deadlock; everything
         else must Read the captured output before proceeding.
-  - agent_inbox_empty: {path}
+  - agent_inbox_empty: {path, agent_id?}
         satisfied iff the JSON inbox at ``path`` is missing OR contains
         no UNREAD messages. Accepts both schema v2 (a dict envelope
         ``{"schema_version": 2, "messages": [...]}``) and legacy v1
@@ -125,7 +125,21 @@ Predicate vocabulary (BOUNDED -- not Turing complete):
         unread entry: from / ts / id / text). Already-read messages
         (``read: true`` in v2) do NOT block the gate -- they remain
         on disk for re-read but are no longer pending work.
-        Used by the agent-msg async messaging system: an inform-mode
+
+        ``agent_id`` (optional): if set, the predicate is auto-satisfied
+        when the CURRENT call's agent_id does not match the registered
+        agent_id. This scopes the obligation to its owning agent so an
+        unread inbox for agent A does not gate tool calls from agent B.
+        Without this scope, every leaked obligation row from a past
+        agent would deny every future subagent's first tool call until
+        TTL expiry (the agent-msg cross-agent leak, 2026-05-03).
+        Calls from the main loop (no agent_id) are always scope-skipped
+        when ``agent_id`` is set -- the typical wiring pairs this
+        predicate with ``is_main_loop {negate: true}`` inside ``all_of``
+        so main-loop calls already short-circuit there, but the
+        agent_inbox_empty leaf is also defensive on its own.
+
+        Used by the agent-msg async messaging system: a gate-mode
         obligation registered at agent-spawn time surfaces inbox
         contents to the subagent on the next tool call.
   - stale_ready_queue_present: {threshold_secs?, queue_path?}
@@ -894,6 +908,23 @@ def _eval_predicate(pred, tool_name, command_string, agent_id=None):
         path = params.get("path")
         if not path:
             return (True, "missing path (allow by default)")
+        # Per-agent scope guard: if the obligation was registered with a
+        # specific agent_id, it must only fire for THAT agent. Calls from
+        # other subagents (different agent_id) or from the main loop (no
+        # agent_id) auto-satisfy. Without this, every leaked obligation
+        # row from a past subagent would deny every future subagent's
+        # first tool call (cross-agent inbox leak, 2026-05-03).
+        registered_agent_id = params.get("agent_id")
+        if registered_agent_id:
+            current = (agent_id or "").strip()
+            if not current:
+                return (True,
+                        f"inbox {path} is scoped to agent {registered_agent_id!r}; "
+                        f"current call is from main loop -- not applicable")
+            if current != str(registered_agent_id).strip():
+                return (True,
+                        f"inbox {path} is scoped to agent {registered_agent_id!r}; "
+                        f"current agent_id={current!r} -- not applicable")
         full = os.path.expanduser(str(path))
         if not os.path.exists(full):
             return (True, f"inbox {path} does not exist (no messages)")
