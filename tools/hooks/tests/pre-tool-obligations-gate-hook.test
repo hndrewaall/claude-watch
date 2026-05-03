@@ -3152,6 +3152,163 @@ def main() -> int:
             ))
             _run([str(CLI), "satisfy", ob_105], env_fs)
 
+            # ===================================================================
+            # Tests 106-109: force_started_unspawned + pending-spawns sidecar.
+            #
+            # Closes the cron-cadence race in the original predicate: the
+            # active-agents poller refreshes every 60s, but the
+            # pre-agent-queue-gate-hook writes a synthetic pending-spawn
+            # record at PreToolUse:Agent time. The predicate must accept a
+            # FRESH pending-spawn entry as proof of dispatch, ignore stale
+            # ones, ignore mismatched queue ids, and default-open on a
+            # corrupt file.
+            # ===================================================================
+
+            # Helper: write a pending-spawns.json with given entries.
+            def _write_pending(path, entries):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(json.dumps({"pending": entries}) + "\n")
+
+            # 106: queue running + no agent + FRESH pending-spawn -> ALLOW
+            qfile_106 = tmpdir_fs / "fs106-queue.json"
+            afile_106 = tmpdir_fs / "fs106-agents.json"
+            pfile_106 = tmpdir_fs / "fs106-pending.json"
+            _write_queue_one(qfile_106, "q-fs-106-test", "running")
+            _write_agents(afile_106, [])
+            _write_pending(pfile_106, [{
+                "queue_id": "q-fs-106-test",
+                "registered_at": int(time.time()),
+                "pid": 12345,
+            }])
+            ob_106 = _add_ob(
+                env_fs,
+                tool_pattern="Bash",
+                predicate="force_started_unspawned",
+                params={
+                    "queue_id": "q-fs-106-test",
+                    "queue_path": str(qfile_106),
+                    "agents_state_path": str(afile_106),
+                    "pending_spawns_path": str(pfile_106),
+                },
+                ttl=120,
+                deny_msg="(should not fire)",
+            )
+            rc, out, _err = _hook_pre(
+                {"tool_name": "Bash", "tool_input": {"command": "ls"}}, env_fs,
+            )
+            results.append(_check(
+                "106. force_started_unspawned: fresh pending-spawn -> allow",
+                rc == 0 and _is_allow(out),
+                f"rc={rc} out={out}",
+            ))
+            _run([str(CLI), "satisfy", ob_106], env_fs)
+
+            # 107: queue running + no agent + STALE pending-spawn -> DENY
+            # `pending_spawn_max_age_secs=0` makes any non-zero-age entry
+            # stale, so an entry registered 5s ago is rejected.
+            qfile_107 = tmpdir_fs / "fs107-queue.json"
+            afile_107 = tmpdir_fs / "fs107-agents.json"
+            pfile_107 = tmpdir_fs / "fs107-pending.json"
+            _write_queue_one(qfile_107, "q-fs-107-test", "running")
+            _write_agents(afile_107, [])
+            _write_pending(pfile_107, [{
+                "queue_id": "q-fs-107-test",
+                "registered_at": int(time.time()) - 5,
+                "pid": 12345,
+            }])
+            ob_107 = _add_ob(
+                env_fs,
+                tool_pattern="Bash",
+                predicate="force_started_unspawned",
+                params={
+                    "queue_id": "q-fs-107-test",
+                    "queue_path": str(qfile_107),
+                    "agents_state_path": str(afile_107),
+                    "pending_spawns_path": str(pfile_107),
+                    "pending_spawn_max_age_secs": 0,
+                },
+                ttl=120,
+                deny_msg="must spawn agent for q-fs-107-test",
+            )
+            rc, out, _err = _hook_pre(
+                {"tool_name": "Bash", "tool_input": {"command": "ls"}}, env_fs,
+            )
+            results.append(_check(
+                "107. force_started_unspawned: stale pending-spawn -> deny",
+                rc == 0 and _is_deny(out),
+                f"rc={rc} out={out}",
+            ))
+            _run([str(CLI), "satisfy", ob_107], env_fs)
+
+            # 108: queue running + no agent + WRONG-QID pending-spawn -> DENY
+            # A pending-spawn for a DIFFERENT queue id must not satisfy us.
+            qfile_108 = tmpdir_fs / "fs108-queue.json"
+            afile_108 = tmpdir_fs / "fs108-agents.json"
+            pfile_108 = tmpdir_fs / "fs108-pending.json"
+            _write_queue_one(qfile_108, "q-fs-108-test", "running")
+            _write_agents(afile_108, [])
+            _write_pending(pfile_108, [{
+                "queue_id": "q-fs-108-OTHER",
+                "registered_at": int(time.time()),
+                "pid": 12345,
+            }])
+            ob_108 = _add_ob(
+                env_fs,
+                tool_pattern="Bash",
+                predicate="force_started_unspawned",
+                params={
+                    "queue_id": "q-fs-108-test",
+                    "queue_path": str(qfile_108),
+                    "agents_state_path": str(afile_108),
+                    "pending_spawns_path": str(pfile_108),
+                },
+                ttl=120,
+                deny_msg="must spawn agent for q-fs-108-test",
+            )
+            rc, out, _err = _hook_pre(
+                {"tool_name": "Bash", "tool_input": {"command": "ls"}}, env_fs,
+            )
+            results.append(_check(
+                "108. force_started_unspawned: wrong-qid pending-spawn -> deny",
+                rc == 0 and _is_deny(out),
+                f"rc={rc} out={out}",
+            ))
+            _run([str(CLI), "satisfy", ob_108], env_fs)
+
+            # 109: corrupt pending-spawns.json -> default-open ALLOW (we do
+            # NOT blackhole on a parse error -- same posture as the
+            # active-agents and queue.json default-open clauses).
+            qfile_109 = tmpdir_fs / "fs109-queue.json"
+            afile_109 = tmpdir_fs / "fs109-agents.json"
+            pfile_109 = tmpdir_fs / "fs109-pending.json"
+            _write_queue_one(qfile_109, "q-fs-109-test", "running")
+            _write_agents(afile_109, [])
+            pfile_109.parent.mkdir(parents=True, exist_ok=True)
+            pfile_109.write_text("not json {{{")
+            ob_109 = _add_ob(
+                env_fs,
+                tool_pattern="Bash",
+                predicate="force_started_unspawned",
+                params={
+                    "queue_id": "q-fs-109-test",
+                    "queue_path": str(qfile_109),
+                    "agents_state_path": str(afile_109),
+                    "pending_spawns_path": str(pfile_109),
+                },
+                ttl=120,
+                deny_msg="(should not fire)",
+            )
+            rc, out, _err = _hook_pre(
+                {"tool_name": "Bash", "tool_input": {"command": "ls"}}, env_fs,
+            )
+            results.append(_check(
+                "109. force_started_unspawned: corrupt pending file -> "
+                "allow (default-open)",
+                rc == 0 and _is_allow(out),
+                f"rc={rc} out={out}",
+            ))
+            _run([str(CLI), "satisfy", ob_109], env_fs)
+
     total = len(results)
     passed = sum(1 for r in results if r)
     print()
