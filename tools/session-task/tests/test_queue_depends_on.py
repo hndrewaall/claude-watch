@@ -1,0 +1,267 @@
+#!/usr/bin/env python3
+"""Tests for explicit interjob dependencies on the session-task queue.
+
+Adjacency-list storage + lazy read-time compute (per Andrew's perf brief
+2026-05-02). Covered:
+
+  * queue add --depends-on attaches the field; ready_now=False until
+    every dep is done.
+  * queue depend <id> --add q-AAA / --remove q-BBB / --clear edits
+    edges atomically.
+  * Cross-group deps are allowed (different groups, different scopes).
+  * Cycle detection on read: A->B->A keeps both ready_now=False, sets
+    dep_cycle=true on queue show.
+  * Self-deps are refused at write time (queue add --depends-on, queue
+    depend --add).
+  * Adding a dep onto an unknown queue id is refused.
+  * spawn_instruction surfaces "deps:" blockers separately from queue
+    head serialization.
+  * queue show surfaces dependents (reverse edges).
+
+Run:
+    uv run --python 3.11 --with pytest \\
+        pytest tests/test_queue_depends_on.py -v
+"""
+
+import json
+import os
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+SESSION_TASK = Path(__file__).resolve().parent.parent / "session-task"
+
+
+def _env_for_tmp(tmp):
+    env = dict(os.environ)
+    env["HOME"] = str(tmp)
+    # Disable noisy pingme + claude-event side-effects during tests.
+    env["PINGME_SESSION_TASK"] = "0"
+    env["CLAUDE_EVENT_SESSION_TASK"] = "0"
+    Path(tmp, ".config/session").mkdir(parents=True, exist_ok=True)
+    return env
+
+
+def _run(env, *argv, check=False, timeout=15):
+    cmd = [sys.executable, str(SESSION_TASK)] + list(argv)
+    r = subprocess.run(
+        cmd, capture_output=True, text=True, env=env, timeout=timeout
+    )
+    if check and r.returncode != 0:
+        raise RuntimeError(
+            f"command failed rc={r.returncode}\n"
+            f"  cmd: {' '.join(argv)}\n"
+            f"  stdout: {r.stdout}\n"
+            f"  stderr: {r.stderr}"
+        )
+    return r
+
+
+def _add(env, desc, scopes, *extra):
+    cmd = ["queue", "add", desc, "--json", "--summary", desc]
+    for s in scopes:
+        cmd.extend(["--scope", s])
+    cmd.extend(extra)
+    r = _run(env, *cmd)
+    if r.returncode != 0:
+        raise RuntimeError(f"add failed: {r.stderr}")
+    return json.loads(r.stdout)
+
+
+def _register(env, qid):
+    return _run(env, "queue", "register", qid, check=True)
+
+
+def _done(env, qid):
+    return _run(env, "queue", "done", qid, check=True)
+
+
+def _show(env, qid):
+    r = _run(env, "queue", "show", qid, check=True)
+    return json.loads(r.stdout)
+
+
+# ---------------------------------------------------------------------------
+# 1. queue add --depends-on attaches the field; ready flips on done
+# ---------------------------------------------------------------------------
+def test_add_with_depends_on_blocks_until_done():
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _env_for_tmp(tmp)
+        a = _add(env, "first", ["repo:a"])
+        b = _add(env, "second", ["repo:b"], "--depends-on", a["id"])
+
+        assert b["depends_on"] == [a["id"]]
+        assert b["ready_now"] is False
+        assert b["dep_blockers"] == [a["id"]]
+        assert "deps:" in b["spawn_instruction"]
+
+        # finishing A should flip B to ready
+        _register(env, a["id"])
+        _done(env, a["id"])
+
+        b_show = _show(env, b["id"])
+        assert b_show["ready_now"] is True
+        assert b_show["depends_on"] == [a["id"]]
+        assert b_show["dep_blockers"] == []
+        assert b_show["depends_on_status"] == [
+            {"id": a["id"], "status": "done"}
+        ]
+
+
+# ---------------------------------------------------------------------------
+# 2. cross-group deps are allowed
+# ---------------------------------------------------------------------------
+def test_cross_group_deps_allowed():
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _env_for_tmp(tmp)
+        a = _add(env, "a-job", ["repo:lib-a"])
+        b = _add(env, "b-job", ["repo:lib-b"], "--depends-on", a["id"])
+
+        # Different groups (disjoint scope), but the dep is honored.
+        assert a["group_id"] != b["group_id"]
+        assert b["ready_now"] is False
+        b_show = _show(env, b["id"])
+        assert b_show["depends_on"] == [a["id"]]
+
+
+# ---------------------------------------------------------------------------
+# 3. queue depend --add / --remove / --clear
+# ---------------------------------------------------------------------------
+def test_depend_add_remove_clear():
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _env_for_tmp(tmp)
+        a = _add(env, "a", ["repo:a"])
+        b = _add(env, "b", ["repo:b"])
+        c = _add(env, "c", ["repo:c"])
+
+        # add a -> b, c (b depends on a + c)
+        r = _run(env, "queue", "depend", b["id"],
+                 "--add", a["id"],
+                 "--add", c["id"],
+                 "--json", check=True)
+        out = json.loads(r.stdout)
+        assert sorted(out["depends_on"]) == sorted([a["id"], c["id"]])
+        assert out["ready_now"] is False
+
+        # remove c
+        r = _run(env, "queue", "depend", b["id"],
+                 "--remove", c["id"],
+                 "--json", check=True)
+        out = json.loads(r.stdout)
+        assert out["depends_on"] == [a["id"]]
+
+        # clear all
+        r = _run(env, "queue", "depend", b["id"], "--clear",
+                 "--json", check=True)
+        out = json.loads(r.stdout)
+        assert out["depends_on"] == []
+        assert out["ready_now"] is True  # head of group, no deps
+
+
+# ---------------------------------------------------------------------------
+# 4. cycle detection: A->B->A both stuck
+# ---------------------------------------------------------------------------
+def test_dep_cycle_detected_on_read():
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _env_for_tmp(tmp)
+        a = _add(env, "a", ["repo:a"])
+        b = _add(env, "b", ["repo:b"])
+
+        # b -> a
+        _run(env, "queue", "depend", b["id"], "--add", a["id"], check=True)
+        # a -> b (creates cycle)
+        _run(env, "queue", "depend", a["id"], "--add", b["id"], check=True)
+
+        a_show = _show(env, a["id"])
+        b_show = _show(env, b["id"])
+        assert a_show["dep_cycle"] is True
+        assert b_show["dep_cycle"] is True
+        assert a_show["ready_now"] is False
+        assert b_show["ready_now"] is False
+
+        # Breaking the cycle restores forward progress (a no longer
+        # depends on b -> a is ready -> can finish -> b unblocks).
+        _run(env, "queue", "depend", a["id"], "--remove", b["id"],
+             check=True)
+        a_show = _show(env, a["id"])
+        assert a_show["dep_cycle"] is False
+        assert a_show["ready_now"] is True
+
+
+# ---------------------------------------------------------------------------
+# 5. self-dep refused
+# ---------------------------------------------------------------------------
+def test_self_dep_refused_on_add():
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _env_for_tmp(tmp)
+        a = _add(env, "a", ["repo:a"])
+        r = _run(env, "queue", "depend", a["id"], "--add", a["id"])
+        assert r.returncode != 0
+        assert "itself" in r.stderr.lower() or "self" in r.stderr.lower()
+
+
+def test_self_dep_refused_at_queue_add():
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _env_for_tmp(tmp)
+        # The new id can never reference itself at add time (it doesn't
+        # exist yet) — the unknown-id check catches it. Verify by
+        # passing a deliberately wrong dep.
+        r = _run(env, "queue", "add", "x", "--summary", "x",
+                 "--scope", "repo:x", "--depends-on", "q-2099-99-99-zzzz")
+        assert r.returncode != 0
+        assert "unknown" in r.stderr.lower()
+
+
+# ---------------------------------------------------------------------------
+# 6. unknown-id refused on add and depend
+# ---------------------------------------------------------------------------
+def test_unknown_dep_refused_on_depend():
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _env_for_tmp(tmp)
+        a = _add(env, "a", ["repo:a"])
+        r = _run(env, "queue", "depend", a["id"],
+                 "--add", "q-2099-01-01-aaaa")
+        assert r.returncode != 0
+        assert "unknown" in r.stderr.lower()
+
+
+# ---------------------------------------------------------------------------
+# 7. show surfaces dependents (reverse edges)
+# ---------------------------------------------------------------------------
+def test_show_surfaces_dependents():
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _env_for_tmp(tmp)
+        a = _add(env, "a", ["repo:a"])
+        b = _add(env, "b", ["repo:b"], "--depends-on", a["id"])
+        c = _add(env, "c", ["repo:c"], "--depends-on", a["id"])
+
+        a_show = _show(env, a["id"])
+        assert sorted(a_show["dependents"]) == sorted([b["id"], c["id"]])
+        # a itself has no deps
+        assert a_show.get("depends_on") in (None, [])
+
+
+# ---------------------------------------------------------------------------
+# 8. dangling dep blocks ready_now (target abandoned)
+# ---------------------------------------------------------------------------
+def test_abandoned_dep_keeps_blocked():
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _env_for_tmp(tmp)
+        a = _add(env, "a", ["repo:a"])
+        b = _add(env, "b", ["repo:b"], "--depends-on", a["id"])
+
+        _run(env, "queue", "abandon", a["id"], "--reason", "test",
+             check=True)
+
+        b_show = _show(env, b["id"])
+        # a is abandoned, not done — b stays blocked until the operator
+        # explicitly removes the dep.
+        assert b_show["ready_now"] is False
+        assert b_show["dep_blockers"] == [a["id"]]
+
+
+if __name__ == "__main__":
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-v"]))
