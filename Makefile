@@ -96,39 +96,47 @@ deploy: build
 #   - post-tool-obligations-update-hook     : PostToolUse hook (* matcher)
 #   - post-tool-mark-attachment-read-hook   : PostToolUse hook (Read matcher)
 #
-# All Python scripts ship as the source itself (no compile step). The Rust
-# binary depends on `make build` having been run first.
+# Install policy:
+#   - The claude-watch Rust daemon is a build artifact, so it's a real
+#     file copy from target/release/ into $(BIN_DIR). Re-running `make
+#     install` after `make build` refreshes it.
+#   - Every other tool is a script (Python / shell). Those install as
+#     ABSOLUTE-PATH symlinks back to the source under tools/, so editing
+#     a script in-tree is immediately reflected in $(BIN_DIR) without
+#     another `make install` round-trip. `ln -sfn` makes the operation
+#     idempotent (overwrites existing files / stale symlinks; -n
+#     prevents following a directory at the link path).
 BIN_DIR ?= $(HOME)/bin
 
 install: build
 	@mkdir -p $(BIN_DIR)
 	@install -m 0755 target/release/claude-watch $(BIN_DIR)/claude-watch
-	@install -m 0755 tools/session-task/session-task $(BIN_DIR)/session-task
-	@install -m 0755 tools/obligations/obligations $(BIN_DIR)/obligations
-	@install -m 0755 tools/hooks/pre-agent-queue-gate-hook $(BIN_DIR)/pre-agent-queue-gate-hook
-	@install -m 0755 tools/hooks/pre-tool-obligations-gate-hook $(BIN_DIR)/pre-tool-obligations-gate-hook
-	@install -m 0755 tools/hooks/post-tool-obligations-update-hook $(BIN_DIR)/post-tool-obligations-update-hook
-	@install -m 0755 tools/hooks/post-tool-mark-attachment-read-hook $(BIN_DIR)/post-tool-mark-attachment-read-hook
-	@install -m 0755 tools/agent-msg/agent-msg $(BIN_DIR)/agent-msg
-	@install -m 0755 tools/agent-tail/agent-tail $(BIN_DIR)/agent-tail
-	@install -m 0755 tools/claude-event/claude-event $(BIN_DIR)/claude-event
-	@install -m 0755 tools/claude-event/claude-event-tail $(BIN_DIR)/claude-event-tail
-	@install -m 0755 tools/watchers/claude-event-watch $(BIN_DIR)/claude-event-watch
-	@install -m 0755 tools/watchers/self-clear $(BIN_DIR)/self-clear
+	@ln -sfn $(abspath tools/session-task/session-task) $(BIN_DIR)/session-task
+	@ln -sfn $(abspath tools/obligations/obligations) $(BIN_DIR)/obligations
+	@ln -sfn $(abspath tools/hooks/pre-agent-queue-gate-hook) $(BIN_DIR)/pre-agent-queue-gate-hook
+	@ln -sfn $(abspath tools/hooks/pre-tool-obligations-gate-hook) $(BIN_DIR)/pre-tool-obligations-gate-hook
+	@ln -sfn $(abspath tools/hooks/post-tool-obligations-update-hook) $(BIN_DIR)/post-tool-obligations-update-hook
+	@ln -sfn $(abspath tools/hooks/post-tool-mark-attachment-read-hook) $(BIN_DIR)/post-tool-mark-attachment-read-hook
+	@ln -sfn $(abspath tools/agent-msg/agent-msg) $(BIN_DIR)/agent-msg
+	@ln -sfn $(abspath tools/agent-tail/agent-tail) $(BIN_DIR)/agent-tail
+	@ln -sfn $(abspath tools/claude-event/claude-event) $(BIN_DIR)/claude-event
+	@ln -sfn $(abspath tools/claude-event/claude-event-tail) $(BIN_DIR)/claude-event-tail
+	@ln -sfn $(abspath tools/watchers/claude-event-watch) $(BIN_DIR)/claude-event-watch
+	@ln -sfn $(abspath tools/watchers/self-clear) $(BIN_DIR)/self-clear
 	@echo "Installed to $(BIN_DIR):"
-	@echo "  - claude-watch"
-	@echo "  - session-task"
-	@echo "  - obligations"
-	@echo "  - pre-agent-queue-gate-hook"
-	@echo "  - pre-tool-obligations-gate-hook"
-	@echo "  - post-tool-obligations-update-hook"
-	@echo "  - post-tool-mark-attachment-read-hook"
-	@echo "  - agent-msg"
-	@echo "  - agent-tail"
-	@echo "  - claude-event"
-	@echo "  - claude-event-tail"
-	@echo "  - claude-event-watch"
-	@echo "  - self-clear"
+	@echo "  - claude-watch              (file copy, build artifact)"
+	@echo "  - session-task              (symlink -> tools/session-task/)"
+	@echo "  - obligations               (symlink -> tools/obligations/)"
+	@echo "  - pre-agent-queue-gate-hook (symlink -> tools/hooks/)"
+	@echo "  - pre-tool-obligations-gate-hook (symlink -> tools/hooks/)"
+	@echo "  - post-tool-obligations-update-hook (symlink -> tools/hooks/)"
+	@echo "  - post-tool-mark-attachment-read-hook (symlink -> tools/hooks/)"
+	@echo "  - agent-msg                 (symlink -> tools/agent-msg/)"
+	@echo "  - agent-tail                (symlink -> tools/agent-tail/)"
+	@echo "  - claude-event              (symlink -> tools/claude-event/)"
+	@echo "  - claude-event-tail         (symlink -> tools/claude-event/)"
+	@echo "  - claude-event-watch        (symlink -> tools/watchers/)"
+	@echo "  - self-clear                (symlink -> tools/watchers/)"
 
 # Install git pre-commit hook (warning-free build + unit/fixture tests).
 # Symlinks scripts/git-hooks/pre-commit into .git/hooks so script edits
