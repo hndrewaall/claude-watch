@@ -307,6 +307,7 @@ VALID_PREDICATE_KINDS = {
     "agent_inbox_empty",
     "is_main_loop",
     "stale_ready_queue_present",
+    "force_started_unspawned",
     "all_of",
 }
 
@@ -1014,6 +1015,100 @@ def _eval_predicate(pred, tool_name, command_string, agent_id=None):
         if n > 5:
             lines.append(f"  ... (+{n - 5} more)")
         return (False, "\n".join(lines))
+
+    if kind == "force_started_unspawned":
+        # Satisfied (=allow) iff EITHER:
+        #   (a) the queue item is no longer ``running`` (already finished /
+        #       abandoned -- nothing to enforce against), OR
+        #   (b) there exists at least one record in the claude-watch
+        #       active-agents JSON whose ``queue_id`` matches AND ``alive``
+        #       is true (i.e. the main loop has spawned a live subagent for
+        #       this force-started item).
+        # Failure (=deny) means the item is still running but no live
+        # subagent has been observed yet -- i.e. the main loop force-started
+        # but hasn't dispatched. The deny banner names the queue id so the
+        # operator knows exactly which item to spawn for.
+        #
+        # Default-open on any IO / parse error: a broken state file must
+        # never blackhole the loop. Same posture as every other predicate.
+        qid = params.get("queue_id")
+        if not qid:
+            return (True, "missing queue_id (allow)")
+        queue_path_param = params.get("queue_path")
+        agents_state_path_param = params.get("agents_state_path")
+        queue_path = (
+            Path(os.path.expanduser(str(queue_path_param)))
+            if queue_path_param else DEFAULT_QUEUE_PATH
+        )
+        agents_state_path = Path(
+            os.path.expanduser(str(agents_state_path_param))
+        ) if agents_state_path_param else Path(
+            "/var/lib/claude-watch/active-agents.json"
+        )
+
+        # 1. Queue check. If the item isn't running anymore, the obligation
+        # is moot -- allow.
+        try:
+            if not queue_path.exists():
+                return (True,
+                        f"queue.json {queue_path} missing (default-open)")
+            qraw = queue_path.read_text(encoding="utf-8")
+            if not qraw.strip():
+                return (True, f"queue.json {queue_path} empty (default-open)")
+            qdata = json.loads(qraw)
+        except (OSError, json.JSONDecodeError, ValueError) as e:
+            return (True,
+                    f"queue.json {queue_path} unreadable (default-open): {e}")
+        items = qdata.get("items", []) if isinstance(qdata, dict) else (
+            qdata if isinstance(qdata, list) else []
+        )
+        target = next(
+            (it for it in items if isinstance(it, dict) and it.get("id") == qid),
+            None,
+        )
+        if target is None:
+            return (True, f"queue id {qid!r} not found (allow)")
+        status = target.get("status")
+        if status != "running":
+            return (True,
+                    f"queue {qid} status={status!r} (no longer running -- "
+                    f"obligation moot)")
+
+        # 2. Active-agents check. The state file is written by claude-watch's
+        # active-agents poller. It maps each subagent's first user-message
+        # ``queue_id`` marker to the agent record + liveness.
+        try:
+            if not agents_state_path.exists():
+                # No state file yet => no agents observed. Treat as "no live
+                # agent for this queue id" => deny.
+                summary = target.get("summary") or "(no summary)"
+                return (False,
+                        f"queue {qid} ({summary}) was force-started but "
+                        f"active-agents state file {agents_state_path} does "
+                        f"not exist -- spawn an Agent for q={qid} before "
+                        f"doing anything else.")
+            sraw = agents_state_path.read_text(encoding="utf-8")
+            sdata = json.loads(sraw) if sraw.strip() else {}
+        except (OSError, json.JSONDecodeError, ValueError) as e:
+            # Default-open: a broken state file must not blackhole the loop.
+            return (True,
+                    f"active-agents {agents_state_path} unreadable "
+                    f"(default-open): {e}")
+        agents = sdata.get("agents", []) if isinstance(sdata, dict) else []
+        for a in agents:
+            if not isinstance(a, dict):
+                continue
+            if a.get("queue_id") == qid and bool(a.get("alive")):
+                return (True,
+                        f"queue {qid} has live agent "
+                        f"{a.get('agent_id', '?')!r}")
+        # No live agent record for this queue id => the dispatch hasn't
+        # happened yet. DENY.
+        summary = target.get("summary") or "(no summary)"
+        return (False,
+                f"queue {qid} ({summary}) was force-started but no live "
+                f"subagent has been observed in {agents_state_path} -- "
+                f"spawn an Agent for q={qid} before doing anything else.")
 
     if kind == "is_main_loop":
         # Satisfied iff the call is from the main loop (no agent_id).
