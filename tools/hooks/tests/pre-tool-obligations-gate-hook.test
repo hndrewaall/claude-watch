@@ -2903,6 +2903,255 @@ def main() -> int:
             ))
             _run([str(CLI), "satisfy", ob_inform], env_u)
 
+        # ===================================================================
+        # Tests 99-105: force_started_unspawned predicate.
+        #
+        # Used by `session-task queue force-start` to gate the main loop
+        # after a force-start until an Agent has been dispatched for the
+        # promoted queue id. Predicate fails iff the queue item is
+        # `running` AND no live agent record exists for it in the
+        # active-agents JSON. Default-open on any IO / parse error.
+        # ===================================================================
+        with tempfile.TemporaryDirectory(prefix="obligations-fs-") as td_fs:
+            tmpdir_fs = Path(td_fs)
+            env_fs, _ob_fs = _make_isolated_env(tmpdir_fs)
+
+            # Helper: write a queue.json with one item.
+            def _write_queue_one(path, qid, status, summary="test summary"):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(json.dumps({
+                    "items": [{
+                        "id": qid,
+                        "status": status,
+                        "group_id": "g-x",
+                        "summary": summary,
+                        "scope": ["test"],
+                        "created_at": "2026-05-02T00:00:00+00:00",
+                    }],
+                }) + "\n")
+
+            # Helper: write an active-agents.json with given agent records.
+            def _write_agents(path, records):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(json.dumps({
+                    "subagents": [],
+                    "workloads": [],
+                    "agents": records,
+                }) + "\n")
+
+            # 99: queue running + no agent record at all -> DENY
+            qfile_99 = tmpdir_fs / "fs99-queue.json"
+            afile_99 = tmpdir_fs / "fs99-agents.json"
+            _write_queue_one(qfile_99, "q-fs-99-test", "running")
+            _write_agents(afile_99, [])
+            ob_99 = _add_ob(
+                env_fs,
+                tool_pattern="Bash",
+                predicate="force_started_unspawned",
+                params={
+                    "queue_id": "q-fs-99-test",
+                    "queue_path": str(qfile_99),
+                    "agents_state_path": str(afile_99),
+                },
+                ttl=120,
+                deny_msg="must spawn agent for q-fs-99-test",
+            )
+            rc, out, _err = _hook_pre(
+                {"tool_name": "Bash", "tool_input": {"command": "ls"}}, env_fs,
+            )
+            banner = (out or {}).get("systemMessage", "")
+            results.append(_check(
+                "99. force_started_unspawned: running + no agent -> deny",
+                (rc == 0 and _is_deny(out)
+                 and "q-fs-99-test" in banner
+                 and "spawn an Agent" in banner),
+                f"rc={rc} out={out}",
+            ))
+            _run([str(CLI), "satisfy", ob_99], env_fs)
+
+            # 100: queue running + live agent record -> ALLOW
+            qfile_100 = tmpdir_fs / "fs100-queue.json"
+            afile_100 = tmpdir_fs / "fs100-agents.json"
+            _write_queue_one(qfile_100, "q-fs-100-test", "running")
+            _write_agents(afile_100, [
+                {
+                    "agent_id": "a-fs-100",
+                    "queue_id": "q-fs-100-test",
+                    "alive": True,
+                    "jsonl_age_seconds": 4,
+                },
+            ])
+            ob_100 = _add_ob(
+                env_fs,
+                tool_pattern="Bash",
+                predicate="force_started_unspawned",
+                params={
+                    "queue_id": "q-fs-100-test",
+                    "queue_path": str(qfile_100),
+                    "agents_state_path": str(afile_100),
+                },
+                ttl=120,
+                deny_msg="(should not fire)",
+            )
+            rc, out, _err = _hook_pre(
+                {"tool_name": "Bash", "tool_input": {"command": "ls"}}, env_fs,
+            )
+            results.append(_check(
+                "100. force_started_unspawned: running + live agent -> allow",
+                rc == 0 and _is_allow(out),
+                f"rc={rc} out={out}",
+            ))
+            _run([str(CLI), "satisfy", ob_100], env_fs)
+
+            # 101: queue running + dead agent record -> DENY
+            # alive=false means the prior dispatch is gone -- we still owe a
+            # fresh spawn while the queue item remains `running`.
+            qfile_101 = tmpdir_fs / "fs101-queue.json"
+            afile_101 = tmpdir_fs / "fs101-agents.json"
+            _write_queue_one(qfile_101, "q-fs-101-test", "running")
+            _write_agents(afile_101, [
+                {
+                    "agent_id": "a-fs-101",
+                    "queue_id": "q-fs-101-test",
+                    "alive": False,
+                    "jsonl_age_seconds": 9999,
+                },
+            ])
+            ob_101 = _add_ob(
+                env_fs,
+                tool_pattern="Bash",
+                predicate="force_started_unspawned",
+                params={
+                    "queue_id": "q-fs-101-test",
+                    "queue_path": str(qfile_101),
+                    "agents_state_path": str(afile_101),
+                },
+                ttl=120,
+                deny_msg="must spawn agent for q-fs-101-test",
+            )
+            rc, out, _err = _hook_pre(
+                {"tool_name": "Bash", "tool_input": {"command": "ls"}}, env_fs,
+            )
+            results.append(_check(
+                "101. force_started_unspawned: running + dead agent -> deny",
+                rc == 0 and _is_deny(out),
+                f"rc={rc} out={out}",
+            ))
+            _run([str(CLI), "satisfy", ob_101], env_fs)
+
+            # 102: queue done -> ALLOW (obligation moot once item completes)
+            qfile_102 = tmpdir_fs / "fs102-queue.json"
+            afile_102 = tmpdir_fs / "fs102-agents.json"
+            _write_queue_one(qfile_102, "q-fs-102-test", "done")
+            _write_agents(afile_102, [])
+            ob_102 = _add_ob(
+                env_fs,
+                tool_pattern="Bash",
+                predicate="force_started_unspawned",
+                params={
+                    "queue_id": "q-fs-102-test",
+                    "queue_path": str(qfile_102),
+                    "agents_state_path": str(afile_102),
+                },
+                ttl=120,
+                deny_msg="(should not fire)",
+            )
+            rc, out, _err = _hook_pre(
+                {"tool_name": "Bash", "tool_input": {"command": "ls"}}, env_fs,
+            )
+            results.append(_check(
+                "102. force_started_unspawned: queue done -> allow (moot)",
+                rc == 0 and _is_allow(out),
+                f"rc={rc} out={out}",
+            ))
+            _run([str(CLI), "satisfy", ob_102], env_fs)
+
+            # 103: missing active-agents file -> DENY
+            qfile_103 = tmpdir_fs / "fs103-queue.json"
+            afile_103 = tmpdir_fs / "fs103-NONEXISTENT.json"
+            _write_queue_one(qfile_103, "q-fs-103-test", "running")
+            ob_103 = _add_ob(
+                env_fs,
+                tool_pattern="Bash",
+                predicate="force_started_unspawned",
+                params={
+                    "queue_id": "q-fs-103-test",
+                    "queue_path": str(qfile_103),
+                    "agents_state_path": str(afile_103),
+                },
+                ttl=120,
+                deny_msg="must spawn agent for q-fs-103-test",
+            )
+            rc, out, _err = _hook_pre(
+                {"tool_name": "Bash", "tool_input": {"command": "ls"}}, env_fs,
+            )
+            results.append(_check(
+                "103. force_started_unspawned: missing agents file -> deny",
+                rc == 0 and _is_deny(out),
+                f"rc={rc} out={out}",
+            ))
+            _run([str(CLI), "satisfy", ob_103], env_fs)
+
+            # 104: missing queue.json -> ALLOW (default-open: a broken queue
+            # state must not blackhole the loop).
+            qfile_104 = tmpdir_fs / "fs104-NONEXISTENT.json"
+            afile_104 = tmpdir_fs / "fs104-agents.json"
+            _write_agents(afile_104, [])
+            ob_104 = _add_ob(
+                env_fs,
+                tool_pattern="Bash",
+                predicate="force_started_unspawned",
+                params={
+                    "queue_id": "q-fs-104-test",
+                    "queue_path": str(qfile_104),
+                    "agents_state_path": str(afile_104),
+                },
+                ttl=120,
+                deny_msg="(should not fire)",
+            )
+            rc, out, _err = _hook_pre(
+                {"tool_name": "Bash", "tool_input": {"command": "ls"}}, env_fs,
+            )
+            results.append(_check(
+                "104. force_started_unspawned: missing queue.json -> "
+                "allow (default-open)",
+                rc == 0 and _is_allow(out),
+                f"rc={rc} out={out}",
+            ))
+            _run([str(CLI), "satisfy", ob_104], env_fs)
+
+            # 105: Agent tool itself is universally exempt, so a force-
+            # started-unspawned obligation must still allow the spawning
+            # Agent call through. Otherwise the gate self-deadlocks (you
+            # can't spawn the agent that satisfies you).
+            qfile_105 = tmpdir_fs / "fs105-queue.json"
+            afile_105 = tmpdir_fs / "fs105-agents.json"
+            _write_queue_one(qfile_105, "q-fs-105-test", "running")
+            _write_agents(afile_105, [])  # no agent yet -> would deny Bash
+            ob_105 = _add_ob(
+                env_fs,
+                tool_pattern="*",  # universal pattern -- worst case
+                predicate="force_started_unspawned",
+                params={
+                    "queue_id": "q-fs-105-test",
+                    "queue_path": str(qfile_105),
+                    "agents_state_path": str(afile_105),
+                },
+                ttl=120,
+                deny_msg="must spawn agent for q-fs-105-test",
+            )
+            rc, out, _err = _hook_pre(
+                {"tool_name": "Agent",
+                 "tool_input": {"prompt": "Queue item: q-fs-105-test\nGo"}},
+                env_fs,
+            )
+            results.append(_check(
+                "105. force_started_unspawned: Agent tool exempt -> allow",
+                rc == 0 and _is_allow(out),
+                f"rc={rc} out={out}",
+            ))
+            _run([str(CLI), "satisfy", ob_105], env_fs)
+
     total = len(results)
     passed = sum(1 for r in results if r)
     print()

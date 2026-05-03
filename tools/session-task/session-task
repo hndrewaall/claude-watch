@@ -848,6 +848,69 @@ def _claude_event_notify(tag, message, data, priority="low", silent=False):
     return cmd
 
 
+def _obligations_register_force_start(queue_id, summary, reason, ttl_secs=900):
+    """Register a `force_started_unspawned` obligation on the queue id.
+
+    Wired by `cmd_queue_force_start` after a successful pending->running
+    promotion. The obligation gates `*` (every tool) until the main loop
+    actually spawns an Agent for the queue item -- the predicate clears
+    the moment claude-watch's active-agents JSON shows a live record for
+    the qid. The Agent tool itself is in `UNIVERSAL_RECOVERY_EXEMPT_PATTERNS`
+    so the spawning Agent call is never blocked by the gate it satisfies.
+
+    MUST NEVER block or fail the underlying queue op. All errors are
+    caught and logged to stderr as a warning. Suppression mirrors
+    pingme / claude-event:
+      * `OBLIGATIONS_FORCE_START=0` env var skips the call entirely
+        (test harnesses, scripted batch runs).
+      * `obligations` not on PATH -> silent no-op (not an error).
+
+    The TTL defaults to 15 min (900s). If the main loop genuinely can't
+    dispatch within that window the obligation auto-expires rather than
+    deadlocking forever; this matches Andrew's "short" guidance in the
+    spec. Bump or pass a larger value if that proves too tight in
+    practice.
+    """
+    if os.environ.get("OBLIGATIONS_FORCE_START") == "0":
+        return None
+    cli = shutil.which("obligations")
+    if not cli:
+        return None
+    deny_msg = (
+        f"FORCE-START: q={queue_id} ({summary}) was force-started but no "
+        f"Agent has been spawned for it yet. Dispatch the agent before "
+        f"running any other tool. Reason: {reason}"
+    )
+    params = json.dumps({"queue_id": queue_id})
+    cmd = [
+        cli,
+        "add",
+        "--tool-pattern", "*",
+        "--predicate", "force_started_unspawned",
+        "--params", params,
+        "--ttl", str(int(ttl_secs)),
+        "--deny-msg", deny_msg,
+        "--enforcement", "gate",
+        "--created-by", f"force-start:{queue_id}",
+    ]
+    try:
+        subprocess.run(
+            cmd,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except Exception as exc:  # noqa: BLE001 -- never block the queue op
+        print(
+            f"[obligations] force-start register failed "
+            f"({exc.__class__.__name__}): {exc}",
+            file=sys.stderr,
+        )
+        return None
+    return cmd
+
+
 def _item_summary(item):
     """Read the one-line summary of a queue item, defaulting to placeholder.
 
@@ -2138,6 +2201,42 @@ def cmd_queue_force_start(args):
         },
         priority="low",
         silent=getattr(args, "silent", False),
+    )
+
+    # Claude-event emit: dedicated `force-start` tag so `claude-event-watch`
+    # surfaces force-starts distinctly to the main loop. The companion
+    # obligation (next call) provides the hard gate; this event is the
+    # signal-via-bus layer requested by Andrew (2026-05-02 19:54 ET):
+    # "force starting should both emit an event AND add a hard obligation
+    # to spawn." Routed in claude-event-routing.md.
+    _claude_event_notify(
+        tag="force-start",
+        message=(
+            f"queue force-started: {promoted['id']} "
+            f"({_item_summary(promoted)}) -- main loop must dispatch "
+            f"Agent before any other tool call"
+        ),
+        data={
+            "queue_id": promoted["id"],
+            "group_id": promoted.get("group_id"),
+            "scope": promoted.get("scope", []),
+            "summary": _item_summary(promoted),
+            "created_by": promoted.get("created_by", ""),
+            "force_started_reason": raw_reason,
+        },
+        priority="normal",
+        silent=getattr(args, "silent", False),
+    )
+
+    # Obligations gate: hard-deny every non-exempt main-loop tool call
+    # until an Agent has been spawned for this queue id. The Agent tool
+    # is in UNIVERSAL_RECOVERY_EXEMPT_PATTERNS so the spawning call is
+    # never blocked by its own gate. TTL 15min so a wedged main loop
+    # doesn't deadlock forever.
+    _obligations_register_force_start(
+        queue_id=promoted["id"],
+        summary=_item_summary(promoted),
+        reason=raw_reason,
     )
 
     if args.json:
