@@ -35,6 +35,8 @@ Usage:
     session-task queue pop [--id ID]
     session-task queue register <id> [--pid N]   # claim item for spawn (gated)
     session-task queue heartbeat <id> [--pid N]  # refresh liveness on running item
+    session-task queue wedge <id> --reason TEXT  # flag a stuck running item
+    session-task queue unwedge <id>              # mark wedged item recovered
     session-task queue spawn-check <id> [--json] # "am I clear to spawn?" check
     session-task queue force-start <id> --reason TEXT  # MANUAL OVERRIDE: promote
                                                        # blocked-pending to running
@@ -76,6 +78,26 @@ TASK_FILE = Path.home() / ".config" / "session" / "resume-action.json"
 COMPLETED_FILE = Path.home() / ".config" / "session" / "completed-tasks.jsonl"
 QUEUE_FILE = Path.home() / ".config" / "session" / "queue.json"
 QUEUE_SCHEMA_VERSION = 2
+
+# Queue item lifecycle states:
+#   pending    -- created but not yet claimed by a running agent
+#   running    -- claimed (via `register`) and actively being worked
+#   wedged     -- was running but the owning agent is stuck (context-limit /
+#                 prolonged-thinking / heartbeat-stale). Still owns its scope
+#                 (peers cannot spawn into the same scope) but is flagged
+#                 distinctly in CLI/exporter/UI so the operator can see the
+#                 wedge without scrolling logs. Set via `queue wedge <id>
+#                 --reason ...`. Cleared via `queue unwedge <id>` (back to
+#                 running) or `queue abandon <id>` (operator gives up).
+#   done       -- terminal: completed successfully
+#   abandoned  -- terminal: gave up (with optional reason)
+#
+# `ACTIVE_STATUSES` is the canonical "in-flight" set used by serialization
+# and spawn-gating. `RUNNING_STATUSES` is the subset that owns a slot
+# (running OR wedged); `wedged` is included precisely because a wedge is
+# transient and the agent still holds the scope.
+ACTIVE_STATUSES = ("pending", "running", "wedged")
+RUNNING_STATUSES = ("running", "wedged")
 
 # Agent-transcript archive directory. At queue-done / queue-abandon time the
 # spawning subagent's JSONL transcript (if locatable) is copied here so it
@@ -654,7 +676,7 @@ def _union_scopes(*sets):
 
 
 def _active_items(items):
-    return [it for it in items if it.get("status") in ("pending", "running")]
+    return [it for it in items if it.get("status") in ACTIVE_STATUSES]
 
 
 def _group_members(items, group_id):
@@ -685,12 +707,16 @@ def _group_ids_overlapping(items, new_scope):
 
 def _running_scope_conflicts(items, candidate_scope, *, exclude_id=None,
                              exclude_group=None):
-    """Return list of running items whose scope overlaps candidate_scope.
+    """Return list of running OR wedged items whose scope overlaps candidate_scope.
 
-    Used for spawn-gating: if ANY running item overlaps the candidate's
-    scope (even across groups -- which should be rare given the merge
-    semantics but can happen for untracked/unregistered in-flight work),
-    spawning is a conflict.
+    Used for spawn-gating: if ANY running/wedged item overlaps the
+    candidate's scope (even across groups -- which should be rare given
+    the merge semantics but can happen for untracked/unregistered
+    in-flight work), spawning is a conflict.
+
+    Wedged items still own their scope -- the agent is stuck but hasn't
+    released the slot. Letting a peer claim the same scope while the
+    wedge is unresolved would defeat the queue's serialization guarantee.
 
     `exclude_id` skips a specific item (e.g. the candidate itself once
     it's been marked running). `exclude_group` skips an entire group (used
@@ -698,7 +724,7 @@ def _running_scope_conflicts(items, candidate_scope, *, exclude_id=None,
     """
     out = []
     for it in items:
-        if it.get("status") != "running":
+        if it.get("status") not in RUNNING_STATUSES:
             continue
         if exclude_id and it.get("id") == exclude_id:
             continue
@@ -715,11 +741,16 @@ def _sort_key(item):
 
 
 def _group_head(items, group_id):
-    """Return the current head (running if any, else next pending)."""
-    members = [it for it in _group_members(items, group_id) if it.get("status") in ("pending", "running")]
+    """Return the current head (running/wedged if any, else next pending).
+
+    Wedged items count as "in flight" for head-of-group purposes so a
+    peer pending item in the same group cannot be promoted while the
+    wedge is unresolved.
+    """
+    members = [it for it in _group_members(items, group_id) if it.get("status") in ACTIVE_STATUSES]
     if not members:
         return None
-    running = [it for it in members if it.get("status") == "running"]
+    running = [it for it in members if it.get("status") in RUNNING_STATUSES]
     if running:
         return sorted(running, key=_sort_key)[0]
     return sorted(members, key=_sort_key)[0]
@@ -733,9 +764,9 @@ def _item_is_ready(items, item):
         return False
     if head["id"] != item["id"]:
         return False
-    # Head must not be running (if something is running in the group, not ready).
+    # Head must not be running OR wedged (anything in flight blocks).
     members = _group_members(items, item["group_id"])
-    if any(m.get("status") == "running" for m in members):
+    if any(m.get("status") in RUNNING_STATUSES for m in members):
         return False
     # Explicit interjob deps (added 2026-05-02): every dep id must resolve to
     # an item with status=done. Targets that are missing, abandoned, or part
@@ -1539,7 +1570,7 @@ def _autostop_overlapping_peers(items, target, *, raw_reason):
             continue
         if peer.get("id") == target_id:
             continue
-        if peer.get("status") != "running":
+        if peer.get("status") not in RUNNING_STATUSES:
             continue
         if not _scope_sets_overlap(peer.get("scope", []), target_scope):
             continue
@@ -1790,8 +1821,8 @@ def cmd_queue_add(args):
         position = next((i + 1 for i, it in enumerate(group_members_sorted) if it["id"] == new_id), -1)
         ready_now = _item_is_ready(items, item)
         serialized_after = [it["id"] for it in group_members_sorted if it["id"] != new_id and _sort_key(it) < _sort_key(item)]
-        # Also consider running items in same group
-        running_in_group = [it["id"] for it in _group_members(items, group_id) if it.get("status") == "running"]
+        # Also consider in-flight (running or wedged) items in same group
+        running_in_group = [it["id"] for it in _group_members(items, group_id) if it.get("status") in RUNNING_STATUSES]
         serialized_after = running_in_group + serialized_after
 
         _queue_write_and_unlock(fh, data)
@@ -1923,7 +1954,10 @@ def cmd_queue_list(args):
     if args.ready:
         items = [it for it in items if _item_is_ready(data["items"], it)]
     elif not args.all:
-        items = [it for it in items if it.get("status") in ("pending", "running")]
+        # Default view: in-flight items (pending + running + wedged). Wedged
+        # included so the operator notices stuck agents at a glance — the
+        # whole point of the wedged state is to surface attention.
+        items = [it for it in items if it.get("status") in ACTIVE_STATUSES]
 
     items.sort(key=lambda it: (it.get("group_id", ""), _sort_key(it)))
 
@@ -1935,10 +1969,15 @@ def cmd_queue_list(args):
         print("(no items)")
         return
 
-    # Tabular
+    # Tabular. WEDGED items get a leading `!` marker on the head column so
+    # the eye catches them in a long list. Status column shows `wedged`
+    # verbatim so JSON consumers and grepping operators see the same word.
     print(f"{'ID':22} {'GROUP':14} {'ST':8} {'PR':3} {'H':1} {'SCOPE'}")
     for it in items:
-        head_mark = "*" if it.get("group_head") else " "
+        if it.get("status") == "wedged":
+            head_mark = "!"
+        else:
+            head_mark = "*" if it.get("group_head") else " "
         scope_str = ",".join(it.get("scope", []))
         if len(scope_str) > 48:
             scope_str = scope_str[:45] + "..."
@@ -1955,6 +1994,11 @@ def cmd_queue_list(args):
         )
         print(f"  summary: {summary}")
         print(f"  desc   : {desc}")
+        # Surface the wedge reason inline so `queue list` is the one-stop
+        # diagnosis surface — no need to drill into `queue show` for the
+        # most common operator question ("why is this stuck?").
+        if it.get("status") == "wedged" and it.get("wedged_reason"):
+            print(f"  wedged : {it.get('wedged_reason')}")
 
 
 def cmd_queue_show(args):
@@ -2022,7 +2066,7 @@ def cmd_queue_groups(args):
 
     by_group = {}
     for it in items:
-        if it.get("status") not in ("pending", "running"):
+        if it.get("status") not in ACTIVE_STATUSES:
             continue
         by_group.setdefault(it["group_id"], []).append(it)
 
@@ -2031,12 +2075,14 @@ def cmd_queue_groups(args):
         gscope = _union_scopes(*(m.get("scope", []) for m in members))
         running = [m for m in members if m.get("status") == "running"]
         pending = [m for m in members if m.get("status") == "pending"]
+        wedged = [m for m in members if m.get("status") == "wedged"]
         head = _group_head(items, gid)
         out.append({
             "group_id": gid,
             "scope": gscope,
             "running_count": len(running),
             "pending_count": len(pending),
+            "wedged_count": len(wedged),
             "head_id": head["id"] if head else None,
             "members": [m["id"] for m in sorted(members, key=_sort_key)],
         })
@@ -2049,7 +2095,8 @@ def cmd_queue_groups(args):
         print("(no active groups)")
         return
     for g in out:
-        print(f"{g['group_id']}  running={g['running_count']}  pending={g['pending_count']}  head={g['head_id']}")
+        wedged_str = f"  wedged={g['wedged_count']}" if g.get("wedged_count") else ""
+        print(f"{g['group_id']}  running={g['running_count']}  pending={g['pending_count']}{wedged_str}  head={g['head_id']}")
         print(f"  scope: {','.join(g['scope'])}")
         print(f"  members: {','.join(g['members'])}")
 
@@ -2491,6 +2538,29 @@ def cmd_queue_register(args):
                   file=sys.stderr)
             print("!! OR USE --if-absent TO NO-OP WHEN THE ITEM IS ALREADY RUNNING.",
                   file=sys.stderr)
+            print(bar, file=sys.stderr)
+            sys.exit(2)
+
+        if target.get("status") == "wedged":
+            # A wedged item still owns its scope. Re-registering would
+            # blow past the wedge without resolving it. Operator must
+            # explicitly unwedge (back to running) or abandon first.
+            fcntl.flock(fh, fcntl.LOCK_UN)
+            fh.close()
+            print("", file=sys.stderr)
+            bar = "!" * 72
+            print(bar, file=sys.stderr)
+            print(f"!! REGISTER REFUSED: {args.id} IS WEDGED.", file=sys.stderr)
+            print("!! THE OWNING AGENT IS STUCK BUT STILL HOLDS THE SCOPE.",
+                  file=sys.stderr)
+            print("!! UNWEDGE OR ABANDON BEFORE REGISTERING A REPLACEMENT:",
+                  file=sys.stderr)
+            print(f"!!   session-task queue unwedge {args.id}", file=sys.stderr)
+            print(f"!!   session-task queue abandon {args.id} --reason '...'",
+                  file=sys.stderr)
+            wr = target.get("wedged_reason")
+            if wr:
+                print(f"!! WEDGED REASON: {wr}", file=sys.stderr)
             print(bar, file=sys.stderr)
             sys.exit(2)
 
@@ -2997,6 +3067,235 @@ def cmd_queue_heartbeat(args):
         )
 
 
+def cmd_queue_wedge(args):
+    """Flip a running queue item to status=wedged with a reason.
+
+    Wedged is a transient "in-flight but stuck" state. The item still
+    owns its scope (peers cannot grab it via spawn-gating) but is
+    flagged distinctly in CLI/exporter/UI so the operator can see the
+    wedge at a glance instead of the row sitting indistinguishable from
+    a healthy long-runner.
+
+    Two ways to recover:
+      * `queue unwedge <id>`  -- back to running (the agent recovered)
+      * `queue abandon <id>`  -- operator gives up
+
+    Behavior:
+      * Item must exist and be in status=running. Any other status (pending,
+        wedged, done, abandoned) refuses.
+      * `--reason TEXT` is REQUIRED -- a wedge without a reason defeats
+        the operator-attention purpose. Common reasons:
+          - "context_limit"       (claude-watch wedged-pane fired)
+          - "prolonged-thinking"  (foreground monitor fired)
+          - "heartbeat-stale"     (last_heartbeat_at older than threshold)
+          - "operator-flag"       (manual: anything else)
+      * Stamps `wedged_at` (ISO timestamp), `wedged_reason`. Preserves
+        `started_at`, `last_heartbeat_at`, `pid` for post-mortem.
+      * Emits a `queue-wedged` claude-event so the main loop / dashboard
+        can surface a banner alert.
+      * Pingme notification fires by default (this is an attention-
+        required event); --silent suppresses it.
+    """
+    raw_reason = (args.reason or "").strip()
+    if not raw_reason:
+        print(
+            "ERROR: --reason is required for wedge "
+            "(common values: context_limit, prolonged-thinking, "
+            "heartbeat-stale, operator-flag).",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    fh, data = _queue_open_locked("rw")
+    try:
+        items = data["items"]
+        target = next((it for it in items if it["id"] == args.id), None)
+        if target is None:
+            print(f"not found: {args.id}", file=sys.stderr)
+            fcntl.flock(fh, fcntl.LOCK_UN)
+            fh.close()
+            sys.exit(1)
+        status = target.get("status")
+        if status != "running":
+            print(
+                f"wedge refused: {args.id} status={status!r} (must be running)",
+                file=sys.stderr,
+            )
+            fcntl.flock(fh, fcntl.LOCK_UN)
+            fh.close()
+            sys.exit(1)
+
+        target["status"] = "wedged"
+        target["wedged_at"] = _fmt_ts()
+        target["wedged_reason"] = raw_reason
+        # group_head stays as-is -- a wedged item is still the in-flight
+        # head of its group. _recompute_group_heads will confirm.
+        _recompute_group_heads(items)
+        updated = dict(target)
+        _queue_write_and_unlock(fh, data)
+    except Exception:
+        fcntl.flock(fh, fcntl.LOCK_UN)
+        fh.close()
+        raise
+
+    log_completed(
+        f"[queue {target['id']} WEDGED] {target.get('description','')} "
+        f"(reason: {raw_reason})",
+        extra={
+            "source": "queue",
+            "event": "wedge",
+            "id": target["id"],
+            "group_id": target.get("group_id"),
+            "reason": raw_reason,
+        },
+    )
+
+    # Pingme: wedge IS an attention-required event. High priority so the
+    # banner cuts through other notifications.
+    _pingme_notify(
+        title=f"queue WEDGED: {target['id']}",
+        message=(
+            f"{_item_summary(target)}\n"
+            f"reason: {raw_reason} | "
+            f"scope: {','.join(target.get('scope', []))}"
+        ),
+        priority="high",
+        silent=getattr(args, "silent", False),
+    )
+
+    # Claude-event emit: queue-wedged. Main loop dashboard / status banner
+    # picks this up and surfaces the wedge prominently. Includes
+    # queue_id + reason so consumers can format their own banner without
+    # round-tripping queue.json.
+    _claude_event_notify(
+        tag="queue-wedged",
+        message=(
+            f"queue WEDGED: {target['id']} ({_item_summary(target)}) "
+            f"-- reason: {raw_reason}"
+        ),
+        data={
+            "queue_id": target["id"],
+            "group_id": target.get("group_id"),
+            "scope": target.get("scope", []),
+            "summary": _item_summary(target),
+            "wedged_reason": raw_reason,
+            "wedged_at": target["wedged_at"],
+        },
+        priority="normal",
+        silent=getattr(args, "silent", False),
+    )
+
+    if args.json:
+        print(json.dumps(updated, indent=2))
+    else:
+        print(
+            f"wedged: {args.id} reason={raw_reason!r} "
+            f"wedged_at={target['wedged_at']}"
+        )
+
+
+def cmd_queue_unwedge(args):
+    """Flip a wedged queue item back to status=running.
+
+    Used when the operator (or claude-watch's recovery path) sees the
+    agent has recovered from the wedge -- e.g. after a self-clear, after
+    Andrew manually pinged the agent and it resumed, or after the
+    underlying API issue cleared.
+
+    Behavior:
+      * Item must exist and be in status=wedged. Any other status refuses.
+      * Flips status=running. Refreshes `last_heartbeat_at` so the
+        exporter doesn't immediately re-flag the item as stale.
+      * Records `unwedged_at` (ISO timestamp). Preserves `wedged_at` /
+        `wedged_reason` on the row for post-mortem -- they are the
+        history, not current state.
+      * Emits a `queue-unwedged` claude-event so dashboards can clear
+        the wedge banner.
+      * Pingme is opt-out via --silent (default fires; you want to
+        confirm the recovery landed).
+    """
+    fh, data = _queue_open_locked("rw")
+    try:
+        items = data["items"]
+        target = next((it for it in items if it["id"] == args.id), None)
+        if target is None:
+            print(f"not found: {args.id}", file=sys.stderr)
+            fcntl.flock(fh, fcntl.LOCK_UN)
+            fh.close()
+            sys.exit(1)
+        status = target.get("status")
+        if status != "wedged":
+            print(
+                f"unwedge refused: {args.id} status={status!r} (must be wedged)",
+                file=sys.stderr,
+            )
+            fcntl.flock(fh, fcntl.LOCK_UN)
+            fh.close()
+            sys.exit(1)
+
+        prior_reason = target.get("wedged_reason") or "(unspecified)"
+        now = _fmt_ts()
+        target["status"] = "running"
+        target["unwedged_at"] = now
+        # Bump heartbeat so the exporter doesn't immediately flag the
+        # item as stale right after recovery.
+        target["last_heartbeat_at"] = now
+        # Intentionally preserve wedged_at + wedged_reason on the row --
+        # they are now the audit trail, not current state.
+        _recompute_group_heads(items)
+        updated = dict(target)
+        _queue_write_and_unlock(fh, data)
+    except Exception:
+        fcntl.flock(fh, fcntl.LOCK_UN)
+        fh.close()
+        raise
+
+    log_completed(
+        f"[queue {target['id']} UNWEDGED] {target.get('description','')}",
+        extra={
+            "source": "queue",
+            "event": "unwedge",
+            "id": target["id"],
+            "group_id": target.get("group_id"),
+            "prior_reason": prior_reason,
+        },
+    )
+
+    _pingme_notify(
+        title=f"queue unwedged: {target['id']}",
+        message=(
+            f"{_item_summary(target)}\n"
+            f"prior reason: {prior_reason} | "
+            f"scope: {','.join(target.get('scope', []))}"
+        ),
+        priority="low",
+        silent=getattr(args, "silent", False),
+    )
+
+    _claude_event_notify(
+        tag="queue-unwedged",
+        message=f"queue unwedged: {target['id']} ({_item_summary(target)})",
+        data={
+            "queue_id": target["id"],
+            "group_id": target.get("group_id"),
+            "scope": target.get("scope", []),
+            "summary": _item_summary(target),
+            "prior_reason": prior_reason,
+            "unwedged_at": now,
+        },
+        priority="low",
+        silent=getattr(args, "silent", False),
+    )
+
+    if args.json:
+        print(json.dumps(updated, indent=2))
+    else:
+        print(
+            f"unwedged: {args.id} prior_reason={prior_reason!r} "
+            f"unwedged_at={now}"
+        )
+
+
 def cmd_queue_set_summary(args):
     """Add / replace the one-line summary on an existing queue item.
 
@@ -3097,7 +3396,7 @@ def cmd_queue_depend(args):
             fh.close()
             print(f"not found: {args.id}", file=sys.stderr)
             sys.exit(1)
-        if target.get("status") not in ("pending", "running"):
+        if target.get("status") not in ACTIVE_STATUSES:
             fcntl.flock(fh, fcntl.LOCK_UN)
             fh.close()
             print(
@@ -3276,8 +3575,9 @@ def cmd_queue_banner(args):
     ready.sort(key=_sort_key)
     pending = [it for it in items if it.get("status") == "pending"]
     running = [it for it in items if it.get("status") == "running"]
+    wedged = [it for it in items if it.get("status") == "wedged"]
 
-    if not ready and not pending and not running:
+    if not ready and not pending and not running and not wedged:
         return  # silent when empty -- banner only when something to show
 
     lines = [
@@ -3286,6 +3586,16 @@ def cmd_queue_banner(args):
         "## SESSION-TASK QUEUE — TOP READY ITEMS",
         "#" * 60,
     ]
+    # Wedged items lead the banner -- they're the highest-priority operator
+    # signal: "you have a stuck agent, attention required".
+    if wedged:
+        lines.append(f"  !! WEDGED: {len(wedged)} item(s) need operator attention")
+        for it in wedged[:5]:
+            wr = it.get("wedged_reason") or "no reason"
+            lines.append(
+                f"     - [{it['id']}] {it.get('description','')[:70]}  ({wr[:40]})"
+            )
+        lines.append("")
     if ready:
         for it in ready[:5]:
             lines.append(
@@ -3571,7 +3881,7 @@ def build_parser():
         ),
     )
 
-    q_list = qsub.add_parser("list", help="List items (default: pending+running)")
+    q_list = qsub.add_parser("list", help="List items (default: pending+running+wedged)")
     q_list.add_argument("--ready", action="store_true")
     q_list.add_argument("--all", action="store_true")
     q_list.add_argument("--group")
@@ -3670,6 +3980,45 @@ def build_parser():
         ),
     )
     q_heartbeat.add_argument("--json", action="store_true")
+
+    q_wedge = qsub.add_parser(
+        "wedge",
+        help=(
+            "Flip a running item to status=wedged with a reason. The item "
+            "still owns its scope but is flagged distinctly so the operator "
+            "notices the stuck agent. Recover via `unwedge` or `abandon`."
+        ),
+    )
+    q_wedge.add_argument("id")
+    q_wedge.add_argument(
+        "--reason",
+        required=True,
+        help=(
+            "Why is the agent wedged? Common values: context_limit, "
+            "prolonged-thinking, heartbeat-stale, operator-flag. Recorded "
+            "on the item as `wedged_reason` and surfaced in CLI/exporter/UI."
+        ),
+    )
+    q_wedge.add_argument("--json", action="store_true")
+    q_wedge.add_argument(
+        "--silent", action="store_true",
+        help="Suppress the pingme + claude-event notifications for this operation.",
+    )
+
+    q_unwedge = qsub.add_parser(
+        "unwedge",
+        help=(
+            "Flip a wedged item back to status=running. Use when the agent "
+            "has recovered (self-clear succeeded, API issue cleared, manual "
+            "ping unblocked it). Preserves wedged_at/wedged_reason as audit."
+        ),
+    )
+    q_unwedge.add_argument("id")
+    q_unwedge.add_argument("--json", action="store_true")
+    q_unwedge.add_argument(
+        "--silent", action="store_true",
+        help="Suppress the pingme + claude-event notifications for this operation.",
+    )
 
     q_spawn = qsub.add_parser(
         "spawn-check",
@@ -3804,6 +4153,8 @@ def main():
             "pop": cmd_queue_pop,
             "register": cmd_queue_register,
             "heartbeat": cmd_queue_heartbeat,
+            "wedge": cmd_queue_wedge,
+            "unwedge": cmd_queue_unwedge,
             "spawn-check": cmd_queue_spawn_check,
             "force-start": cmd_queue_force_start,
             "promote": cmd_queue_promote,
