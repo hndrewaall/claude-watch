@@ -392,6 +392,85 @@ fn get_descendants(pid: &str) -> Vec<String> {
     out
 }
 
+/// Build the wrapper bash script that runs the workload command in the
+/// `tasks` tmux pane. Pure function (no I/O, no globals) so it can be
+/// unit-tested. The wrapper:
+///
+///   * Traps INT/TERM (fatfinger-proof against accidental Ctrl-C in the
+///     pane).
+///   * Pipes all stdout+stderr through a per-line ISO8601-with-timezone
+///     timestamp prefixer (e.g. `2026-05-05T14:33:21-04:00 line text`)
+///     before tee'ing into `<label>.output`. Prefer `ts` from moreutils
+///     when available; fall back to a pure-bash `while read` loop.
+///     Per-line timestamps make 4+ hour workloads (gpt-image-2 iter
+///     batches, large rsync runs) post-mortem-debuggable straight from
+///     the .output file without correlating against journalctl.
+///   * Echoes a header (`=== workload: <label> ===` etc.), runs the
+///     command via `setsid --wait bash -c ...`, captures the exit code,
+///     writes `<label>.exit`, and emits the `workload-done` claude-event
+///     via the embedded `claude-watch workload emit-done` subcommand.
+fn build_wrapper_script(
+    label: &str,
+    command: &str,
+    out_path: &Path,
+    exit_path: &Path,
+    exe_path: &str,
+    queue_id: Option<&str>,
+) -> String {
+    let out_q = shell_quote(&out_path.to_string_lossy());
+    let exit_q = shell_quote(&exit_path.to_string_lossy());
+    let cmd_q = shell_quote(command);
+    let label_q = shell_quote(label);
+    let exe_q = shell_quote(exe_path);
+    // When the workload is bound to a queue item (auto-created in
+    // `cmd_run` OR explicitly supplied via --queue-id), append the qid
+    // to the emit-done call so the wrapper-side emit carries the qid
+    // into the workload-done event AND triggers the queue done/abandon
+    // transition. Bare (--no-queue / auto-create disabled) workloads
+    // emit the legacy event with no qid and no queue side effect.
+    let queue_id_emit_arg = match queue_id {
+        Some(qid) => format!(" --queue-id {}", shell_quote(qid)),
+        None => String::new(),
+    };
+    // Per-line ISO8601 timestamp prefix. Two paths:
+    //   1. `ts` from moreutils if installed — fast, native.
+    //   2. Pure-bash fallback — a `while IFS= read -r line` loop calling
+    //      `date -Is` per line. Slower (one fork per line) but no extra
+    //      dependency. `IFS=` + `-r` preserves whitespace and backslashes
+    //      verbatim.
+    // The detection is in the wrapper itself so the same script works
+    // on hosts with or without moreutils installed.
+    format!(
+        "#!/bin/bash\n\
+         # Trap SIGINT/SIGTERM — fatfinger-proof against accidental Ctrl-C\n\
+         trap '' INT TERM\n\
+         # Per-line ISO8601 timestamp prefix for {out_q}.\n\
+         # Prefer `ts` (moreutils); fall back to pure-bash `date -Is`.\n\
+         if command -v ts >/dev/null 2>&1; then\n\
+             exec > >(ts '%Y-%m-%dT%H:%M:%S%z ' | tee -a {out_q}) 2>&1\n\
+         else\n\
+             exec > >(while IFS= read -r line; do printf '%s %s\\n' \"$(date -Is)\" \"$line\"; done | tee -a {out_q}) 2>&1\n\
+         fi\n\
+         echo '=== workload: {label} ==='\n\
+         echo 'Started: '$(date -Iseconds)\n\
+         echo 'Command: {command_escaped}'\n\
+         echo '---'\n\
+         setsid --wait bash -c {cmd_q}\n\
+         EC=$?\n\
+         echo ''\n\
+         echo \"=== DONE (exit $EC) at $(date -Iseconds) ===\"\n\
+         echo $EC > {exit_q}\n\
+         # Emit claude-event for the main loop. Default-open: any failure\n\
+         # here is silently swallowed — the exit-file write above is the\n\
+         # source of truth for `workload wait`.\n\
+         {exe_q} workload emit-done --label {label_q} --exit-code \"$EC\" --log-path {out_q}{queue_id_emit_arg} >/dev/null 2>&1 || true\n\
+         sleep 30\n",
+        // The "Command: " line gets the unquoted version for readability;
+        // escape single quotes for the heredoc context.
+        command_escaped = command.replace('\'', "'\\''"),
+    )
+}
+
 /// CLI: `workload run <label> [--queue-id q-X | --no-queue] -- <command...>`
 ///
 /// **Workloads are first-class queue items by default** (Andrew DM
@@ -502,47 +581,17 @@ pub fn cmd_run(
     // current_exe path baked in at run time) via the hidden `workload
     // emit-done` subcommand. We embed the absolute path so the wrapper
     // doesn't depend on PATH discovery inside tmux.
-    let out_q = shell_quote(&out_path.to_string_lossy());
-    let exit_q = shell_quote(&exit_path.to_string_lossy());
-    let cmd_q = shell_quote(&command);
-    let label_q = shell_quote(label);
     let exe_path = std::env::current_exe()
         .ok()
         .and_then(|p| p.to_str().map(str::to_string))
         .unwrap_or_else(|| "claude-watch".to_string());
-    let exe_q = shell_quote(&exe_path);
-    // When the workload is bound to a queue item (auto-created above
-    // OR explicitly supplied via --queue-id), append the qid to the
-    // emit-done call so the wrapper-side emit carries the qid into the
-    // workload-done event AND triggers the queue done/abandon
-    // transition. Bare (--no-queue / auto-create disabled) workloads
-    // emit the legacy event with no qid and no queue side effect.
-    let queue_id_emit_arg = match effective_queue_id.as_deref() {
-        Some(qid) => format!(" --queue-id {}", shell_quote(qid)),
-        None => String::new(),
-    };
-    let script = format!(
-        "#!/bin/bash\n\
-         # Trap SIGINT/SIGTERM — fatfinger-proof against accidental Ctrl-C\n\
-         trap '' INT TERM\n\
-         exec > >(tee -a {out_q}) 2>&1\n\
-         echo '=== workload: {label} ==='\n\
-         echo 'Started: '$(date -Iseconds)\n\
-         echo 'Command: {command_escaped}'\n\
-         echo '---'\n\
-         setsid --wait bash -c {cmd_q}\n\
-         EC=$?\n\
-         echo ''\n\
-         echo \"=== DONE (exit $EC) at $(date -Iseconds) ===\"\n\
-         echo $EC > {exit_q}\n\
-         # Emit claude-event for the main loop. Default-open: any failure\n\
-         # here is silently swallowed — the exit-file write above is the\n\
-         # source of truth for `workload wait`.\n\
-         {exe_q} workload emit-done --label {label_q} --exit-code \"$EC\" --log-path {out_q}{queue_id_emit_arg} >/dev/null 2>&1 || true\n\
-         sleep 30\n",
-        // The "Command: " line gets the unquoted version for readability;
-        // escape single quotes for the heredoc context.
-        command_escaped = command.replace('\'', "'\\''"),
+    let script = build_wrapper_script(
+        label,
+        &command,
+        &out_path,
+        &exit_path,
+        &exe_path,
+        effective_queue_id.as_deref(),
     );
 
     if let Err(e) = fs::write(&script_path, script) {
@@ -1829,6 +1878,209 @@ mod tests {
         assert!(
             elapsed < std::time::Duration::from_secs(5),
             "timeout fired too late: {elapsed:?}"
+        );
+    }
+
+    // ----- build_wrapper_script: timestamp-prefix tests ---------------------
+
+    #[test]
+    fn wrapper_script_contains_timestamp_prefix_paths() {
+        // Both the `ts` (moreutils) path and the pure-bash fallback
+        // must be present in the generated script — the wrapper
+        // chooses at runtime via `command -v ts`.
+        let script = build_wrapper_script(
+            "demo",
+            "echo hi",
+            Path::new("/tmp/claude-workloads/demo.output"),
+            Path::new("/tmp/claude-workloads/demo.exit"),
+            "/usr/local/bin/claude-watch",
+            None,
+        );
+        assert!(
+            script.contains("if command -v ts"),
+            "wrapper must runtime-detect `ts`:\n{script}"
+        );
+        assert!(
+            script.contains("ts '%Y-%m-%dT%H:%M:%S%z '"),
+            "wrapper must invoke `ts` with ISO8601+tz format:\n{script}"
+        );
+        assert!(
+            script.contains("while IFS= read -r line"),
+            "wrapper must include pure-bash fallback loop:\n{script}"
+        );
+        assert!(
+            script.contains("$(date -Is)"),
+            "fallback must call `date -Is` per line:\n{script}"
+        );
+        assert!(
+            script.contains("tee -a '/tmp/claude-workloads/demo.output'"),
+            "wrapper must still tee into the .output path:\n{script}"
+        );
+    }
+
+    #[test]
+    fn wrapper_script_no_unprefixed_tee_exec() {
+        // Regression guard: the old wrapper had `exec > >(tee -a OUT) 2>&1`
+        // with no timestamp filter. Make sure that exact substring is
+        // gone — every `tee -a` must follow a prefixer pipe.
+        let script = build_wrapper_script(
+            "guard",
+            "true",
+            Path::new("/tmp/g.output"),
+            Path::new("/tmp/g.exit"),
+            "/bin/claude-watch",
+            None,
+        );
+        assert!(
+            !script.contains("exec > >(tee -a"),
+            "regressed to unprefixed tee:\n{script}"
+        );
+        assert!(
+            !script.contains(">(tee -a"),
+            "found `>(tee -a` (unprefixed) — every tee must follow a `|` from a prefixer:\n{script}"
+        );
+    }
+
+    #[test]
+    fn wrapper_script_preserves_headers_and_emit_done() {
+        // The timestamp change must NOT break the existing wrapper
+        // structure: header lines, setsid invocation, exit-file write,
+        // and the emit-done CLI call all stay.
+        let script = build_wrapper_script(
+            "wp",
+            "true",
+            Path::new("/tmp/wp.output"),
+            Path::new("/tmp/wp.exit"),
+            "/usr/bin/claude-watch",
+            Some("q-2026-05-05-test"),
+        );
+        assert!(script.contains("=== workload: wp ==="));
+        assert!(script.contains("setsid --wait bash -c"));
+        assert!(script.contains("echo $EC > '/tmp/wp.exit'"));
+        assert!(script.contains("workload emit-done --label 'wp'"));
+        assert!(
+            script.contains("--queue-id 'q-2026-05-05-test'"),
+            "queue id must be plumbed into emit-done:\n{script}"
+        );
+        assert!(script.contains("=== DONE (exit $EC)"));
+    }
+
+    #[test]
+    fn wrapper_script_no_queue_id_omits_arg() {
+        // When the workload has no queue binding, the emit-done call
+        // must NOT include `--queue-id` (legacy event shape).
+        let script = build_wrapper_script(
+            "wnq",
+            "true",
+            Path::new("/tmp/wnq.output"),
+            Path::new("/tmp/wnq.exit"),
+            "/usr/bin/claude-watch",
+            None,
+        );
+        assert!(
+            !script.contains("--queue-id"),
+            "no-queue workload must omit --queue-id from emit-done:\n{script}"
+        );
+    }
+
+    /// End-to-end verification: actually execute the wrapper script and
+    /// check that the .output file ends up with ISO8601 timestamp
+    /// prefixes on every line. This catches shell-syntax regressions
+    /// the `script.contains(...)` unit tests can't — a typo in the
+    /// heredoc would still pass those but blow up at runtime.
+    ///
+    /// We run the wrapper directly (not through tmux). The wrapper
+    /// includes a trailing `sleep 30` (so tmux pane stays alive a bit
+    /// after exit) — we patch it to `sleep 0` before executing so the
+    /// test runs in <1s.
+    #[test]
+    fn wrapper_script_runtime_emits_iso8601_prefixes() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let out_path = tmp.path().join("rt.output");
+        let exit_path = tmp.path().join("rt.exit");
+        let script_path = tmp.path().join("rt.sh");
+
+        // Use /bin/true as the "claude-watch" binary; the wrapper's
+        // emit-done call becomes `/bin/true workload emit-done ...`
+        // which exits 0 (true ignores its args) and the wrapper's
+        // `|| true` swallows any anomaly.
+        let script_full = build_wrapper_script(
+            "rt",
+            "echo first; echo second",
+            &out_path,
+            &exit_path,
+            "/bin/true",
+            None,
+        );
+        // Patch out the `sleep 30` keep-alive so the wrapper exits
+        // promptly. The wrapper has exactly one `sleep 30\n` line.
+        let script = script_full.replace("sleep 30\n", "sleep 0\n");
+        assert_ne!(
+            script, script_full,
+            "expected `sleep 30` keep-alive in generated script"
+        );
+
+        std::fs::write(&script_path, &script).expect("write script");
+        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o700))
+            .expect("chmod");
+
+        let status = Command::new("bash")
+            .arg(&script_path)
+            .status()
+            .expect("run wrapper");
+        assert!(
+            status.success(),
+            "wrapper exited non-zero: {status:?}\nscript:\n{script}"
+        );
+
+        // Bash reaps `>(...)` process substitutions on parent exit,
+        // but the tee inside may need a brief moment to flush. 200ms
+        // is generous; in practice it's instant.
+        std::thread::sleep(Duration::from_millis(200));
+
+        let body = std::fs::read_to_string(&out_path)
+            .unwrap_or_else(|e| panic!("read {out_path:?}: {e}"));
+        assert!(
+            !body.is_empty(),
+            "output file is empty; script:\n{script}"
+        );
+
+        // Every non-empty line must start with an ISO8601-with-tz
+        // timestamp. `date -Is` produces `YYYY-MM-DDTHH:MM:SS±HH:MM`
+        // (with colon); `ts '%Y-%m-%dT%H:%M:%S%z '` produces
+        // `±HHMM` (no colon). Accept either shape.
+        let ts_re = regex_lite::Regex::new(
+            r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:?\d{2} ",
+        )
+        .expect("compile regex");
+        let mut checked = 0;
+        for (i, line) in body.lines().enumerate() {
+            if line.is_empty() {
+                continue;
+            }
+            assert!(
+                ts_re.is_match(line),
+                "line {i} missing ISO8601 prefix: {line:?}\nfull body:\n{body}"
+            );
+            checked += 1;
+        }
+        // Header (3 echoes + ---) + 2 echo lines + blank + DONE = ≥5 prefixed lines.
+        assert!(
+            checked >= 5,
+            "expected at least 5 prefixed lines, got {checked}\nbody:\n{body}"
+        );
+
+        assert!(
+            body.contains("first") && body.contains("second"),
+            "expected echoed text in output:\n{body}"
+        );
+        assert!(
+            body.contains("=== workload: rt ==="),
+            "expected workload header in output:\n{body}"
+        );
+        assert!(
+            body.contains("=== DONE (exit 0)"),
+            "expected DONE line in output:\n{body}"
         );
     }
 }
