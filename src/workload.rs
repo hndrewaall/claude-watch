@@ -144,6 +144,152 @@ fn find_session_task_cli() -> Option<PathBuf> {
     }
 }
 
+/// Auto-create + register a queue item bound to this workload.
+///
+/// Workloads-are-first-class-queue-items default (Andrew DM 2026-05-04
+/// 21:02 ET): if `workload run` wasn't given an explicit `--queue-id`,
+/// we synthesise one so the workload appears in `session-task queue
+/// list` alongside agent items. Scope is `workload:<label>` (label is
+/// already unique within `/tmp/claude-workloads/state.json` — kill+run
+/// of the same label is the only collision case, which is the same
+/// constraint workloads have always had). `--force-enqueue` bypasses
+/// scope-conflict checks: peer workloads with overlapping scope
+/// (essentially: the same label re-run, which `cmd_run` itself
+/// already kills before reaching this point) shouldn't block queue
+/// registration.
+///
+/// Steps:
+///   1. `session-task queue add --scope workload:<label> --summary <60-char snippet> --force-enqueue --json <desc>`
+///      → parse `id` from JSON output
+///   2. `session-task queue register <id> --silent` to mark running
+///   3. return Ok(qid)
+///
+/// Any failure (CLI missing, non-zero exit, JSON parse) returns Err so
+/// the caller can fail-soft and continue without a queue row.
+///
+/// Both invocations are bounded with a 10s timeout (registration is
+/// normally <500ms; a wedged session-task must not stall the workload
+/// startup path).
+fn auto_create_and_register_queue_item(
+    label: &str,
+    command: &str,
+) -> Result<String, String> {
+    let cli = find_session_task_cli()
+        .ok_or_else(|| "session-task CLI not found on PATH".to_string())?;
+
+    let scope = format!("workload:{label}");
+    // Summary: first ~60 chars of the command for at-a-glance
+    // identification in `queue list`. Description gets the full
+    // command for forensic detail.
+    let summary: String = command.chars().take(60).collect();
+    let description = format!("workload:{label} — {command}");
+
+    // Step 1: queue add (returns JSON with id)
+    let add_args = vec![
+        "queue".to_string(),
+        "add".to_string(),
+        description,
+        "--scope".to_string(),
+        scope,
+        "--summary".to_string(),
+        summary,
+        "--force-enqueue".to_string(),
+        "--json".to_string(),
+        "--created-by".to_string(),
+        "workload".to_string(),
+    ];
+    let add_output = run_session_task_with_timeout(&cli, &add_args, 10)
+        .map_err(|e| format!("queue add: {e}"))?;
+    if !add_output.status.success() {
+        return Err(format!(
+            "queue add exited non-zero (rc={:?}): stderr={}",
+            add_output.status.code(),
+            String::from_utf8_lossy(&add_output.stderr).trim()
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&add_output.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim())
+        .map_err(|e| format!("queue add JSON parse: {e} (raw={})", stdout.trim()))?;
+    let qid = parsed
+        .get("id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| format!("queue add JSON missing `id` field: {}", stdout.trim()))?
+        .to_string();
+
+    // Step 2: queue register (atomically claim as running). --silent
+    // suppresses the pingme so we don't double-notify (the workload's
+    // own start banner is enough). On failure we still return the qid
+    // — `cmd_emit_done`'s done/abandon transition still cleans up an
+    // unregistered row, and the visibility (the row exists in the list)
+    // is the user-facing goal.
+    let reg_args = vec![
+        "queue".to_string(),
+        "register".to_string(),
+        qid.clone(),
+        "--silent".to_string(),
+    ];
+    match run_session_task_with_timeout(&cli, &reg_args, 10) {
+        Ok(out) if out.status.success() => Ok(qid),
+        Ok(out) => {
+            tracing::warn!(
+                qid = %qid,
+                label = %label,
+                rc = ?out.status.code(),
+                stderr = %String::from_utf8_lossy(&out.stderr).trim(),
+                "queue register failed; workload continues with bound qid anyway"
+            );
+            Ok(qid)
+        }
+        Err(e) => {
+            tracing::warn!(
+                qid = %qid,
+                label = %label,
+                error = %e,
+                "queue register errored; workload continues with bound qid anyway"
+            );
+            Ok(qid)
+        }
+    }
+}
+
+/// Run `session-task` with a wall-clock timeout. Returns the full
+/// `Output` (status + stdout + stderr). On timeout the child is killed
+/// and we return ErrorKind::TimedOut.
+fn run_session_task_with_timeout(
+    cli: &Path,
+    args: &[String],
+    timeout_secs: u64,
+) -> std::io::Result<std::process::Output> {
+    use std::time::{Duration, Instant};
+    let mut child = std::process::Command::new(cli)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+
+    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+    loop {
+        match child.try_wait()? {
+            Some(_status) => {
+                // wait_with_output consumes the child; child.wait_with_output
+                // is the canonical way to harvest stdout/stderr after exit.
+                return child.wait_with_output();
+            }
+            None => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!("session-task timed out after {timeout_secs}s"),
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+    }
+}
+
 fn read_exit_code(label: &str) -> Option<i32> {
     let path = exit_file(label);
     let s = fs::read_to_string(path).ok()?;
@@ -246,16 +392,38 @@ fn get_descendants(pid: &str) -> Vec<String> {
     out
 }
 
-/// CLI: `workload run <label> [--queue-id q-X] -- <command...>`
+/// CLI: `workload run <label> [--queue-id q-X | --no-queue] -- <command...>`
 ///
-/// When `queue_id` is `Some(...)` the workload is bound to a queue
-/// item: on completion the `workload-done` event carries the qid AND
-/// the queue item is transitioned to done/abandoned via `session-task`.
-/// Workloads-as-first-class-queue-items model — Andrew DM 2026-05-03
-/// 05:23 ET. Resolves the q-2026-05-03-1e7d orphaned-workload bug by
-/// making workload exit equivalent to queue completion (no agent
-/// respawn dance).
-pub fn cmd_run(label: &str, cmd_args: &[String], queue_id: Option<&str>) -> i32 {
+/// **Workloads are first-class queue items by default** (Andrew DM
+/// 2026-05-04 21:02 ET). When neither `--queue-id` nor `--no-queue` is
+/// passed, `cmd_run` auto-creates a queue row via `session-task queue
+/// add --force-enqueue` (scope `workload:<label>`, summary derived from
+/// the command), atomically `register`s it, and binds the resulting qid
+/// to the workload — so the workload appears in `session-task queue
+/// list` alongside agent queue items, and on workload exit the queue
+/// item transitions to `done` (rc==0) or `abandoned` (rc!=0 / killed).
+///
+/// Explicit modes:
+///   * `--queue-id q-X` — bind to an existing queue item (caller has
+///     already added/registered it). Auto-create is skipped; the qid is
+///     used as-is.
+///   * `--no-queue` — opt out entirely. The workload runs without a
+///     queue row (legacy behaviour). Use this when the caller knows the
+///     queue layer is unavailable, or for short throwaway workloads
+///     that shouldn't pollute the queue history.
+///   * Neither — auto-create a queue row tied to the workload.
+///
+/// Auto-create is fail-soft: if `session-task` is missing or returns
+/// non-zero, the workload still runs — only the queue side effect is
+/// skipped. Suppression knob: `WORKLOAD_QUEUE_AUTO_CREATE=0` (env)
+/// disables auto-create globally without touching CLI args. Used by
+/// tests + by environments without `session-task` installed.
+pub fn cmd_run(
+    label: &str,
+    cmd_args: &[String],
+    queue_id: Option<&str>,
+    no_queue: bool,
+) -> i32 {
     if cmd_args.is_empty() {
         eprintln!("No command specified");
         return 1;
@@ -269,6 +437,35 @@ pub fn cmd_run(label: &str, cmd_args: &[String], queue_id: Option<&str>) -> i32 
     if !session_exists() {
         eprintln!("No '{SESSION}' tmux session. Run: claude-watch task init");
         return 1;
+    }
+
+    // Resolve effective queue id. Precedence:
+    //   1. Caller-supplied --queue-id wins (existing behaviour).
+    //   2. --no-queue opts out entirely (no auto-create).
+    //   3. WORKLOAD_QUEUE_AUTO_CREATE=0 env opts out (test escape hatch).
+    //   4. Otherwise: auto-create + register a queue row, bind qid.
+    let mut effective_queue_id: Option<String> = queue_id.map(str::to_string);
+    let auto_create_disabled = std::env::var("WORKLOAD_QUEUE_AUTO_CREATE")
+        .ok()
+        .as_deref()
+        == Some("0");
+    if effective_queue_id.is_none() && !no_queue && !auto_create_disabled {
+        match auto_create_and_register_queue_item(label, &command) {
+            Ok(qid) => {
+                println!("Bound workload '{label}' to queue item {qid}");
+                effective_queue_id = Some(qid);
+            }
+            Err(e) => {
+                // Fail-soft: log and continue without a queue row. The
+                // workload still runs; only the queue side effect is
+                // skipped. This matches the contract that workloads are
+                // resilient to queue-layer outages (the queue is a
+                // visibility layer, not a hard prerequisite).
+                eprintln!(
+                    "warning: workload queue auto-register failed (running without queue row): {e}"
+                );
+            }
+        }
     }
 
     if let Err(e) = fs::create_dir_all(WORKLOAD_DIR) {
@@ -314,12 +511,13 @@ pub fn cmd_run(label: &str, cmd_args: &[String], queue_id: Option<&str>) -> i32 
         .and_then(|p| p.to_str().map(str::to_string))
         .unwrap_or_else(|| "claude-watch".to_string());
     let exe_q = shell_quote(&exe_path);
-    // When --queue-id is set, append it to the emit-done call so the
-    // wrapper-side emit carries the qid into the workload-done event
-    // AND triggers the queue done/abandon transition. The flag stays
-    // optional — bare workloads emit the legacy event with no qid and
-    // no queue side effect (regression safety).
-    let queue_id_emit_arg = match queue_id {
+    // When the workload is bound to a queue item (auto-created above
+    // OR explicitly supplied via --queue-id), append the qid to the
+    // emit-done call so the wrapper-side emit carries the qid into the
+    // workload-done event AND triggers the queue done/abandon
+    // transition. Bare (--no-queue / auto-create disabled) workloads
+    // emit the legacy event with no qid and no queue side effect.
+    let queue_id_emit_arg = match effective_queue_id.as_deref() {
         Some(qid) => format!(" --queue-id {}", shell_quote(qid)),
         None => String::new(),
     };
@@ -391,7 +589,7 @@ pub fn cmd_run(label: &str, cmd_args: &[String], queue_id: Option<&str>) -> i32 
             command: command.clone(),
             output: out_path.to_string_lossy().to_string(),
             started_at,
-            queue_id: queue_id.map(str::to_string),
+            queue_id: effective_queue_id.clone(),
         },
     );
     let _ = save_state(&state);
@@ -1237,6 +1435,400 @@ mod tests {
         assert!(
             !recording.exists(),
             "stub must NOT be invoked when WORKLOAD_QUEUE_TRANSITION=0"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // Auto-register tests (workloads-as-first-class-queue-items by
+    // default — Andrew DM 2026-05-04 21:02 ET).
+    //
+    // These exercise `auto_create_and_register_queue_item` directly
+    // (cmd_run is wedged behind the live `tasks` tmux session, which
+    // we don't want to spin up in unit tests). The helper is the
+    // single source of truth for the queue-add + register semantics
+    // — testing it covers the auto-register path comprehensively.
+    // ---------------------------------------------------------------
+
+    /// Build a session-task stub that records argv to `recording` and
+    /// emits a fake `queue add --json` payload on stdout when invoked
+    /// with `queue add`. `register` invocations succeed silently.
+    /// Returns the path to the stub.
+    fn write_session_task_stub(
+        tmp: &std::path::Path,
+        recording: &std::path::Path,
+        synth_qid: &str,
+    ) -> PathBuf {
+        let stub_path = tmp.join("session-task-stub");
+        // Append all invocations to recording (one block per call,
+        // separated by `---`) so multi-call tests can inspect both
+        // the add AND the register call.
+        let stub = format!(
+            "#!/bin/bash\n\
+             {{\n\
+               printf '=== invocation ===\\n'\n\
+               printf '%s\\n' \"$@\"\n\
+             }} >> {rec}\n\
+             # When invoked with `queue add`, emit JSON containing the\n\
+             # synthesised qid on stdout. Otherwise (`queue register`,\n\
+             # etc.) just exit cleanly.\n\
+             if [[ \"$1\" == \"queue\" && \"$2\" == \"add\" ]]; then\n\
+               printf '{{\"id\":\"%s\",\"group_id\":\"g-test\",\"position\":1,\"ready_now\":true,\"serialized_after\":[],\"depends_on\":[],\"dep_blockers\":[],\"scope\":[\"workload:stub\"],\"running_scope_conflicts\":[],\"spawn_instruction\":\"READY\"}}\\n' '{qid}'\n\
+             fi\n\
+             exit 0\n",
+            rec = shell_quote(&recording.to_string_lossy()),
+            qid = synth_qid,
+        );
+        std::fs::write(&stub_path, stub).expect("write stub");
+        let _ = std::fs::set_permissions(
+            &stub_path,
+            std::fs::Permissions::from_mode(0o755),
+        );
+        stub_path
+    }
+
+    #[test]
+    fn auto_create_calls_queue_add_with_workload_scope() {
+        // Default-on auto-register: cmd_run with no --queue-id should
+        // call `session-task queue add --scope workload:<label> --force-enqueue`.
+        let _lock = WORKLOAD_TEST_ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let prev_cli = std::env::var("SESSION_TASK_CLI").ok();
+
+        let recording = tmp.path().join("session-task.recording");
+        let stub_path =
+            write_session_task_stub(tmp.path(), &recording, "q-test-auto-1");
+
+        unsafe {
+            std::env::set_var("SESSION_TASK_CLI", &stub_path);
+        }
+
+        let result = auto_create_and_register_queue_item(
+            "auto-test-1",
+            "echo hello world",
+        );
+
+        unsafe {
+            match prev_cli {
+                Some(v) => std::env::set_var("SESSION_TASK_CLI", v),
+                None => std::env::remove_var("SESSION_TASK_CLI"),
+            }
+        }
+
+        let qid = result.expect("auto-create should succeed");
+        assert_eq!(qid, "q-test-auto-1");
+
+        assert!(recording.exists(), "stub should have been invoked");
+        let recorded = std::fs::read_to_string(&recording).expect("read");
+        // First invocation: queue add with workload:<label> scope.
+        assert!(
+            recorded.contains("queue\nadd"),
+            "expected queue add invocation: {recorded}"
+        );
+        assert!(
+            recorded.contains("workload:auto-test-1"),
+            "scope must be workload:<label>: {recorded}"
+        );
+        assert!(
+            recorded.contains("--force-enqueue"),
+            "must pass --force-enqueue to bypass scope conflicts: {recorded}"
+        );
+        assert!(
+            recorded.contains("--json"),
+            "queue add must request JSON output to parse qid: {recorded}"
+        );
+        // Summary should be derived from the command (first ~60 chars).
+        assert!(
+            recorded.contains("echo hello world"),
+            "summary should contain command snippet: {recorded}"
+        );
+        // Created-by stamp identifies the source.
+        assert!(
+            recorded.contains("workload"),
+            "created-by stamp expected: {recorded}"
+        );
+    }
+
+    #[test]
+    fn auto_create_calls_register_after_add() {
+        // After `queue add` returns the qid, we MUST call `queue
+        // register <qid> --silent` so the row is in `running` state
+        // (matches the agent-spawn pattern). Without --silent the
+        // pingme would double-fire alongside the workload's own start
+        // banner.
+        let _lock = WORKLOAD_TEST_ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let prev_cli = std::env::var("SESSION_TASK_CLI").ok();
+
+        let recording = tmp.path().join("session-task.recording");
+        let stub_path =
+            write_session_task_stub(tmp.path(), &recording, "q-test-reg-1");
+
+        unsafe {
+            std::env::set_var("SESSION_TASK_CLI", &stub_path);
+        }
+
+        let _ = auto_create_and_register_queue_item("reg-test", "true");
+
+        unsafe {
+            match prev_cli {
+                Some(v) => std::env::set_var("SESSION_TASK_CLI", v),
+                None => std::env::remove_var("SESSION_TASK_CLI"),
+            }
+        }
+
+        let recorded = std::fs::read_to_string(&recording).expect("read");
+        // Must contain a register invocation with the qid + --silent.
+        assert!(
+            recorded.contains("queue\nregister\nq-test-reg-1"),
+            "expected `queue register <qid>`: {recorded}"
+        );
+        assert!(
+            recorded.contains("--silent"),
+            "register must use --silent: {recorded}"
+        );
+        // And the order: add comes BEFORE register (substring index check).
+        let add_idx = recorded.find("queue\nadd").expect("add invocation");
+        let reg_idx = recorded
+            .find("queue\nregister")
+            .expect("register invocation");
+        assert!(
+            add_idx < reg_idx,
+            "add must precede register: add={add_idx}, register={reg_idx}"
+        );
+    }
+
+    #[test]
+    fn auto_create_returns_err_when_session_task_missing() {
+        // CLI not on PATH → fail-soft contract: caller logs warning
+        // and continues without a queue row. The helper itself returns
+        // Err so the caller can decide what to do.
+        let _lock = WORKLOAD_TEST_ENV_LOCK.lock().unwrap();
+        let prev_cli = std::env::var("SESSION_TASK_CLI").ok();
+        let prev_path = std::env::var("PATH").ok();
+        let prev_home = std::env::var("HOME").ok();
+
+        // Point env vars at an empty tempdir so the find_session_task_cli
+        // walk (PATH first, $HOME/bin/session-task fallback) finds nothing.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        unsafe {
+            std::env::remove_var("SESSION_TASK_CLI");
+            std::env::set_var("PATH", tmp.path()); // empty dir
+            std::env::set_var("HOME", tmp.path()); // no $HOME/bin/session-task
+        }
+
+        let result =
+            auto_create_and_register_queue_item("missing-cli-test", "true");
+
+        unsafe {
+            match prev_cli {
+                Some(v) => std::env::set_var("SESSION_TASK_CLI", v),
+                None => std::env::remove_var("SESSION_TASK_CLI"),
+            }
+            match prev_path {
+                Some(v) => std::env::set_var("PATH", v),
+                None => std::env::remove_var("PATH"),
+            }
+            match prev_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+
+        assert!(
+            result.is_err(),
+            "helper must return Err when CLI missing: {:?}",
+            result
+        );
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("not found"),
+            "error message should mention CLI not found: {err}"
+        );
+    }
+
+    #[test]
+    fn auto_create_returns_err_on_queue_add_failure() {
+        // session-task queue add exits non-zero (e.g. malformed args,
+        // DB lock contention) → helper returns Err. Important: we do
+        // NOT proceed to `register` against an unknown qid.
+        let _lock = WORKLOAD_TEST_ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let prev_cli = std::env::var("SESSION_TASK_CLI").ok();
+
+        let recording = tmp.path().join("session-task.recording");
+        // Stub that fails on queue add.
+        let stub_path = tmp.path().join("session-task-stub");
+        let stub = format!(
+            "#!/bin/bash\n\
+             printf '%s\\n' \"$@\" >> {rec}\n\
+             if [[ \"$1\" == \"queue\" && \"$2\" == \"add\" ]]; then\n\
+               printf 'simulated queue add failure\\n' >&2\n\
+               exit 7\n\
+             fi\n\
+             exit 0\n",
+            rec = shell_quote(&recording.to_string_lossy()),
+        );
+        std::fs::write(&stub_path, stub).expect("write stub");
+        let _ = std::fs::set_permissions(
+            &stub_path,
+            std::fs::Permissions::from_mode(0o755),
+        );
+
+        unsafe {
+            std::env::set_var("SESSION_TASK_CLI", &stub_path);
+        }
+
+        let result =
+            auto_create_and_register_queue_item("fail-add-test", "true");
+
+        unsafe {
+            match prev_cli {
+                Some(v) => std::env::set_var("SESSION_TASK_CLI", v),
+                None => std::env::remove_var("SESSION_TASK_CLI"),
+            }
+        }
+
+        assert!(
+            result.is_err(),
+            "helper must return Err when queue add fails: {:?}",
+            result
+        );
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("queue add"),
+            "error must mention queue add: {err}"
+        );
+        // Crucially, register should NOT have been called.
+        let recorded = std::fs::read_to_string(&recording).expect("read");
+        assert!(
+            !recorded.contains("queue\nregister"),
+            "register must NOT run after add failure: {recorded}"
+        );
+    }
+
+    #[test]
+    fn auto_create_returns_err_on_malformed_json() {
+        // Stub returns success but emits non-JSON on stdout. Helper
+        // must surface the parse error so the caller can fail-soft.
+        let _lock = WORKLOAD_TEST_ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let prev_cli = std::env::var("SESSION_TASK_CLI").ok();
+
+        let stub_path = tmp.path().join("session-task-stub");
+        let stub = "#!/bin/bash\n\
+                    if [[ \"$1\" == \"queue\" && \"$2\" == \"add\" ]]; then\n\
+                      printf 'this is not json\\n'\n\
+                    fi\n\
+                    exit 0\n";
+        std::fs::write(&stub_path, stub).expect("write stub");
+        let _ = std::fs::set_permissions(
+            &stub_path,
+            std::fs::Permissions::from_mode(0o755),
+        );
+
+        unsafe {
+            std::env::set_var("SESSION_TASK_CLI", &stub_path);
+        }
+
+        let result = auto_create_and_register_queue_item(
+            "malformed-json-test",
+            "true",
+        );
+
+        unsafe {
+            match prev_cli {
+                Some(v) => std::env::set_var("SESSION_TASK_CLI", v),
+                None => std::env::remove_var("SESSION_TASK_CLI"),
+            }
+        }
+
+        assert!(result.is_err(), "malformed JSON must surface as Err");
+        let err = result.unwrap_err();
+        assert!(
+            err.to_lowercase().contains("json"),
+            "error should mention JSON: {err}"
+        );
+    }
+
+    #[test]
+    fn auto_create_register_failure_still_returns_qid() {
+        // queue add succeeds (qid extracted); queue register fails.
+        // The helper still returns Ok(qid) because:
+        //   * The row exists in the queue (visible in `queue list`)
+        //   * The done/abandon transition path can still clean it up
+        //   * The user-facing visibility goal is met
+        // Better to have a row in `pending` than no row at all.
+        let _lock = WORKLOAD_TEST_ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let prev_cli = std::env::var("SESSION_TASK_CLI").ok();
+
+        let stub_path = tmp.path().join("session-task-stub");
+        let stub = "#!/bin/bash\n\
+                    if [[ \"$1\" == \"queue\" && \"$2\" == \"add\" ]]; then\n\
+                      printf '{\"id\":\"q-soft-fail\",\"ready_now\":true}\\n'\n\
+                      exit 0\n\
+                    fi\n\
+                    if [[ \"$1\" == \"queue\" && \"$2\" == \"register\" ]]; then\n\
+                      printf 'simulated register failure\\n' >&2\n\
+                      exit 5\n\
+                    fi\n\
+                    exit 0\n";
+        std::fs::write(&stub_path, stub).expect("write stub");
+        let _ = std::fs::set_permissions(
+            &stub_path,
+            std::fs::Permissions::from_mode(0o755),
+        );
+
+        unsafe {
+            std::env::set_var("SESSION_TASK_CLI", &stub_path);
+        }
+
+        let result =
+            auto_create_and_register_queue_item("register-fail-test", "true");
+
+        unsafe {
+            match prev_cli {
+                Some(v) => std::env::set_var("SESSION_TASK_CLI", v),
+                None => std::env::remove_var("SESSION_TASK_CLI"),
+            }
+        }
+
+        let qid = result.expect("register failure should be soft (Ok-soft)");
+        assert_eq!(qid, "q-soft-fail");
+    }
+
+    #[test]
+    fn run_session_task_with_timeout_kills_runaway_child() {
+        // A wedged session-task must not stall the workload startup
+        // path. The bounded timeout (here 1s) must fire and we must
+        // get TimedOut back.
+        let _lock = WORKLOAD_TEST_ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let stub_path = tmp.path().join("hang-stub");
+        let stub = "#!/bin/bash\nsleep 30\n";
+        std::fs::write(&stub_path, stub).expect("write stub");
+        let _ = std::fs::set_permissions(
+            &stub_path,
+            std::fs::Permissions::from_mode(0o755),
+        );
+
+        let start = std::time::Instant::now();
+        let res = run_session_task_with_timeout(
+            &stub_path,
+            &["queue".to_string(), "add".to_string()],
+            1, // 1 second
+        );
+        let elapsed = start.elapsed();
+
+        assert!(res.is_err(), "hang-stub must trip the timeout");
+        let err = res.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        // Loose upper bound: should be ~1s (50ms poll interval). 5s
+        // gives us plenty of slack on a loaded test runner without
+        // letting a regression that disables the timeout slip through.
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "timeout fired too late: {elapsed:?}"
         );
     }
 }
