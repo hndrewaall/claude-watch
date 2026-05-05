@@ -494,14 +494,17 @@ fn build_wrapper_script(
          HEARTBEAT_PID=\n\
          if [ \"${{WORKLOAD_HEARTBEAT:-1}}\" != \"0\" ]; then\n\
              # Touch immediately so a fresh-arrival check has a non-empty file.\n\
-             date -Iseconds > {hb_q} 2>/dev/null || true\n\
+             # Use write-tmp + atomic mv so a concurrent reader never sees a\n\
+             # post-truncate / pre-write empty file (real prod race; readers\n\
+             # like cron-workload-stale-check parse this body as ISO8601).\n\
+             date -Iseconds > {hb_q}.tmp 2>/dev/null && mv -f {hb_q}.tmp {hb_q} 2>/dev/null || true\n\
              # Pass the heartbeat path via env var so we don't have to\n\
              # nest single-quoted shell-escape inside the outer\n\
              # `bash -c '...'` (which would close the outer quote and\n\
              # break the loop body — see q-2026-05-05-8aae bring-up).\n\
              WORKLOAD_HB_FILE={hb_q} setsid bash -c 'while true; do\n\
                  sleep \"${{WORKLOAD_HEARTBEAT_INTERVAL_SECS:-900}}\"\n\
-                 date -Iseconds > \"$WORKLOAD_HB_FILE\" 2>/dev/null || true\n\
+                 date -Iseconds > \"$WORKLOAD_HB_FILE.tmp\" 2>/dev/null && mv -f \"$WORKLOAD_HB_FILE.tmp\" \"$WORKLOAD_HB_FILE\" 2>/dev/null || true\n\
                done' </dev/null >/dev/null 2>&1 &\n\
              HEARTBEAT_PID=$!\n\
          fi\n\
