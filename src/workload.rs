@@ -42,6 +42,18 @@ fn script_file(label: &str) -> PathBuf {
     PathBuf::from(WORKLOAD_DIR).join(format!("{label}.sh"))
 }
 
+/// Per-workload watchdog heartbeat file. The wrapper script touches this
+/// every `WORKLOAD_HEARTBEAT_INTERVAL_SECS` seconds (default 900 = 15 min)
+/// while the user command is running. A separate cron-driven detector
+/// (`cron-workload-stale-check`) scans these files for stale mtimes and
+/// emits a `workload-stale` claude-event when one ages past 1h with no
+/// matching `<label>.exit` (i.e. the workload hasn't legitimately
+/// finished). Pet-or-fire watchdog pattern — no per-iter health spam,
+/// but real stalls page Andrew.
+fn heartbeat_file(label: &str) -> PathBuf {
+    PathBuf::from(WORKLOAD_DIR).join(format!("{label}.heartbeat"))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct WorkloadEntry {
     #[serde(default)]
@@ -414,11 +426,13 @@ fn build_wrapper_script(
     command: &str,
     out_path: &Path,
     exit_path: &Path,
+    heartbeat_path: &Path,
     exe_path: &str,
     queue_id: Option<&str>,
 ) -> String {
     let out_q = shell_quote(&out_path.to_string_lossy());
     let exit_q = shell_quote(&exit_path.to_string_lossy());
+    let hb_q = shell_quote(&heartbeat_path.to_string_lossy());
     let cmd_q = shell_quote(command);
     let label_q = shell_quote(label);
     let exe_q = shell_quote(exe_path);
@@ -442,8 +456,16 @@ fn build_wrapper_script(
     // on hosts with or without moreutils installed.
     format!(
         "#!/bin/bash\n\
-         # Trap SIGINT/SIGTERM — fatfinger-proof against accidental Ctrl-C\n\
-         trap '' INT TERM\n\
+         # Trap SIGINT/SIGTERM — fatfinger-proof against accidental Ctrl-C.\n\
+         # Use `trap :` (no-op handler) NOT `trap ''` (SIG_IGN). SIG_IGN\n\
+         # persists across exec into all child processes — including the\n\
+         # heartbeat sidecar — so `kill -TERM` to that sidecar would be\n\
+         # silently ignored. POSIX: signals inherited as SIG_IGN cannot\n\
+         # be reset by the child via `trap`. A `:` handler exec-resets\n\
+         # to SIG_DFL in children. Verified during q-2026-05-05-8aae\n\
+         # bring-up — without this, the EXIT-trap kill of the heartbeat\n\
+         # sidecar fires but the sidecar lives on with PPID=1.\n\
+         trap : INT TERM\n\
          # Per-line ISO8601 timestamp prefix for {out_q}.\n\
          # Prefer `ts` (moreutils); fall back to pure-bash `date -Is`.\n\
          if command -v ts >/dev/null 2>&1; then\n\
@@ -455,11 +477,48 @@ fn build_wrapper_script(
          echo 'Started: '$(date -Iseconds)\n\
          echo 'Command: {command_escaped}'\n\
          echo '---'\n\
+         # Pet-or-fire watchdog: touch the heartbeat file every\n\
+         # ${{WORKLOAD_HEARTBEAT_INTERVAL_SECS:-900}} seconds (default 15 min)\n\
+         # while the user command runs. NO claude-event emitted on heartbeat —\n\
+         # absence-of-heartbeat is the signal. cron-workload-stale-check\n\
+         # detects mtime > 1h + no .exit file and fires workload-stale.\n\
+         # Set WORKLOAD_HEARTBEAT=0 to disable (e.g. for tests).\n\
+         #\n\
+         # Spawn the sidecar via `setsid` so it runs in its OWN process\n\
+         # group. We then kill the whole group on teardown (`kill -TERM\n\
+         # -<pgid>`), which reliably reaps both the loop subshell AND\n\
+         # any in-flight `sleep` child. Without setsid, killing just\n\
+         # $! often leaves a dangling `sleep` that wakes up and writes\n\
+         # one more heartbeat, giving false-positive freshness to the\n\
+         # stale-watchdog detector.\n\
+         HEARTBEAT_PID=\n\
+         if [ \"${{WORKLOAD_HEARTBEAT:-1}}\" != \"0\" ]; then\n\
+             # Touch immediately so a fresh-arrival check has a non-empty file.\n\
+             date -Iseconds > {hb_q} 2>/dev/null || true\n\
+             # Pass the heartbeat path via env var so we don't have to\n\
+             # nest single-quoted shell-escape inside the outer\n\
+             # `bash -c '...'` (which would close the outer quote and\n\
+             # break the loop body — see q-2026-05-05-8aae bring-up).\n\
+             WORKLOAD_HB_FILE={hb_q} setsid bash -c 'while true; do\n\
+                 sleep \"${{WORKLOAD_HEARTBEAT_INTERVAL_SECS:-900}}\"\n\
+                 date -Iseconds > \"$WORKLOAD_HB_FILE\" 2>/dev/null || true\n\
+               done' </dev/null >/dev/null 2>&1 &\n\
+             HEARTBEAT_PID=$!\n\
+         fi\n\
+         # Reap the heartbeat sidecar on any wrapper exit (normal, signal, or\n\
+         # tmux kill-pane). Without this the sidecar leaks and keeps petting\n\
+         # the watchdog after the workload has died — exactly the case we\n\
+         # want to detect. EXIT pseudo-signal fires unconditionally. Kill the\n\
+         # whole process group (negative pid) so any in-flight `sleep` dies\n\
+         # alongside the loop subshell.\n\
+         trap 'if [ -n \"$HEARTBEAT_PID\" ]; then kill -TERM -\"$HEARTBEAT_PID\" 2>/dev/null || kill \"$HEARTBEAT_PID\" 2>/dev/null || true; fi' EXIT\n\
          setsid --wait bash -c {cmd_q}\n\
          EC=$?\n\
          echo ''\n\
          echo \"=== DONE (exit $EC) at $(date -Iseconds) ===\"\n\
          echo $EC > {exit_q}\n\
+         # Stop heartbeat BEFORE emit-done so the .exit + stop happen tightly.\n\
+         if [ -n \"$HEARTBEAT_PID\" ]; then kill -TERM -\"$HEARTBEAT_PID\" 2>/dev/null || kill \"$HEARTBEAT_PID\" 2>/dev/null || true; fi\n\
          # Emit claude-event for the main loop. Default-open: any failure\n\
          # here is silently swallowed — the exit-file write above is the\n\
          # source of truth for `workload wait`.\n\
@@ -554,11 +613,21 @@ pub fn cmd_run(
 
     let out_path = output_file(label);
     let exit_path = exit_file(label);
+    let heartbeat_path = heartbeat_file(label);
     let script_path = script_file(label);
 
-    // Clean up previous run's exit marker + output
+    // Clean up previous run's exit marker + output + heartbeat. The
+    // heartbeat MUST be removed up-front so the stale-watchdog detector
+    // can't get a false-positive on a stale leftover from a prior run
+    // that pet the watchdog and then crashed.
     let _ = fs::remove_file(&exit_path);
     let _ = fs::remove_file(&out_path);
+    let _ = fs::remove_file(&heartbeat_path);
+    // Also clear the cron-workload-stale-check single-emit sentinel so
+    // a freshly-started workload that legitimately stalls again will
+    // re-fire workload-stale instead of being silently swallowed.
+    let alerted_path = PathBuf::from(WORKLOAD_DIR).join(format!("{label}.heartbeat.alerted"));
+    let _ = fs::remove_file(&alerted_path);
 
     // Kill existing workload with same label
     let mut state = load_state();
@@ -590,6 +659,7 @@ pub fn cmd_run(
         &command,
         &out_path,
         &exit_path,
+        &heartbeat_path,
         &exe_path,
         effective_queue_id.as_deref(),
     );
@@ -1893,6 +1963,7 @@ mod tests {
             "echo hi",
             Path::new("/tmp/claude-workloads/demo.output"),
             Path::new("/tmp/claude-workloads/demo.exit"),
+            Path::new("/tmp/claude-workloads/demo.heartbeat"),
             "/usr/local/bin/claude-watch",
             None,
         );
@@ -1928,6 +1999,7 @@ mod tests {
             "true",
             Path::new("/tmp/g.output"),
             Path::new("/tmp/g.exit"),
+            Path::new("/tmp/g.heartbeat"),
             "/bin/claude-watch",
             None,
         );
@@ -1951,6 +2023,7 @@ mod tests {
             "true",
             Path::new("/tmp/wp.output"),
             Path::new("/tmp/wp.exit"),
+            Path::new("/tmp/wp.heartbeat"),
             "/usr/bin/claude-watch",
             Some("q-2026-05-05-test"),
         );
@@ -1974,6 +2047,7 @@ mod tests {
             "true",
             Path::new("/tmp/wnq.output"),
             Path::new("/tmp/wnq.exit"),
+            Path::new("/tmp/wnq.heartbeat"),
             "/usr/bin/claude-watch",
             None,
         );
@@ -2004,11 +2078,13 @@ mod tests {
         // emit-done call becomes `/bin/true workload emit-done ...`
         // which exits 0 (true ignores its args) and the wrapper's
         // `|| true` swallows any anomaly.
+        let hb_path = tmp.path().join("rt.heartbeat");
         let script_full = build_wrapper_script(
             "rt",
             "echo first; echo second",
             &out_path,
             &exit_path,
+            &hb_path,
             "/bin/true",
             None,
         );
@@ -2082,5 +2158,175 @@ mod tests {
             body.contains("=== DONE (exit 0)"),
             "expected DONE line in output:\n{body}"
         );
+    }
+
+    // ----- build_wrapper_script: heartbeat sidecar tests --------------------
+
+    #[test]
+    fn wrapper_script_contains_heartbeat_sidecar() {
+        // The wrapper must spawn a backgrounded `while true; touch HB; sleep N`
+        // sidecar so the watchdog file gets pet every interval, AND must
+        // install an EXIT trap that reaps the sidecar PID. Both halves are
+        // load-bearing — without the trap the sidecar leaks past wrapper
+        // death (the exact case the watchdog should detect).
+        let script = build_wrapper_script(
+            "hb",
+            "true",
+            Path::new("/tmp/claude-workloads/hb.output"),
+            Path::new("/tmp/claude-workloads/hb.exit"),
+            Path::new("/tmp/claude-workloads/hb.heartbeat"),
+            "/usr/local/bin/claude-watch",
+            None,
+        );
+        assert!(
+            script.contains("WORKLOAD_HEARTBEAT:-1"),
+            "wrapper must default WORKLOAD_HEARTBEAT to 1 when unset:\n{script}"
+        );
+        assert!(
+            script.contains("WORKLOAD_HEARTBEAT_INTERVAL_SECS:-900"),
+            "wrapper must default heartbeat interval to 900s (15 min):\n{script}"
+        );
+        assert!(
+            script.contains("'/tmp/claude-workloads/hb.heartbeat'"),
+            "wrapper must write to the per-label heartbeat path:\n{script}"
+        );
+        assert!(
+            script.contains("HEARTBEAT_PID=$!"),
+            "wrapper must capture sidecar pid:\n{script}"
+        );
+        assert!(
+            script.contains("trap 'if [ -n \"$HEARTBEAT_PID\" ]; then kill"),
+            "wrapper must install EXIT trap reaping sidecar pid:\n{script}"
+        );
+        assert!(
+            script.contains("kill -TERM -\"$HEARTBEAT_PID\""),
+            "wrapper must kill the sidecar's whole process group (kill -- -pgid):\n{script}"
+        );
+        assert!(
+            script.contains("setsid bash -c 'while true"),
+            "sidecar must run via setsid so it owns its own pgid:\n{script}"
+        );
+        assert!(
+            script.contains("WORKLOAD_HB_FILE="),
+            "heartbeat path must be passed via env var (not inline quoted) to avoid breaking the outer single-quote of bash -c:\n{script}"
+        );
+        // After setsid returns, before emit-done, the wrapper kills the
+        // sidecar so the heartbeat does NOT keep getting pet during the
+        // 30s tmux keepalive sleep at the end (otherwise a workload that
+        // exited an hour ago could still appear "alive" to the watchdog).
+        let post_exit_idx = script.find("=== DONE (exit $EC)")
+            .expect("DONE line present");
+        let post_exit = &script[post_exit_idx..];
+        assert!(
+            post_exit.contains("kill") && post_exit.contains("HEARTBEAT_PID"),
+            "wrapper must kill sidecar after the user command exits, not just on EXIT trap:\n{post_exit}"
+        );
+    }
+
+    #[test]
+    fn wrapper_script_heartbeat_disabled_via_env() {
+        // The opt-out path: WORKLOAD_HEARTBEAT=0 in the environment skips
+        // the sidecar entirely. The script still must compile (the
+        // shell-script-side guard does the work).
+        let script = build_wrapper_script(
+            "hbo",
+            "true",
+            Path::new("/tmp/hbo.output"),
+            Path::new("/tmp/hbo.exit"),
+            Path::new("/tmp/hbo.heartbeat"),
+            "/bin/claude-watch",
+            None,
+        );
+        // Must reference the env var (gating logic exists).
+        assert!(
+            script.contains("WORKLOAD_HEARTBEAT:-1"),
+            "wrapper must reference WORKLOAD_HEARTBEAT env var:\n{script}"
+        );
+        // The condition checks for "!= 0" (default-on, opt-out):
+        assert!(
+            script.contains("\"${WORKLOAD_HEARTBEAT:-1}\" != \"0\""),
+            "wrapper heartbeat must be default-on (opt-out via =0):\n{script}"
+        );
+    }
+
+    /// End-to-end: actually run the wrapper with a fast heartbeat interval
+    /// and verify (a) the heartbeat file is written immediately on start,
+    /// (b) the file mtime is fresh after the user command exits, and
+    /// (c) the sidecar is NOT still petting the watchdog after wrapper
+    /// teardown (else the EXIT trap is broken). Catches shell-syntax
+    /// regressions the contains-tests can't.
+    #[test]
+    fn wrapper_script_runtime_pets_and_reaps_heartbeat() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let out_path = tmp.path().join("rh.output");
+        let exit_path = tmp.path().join("rh.exit");
+        let hb_path = tmp.path().join("rh.heartbeat");
+        let script_path = tmp.path().join("rh.sh");
+
+        let script_full = build_wrapper_script(
+            "rh",
+            "echo running; sleep 1",
+            &out_path,
+            &exit_path,
+            &hb_path,
+            "/bin/true",
+            None,
+        );
+        // Patch out the trailing tmux-keepalive sleep so the test runs in
+        // ~1s (the user command sleeps 1s by design — covers an interval
+        // boundary).
+        let script = script_full.replace("sleep 30\n", "sleep 0\n");
+        std::fs::write(&script_path, &script).expect("write script");
+        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o700))
+            .expect("chmod");
+
+        // Run with a 1-second heartbeat interval; that way during the
+        // 1-second user command the sidecar should pet at least once.
+        let status = Command::new("bash")
+            .env("WORKLOAD_HEARTBEAT_INTERVAL_SECS", "1")
+            .arg(&script_path)
+            .status()
+            .expect("run wrapper");
+        assert!(
+            status.success(),
+            "wrapper exited non-zero: {status:?}\nscript:\n{script}"
+        );
+
+        // (a) Heartbeat file must exist (touched on startup).
+        assert!(
+            hb_path.exists(),
+            "heartbeat file was never created at {hb_path:?}\nscript:\n{script}"
+        );
+        let body = std::fs::read_to_string(&hb_path).expect("read heartbeat");
+        // Body should be an ISO8601 timestamp from `date -Iseconds`.
+        let ts_re = regex_lite::Regex::new(
+            r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:?\d{2}",
+        )
+        .expect("compile regex");
+        assert!(
+            ts_re.is_match(body.trim()),
+            "heartbeat body is not ISO8601: {body:?}"
+        );
+
+        // (b) Capture mtime, sleep > 2× interval, verify it didn't move
+        // (sidecar reaped). If the EXIT trap is broken the sidecar
+        // would still be petting the file after wrapper exit.
+        let mtime_a = std::fs::metadata(&hb_path)
+            .expect("stat hb")
+            .modified()
+            .expect("mtime");
+        std::thread::sleep(Duration::from_millis(2500));
+        let mtime_b = std::fs::metadata(&hb_path)
+            .expect("stat hb")
+            .modified()
+            .expect("mtime");
+        assert_eq!(
+            mtime_a, mtime_b,
+            "heartbeat file kept getting touched after wrapper exit — sidecar leaked past EXIT trap"
+        );
+
+        // (c) Exit file must also exist with the user-command rc.
+        let ec = std::fs::read_to_string(&exit_path).expect("read exit");
+        assert_eq!(ec.trim(), "0", "expected exit 0; got {ec:?}");
     }
 }
