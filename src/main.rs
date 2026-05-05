@@ -167,8 +167,20 @@ enum WorkloadAction {
         /// via `session-task`. Workload completion IS queue
         /// completion — no separate respawn dance. Resolves the
         /// q-2026-05-03-1e7d orphaned-workload bug.
-        #[arg(long = "queue-id")]
+        ///
+        /// If neither --queue-id nor --no-queue is passed, `workload
+        /// run` auto-creates a queue row (scope `workload:<label>`)
+        /// and binds the workload to it — workloads are first-class
+        /// queue items by default (Andrew DM 2026-05-04 21:02 ET).
+        #[arg(long = "queue-id", conflicts_with = "no_queue")]
         queue_id: Option<String>,
+        /// Opt out of queue auto-registration. By default, every
+        /// `workload run` synthesises a queue row so the workload
+        /// shows up in `session-task queue list`. Use --no-queue for
+        /// short throwaway workloads that shouldn't pollute queue
+        /// history, or when `session-task` isn't available.
+        #[arg(long = "no-queue", conflicts_with = "queue_id")]
+        no_queue: bool,
         /// Command to run (after --)
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
         cmd: Vec<String>,
@@ -1085,13 +1097,14 @@ fn run_workload(action: WorkloadAction) -> i32 {
         WorkloadAction::Run {
             label,
             queue_id,
+            no_queue,
             mut cmd,
         } => {
             // Strip leading '--' from command remainder (shell passes it through)
             if cmd.first().map(|s| s.as_str()) == Some("--") {
                 cmd.remove(0);
             }
-            workload::cmd_run(&label, &cmd, queue_id.as_deref())
+            workload::cmd_run(&label, &cmd, queue_id.as_deref(), no_queue)
         }
         WorkloadAction::List => workload::cmd_list(),
         WorkloadAction::Wait {
