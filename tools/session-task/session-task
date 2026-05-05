@@ -133,6 +133,25 @@ CLAUDE_AGENTS_JSONL_ROOT = Path(
     )
 )
 
+# Directory where `workload run` writes per-label stdout/stderr capture
+# files (`<label>.output`, `<label>.exit`). When a workload-bound queue
+# item transitions to done/abandoned, the archive helper copies the
+# `.output` file into QUEUE_LOG_ARCHIVE_DIR so it survives /tmp cleanup
+# the same way agent JSONL transcripts do. Override for tests / non-
+# default deploys; default mirrors the workload-runner constant
+# (`/tmp/claude-workloads`).
+WORKLOAD_OUTPUT_DIR = Path(
+    os.environ.get(
+        "WORKLOAD_OUTPUT_DIR",
+        "/tmp/claude-workloads",
+    )
+)
+
+# Strict allow-list for workload labels: alnum + `-` + `_`, 1-64 chars.
+# Mirrors the workload-runner's own validation so the archive helper
+# never opens an attacker-controlled path off a malformed scope token.
+_WORKLOAD_LABEL_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
 # Placeholder used when a queue item is added without --summary (soft-required
 # as of 2026-04-19). Pingme notifications display this verbatim so the operator
 # immediately notices the missing headline.
@@ -1255,6 +1274,133 @@ def _archive_agent_transcript(item, *, reason="done"):
     return archive_name
 
 
+def _extract_workload_label(scope):
+    """Return the bare workload label encoded in a scope list, or None.
+
+    `workload run <label>` creates a queue item with scope
+    `["workload:<label>"]`. Mirrors the canonical extractor in
+    queue-minisite/app.py — kept inline here so this script stays
+    stdlib-only and the two implementations agree on the regex gate.
+
+    Returns the bare label string (e.g. ``"saoirse-logical-200x"``) or
+    None if the scope contains no `workload:` token, the token is
+    malformed, or the value isn't a list. We honor only the FIRST match
+    — multi-binding would be a bug elsewhere we don't paper over here.
+    """
+    if not isinstance(scope, list):
+        return None
+    for s in scope:
+        if not isinstance(s, str):
+            continue
+        if not s.startswith("workload:"):
+            continue
+        label = s[len("workload:"):]
+        if _WORKLOAD_LABEL_RE.match(label):
+            return label
+    return None
+
+
+def _archive_workload_output(item, *, reason="done"):
+    """Best-effort archive of a workload-bound queue item's stdout file.
+
+    Workload-driven queue items (created by `workload run <label>`) carry
+    scope `["workload:<label>"]` and have NO entry in the active-agents
+    map (workloads aren't subagents). Their stdout/stderr lands in
+    ``WORKLOAD_OUTPUT_DIR/<label>.output`` (default
+    ``/tmp/claude-workloads/<label>.output``) which is on tmpfs and gets
+    cleaned up. To make historical workload logs survive /tmp cleanup +
+    session restart the same way subagent JSONL transcripts do, this
+    helper copies that file into ``QUEUE_LOG_ARCHIVE_DIR`` at queue-done
+    / queue-abandon time.
+
+    Lifecycle / safety contract — mirrors ``_archive_agent_transcript``:
+
+    * Best-effort. Missing source file or copy errors log to stderr and
+      return None — the lifecycle transition completes regardless.
+    * Idempotent on dest existence: if the archive already exists for
+      this queue id we leave it alone (first archive wins) and return
+      its relative path.
+    * Path-traversal-safe. Both the queue id and the workload label are
+      regex-gated before any filesystem walk.
+
+    Returns the relative-to-archive-dir filename
+    (``"<qid>.workload.txt"``) on success, or None on failure /
+    not-applicable. The caller stores this on the item as
+    ``log_archive_path`` (same field used by the agent variant — the
+    suffix differentiates the on-disk format for downstream readers).
+    """
+    qid = item.get("id")
+    if not isinstance(qid, str) or not qid:
+        return None
+
+    if not re.match(r"^q-[a-z0-9-]{4,64}$", qid):
+        return None
+
+    label = _extract_workload_label(item.get("scope") or [])
+    if label is None:
+        # Not a workload item — nothing to archive here. Caller will
+        # have separately tried the agent-transcript variant.
+        return None
+
+    archive_name = f"{qid}.workload.txt"
+    dest = QUEUE_LOG_ARCHIVE_DIR / archive_name
+
+    # Idempotent: never overwrite. Same rule as the agent variant.
+    if dest.exists():
+        return archive_name
+
+    src = WORKLOAD_OUTPUT_DIR / f"{label}.output"
+    if not src.is_file():
+        print(
+            f"[archive] no workload output file for {qid} label={label}; "
+            f"checked {src} ({reason})",
+            file=sys.stderr,
+        )
+        return None
+
+    try:
+        QUEUE_LOG_ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        print(
+            f"[archive] failed to create {QUEUE_LOG_ARCHIVE_DIR}: {exc}",
+            file=sys.stderr,
+        )
+        return None
+
+    try:
+        shutil.copyfile(src, dest)
+    except OSError as exc:
+        print(
+            f"[archive] copy failed {src} -> {dest}: {exc}",
+            file=sys.stderr,
+        )
+        return None
+
+    print(
+        f"[archive] {qid} -> {archive_name} (from workload={label}, reason={reason})",
+        file=sys.stderr,
+    )
+    return archive_name
+
+
+def _archive_for_item(item, *, reason="done"):
+    """Dispatch to the appropriate archive helper for ``item``.
+
+    Workload-bound items (scope contains ``workload:<label>``) get the
+    workload-output archive. Everything else falls through to the agent
+    transcript archive. The two are mutually exclusive — workload items
+    have no active-agent record by construction.
+
+    Returns the archive filename (relative to ``QUEUE_LOG_ARCHIVE_DIR``)
+    or None. Best-effort: failures inside the helpers are non-fatal and
+    surface only as stderr warnings. Caller stamps ``log_archive_path``
+    on the item with whatever we return.
+    """
+    if _extract_workload_label(item.get("scope") or []) is not None:
+        return _archive_workload_output(item, reason=reason)
+    return _archive_agent_transcript(item, reason=reason)
+
+
 # ---------------------------------------------------------------------------
 # Force-start autostop + recovery bundle (added 2026-05-02)
 # ---------------------------------------------------------------------------
@@ -1603,11 +1749,12 @@ def _autostop_overlapping_peers(items, target, *, raw_reason):
         peer["group_head"] = False
         peer["autostopped_by_force_start"] = target_id
 
-        # Archive the spawning subagent's transcript inside the queue lock
-        # window so the archive landed BEFORE the queue.json write that
-        # transitions the row to abandoned. _archive_agent_transcript is
-        # idempotent and best-effort.
-        archive_path = _archive_agent_transcript(peer, reason="autostop-force-start")
+        # Archive the spawning subagent's transcript (or workload output,
+        # for workload-bound items) inside the queue lock window so the
+        # archive lands BEFORE the queue.json write that transitions the
+        # row to abandoned. _archive_for_item dispatches by scope and is
+        # idempotent + best-effort.
+        archive_path = _archive_for_item(peer, reason="autostop-force-start")
         if archive_path:
             peer["log_archive_path"] = archive_path
 
@@ -2136,12 +2283,12 @@ def cmd_queue_done(args):
         target["status"] = "done"
         target["completed_at"] = _fmt_ts()
         target["group_head"] = False
-        # Archive the spawning subagent's transcript while we still
-        # have the lock. Best-effort: failures don't block the done
-        # transition. The path lands on the item as `log_archive_path`
-        # so a queue viewer UI can offer a "View log" affordance on
-        # Done entries.
-        archive_path = _archive_agent_transcript(target, reason="done")
+        # Archive the spawning subagent's transcript (or workload output,
+        # for workload-bound items) while we still have the lock. Best-
+        # effort: failures don't block the done transition. The path
+        # lands on the item as `log_archive_path` so a queue viewer UI
+        # can offer a "View log" affordance on Done entries.
+        archive_path = _archive_for_item(target, reason="done")
         if archive_path:
             target["log_archive_path"] = archive_path
         _recompute_group_heads(items)
@@ -2217,10 +2364,10 @@ def cmd_queue_abandon(args):
         if args.reason:
             target["abandon_reason"] = args.reason
         target["group_head"] = False
-        # Archive the spawning subagent's transcript (if any). Pending
-        # items abandoned before spawn won't have a record — the helper
-        # silently skips that case.
-        archive_path = _archive_agent_transcript(target, reason="abandon")
+        # Archive the spawning subagent's transcript or workload output
+        # (if any). Pending items abandoned before spawn won't have a
+        # record — the helper silently skips that case.
+        archive_path = _archive_for_item(target, reason="abandon")
         if archive_path:
             target["log_archive_path"] = archive_path
         _recompute_group_heads(items)
