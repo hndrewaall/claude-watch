@@ -72,10 +72,15 @@ if [ "$1" = "--detach" ]; then
     else
         APPEND='--append-system-prompt "You were just restarted via systemd boot (fresh session). Immediately run your full session start checklist from MEMORY.md without waiting for user input."'
     fi
+    # --dangerously-skip-permissions: Andrew's main-loop hndrewaall@gomorrah
+    # session runs in permanent permission-bypass mode. The harness has its
+    # own permission gates (obligations, queue gate, signal ack gate, etc.)
+    # which provide finer-grained safety than the per-tool prompts; the
+    # built-in permission UI just adds friction.
     if [ "$CONTINUE" = 1 ]; then
-        CLAUDE_CMD="claude --continue $APPEND"
+        CLAUDE_CMD="claude --dangerously-skip-permissions --continue $APPEND"
     else
-        CLAUDE_CMD="claude $APPEND"
+        CLAUDE_CMD="claude --dangerously-skip-permissions $APPEND"
     fi
     tmux send-keys -t "$SESSION:0.0" "cd ~ &&$CLAUDE_CMD" Enter
     # Inject "resume" after Claude initializes (polls for idle, up to 90s).
