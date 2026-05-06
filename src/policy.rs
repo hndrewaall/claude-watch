@@ -470,12 +470,15 @@ async fn restart_claude(pane: &str, state: &mut State, config: &crate::config::C
     // NOTE: Do NOT use --append-system-prompt here. It persists for the lifetime of the
     // process (survives /clear), causing misleading messages on subsequent context clears.
     // The resume prompt injection handles session startup instead.
+    // --dangerously-skip-permissions: harness-managed instances run in
+    // permanent permission-bypass mode. The harness's own gates (obligations,
+    // queue, signal-ack) provide finer-grained safety than per-tool prompts.
     let launch = if let Some(ref sid) = session_id {
         info!(session_id = %sid, "restarting Claude Code with --resume");
-        format!("claude --resume {}", sid)
+        format!("claude --dangerously-skip-permissions --resume {}", sid)
     } else {
         info!("restarting Claude Code with --continue (no session ID found)");
-        "claude --continue".to_string()
+        "claude --dangerously-skip-permissions --continue".to_string()
     };
 
     // Write relaunch script
@@ -1616,10 +1619,13 @@ async fn run_auto_update(pane: &str, old_version: &str, new_version: &str, confi
     // NOTE: Do NOT use --append-system-prompt here. It persists for the lifetime of the
     // process (survives /clear), causing misleading "version update" messages on subsequent
     // context clears. The resume prompt (step 9) handles session startup instead.
+    //
+    // --dangerously-skip-permissions: harness-managed instances run in permanent
+    // permission-bypass mode (see also crash-recovery launch above).
     let launch = if let Some(ref sid) = session_id {
-        format!("claude --resume {}", sid)
+        format!("claude --dangerously-skip-permissions --resume {}", sid)
     } else {
-        "claude --continue".to_string()
+        "claude --dangerously-skip-permissions --continue".to_string()
     };
 
     let script_content = format!(
