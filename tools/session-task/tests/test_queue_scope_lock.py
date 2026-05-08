@@ -326,6 +326,315 @@ def test_lock_only_affects_overlapping_scopes():
         assert d["lock_blockers"] == []
 
 
+# ---------------------------------------------------------------------------
+# 12. task:<id> scope token: blocked while target running, ready on done
+# ---------------------------------------------------------------------------
+
+
+def test_task_scope_token_blocks_while_target_running():
+    """An item carrying `task:<id>` in its scope is blocked until the
+    target reaches `done`. This is the unified surface that replaces a
+    separate `depends_on` field.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _env_for_tmp(tmp)
+
+        # A is the target dep.
+        r_a = _add(env, "first", ["repo:a"])
+        a = json.loads(r_a.stdout)
+
+        # B carries task:q-A as a scope token (no --depends-on used).
+        r_b = _add(env, "second", ["repo:b", f"task:{a['id']}"])
+        b = json.loads(r_b.stdout)
+        assert b["ready_now"] is False, b
+        assert a["id"] in b["depends_on"], b
+        assert a["id"] in b["dep_blockers"], b
+        # Different repo scopes -> separate groups (task: tokens don't
+        # serialize via groups).
+        assert a["group_id"] != b["group_id"]
+
+        # Finish A; B flips ready.
+        subprocess.run(
+            [sys.executable, str(SESSION_TASK), "queue", "register", a["id"]],
+            env=env, capture_output=True, text=True, timeout=15, check=True,
+        )
+        subprocess.run(
+            [sys.executable, str(SESSION_TASK), "queue", "done", a["id"]],
+            env=env, capture_output=True, text=True, timeout=15, check=True,
+        )
+
+        r_show = _run(env, "queue", "show", b["id"], check=True)
+        b_show = json.loads(r_show.stdout)
+        assert b_show["ready_now"] is True, b_show
+        assert b_show["dep_blockers"] == [], b_show
+
+
+# ---------------------------------------------------------------------------
+# 13. queue lock task:<id> blocks any pending item carrying task:<id>
+# ---------------------------------------------------------------------------
+
+
+def test_queue_lock_task_id_blocks_dependents():
+    """Locking `task:<id>` parks every pending item carrying that token
+    in its scope. The lock machinery is reused as-is — no new code path
+    for task locks.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _env_for_tmp(tmp)
+
+        # A is some queue id we'll lock the task: token on.
+        r_a = _add(env, "anchor", ["repo:a"])
+        a = json.loads(r_a.stdout)
+        # Done so it can't block on its own merits.
+        _run(env, "queue", "register", a["id"], check=True)
+        _run(env, "queue", "done", a["id"], check=True)
+
+        # Lock task:<a-id>.
+        _run(env, "queue", "lock", f"task:{a['id']}",
+             "--reason", "manual gate before B", check=True)
+
+        # B carries task:<a-id>. Even though A is done, the lock parks B.
+        r_b = _add(env, "after-a", ["repo:b", f"task:{a['id']}"])
+        b = json.loads(r_b.stdout)
+        assert b["ready_now"] is False, b
+        assert f"task:{a['id']}" in b["lock_blockers"], b
+        assert "locks: " in b["spawn_instruction"]
+
+        # Unlocking the task: token releases B.
+        _run(env, "queue", "unlock", f"task:{a['id']}", check=True)
+        r_check = _run(env, "queue", "spawn-check", b["id"], "--json", check=True)
+        body = json.loads(r_check.stdout)
+        assert body["ok"] is True, body
+
+
+# ---------------------------------------------------------------------------
+# 14. Mix of task: and regular scope: blocked iff EITHER condition holds
+# ---------------------------------------------------------------------------
+
+
+def test_mixed_scope_task_and_regular_blocks_independently():
+    """Item with scope=[repo:x, task:q-A] is blocked if EITHER any
+    running peer overlaps repo:x OR q-A is not yet done. Each gate is
+    independent.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _env_for_tmp(tmp)
+
+        # Set up a dep target A and a scope-conflict source X.
+        r_a = _add(env, "dep-target", ["repo:dep"])
+        a = json.loads(r_a.stdout)
+        r_x = _add(env, "scope-peer", ["repo:shared"])
+        x = json.loads(r_x.stdout)
+        # X is running and holds repo:shared.
+        _run(env, "queue", "register", x["id"], check=True)
+
+        # B has both repo:shared (conflicts with X) AND task:q-A.
+        # Adding under conflict requires --force-enqueue.
+        r_b = _add(env, "double-blocked", ["repo:shared", f"task:{a['id']}"],
+                   "--force-enqueue")
+        b = json.loads(r_b.stdout)
+        assert b["ready_now"] is False, b
+        # B is blocked by both running peer X (in same merged group) AND
+        # by the unmet task:q-A dep.
+        assert a["id"] in b["dep_blockers"], b
+        # X is in serialized_after (same scope group, X running).
+        assert x["id"] in b["serialized_after"], b
+
+        # Finish X (the scope-conflict source). B is still blocked by A.
+        _run(env, "queue", "done", x["id"], check=True)
+        r_show1 = _run(env, "queue", "show", b["id"], check=True)
+        b1 = json.loads(r_show1.stdout)
+        assert b1["ready_now"] is False, b1
+        assert a["id"] in b1["dep_blockers"], b1
+
+        # Now finish A. B becomes ready.
+        _run(env, "queue", "register", a["id"], check=True)
+        _run(env, "queue", "done", a["id"], check=True)
+        r_show2 = _run(env, "queue", "show", b["id"], check=True)
+        b2 = json.loads(r_show2.stdout)
+        assert b2["ready_now"] is True, b2
+        assert b2["dep_blockers"] == [], b2
+
+
+# ---------------------------------------------------------------------------
+# 15. --depends-on sugar translates to task:<id> scope tokens on add
+# ---------------------------------------------------------------------------
+
+
+def test_depends_on_sugar_materializes_as_task_scope_token():
+    """`session-task queue add ... --depends-on q-A` is parser-level
+    sugar that appends `task:q-A` to scope. The on-disk record stores the
+    dep as a scope token; the legacy `depends_on` field is no longer
+    written.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _env_for_tmp(tmp)
+
+        r_a = _add(env, "first", ["repo:a"])
+        a = json.loads(r_a.stdout)
+        r_b = _add(env, "second", ["repo:b"], "--depends-on", a["id"])
+        b = json.loads(r_b.stdout)
+
+        # The JSON output preserves the depends_on field for back-compat.
+        assert b["depends_on"] == [a["id"]], b
+        assert a["id"] in b["dep_blockers"], b
+
+        # On disk, the dep is materialized as task:<id> in scope; the
+        # legacy depends_on field is NOT written.
+        qjson = json.loads(
+            (Path(tmp) / ".config" / "session" / "queue.json").read_text()
+        )
+        b_record = next(it for it in qjson["items"] if it["id"] == b["id"])
+        assert f"task:{a['id']}" in b_record["scope"], b_record
+        assert "depends_on" not in b_record, b_record
+
+
+# ---------------------------------------------------------------------------
+# 16. Legacy depends_on field is migrated to task: scope tokens on read
+# ---------------------------------------------------------------------------
+
+
+def test_legacy_depends_on_field_migrated_on_read():
+    """A queue.json written by an older session-task with `depends_on`
+    on items is transparently migrated: on next read, each dep is
+    materialized as a `task:<id>` scope token and the legacy field is
+    dropped. Behavior remains identical.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _env_for_tmp(tmp)
+
+        # Bootstrap two items, then hand-craft a legacy queue.json so we
+        # can test the read-time migration.
+        r_a = _add(env, "first", ["repo:a"])
+        a = json.loads(r_a.stdout)
+        r_b = _add(env, "second", ["repo:b"])
+        b = json.loads(r_b.stdout)
+
+        qpath = Path(tmp) / ".config" / "session" / "queue.json"
+        qdata = json.loads(qpath.read_text())
+        b_rec = next(it for it in qdata["items"] if it["id"] == b["id"])
+        # Strip any task: tokens that may already be there (none, but be
+        # explicit) and add a legacy depends_on field.
+        b_rec["scope"] = [t for t in b_rec["scope"] if not t.startswith("task:")]
+        b_rec["depends_on"] = [a["id"]]
+        qpath.write_text(json.dumps(qdata, indent=2) + "\n")
+
+        # First read should migrate. queue show on B exposes the dep via
+        # depends_on (back-compat field) and surfaces it as a blocker.
+        r_show = _run(env, "queue", "show", b["id"], check=True)
+        b_show = json.loads(r_show.stdout)
+        assert b_show["depends_on"] == [a["id"]], b_show
+        assert a["id"] in b_show["dep_blockers"], b_show
+        assert b_show["ready_now"] is False, b_show
+
+        # Any write op (e.g. set-summary) persists the migration. Use
+        # set-summary to trigger a write that doesn't change semantics.
+        _run(env, "queue", "set-summary", b["id"], "post-migration", check=True)
+        qdata2 = json.loads(qpath.read_text())
+        b_rec2 = next(it for it in qdata2["items"] if it["id"] == b["id"])
+        assert f"task:{a['id']}" in b_rec2["scope"], b_rec2
+        assert "depends_on" not in b_rec2, b_rec2
+
+
+# ---------------------------------------------------------------------------
+# 17. queue depend --add stamps task: scope token (not legacy field)
+# ---------------------------------------------------------------------------
+
+
+def test_queue_depend_add_writes_task_scope_token():
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _env_for_tmp(tmp)
+
+        r_a = _add(env, "a", ["repo:a"])
+        a = json.loads(r_a.stdout)
+        r_b = _add(env, "b", ["repo:b"])
+        b = json.loads(r_b.stdout)
+
+        _run(env, "queue", "depend", b["id"], "--add", a["id"], check=True)
+
+        # Check on-disk shape: task:<a-id> in scope, no depends_on field.
+        qjson = json.loads(
+            (Path(tmp) / ".config" / "session" / "queue.json").read_text()
+        )
+        b_record = next(it for it in qjson["items"] if it["id"] == b["id"])
+        assert f"task:{a['id']}" in b_record["scope"], b_record
+        assert "depends_on" not in b_record, b_record
+
+        # show still surfaces depends_on field for back-compat.
+        r_show = _run(env, "queue", "show", b["id"], check=True)
+        b_show = json.loads(r_show.stdout)
+        assert b_show["depends_on"] == [a["id"]], b_show
+
+
+# ---------------------------------------------------------------------------
+# 18. queue depend --clear strips only task: tokens (regular scope kept)
+# ---------------------------------------------------------------------------
+
+
+def test_queue_depend_clear_preserves_regular_scope():
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _env_for_tmp(tmp)
+
+        r_a = _add(env, "a", ["repo:a"])
+        a = json.loads(r_a.stdout)
+        r_b = _add(env, "b", ["repo:b", "resource:thing"], "--depends-on", a["id"])
+        b = json.loads(r_b.stdout)
+        assert any(t.startswith("task:") for t in b["scope"])
+
+        _run(env, "queue", "depend", b["id"], "--clear", check=True)
+
+        qjson = json.loads(
+            (Path(tmp) / ".config" / "session" / "queue.json").read_text()
+        )
+        b_record = next(it for it in qjson["items"] if it["id"] == b["id"])
+        # Regular tokens preserved, task: gone.
+        assert "repo:b" in b_record["scope"]
+        assert "resource:thing" in b_record["scope"]
+        assert not any(t.startswith("task:") for t in b_record["scope"])
+
+
+# ---------------------------------------------------------------------------
+# 19. task: scope tokens do NOT trigger same-scope conflict on add
+# ---------------------------------------------------------------------------
+
+
+def test_task_scope_does_not_trigger_running_conflict():
+    """Two items both carrying `task:q-A` should NOT collide as a
+    running-scope conflict. task: is an inert dep marker, not a
+    serialization key.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        env = _env_for_tmp(tmp)
+
+        # Long-running anchor never used as dep target -- just to keep A
+        # alive.
+        r_a = _add(env, "dep-target", ["repo:dep"])
+        a = json.loads(r_a.stdout)
+
+        # B depends on A and is running.
+        r_b = _add(env, "first-dependent", ["repo:b", f"task:{a['id']}"])
+        b = json.loads(r_b.stdout)
+        # B can't actually run while A is pending, but we can manipulate
+        # state directly via queue.json -- or alternatively, test that
+        # add-ing C with the same task: token does NOT exit 3 even though
+        # B is running. Force-running: register A, then register B.
+        _run(env, "queue", "register", a["id"], check=True)
+        _run(env, "queue", "done", a["id"], check=True)
+        # B is now ready, register it.
+        _run(env, "queue", "register", b["id"], check=True)
+
+        # C carries task:<a-id> too, but a is done now -- so the dep is
+        # satisfied. The point of this test is that B running with the
+        # same task: token doesn't cause an exit-3 add conflict.
+        r_c = _add(env, "second-dependent", ["repo:c", f"task:{a['id']}"])
+        # Should succeed (rc=0), NOT exit 3.
+        assert r_c.returncode == 0, r_c.stderr
+        c = json.loads(r_c.stdout)
+        # Different scope (repo:b vs repo:c) -> separate groups; B's task:
+        # token isn't a conflict.
+        assert c["group_id"] != b["group_id"]
+
+
 if __name__ == "__main__":
     import traceback
     tests = [v for k, v in list(globals().items()) if k.startswith("test_")]

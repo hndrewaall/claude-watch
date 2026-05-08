@@ -53,6 +53,28 @@ Usage:
                                                        # scopes
     session-task queue migrate --from FILE [--yes]
 
+Scope tokens (2026-05-08): scope is a list of `<type>:<value>` tokens that
+serve as the single substrate for serialization, group-merge, locks, AND
+explicit cross-queue dependencies. Token types:
+    file:<path>       prefix-match (`**` suffix is readability sugar)
+    repo:<name>       exact-match
+    resource:<name>   exact-match
+    book:<name>       exact-match
+    agent-proto:<name> exact-match
+    task:<queue-id>   inert dep marker -- carries the semantic "this item
+                      is blocked until queue id <queue-id> is done", BUT
+                      it does NOT serialize via group-merge or
+                      running-conflict (so two items both depending on
+                      q-A don't accidentally serialize each other). The
+                      lock machinery still operates on it as a regular
+                      token, so `queue lock task:<id>` parks every
+                      pending item depending on <id>.
+    *                 universal -- overlaps everything; use sparingly.
+
+`--depends-on q-A` is parser sugar for appending `task:q-A` to scope --
+the canonical surface is the scope token, not a separate field. Legacy
+`depends_on` fields on disk are migrated to task: scope tokens on read.
+
 Spawn gating (2026-04-17):
     Before spawning an agent, the main loop MUST go through the queue:
         1. `session-task queue add "desc" --scope <toks>` -> get id + ready_now
@@ -605,6 +627,38 @@ def _queue_open_locked(mode):
             # Tolerate legacy bare-string entries.
             cleaned[k] = {"reason": str(v) if v else "", "locked_at": ""}
     data["locked_scopes"] = cleaned
+
+    # Read-time migration (2026-05-08): legacy items carrying a `depends_on`
+    # list are translated into `task:<id>` scope tokens. Both representations
+    # are unioned in `_iter_dep_ids` so behavior is identical regardless of
+    # which form a record is stored in -- but going forward we materialize
+    # deps as scope tokens so locks, depends_on, and serialization scope all
+    # speak the same language. The legacy field is preserved on read and
+    # only stripped when the item is rewritten via `_queue_write_and_unlock`.
+    for it in data.get("items", []):
+        if not isinstance(it, dict):
+            continue
+        legacy = it.get("depends_on")
+        if not legacy or not isinstance(legacy, list):
+            continue
+        scope = list(it.get("scope") or [])
+        existing_targets = {
+            _task_token_target(t) for t in scope if _is_task_token(t)
+        }
+        added = False
+        for d in legacy:
+            if not isinstance(d, str) or not d:
+                continue
+            if d in existing_targets:
+                continue
+            scope.append(f"task:{d}")
+            existing_targets.add(d)
+            added = True
+        if added:
+            it["scope"] = scope
+        # Drop the legacy field once the migration runs -- we keep the same
+        # info as scope tokens. The next write persists it.
+        it.pop("depends_on", None)
     return fh, data
 
 
@@ -636,6 +690,27 @@ def _new_group_id():
 # --- scope tokens --------------------------------------------------------
 
 _TYPED_TOKEN_RE = re.compile(r"^(repo|resource|book|agent-proto):")
+# `task:<queue-id>` scope tokens (added 2026-05-08 to unify --depends-on with
+# scope). Semantics: an item carrying `task:<id>` in its scope is blocked
+# until queue id <id> reaches a terminal state (done). The token is INERT
+# for normal scope-conflict / scope-overlap purposes -- it does NOT
+# serialize peers. Two items both carrying `task:q-A` are NOT in scope
+# conflict; the readiness gate (in _item_is_ready) consults the queue to
+# resolve the dep separately. This way `--depends-on q-A` is just
+# parser-level sugar for `--scope task:q-A`, and `queue lock task:q-A`
+# Just Works without a second code path.
+_TASK_TOKEN_PREFIX = "task:"
+
+
+def _is_task_token(tok):
+    return isinstance(tok, str) and tok.startswith(_TASK_TOKEN_PREFIX)
+
+
+def _task_token_target(tok):
+    """Return the queue id referenced by a `task:<id>` token, or None."""
+    if not _is_task_token(tok):
+        return None
+    return tok[len(_TASK_TOKEN_PREFIX):]
 
 
 def _normalize_token(tok):
@@ -646,6 +721,8 @@ def _normalize_token(tok):
       kept purely as readability sugar in prompts).
     - Leave '*' alone.
     - Typed tokens (repo:/resource:/book:/agent-proto:) are exact-match.
+    - `task:<id>` tokens (since 2026-05-08) are exact-match and inert for
+      scope-conflict purposes; their semantics live in _item_is_ready.
     """
     if not tok or not isinstance(tok, str):
         raise ValueError(f"Scope token must be non-empty string: {tok!r}")
@@ -667,6 +744,8 @@ def _normalize_token(tok):
         return f"file:{path}"
     if _TYPED_TOKEN_RE.match(tok):
         return tok
+    if _is_task_token(tok):
+        return tok
     # Unknown / untyped token: accept as-is (exact match).
     return tok
 
@@ -674,9 +753,20 @@ def _normalize_token(tok):
 def _tokens_overlap(a, b):
     """Return True if two normalized scope tokens overlap.
 
-    - '*' overlaps everything.
+    - '*' overlaps everything (including task: tokens).
     - Two file: tokens overlap if one is a prefix of the other.
+    - `task:<id>` tokens overlap only with the same exact `task:<id>` token
+      (and '*'). They never overlap regular scope tokens. Lock machinery
+      uses this so `queue lock task:q-XXXX` parks any pending item that
+      lists `task:q-XXXX` in its scope.
     - Typed/other tokens overlap only if equal.
+
+    NOTE: `task:` tokens are EXEMPT from group-merge and running-scope
+    conflict checks. Those callers (`_group_ids_overlapping`,
+    `_running_scope_conflicts`, `_group_scope`) filter task tokens out
+    BEFORE calling this helper -- see `_serializing_scope`. Item readiness
+    (the actual "wait for q-A" gate) is computed in `_item_is_ready` by
+    consulting the queue, not by overlap.
     """
     if a == "*" or b == "*":
         return True
@@ -699,6 +789,18 @@ def _tokens_overlap(a, b):
         return wa.startswith(wb) or wb.startswith(wa)
     # Mixed types or two non-file tokens: exact match only.
     return a == b
+
+
+def _serializing_scope(scope):
+    """Return scope tokens that participate in serialization / group-merge.
+
+    Filters out `task:<id>` tokens, which are inert dep markers (their
+    semantics live in `_item_is_ready` and locks, not in scope conflicts).
+    Used by `_group_ids_overlapping`, `_running_scope_conflicts`, and
+    `_group_scope` so a `--depends-on` cross-group dep does NOT fold the
+    dependent into the depended-on item's group.
+    """
+    return [t for t in (scope or []) if not _is_task_token(t)]
 
 
 def _scope_sets_overlap(set_a, set_b):
@@ -732,22 +834,35 @@ def _group_members(items, group_id):
 
 def _group_scope(items, group_id):
     members = _group_members(items, group_id)
-    return _union_scopes(*(m.get("scope", []) for m in members))
+    # task: tokens are inert for serialization purposes -- they get exposed
+    # via item-level scope but are stripped from the aggregated group scope.
+    return _serializing_scope(
+        _union_scopes(*(m.get("scope", []) for m in members))
+    )
 
 
 def _group_ids_overlapping(items, new_scope):
     """Return list of group_ids whose aggregated scope overlaps new_scope.
 
     Only considers groups with at least one pending/running member.
+    `task:<id>` tokens are inert here (they're cross-group dep markers,
+    not serialization keys).
     """
+    new_serializing = _serializing_scope(new_scope)
+    if not new_serializing:
+        # Item carries only inert (e.g. task:) tokens -- it never merges
+        # into an existing group on serialization grounds.
+        return []
     active = _active_items(items)
     by_group = {}
     for it in active:
         by_group.setdefault(it["group_id"], []).append(it)
     overlapping = []
     for gid, members in by_group.items():
-        gscope = _union_scopes(*(m.get("scope", []) for m in members))
-        if _scope_sets_overlap(gscope, new_scope):
+        gscope = _serializing_scope(
+            _union_scopes(*(m.get("scope", []) for m in members))
+        )
+        if _scope_sets_overlap(gscope, new_serializing):
             overlapping.append(gid)
     return overlapping
 
@@ -769,6 +884,11 @@ def _running_scope_conflicts(items, candidate_scope, *, exclude_id=None,
     it's been marked running). `exclude_group` skips an entire group (used
     when the caller already knows group-level invariant holds).
     """
+    # task: tokens are inert for running-conflict purposes (they're
+    # cross-group dep hints, not serialization keys). Strip them from
+    # both sides before overlap check so two items both carrying
+    # `task:q-A` don't falsely report a conflict.
+    candidate_serializing = _serializing_scope(candidate_scope)
     out = []
     for it in items:
         if it.get("status") not in RUNNING_STATUSES:
@@ -777,7 +897,9 @@ def _running_scope_conflicts(items, candidate_scope, *, exclude_id=None,
             continue
         if exclude_group and it.get("group_id") == exclude_group:
             continue
-        if _scope_sets_overlap(it.get("scope", []), candidate_scope):
+        if _scope_sets_overlap(
+            _serializing_scope(it.get("scope", [])), candidate_serializing
+        ):
             out.append(it)
     return out
 
@@ -841,16 +963,19 @@ def _item_is_ready(items, item, locked_scopes=None):
     members = _group_members(items, item["group_id"])
     if any(m.get("status") in RUNNING_STATUSES for m in members):
         return False
-    # Explicit interjob deps (added 2026-05-02): every dep id must resolve to
-    # an item with status=done. Targets that are missing, abandoned, or part
-    # of a dependency cycle are treated as permanent blockers (the item stays
-    # not-ready until a human edits the deps). This is the lazy read-time
-    # compute path — no transitive-closure cache. Andrew 2026-05-02:
-    #   "see if you can avoid having to recompute the tree every time a new
-    #    job is added or an existing one is modified. that would be bad lol"
-    # Direct-only check is O(direct-deps-count). Cycle detection: see
-    # _has_dep_cycle.
-    deps = item.get("depends_on") or []
+    # Explicit interjob deps (added 2026-05-02; unified with scope tokens
+    # 2026-05-08): every dep id must resolve to an item with status=done.
+    # Targets that are missing, abandoned, or part of a dependency cycle
+    # are treated as permanent blockers (the item stays not-ready until a
+    # human edits the deps). Lazy read-time compute path -- no
+    # transitive-closure cache.
+    #
+    # As of 2026-05-08, deps live BOTH on `depends_on` (legacy field, still
+    # honored for back-compat in case any caller stamped one directly) AND
+    # as `task:<id>` scope tokens (the new canonical surface, materialized
+    # by `--depends-on` / `queue depend` and the read-time migration in
+    # `_queue_open_locked`). They union here -- either source blocks.
+    deps = list(_iter_dep_ids(item))
     if deps:
         if _has_dep_cycle(items, item["id"]):
             return False
@@ -864,6 +989,30 @@ def _item_is_ready(items, item, locked_scopes=None):
             if dep.get("status") != "done":
                 return False
     return True
+
+
+def _iter_dep_ids(item):
+    """Yield the queue ids this item depends on, deduplicated.
+
+    Combines two sources:
+      * `task:<id>` scope tokens (canonical 2026-05-08+).
+      * Legacy `depends_on` list (older queue.json files; the read-time
+        migration in `_queue_open_locked` translates these into task:
+        scope tokens, so this branch is mostly defensive).
+
+    Order is stable: `task:` tokens in scope order first, then any legacy
+    `depends_on` entries that aren't already covered by a task: token.
+    """
+    seen: set[str] = set()
+    for tok in (item.get("scope") or []):
+        target = _task_token_target(tok)
+        if target and target not in seen:
+            seen.add(target)
+            yield target
+    for d in (item.get("depends_on") or []):
+        if isinstance(d, str) and d and d not in seen:
+            seen.add(d)
+            yield d
 
 
 def _has_dep_cycle(items, root_id):
@@ -881,12 +1030,10 @@ def _has_dep_cycle(items, root_id):
     """
     by_id = {it.get("id"): it for it in items if it.get("id")}
     visited = set()
-    stack = [root_id]
     on_path = set()
 
-    # Iterative DFS using an explicit (node, child-iter) stack so we
-    # can detect back-edges without recursion blowing the stack.
-    walk = [(root_id, iter((by_id.get(root_id, {}).get("depends_on") or [])))]
+    root_item = by_id.get(root_id, {})
+    walk = [(root_id, iter(list(_iter_dep_ids(root_item))))]
     on_path.add(root_id)
     while walk:
         _node, it_children = walk[-1]
@@ -910,7 +1057,7 @@ def _has_dep_cycle(items, root_id):
             visited.add(child)
             continue
         on_path.add(child)
-        walk.append((child, iter(child_item.get("depends_on") or [])))
+        walk.append((child, iter(list(_iter_dep_ids(child_item)))))
     return False
 
 
@@ -1772,7 +1919,10 @@ def _autostop_overlapping_peers(items, target, *, raw_reason):
             continue
         if peer.get("status") not in RUNNING_STATUSES:
             continue
-        if not _scope_sets_overlap(peer.get("scope", []), target_scope):
+        if not _scope_sets_overlap(
+            _serializing_scope(peer.get("scope", [])),
+            _serializing_scope(target_scope),
+        ):
             continue
 
         # Capture BEFORE mutating: _agent_id_for_queue uses claude-watch's
@@ -1927,6 +2077,67 @@ def cmd_queue_add(args):
     fh, data = _queue_open_locked("rw")
     try:
         items = data["items"]
+
+        # Parse --depends-on (comma-separated) and validate the targets
+        # exist NOW. Each dep is materialized as a `task:<id>` scope token
+        # (added 2026-05-08). The legacy `depends_on` field is no longer
+        # written; the read-time migration in `_queue_open_locked`
+        # translates pre-existing entries on next load.
+        deps_raw = getattr(args, "depends_on", None) or []
+        deps_split: list[str] = []
+        seen_dep = set()
+        for raw in deps_raw:
+            for piece in str(raw).split(","):
+                piece = piece.strip()
+                if not piece:
+                    continue
+                if piece in seen_dep:
+                    continue
+                seen_dep.add(piece)
+                deps_split.append(piece)
+        # Pull any task: tokens already supplied via --scope into the same
+        # bucket so they share validation + dedupe with --depends-on. We
+        # leave them in the scope list either way; dedupe below ensures we
+        # don't double-stamp.
+        scope_task_targets: list[str] = []
+        for tok in scope:
+            tgt = _task_token_target(tok)
+            if tgt and tgt not in seen_dep:
+                seen_dep.add(tgt)
+                scope_task_targets.append(tgt)
+        all_dep_targets = deps_split + scope_task_targets
+        if all_dep_targets:
+            existing_ids_now = {it["id"] for it in items}
+            unknown = [d for d in all_dep_targets if d not in existing_ids_now]
+            if unknown:
+                fcntl.flock(fh, fcntl.LOCK_UN)
+                fh.close()
+                print(
+                    f"ERROR: --depends-on references unknown queue id(s): "
+                    f"{','.join(unknown)}",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+
+        # Materialize --depends-on as task: scope tokens. Append rather
+        # than prepend so user-supplied --scope ordering is preserved as
+        # the head of the list. Skip targets already present as task:
+        # tokens (so --scope task:q-A --depends-on q-A is a no-op union).
+        existing_task_targets = {
+            _task_token_target(t) for t in scope if _is_task_token(t)
+        }
+        for d in deps_split:
+            if d not in existing_task_targets:
+                scope.append(f"task:{d}")
+                existing_task_targets.add(d)
+
+        # Recompute deps_split from scope so downstream display reflects
+        # the canonical dep set (--depends-on entries plus any task:
+        # tokens that came in via --scope).
+        deps_split = [
+            _task_token_target(t) for t in scope if _is_task_token(t)
+        ]
+
         running_conflicts = _running_scope_conflicts(items, scope)
 
         if running_conflicts and not args.force_enqueue:
@@ -1964,34 +2175,6 @@ def cmd_queue_add(args):
         while new_id in existing_ids:
             new_id = _new_id()
 
-        # Parse --depends-on (comma-separated) and validate the targets
-        # exist NOW. Self-deps and unknown ids are rejected at write time;
-        # cycle detection is lazy (read-time) per the architecture brief.
-        deps_raw = getattr(args, "depends_on", None) or []
-        deps_split: list[str] = []
-        seen_dep = set()
-        for raw in deps_raw:
-            for piece in str(raw).split(","):
-                piece = piece.strip()
-                if not piece:
-                    continue
-                if piece in seen_dep:
-                    continue
-                seen_dep.add(piece)
-                deps_split.append(piece)
-        if deps_split:
-            existing_ids_now = {it["id"] for it in items}
-            unknown = [d for d in deps_split if d not in existing_ids_now]
-            if unknown:
-                fcntl.flock(fh, fcntl.LOCK_UN)
-                fh.close()
-                print(
-                    f"ERROR: --depends-on references unknown queue id(s): "
-                    f"{','.join(unknown)}",
-                    file=sys.stderr,
-                )
-                sys.exit(1)
-
         item = {
             "id": new_id,
             "description": args.description,
@@ -2004,10 +2187,6 @@ def cmd_queue_add(args):
             "created_at": _fmt_ts(),
             "created_by": args.created_by or "main-loop",
         }
-        # Self-deps are always rejected at this point (the new id can't be
-        # in existing_ids), so deps_split is safe to attach verbatim.
-        if deps_split:
-            item["depends_on"] = list(deps_split)
         if context is not None:
             item["context"] = context
         items.append(item)
@@ -2224,8 +2403,11 @@ def cmd_queue_show(args):
             out["lock_blockers"] = _locked_tokens_blocking_item(it, locked_scopes)
             # Surface dep state + dependents so a single `queue show` is
             # enough to inspect the dependency edges in / out of this item
-            # without re-reading queue.json.
-            deps = list(out.get("depends_on") or [])
+            # without re-reading queue.json. Deps live as `task:<id>` scope
+            # tokens (canonical 2026-05-08+); we expose the legacy
+            # `depends_on` field in the output too so consumers (UI,
+            # tests) keep the same shape.
+            deps = list(_iter_dep_ids(it))
             by_id = {x.get("id"): x for x in items if x.get("id")}
             dep_status = []
             unmet = []
@@ -2239,16 +2421,20 @@ def cmd_queue_show(args):
                     dep_status.append({"id": d, "status": s})
                     if s != "done":
                         unmet.append(d)
+            # Mirror the dep set on the legacy `depends_on` key so existing
+            # UI / tests / scripts keep reading the same field. The on-disk
+            # record stores deps only as task: scope tokens.
+            out["depends_on"] = deps
             out["depends_on_status"] = dep_status
             out["dep_blockers"] = unmet
             out["dep_cycle"] = _has_dep_cycle(items, it["id"]) if deps else False
-            # Reverse-edges: items that name THIS item in their depends_on.
+            # Reverse-edges: items that name THIS item in their deps (via
+            # task: scope token, or legacy depends_on for forward-compat).
             dependents = [
                 x.get("id")
                 for x in items
-                if x.get("id")
-                and isinstance(x.get("depends_on"), list)
-                and it["id"] in x.get("depends_on", [])
+                if x.get("id") and it["id"] in list(_iter_dep_ids(x))
+                and x.get("id") != it["id"]
             ]
             out["dependents"] = dependents
             print(json.dumps(out, indent=2))
@@ -3576,20 +3762,21 @@ def cmd_queue_depend(args):
 
     `session-task queue depend <id> [--add q-AAA] [--remove q-BBB] [--clear]`
 
-    Adjacency-list storage: each pending/running item has ``depends_on:
-    list[str]`` — a set of queue ids it's blocked on. ``ready_now()``
-    flips True only when every dep is ``done``. Cross-group deps are
-    allowed (Andrew 2026-05-02: "explicit specific interjob dependencies
-    (human or bot defined)").
+    Storage (since 2026-05-08): each dep is stored as a `task:<id>` scope
+    token on the dragged item. The legacy `depends_on` field is no longer
+    written; the read-time migration in `_queue_open_locked` translates
+    pre-existing entries on next load. `ready_now` flips True only when
+    every dep is `done`. Cross-group deps are allowed.
 
     Architecture (per Andrew's perf brief): WRITE is just a set
     add/remove on the dragged item. NO transitive-closure cache, NO
     cascade work. Cycles are detected lazily on READ via
     ``_has_dep_cycle``.
 
-    --add / --remove accept comma-separated id lists. --clear wipes the
-    set. Done/abandoned items can't acquire new deps (the deps would be
-    moot — the item is already terminal).
+    --add / --remove accept comma-separated id lists. --clear wipes ALL
+    task: scope tokens (regular scope tokens are preserved). Done/
+    abandoned items can't acquire new deps (the deps would be moot — the
+    item is already terminal).
     """
     add_raw = list(getattr(args, "add", None) or [])
     remove_raw = list(getattr(args, "remove", None) or [])
@@ -3654,22 +3841,33 @@ def cmd_queue_depend(args):
             )
             sys.exit(1)
 
-        before = list(target.get("depends_on") or [])
+        before = list(_iter_dep_ids(target))
+        # Split the target's scope into task: tokens vs everything else
+        # so we can rebuild the task-token slice without disturbing the
+        # rest. --clear wipes only task: tokens; regular scope is left
+        # intact.
+        non_task_scope = [
+            t for t in (target.get("scope") or []) if not _is_task_token(t)
+        ]
         if do_clear:
-            after: list[str] = []
+            after_deps: list[str] = []
         else:
-            after = list(before)
+            after_deps = list(before)
 
         # Removes first, then adds — so `--add x --remove x` is a no-op
         # rather than a delete (callers passing both for the same id is
         # almost certainly a mistake but we don't bake in surprises).
         if to_remove:
-            after = [d for d in after if d not in set(to_remove)]
+            after_deps = [d for d in after_deps if d not in set(to_remove)]
         for a in to_add:
-            if a not in after:
-                after.append(a)
+            if a not in after_deps:
+                after_deps.append(a)
 
-        target["depends_on"] = after
+        # Rewrite scope: regular tokens first (preserves user ordering),
+        # then task: tokens in dep order. Drop the legacy field if a
+        # migration left it lingering.
+        target["scope"] = non_task_scope + [f"task:{d}" for d in after_deps]
+        target.pop("depends_on", None)
         target["depends_on_updated_at"] = _fmt_ts()
         _queue_write_and_unlock(fh, data)
     except Exception:
@@ -3687,13 +3885,17 @@ def cmd_queue_depend(args):
     _queue_unlock_readonly(fh2)
     fresh = next((it for it in items2 if it["id"] == args.id), None)
     ready = _item_is_ready(items2, fresh, locked_scopes=locked_scopes2) if fresh else False
-    cycle = _has_dep_cycle(items2, args.id) if (fresh and fresh.get("depends_on")) else False
+    cycle = (
+        _has_dep_cycle(items2, args.id)
+        if (fresh and list(_iter_dep_ids(fresh)))
+        else False
+    )
 
     if getattr(args, "json", False):
         print(json.dumps(
             {
                 "id": args.id,
-                "depends_on": after,
+                "depends_on": after_deps,
                 "added": to_add,
                 "removed": to_remove,
                 "cleared": do_clear,
@@ -3705,7 +3907,7 @@ def cmd_queue_depend(args):
     else:
         print(f"deps updated: {args.id}")
         print(f"  before : {before}")
-        print(f"  after  : {after}")
+        print(f"  after  : {after_deps}")
         if cycle:
             print(
                 "  WARNING: dependency cycle reachable from this item; "
@@ -4255,10 +4457,14 @@ def build_parser():
         action="append",
         default=[],
         help=(
-            "Queue id(s) this new item is blocked on. Adjacency-set storage "
-            "(no transitive closure). Each dep must be a known queue id at "
-            "add time; ready_now flips True only when every dep is 'done'. "
-            "Comma-separated values and repeated flags both work."
+            "Queue id(s) this new item is blocked on. Sugar for adding "
+            "`task:<id>` scope tokens (the canonical surface as of "
+            "2026-05-08): each dep is materialized as a `task:<id>` token "
+            "in scope. Each dep must be a known queue id at add time; "
+            "ready_now flips True only when every dep is 'done'. The "
+            "lock machinery operates on the same tokens, so "
+            "`queue lock task:<id>` parks every pending item depending "
+            "on <id>. Comma-separated values and repeated flags both work."
         ),
     )
     q_add.add_argument("--json", action="store_true")
@@ -4459,9 +4665,10 @@ def build_parser():
         "depend",
         help=(
             "Edit explicit interjob dependencies on a queue item. "
-            "depends_on is an adjacency set of queue ids; ready_now flips "
-            "True only when every dep is in 'done' state. "
-            "Cross-group deps allowed."
+            "Stored (since 2026-05-08) as `task:<id>` scope tokens; "
+            "ready_now flips True only when every dep is in 'done' state. "
+            "Cross-group deps allowed. --clear strips only task: tokens "
+            "(regular scope is preserved)."
         ),
     )
     q_depend.add_argument("id")
