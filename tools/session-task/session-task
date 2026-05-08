@@ -46,6 +46,11 @@ Usage:
                                    [--clear] [--json]
     session-task queue prune [--older-than DURATION] [-n/--dry-run]
     session-task queue banner
+    session-task queue lock <scope> [--reason "..."]   # park items overlapping
+                                                       # <scope> until unlocked
+    session-task queue unlock <scope>                  # release the lock
+    session-task queue locks                           # list currently locked
+                                                       # scopes
     session-task queue migrate --from FILE [--yes]
 
 Spawn gating (2026-04-17):
@@ -546,7 +551,11 @@ def for_session_resume_history(n_resume=5, n_queue=5, since="7d"):
 
 
 def _queue_empty():
-    return {"schema_version": QUEUE_SCHEMA_VERSION, "items": []}
+    return {
+        "schema_version": QUEUE_SCHEMA_VERSION,
+        "items": [],
+        "locked_scopes": {},
+    }
 
 
 def _queue_open_locked(mode):
@@ -577,6 +586,25 @@ def _queue_open_locked(mode):
         data = _queue_empty()
     data.setdefault("schema_version", QUEUE_SCHEMA_VERSION)
     data.setdefault("items", [])
+    # locked_scopes is a dict: {<token>: {"reason": "...", "locked_at": "iso"}}
+    # Persists in queue.json so it survives /clear and process restarts.
+    locked = data.get("locked_scopes")
+    if not isinstance(locked, dict):
+        locked = {}
+    # Defensive: drop any obviously-malformed entries.
+    cleaned: dict[str, dict] = {}
+    for k, v in locked.items():
+        if not isinstance(k, str) or not k:
+            continue
+        if isinstance(v, dict):
+            cleaned[k] = {
+                "reason": str(v.get("reason") or ""),
+                "locked_at": str(v.get("locked_at") or ""),
+            }
+        else:
+            # Tolerate legacy bare-string entries.
+            cleaned[k] = {"reason": str(v) if v else "", "locked_at": ""}
+    data["locked_scopes"] = cleaned
     return fh, data
 
 
@@ -775,8 +803,34 @@ def _group_head(items, group_id):
     return sorted(members, key=_sort_key)[0]
 
 
-def _item_is_ready(items, item):
+def _locked_tokens_blocking_item(item, locked_scopes):
+    """Return the list of locked-scope tokens that overlap this item's scope.
+
+    Empty list if `locked_scopes` is empty/None or no token overlaps.
+    A "lock" is just a string token in the locked-scopes set; an item is
+    blocked when ANY of its scope tokens overlaps ANY locked token (using
+    the same overlap semantics as scope-conflict detection).
+    """
+    if not locked_scopes:
+        return []
+    item_scope = item.get("scope") or []
+    blockers = []
+    for tok in locked_scopes.keys():
+        for it_tok in item_scope:
+            if _tokens_overlap(it_tok, tok):
+                blockers.append(tok)
+                break
+    return blockers
+
+
+def _item_is_ready(items, item, locked_scopes=None):
     if item.get("status") != "pending":
+        return False
+    # Manual lock (added 2026-05-08): operator-declared "park this scope
+    # until I say so" gate. Any pending item whose scope overlaps a locked
+    # token is held in pending+blocked-by-lock state and is NOT ready.
+    # Stored in queue.json under "locked_scopes" so it survives /clear.
+    if _locked_tokens_blocking_item(item, locked_scopes):
         return False
     head = _group_head(items, item["group_id"])
     if head is None:
@@ -1966,7 +2020,9 @@ def cmd_queue_add(args):
             key=_sort_key,
         )
         position = next((i + 1 for i, it in enumerate(group_members_sorted) if it["id"] == new_id), -1)
-        ready_now = _item_is_ready(items, item)
+        locked_scopes = data.get("locked_scopes") or {}
+        ready_now = _item_is_ready(items, item, locked_scopes=locked_scopes)
+        lock_blockers = _locked_tokens_blocking_item(item, locked_scopes)
         serialized_after = [it["id"] for it in group_members_sorted if it["id"] != new_id and _sort_key(it) < _sort_key(item)]
         # Also consider in-flight (running or wedged) items in same group
         running_in_group = [it["id"] for it in _group_members(items, group_id) if it.get("status") in RUNNING_STATUSES]
@@ -1997,6 +2053,8 @@ def cmd_queue_add(args):
         spawn_instruction = f"READY: register-and-spawn (session-task queue register {new_id})"
     else:
         parts: list[str] = []
+        if lock_blockers:
+            parts.append("locks: " + ",".join(lock_blockers))
         if dep_blockers:
             parts.append("deps: " + ",".join(dep_blockers))
         if serialized_after:
@@ -2022,6 +2080,7 @@ def cmd_queue_add(args):
             "serialized_after": serialized_after,
             "depends_on": deps_split,
             "dep_blockers": dep_blockers,
+            "lock_blockers": lock_blockers,
             "scope": scope,
             "running_scope_conflicts": running_conflict_info,
             "spawn_instruction": spawn_instruction,
@@ -2031,6 +2090,8 @@ def cmd_queue_add(args):
         print(f"assigned: group={group_id}, position={position}, ready_now={'true' if ready_now else 'false'}, serialized_after={serialized_after}")
         if deps_split:
             print(f"depends_on: {deps_split} (unmet: {dep_blockers})")
+        if lock_blockers:
+            print(f"lock_blockers: {lock_blockers}")
         print(f"spawn_instruction: {spawn_instruction}")
         if running_conflicts:
             # Only reachable via --force-enqueue. Still scream.
@@ -2093,13 +2154,14 @@ def _print_add_conflict_banner(new_scope, running_conflicts):
 def cmd_queue_list(args):
     fh, data = _queue_open_locked("r")
     items = list(data["items"])
+    locked_scopes = data.get("locked_scopes") or {}
     _queue_unlock_readonly(fh)
 
     # Filter
     if args.group:
         items = [it for it in items if it.get("group_id") == args.group]
     if args.ready:
-        items = [it for it in items if _item_is_ready(data["items"], it)]
+        items = [it for it in items if _item_is_ready(data["items"], it, locked_scopes=locked_scopes)]
     elif not args.all:
         # Default view: in-flight items (pending + running + wedged). Wedged
         # included so the operator notices stuck agents at a glance — the
@@ -2151,13 +2213,15 @@ def cmd_queue_list(args):
 def cmd_queue_show(args):
     fh, data = _queue_open_locked("r")
     items = list(data["items"])
+    locked_scopes = data.get("locked_scopes") or {}
     _queue_unlock_readonly(fh)
     for it in items:
         if it["id"] == args.id:
-            ready = _item_is_ready(items, it)
+            ready = _item_is_ready(items, it, locked_scopes=locked_scopes)
             out = dict(it)
             out["ready_now"] = ready
             out["group_scope"] = _group_scope(items, it["group_id"])
+            out["lock_blockers"] = _locked_tokens_blocking_item(it, locked_scopes)
             # Surface dep state + dependents so a single `queue show` is
             # enough to inspect the dependency edges in / out of this item
             # without re-reading queue.json.
@@ -2251,8 +2315,9 @@ def cmd_queue_groups(args):
 def cmd_queue_ready(args):
     fh, data = _queue_open_locked("r")
     items = list(data["items"])
+    locked_scopes = data.get("locked_scopes") or {}
     _queue_unlock_readonly(fh)
-    ready = [it for it in items if _item_is_ready(items, it)]
+    ready = [it for it in items if _item_is_ready(items, it, locked_scopes=locked_scopes)]
     ready.sort(key=_sort_key)
     if args.json:
         print(json.dumps(ready, indent=2))
@@ -2432,6 +2497,7 @@ def cmd_queue_pop(args):
     fh, data = _queue_open_locked("rw")
     try:
         items = data["items"]
+        locked_scopes = data.get("locked_scopes") or {}
         target = None
         if args.id:
             target = next((it for it in items if it["id"] == args.id), None)
@@ -2440,13 +2506,13 @@ def cmd_queue_pop(args):
                 fcntl.flock(fh, fcntl.LOCK_UN)
                 fh.close()
                 sys.exit(1)
-            if not _item_is_ready(items, target):
+            if not _item_is_ready(items, target, locked_scopes=locked_scopes):
                 print(f"not ready: {args.id}", file=sys.stderr)
                 fcntl.flock(fh, fcntl.LOCK_UN)
                 fh.close()
                 sys.exit(1)
         else:
-            ready = [it for it in items if _item_is_ready(items, it)]
+            ready = [it for it in items if _item_is_ready(items, it, locked_scopes=locked_scopes)]
             ready.sort(key=_sort_key)
             if not ready:
                 print("(nothing ready)")
@@ -2461,7 +2527,7 @@ def cmd_queue_pop(args):
         # item got registered through a raced add, or there's an untracked
         # in-flight agent on the same scope (rare but possible). Mirrors the
         # `queue register` invariant so `pop` and `register` behave the same.
-        ok, reasons, conflicts = _spawn_check(items, target)
+        ok, reasons, conflicts = _spawn_check(items, target, locked_scopes=locked_scopes)
         if not ok:
             fcntl.flock(fh, fcntl.LOCK_UN)
             fh.close()
@@ -2499,7 +2565,7 @@ def cmd_queue_pop(args):
     print(json.dumps(popped, indent=2))
 
 
-def _spawn_check(items, item):
+def _spawn_check(items, item, locked_scopes=None):
     """Return (ok, reasons, conflicts) tuple for spawn-gating.
 
     ok (bool):
@@ -2511,21 +2577,43 @@ def _spawn_check(items, item):
     conflicts (list[dict]):
         Running items whose scope overlaps this item's scope (excluding
         the item itself if it's already running).
+
+    locked_scopes (dict|None):
+        Operator-declared lock set (from queue.json `locked_scopes`).
+        If a pending item's scope overlaps any locked token, the spawn
+        is refused with a `lock` reason — distinct from in-flight peers.
     """
     reasons = []
     conflicts = _running_scope_conflicts(
         items, item.get("scope", []), exclude_id=item.get("id"),
     )
 
+    # Manual lock check (added 2026-05-08): a locked scope is an explicit
+    # "park this work" gate. Even if the item is otherwise ready, a lock
+    # forbids spawning. Covers both pending (where _item_is_ready also
+    # returns False) and running edge cases (no-op there since register
+    # already happened — kept here so callers can use spawn-check on
+    # in-flight items defensively).
+    lock_blockers = _locked_tokens_blocking_item(item, locked_scopes)
+    if lock_blockers:
+        reasons.append(
+            "scope is locked: " + ",".join(lock_blockers)
+        )
+
     status = item.get("status")
     if status not in ("pending", "running"):
         reasons.append(f"item status is {status!r} (must be pending or running)")
     elif status == "pending":
-        if not _item_is_ready(items, item):
-            reasons.append(
-                "item is not ready (blocked behind another item in its group "
-                f"{item.get('group_id')!r})"
-            )
+        if not _item_is_ready(items, item, locked_scopes=locked_scopes):
+            # Distinguish lock-blocked from group-head-blocked so the
+            # operator's banner reads cleanly. Lock blockers have already
+            # been captured above; only add the head reason if the item
+            # would otherwise be the head.
+            if not lock_blockers:
+                reasons.append(
+                    "item is not ready (blocked behind another item in its group "
+                    f"{item.get('group_id')!r})"
+                )
 
     # Any cross-group running conflict is a hard reject. Same-group conflicts
     # would be a group-invariant violation (only one running per group).
@@ -2554,6 +2642,7 @@ def _spawn_check(items, item):
 def cmd_queue_spawn_check(args):
     fh, data = _queue_open_locked("r")
     items = list(data["items"])
+    locked_scopes = data.get("locked_scopes") or {}
     _queue_unlock_readonly(fh)
 
     target = next((it for it in items if it["id"] == args.id), None)
@@ -2568,7 +2657,7 @@ def cmd_queue_spawn_check(args):
         print(bar, file=sys.stderr)
         sys.exit(2)
 
-    ok, reasons, conflicts = _spawn_check(items, target)
+    ok, reasons, conflicts = _spawn_check(items, target, locked_scopes=locked_scopes)
     conflict_info = [
         {"id": c["id"], "group_id": c.get("group_id"),
          "status": c.get("status"), "scope": c.get("scope", [])}
@@ -2647,6 +2736,7 @@ def cmd_queue_register(args):
     fh, data = _queue_open_locked("rw")
     try:
         items = data["items"]
+        locked_scopes = data.get("locked_scopes") or {}
         target = next((it for it in items if it["id"] == args.id), None)
         if target is None:
             fcntl.flock(fh, fcntl.LOCK_UN)
@@ -2711,7 +2801,7 @@ def cmd_queue_register(args):
             print(bar, file=sys.stderr)
             sys.exit(2)
 
-        ok, reasons, conflicts = _spawn_check(items, target)
+        ok, reasons, conflicts = _spawn_check(items, target, locked_scopes=locked_scopes)
         if not ok:
             fcntl.flock(fh, fcntl.LOCK_UN)
             fh.close()
@@ -3593,9 +3683,10 @@ def cmd_queue_depend(args):
     # Re-read to compute ready_now under the new edge set.
     fh2, data2 = _queue_open_locked("r")
     items2 = list(data2["items"])
+    locked_scopes2 = data2.get("locked_scopes") or {}
     _queue_unlock_readonly(fh2)
     fresh = next((it for it in items2 if it["id"] == args.id), None)
-    ready = _item_is_ready(items2, fresh) if fresh else False
+    ready = _item_is_ready(items2, fresh, locked_scopes=locked_scopes2) if fresh else False
     cycle = _has_dep_cycle(items2, args.id) if (fresh and fresh.get("depends_on")) else False
 
     if getattr(args, "json", False):
@@ -3717,8 +3808,9 @@ def cmd_queue_prune(args):
 def cmd_queue_banner(args):
     fh, data = _queue_open_locked("r")
     items = list(data["items"])
+    locked_scopes = data.get("locked_scopes") or {}
     _queue_unlock_readonly(fh)
-    ready = [it for it in items if _item_is_ready(items, it)]
+    ready = [it for it in items if _item_is_ready(items, it, locked_scopes=locked_scopes)]
     ready.sort(key=_sort_key)
     pending = [it for it in items if it.get("status") == "pending"]
     running = [it for it in items if it.get("status") == "running"]
@@ -3754,12 +3846,14 @@ def cmd_queue_banner(args):
     else:
         lines.append("  (no items are READY -- everything is blocked on a running peer or unblocked below)")
 
-    waiting = [it for it in pending if not _item_is_ready(items, it)]
+    waiting = [it for it in pending if not _item_is_ready(items, it, locked_scopes=locked_scopes)]
     if waiting:
         lines.append("")
         lines.append(f"  Waiting behind a group peer: {len(waiting)} item(s)")
     if running:
         lines.append(f"  In progress (running): {len(running)} item(s)")
+    if locked_scopes:
+        lines.append(f"  Locked scopes: {len(locked_scopes)} (see `session-task queue locks`)")
 
     lines.append("#" * 60)
     lines.append("")
@@ -3833,6 +3927,158 @@ def _parse_legacy_queue(text):
         scope = _infer_scope_from_text(full)
         items.append((desc, scope, body))
     return items
+
+
+# ---------------------------------------------------------------------------
+# Manual scope locks (added 2026-05-08)
+#
+# A "lock" is an operator-declared scope token that pauses any pending
+# queue item whose scope overlaps it. Use case: queue a follow-up task
+# that depends on a real-world condition (a hardware install, a manual
+# config change, an out-of-band review) and don't want it to spawn until
+# the operator says go. Distinct from `--depends-on` (which waits on
+# another queue item) and from in-flight scope conflicts (which clear
+# automatically when the running item finishes).
+#
+# Workflow:
+#     session-task queue lock <scope> --reason "wait for hardware"
+#     session-task queue add "..." --scope <scope> --summary "..."
+#     # ... real-world condition met ...
+#     session-task queue unlock <scope>
+#
+# Stored in queue.json under `locked_scopes`, so the lock survives
+# /clear, restart, compaction, and process death.
+# ---------------------------------------------------------------------------
+
+
+def cmd_queue_lock(args):
+    """Add <scope> to the locked-scopes set."""
+    scope = _normalize_token(args.scope)
+    reason = (args.reason or "").strip()
+    fh, data = _queue_open_locked("rw")
+    try:
+        locked = data.get("locked_scopes") or {}
+        was_locked = scope in locked
+        prev_reason = locked.get(scope, {}).get("reason", "") if was_locked else ""
+        prev_locked_at = locked.get(scope, {}).get("locked_at", "") if was_locked else ""
+        if was_locked:
+            # Idempotent: keep the original locked_at; refresh reason only if
+            # a new one was passed (otherwise leave prior reason untouched).
+            new_reason = reason or prev_reason
+            locked[scope] = {
+                "reason": new_reason,
+                "locked_at": prev_locked_at or _fmt_ts(),
+            }
+        else:
+            locked[scope] = {"reason": reason, "locked_at": _fmt_ts()}
+        data["locked_scopes"] = locked
+        _queue_write_and_unlock(fh, data)
+    except Exception:
+        try:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+            fh.close()
+        except Exception:
+            pass
+        raise
+
+    if args.json:
+        print(json.dumps({
+            "scope": scope,
+            "reason": locked[scope]["reason"],
+            "locked_at": locked[scope]["locked_at"],
+            "already_locked": was_locked,
+        }, indent=2))
+        return
+
+    if was_locked:
+        print(f"already locked: {scope} (locked_at={locked[scope]['locked_at']})")
+        if reason and reason != prev_reason:
+            print(f"  reason updated: {reason!r}")
+    else:
+        print(f"locked: {scope}")
+        if reason:
+            print(f"  reason: {reason}")
+        print(f"  locked_at: {locked[scope]['locked_at']}")
+
+
+def cmd_queue_unlock(args):
+    """Remove <scope> from the locked-scopes set.
+
+    No-op (exit 0) if the scope wasn't locked. Items previously
+    blocked-only-by-the-lock become ready immediately on the next
+    readiness evaluation.
+    """
+    scope = _normalize_token(args.scope)
+    fh, data = _queue_open_locked("rw")
+    try:
+        locked = data.get("locked_scopes") or {}
+        was_locked = scope in locked
+        prev = locked.pop(scope, None)
+        data["locked_scopes"] = locked
+        _queue_write_and_unlock(fh, data)
+    except Exception:
+        try:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+            fh.close()
+        except Exception:
+            pass
+        raise
+
+    if args.json:
+        print(json.dumps({
+            "scope": scope,
+            "was_locked": was_locked,
+            "previous_reason": (prev or {}).get("reason", "") if prev else "",
+            "previous_locked_at": (prev or {}).get("locked_at", "") if prev else "",
+        }, indent=2))
+        return
+
+    if was_locked:
+        print(f"unlocked: {scope}")
+    else:
+        print(f"not locked: {scope} (no-op)")
+
+
+def cmd_queue_locks(args):
+    """List currently locked scopes."""
+    fh, data = _queue_open_locked("r")
+    locked = dict(data.get("locked_scopes") or {})
+    items = list(data["items"])
+    _queue_unlock_readonly(fh)
+
+    rows = []
+    for scope, meta in sorted(locked.items()):
+        # Count pending items currently parked behind this lock.
+        held = 0
+        for it in items:
+            if it.get("status") != "pending":
+                continue
+            if scope in _locked_tokens_blocking_item(it, {scope: meta}):
+                held += 1
+        rows.append({
+            "scope": scope,
+            "reason": (meta or {}).get("reason", ""),
+            "locked_at": (meta or {}).get("locked_at", ""),
+            "items_held": held,
+        })
+
+    if args.json:
+        print(json.dumps(rows, indent=2))
+        return
+
+    if not rows:
+        print("(no locked scopes)")
+        return
+
+    print(f"{'SCOPE':40} {'LOCKED_AT':32} {'HELD':4} REASON")
+    for r in rows:
+        scope_str = r["scope"]
+        if len(scope_str) > 39:
+            scope_str = scope_str[:36] + "..."
+        print(
+            f"{scope_str:40} {r['locked_at']:32} {r['items_held']:<4} "
+            f"{r['reason']}"
+        )
 
 
 def cmd_queue_migrate(args):
@@ -4250,6 +4496,39 @@ def build_parser():
 
     qsub.add_parser("banner", help="Top-5 ready items banner")
 
+    # Manual scope locks (added 2026-05-08).
+    q_lock = qsub.add_parser(
+        "lock",
+        help=(
+            "Park any pending item whose scope overlaps <scope> until the "
+            "scope is unlocked. Use to enqueue work that depends on a "
+            "real-world condition (hardware install, manual config, etc.)."
+        ),
+    )
+    q_lock.add_argument("scope", help="Scope token to lock (same syntax as --scope on `queue add`)")
+    q_lock.add_argument(
+        "--reason",
+        help="Free-form note describing why the scope is locked. Surfaces in `queue locks`.",
+    )
+    q_lock.add_argument("--json", action="store_true")
+
+    q_unlock = qsub.add_parser(
+        "unlock",
+        help=(
+            "Remove <scope> from the locked-scopes set. Items previously "
+            "blocked-only-by-the-lock become ready immediately. No-op (exit 0) "
+            "if the scope was not locked."
+        ),
+    )
+    q_unlock.add_argument("scope", help="Scope token to unlock")
+    q_unlock.add_argument("--json", action="store_true")
+
+    q_locks = qsub.add_parser(
+        "locks",
+        help="List currently locked scopes with reason, lock timestamp, and held-item count.",
+    )
+    q_locks.add_argument("--json", action="store_true")
+
     q_mig = qsub.add_parser("migrate", help="Parse legacy /tmp/claude-queued-tasks.txt")
     q_mig.add_argument("--from", dest="from_file", required=True)
     q_mig.add_argument("--yes", action="store_true")
@@ -4309,6 +4588,9 @@ def main():
             "depend": cmd_queue_depend,
             "prune": cmd_queue_prune,
             "banner": cmd_queue_banner,
+            "lock": cmd_queue_lock,
+            "unlock": cmd_queue_unlock,
+            "locks": cmd_queue_locks,
             "migrate": cmd_queue_migrate,
         }
         fn = qmap.get(args.qcmd)
