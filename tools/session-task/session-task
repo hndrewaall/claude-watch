@@ -46,7 +46,34 @@ Usage:
                                    [--clear] [--json]
     session-task queue prune [--older-than DURATION] [-n/--dry-run]
     session-task queue banner
+    session-task queue lock <scope> [--reason "..."]   # park items overlapping
+                                                       # <scope> until unlocked
+    session-task queue unlock <scope>                  # release the lock
+    session-task queue locks                           # list currently locked
+                                                       # scopes
     session-task queue migrate --from FILE [--yes]
+
+Scope tokens (2026-05-08): scope is a list of `<type>:<value>` tokens that
+serve as the single substrate for serialization, group-merge, locks, AND
+explicit cross-queue dependencies. Token types:
+    file:<path>       prefix-match (`**` suffix is readability sugar)
+    repo:<name>       exact-match
+    resource:<name>   exact-match
+    book:<name>       exact-match
+    agent-proto:<name> exact-match
+    task:<queue-id>   inert dep marker -- carries the semantic "this item
+                      is blocked until queue id <queue-id> is done", BUT
+                      it does NOT serialize via group-merge or
+                      running-conflict (so two items both depending on
+                      q-A don't accidentally serialize each other). The
+                      lock machinery still operates on it as a regular
+                      token, so `queue lock task:<id>` parks every
+                      pending item depending on <id>.
+    *                 universal -- overlaps everything; use sparingly.
+
+`--depends-on q-A` is parser sugar for appending `task:q-A` to scope --
+the canonical surface is the scope token, not a separate field. Legacy
+`depends_on` fields on disk are migrated to task: scope tokens on read.
 
 Spawn gating (2026-04-17):
     Before spawning an agent, the main loop MUST go through the queue:
@@ -546,7 +573,11 @@ def for_session_resume_history(n_resume=5, n_queue=5, since="7d"):
 
 
 def _queue_empty():
-    return {"schema_version": QUEUE_SCHEMA_VERSION, "items": []}
+    return {
+        "schema_version": QUEUE_SCHEMA_VERSION,
+        "items": [],
+        "locked_scopes": {},
+    }
 
 
 def _queue_open_locked(mode):
@@ -577,6 +608,57 @@ def _queue_open_locked(mode):
         data = _queue_empty()
     data.setdefault("schema_version", QUEUE_SCHEMA_VERSION)
     data.setdefault("items", [])
+    # locked_scopes is a dict: {<token>: {"reason": "...", "locked_at": "iso"}}
+    # Persists in queue.json so it survives /clear and process restarts.
+    locked = data.get("locked_scopes")
+    if not isinstance(locked, dict):
+        locked = {}
+    # Defensive: drop any obviously-malformed entries.
+    cleaned: dict[str, dict] = {}
+    for k, v in locked.items():
+        if not isinstance(k, str) or not k:
+            continue
+        if isinstance(v, dict):
+            cleaned[k] = {
+                "reason": str(v.get("reason") or ""),
+                "locked_at": str(v.get("locked_at") or ""),
+            }
+        else:
+            # Tolerate legacy bare-string entries.
+            cleaned[k] = {"reason": str(v) if v else "", "locked_at": ""}
+    data["locked_scopes"] = cleaned
+
+    # Read-time migration (2026-05-08): legacy items carrying a `depends_on`
+    # list are translated into `task:<id>` scope tokens. Both representations
+    # are unioned in `_iter_dep_ids` so behavior is identical regardless of
+    # which form a record is stored in -- but going forward we materialize
+    # deps as scope tokens so locks, depends_on, and serialization scope all
+    # speak the same language. The legacy field is preserved on read and
+    # only stripped when the item is rewritten via `_queue_write_and_unlock`.
+    for it in data.get("items", []):
+        if not isinstance(it, dict):
+            continue
+        legacy = it.get("depends_on")
+        if not legacy or not isinstance(legacy, list):
+            continue
+        scope = list(it.get("scope") or [])
+        existing_targets = {
+            _task_token_target(t) for t in scope if _is_task_token(t)
+        }
+        added = False
+        for d in legacy:
+            if not isinstance(d, str) or not d:
+                continue
+            if d in existing_targets:
+                continue
+            scope.append(f"task:{d}")
+            existing_targets.add(d)
+            added = True
+        if added:
+            it["scope"] = scope
+        # Drop the legacy field once the migration runs -- we keep the same
+        # info as scope tokens. The next write persists it.
+        it.pop("depends_on", None)
     return fh, data
 
 
@@ -608,6 +690,27 @@ def _new_group_id():
 # --- scope tokens --------------------------------------------------------
 
 _TYPED_TOKEN_RE = re.compile(r"^(repo|resource|book|agent-proto):")
+# `task:<queue-id>` scope tokens (added 2026-05-08 to unify --depends-on with
+# scope). Semantics: an item carrying `task:<id>` in its scope is blocked
+# until queue id <id> reaches a terminal state (done). The token is INERT
+# for normal scope-conflict / scope-overlap purposes -- it does NOT
+# serialize peers. Two items both carrying `task:q-A` are NOT in scope
+# conflict; the readiness gate (in _item_is_ready) consults the queue to
+# resolve the dep separately. This way `--depends-on q-A` is just
+# parser-level sugar for `--scope task:q-A`, and `queue lock task:q-A`
+# Just Works without a second code path.
+_TASK_TOKEN_PREFIX = "task:"
+
+
+def _is_task_token(tok):
+    return isinstance(tok, str) and tok.startswith(_TASK_TOKEN_PREFIX)
+
+
+def _task_token_target(tok):
+    """Return the queue id referenced by a `task:<id>` token, or None."""
+    if not _is_task_token(tok):
+        return None
+    return tok[len(_TASK_TOKEN_PREFIX):]
 
 
 def _normalize_token(tok):
@@ -618,6 +721,8 @@ def _normalize_token(tok):
       kept purely as readability sugar in prompts).
     - Leave '*' alone.
     - Typed tokens (repo:/resource:/book:/agent-proto:) are exact-match.
+    - `task:<id>` tokens (since 2026-05-08) are exact-match and inert for
+      scope-conflict purposes; their semantics live in _item_is_ready.
     """
     if not tok or not isinstance(tok, str):
         raise ValueError(f"Scope token must be non-empty string: {tok!r}")
@@ -639,6 +744,8 @@ def _normalize_token(tok):
         return f"file:{path}"
     if _TYPED_TOKEN_RE.match(tok):
         return tok
+    if _is_task_token(tok):
+        return tok
     # Unknown / untyped token: accept as-is (exact match).
     return tok
 
@@ -646,9 +753,20 @@ def _normalize_token(tok):
 def _tokens_overlap(a, b):
     """Return True if two normalized scope tokens overlap.
 
-    - '*' overlaps everything.
+    - '*' overlaps everything (including task: tokens).
     - Two file: tokens overlap if one is a prefix of the other.
+    - `task:<id>` tokens overlap only with the same exact `task:<id>` token
+      (and '*'). They never overlap regular scope tokens. Lock machinery
+      uses this so `queue lock task:q-XXXX` parks any pending item that
+      lists `task:q-XXXX` in its scope.
     - Typed/other tokens overlap only if equal.
+
+    NOTE: `task:` tokens are EXEMPT from group-merge and running-scope
+    conflict checks. Those callers (`_group_ids_overlapping`,
+    `_running_scope_conflicts`, `_group_scope`) filter task tokens out
+    BEFORE calling this helper -- see `_serializing_scope`. Item readiness
+    (the actual "wait for q-A" gate) is computed in `_item_is_ready` by
+    consulting the queue, not by overlap.
     """
     if a == "*" or b == "*":
         return True
@@ -671,6 +789,18 @@ def _tokens_overlap(a, b):
         return wa.startswith(wb) or wb.startswith(wa)
     # Mixed types or two non-file tokens: exact match only.
     return a == b
+
+
+def _serializing_scope(scope):
+    """Return scope tokens that participate in serialization / group-merge.
+
+    Filters out `task:<id>` tokens, which are inert dep markers (their
+    semantics live in `_item_is_ready` and locks, not in scope conflicts).
+    Used by `_group_ids_overlapping`, `_running_scope_conflicts`, and
+    `_group_scope` so a `--depends-on` cross-group dep does NOT fold the
+    dependent into the depended-on item's group.
+    """
+    return [t for t in (scope or []) if not _is_task_token(t)]
 
 
 def _scope_sets_overlap(set_a, set_b):
@@ -704,22 +834,35 @@ def _group_members(items, group_id):
 
 def _group_scope(items, group_id):
     members = _group_members(items, group_id)
-    return _union_scopes(*(m.get("scope", []) for m in members))
+    # task: tokens are inert for serialization purposes -- they get exposed
+    # via item-level scope but are stripped from the aggregated group scope.
+    return _serializing_scope(
+        _union_scopes(*(m.get("scope", []) for m in members))
+    )
 
 
 def _group_ids_overlapping(items, new_scope):
     """Return list of group_ids whose aggregated scope overlaps new_scope.
 
     Only considers groups with at least one pending/running member.
+    `task:<id>` tokens are inert here (they're cross-group dep markers,
+    not serialization keys).
     """
+    new_serializing = _serializing_scope(new_scope)
+    if not new_serializing:
+        # Item carries only inert (e.g. task:) tokens -- it never merges
+        # into an existing group on serialization grounds.
+        return []
     active = _active_items(items)
     by_group = {}
     for it in active:
         by_group.setdefault(it["group_id"], []).append(it)
     overlapping = []
     for gid, members in by_group.items():
-        gscope = _union_scopes(*(m.get("scope", []) for m in members))
-        if _scope_sets_overlap(gscope, new_scope):
+        gscope = _serializing_scope(
+            _union_scopes(*(m.get("scope", []) for m in members))
+        )
+        if _scope_sets_overlap(gscope, new_serializing):
             overlapping.append(gid)
     return overlapping
 
@@ -741,6 +884,11 @@ def _running_scope_conflicts(items, candidate_scope, *, exclude_id=None,
     it's been marked running). `exclude_group` skips an entire group (used
     when the caller already knows group-level invariant holds).
     """
+    # task: tokens are inert for running-conflict purposes (they're
+    # cross-group dep hints, not serialization keys). Strip them from
+    # both sides before overlap check so two items both carrying
+    # `task:q-A` don't falsely report a conflict.
+    candidate_serializing = _serializing_scope(candidate_scope)
     out = []
     for it in items:
         if it.get("status") not in RUNNING_STATUSES:
@@ -749,7 +897,9 @@ def _running_scope_conflicts(items, candidate_scope, *, exclude_id=None,
             continue
         if exclude_group and it.get("group_id") == exclude_group:
             continue
-        if _scope_sets_overlap(it.get("scope", []), candidate_scope):
+        if _scope_sets_overlap(
+            _serializing_scope(it.get("scope", [])), candidate_serializing
+        ):
             out.append(it)
     return out
 
@@ -775,8 +925,34 @@ def _group_head(items, group_id):
     return sorted(members, key=_sort_key)[0]
 
 
-def _item_is_ready(items, item):
+def _locked_tokens_blocking_item(item, locked_scopes):
+    """Return the list of locked-scope tokens that overlap this item's scope.
+
+    Empty list if `locked_scopes` is empty/None or no token overlaps.
+    A "lock" is just a string token in the locked-scopes set; an item is
+    blocked when ANY of its scope tokens overlaps ANY locked token (using
+    the same overlap semantics as scope-conflict detection).
+    """
+    if not locked_scopes:
+        return []
+    item_scope = item.get("scope") or []
+    blockers = []
+    for tok in locked_scopes.keys():
+        for it_tok in item_scope:
+            if _tokens_overlap(it_tok, tok):
+                blockers.append(tok)
+                break
+    return blockers
+
+
+def _item_is_ready(items, item, locked_scopes=None):
     if item.get("status") != "pending":
+        return False
+    # Manual lock (added 2026-05-08): operator-declared "park this scope
+    # until I say so" gate. Any pending item whose scope overlaps a locked
+    # token is held in pending+blocked-by-lock state and is NOT ready.
+    # Stored in queue.json under "locked_scopes" so it survives /clear.
+    if _locked_tokens_blocking_item(item, locked_scopes):
         return False
     head = _group_head(items, item["group_id"])
     if head is None:
@@ -787,16 +963,19 @@ def _item_is_ready(items, item):
     members = _group_members(items, item["group_id"])
     if any(m.get("status") in RUNNING_STATUSES for m in members):
         return False
-    # Explicit interjob deps (added 2026-05-02): every dep id must resolve to
-    # an item with status=done. Targets that are missing, abandoned, or part
-    # of a dependency cycle are treated as permanent blockers (the item stays
-    # not-ready until a human edits the deps). This is the lazy read-time
-    # compute path — no transitive-closure cache. Andrew 2026-05-02:
-    #   "see if you can avoid having to recompute the tree every time a new
-    #    job is added or an existing one is modified. that would be bad lol"
-    # Direct-only check is O(direct-deps-count). Cycle detection: see
-    # _has_dep_cycle.
-    deps = item.get("depends_on") or []
+    # Explicit interjob deps (added 2026-05-02; unified with scope tokens
+    # 2026-05-08): every dep id must resolve to an item with status=done.
+    # Targets that are missing, abandoned, or part of a dependency cycle
+    # are treated as permanent blockers (the item stays not-ready until a
+    # human edits the deps). Lazy read-time compute path -- no
+    # transitive-closure cache.
+    #
+    # As of 2026-05-08, deps live BOTH on `depends_on` (legacy field, still
+    # honored for back-compat in case any caller stamped one directly) AND
+    # as `task:<id>` scope tokens (the new canonical surface, materialized
+    # by `--depends-on` / `queue depend` and the read-time migration in
+    # `_queue_open_locked`). They union here -- either source blocks.
+    deps = list(_iter_dep_ids(item))
     if deps:
         if _has_dep_cycle(items, item["id"]):
             return False
@@ -810,6 +989,30 @@ def _item_is_ready(items, item):
             if dep.get("status") != "done":
                 return False
     return True
+
+
+def _iter_dep_ids(item):
+    """Yield the queue ids this item depends on, deduplicated.
+
+    Combines two sources:
+      * `task:<id>` scope tokens (canonical 2026-05-08+).
+      * Legacy `depends_on` list (older queue.json files; the read-time
+        migration in `_queue_open_locked` translates these into task:
+        scope tokens, so this branch is mostly defensive).
+
+    Order is stable: `task:` tokens in scope order first, then any legacy
+    `depends_on` entries that aren't already covered by a task: token.
+    """
+    seen: set[str] = set()
+    for tok in (item.get("scope") or []):
+        target = _task_token_target(tok)
+        if target and target not in seen:
+            seen.add(target)
+            yield target
+    for d in (item.get("depends_on") or []):
+        if isinstance(d, str) and d and d not in seen:
+            seen.add(d)
+            yield d
 
 
 def _has_dep_cycle(items, root_id):
@@ -827,12 +1030,10 @@ def _has_dep_cycle(items, root_id):
     """
     by_id = {it.get("id"): it for it in items if it.get("id")}
     visited = set()
-    stack = [root_id]
     on_path = set()
 
-    # Iterative DFS using an explicit (node, child-iter) stack so we
-    # can detect back-edges without recursion blowing the stack.
-    walk = [(root_id, iter((by_id.get(root_id, {}).get("depends_on") or [])))]
+    root_item = by_id.get(root_id, {})
+    walk = [(root_id, iter(list(_iter_dep_ids(root_item))))]
     on_path.add(root_id)
     while walk:
         _node, it_children = walk[-1]
@@ -856,7 +1057,7 @@ def _has_dep_cycle(items, root_id):
             visited.add(child)
             continue
         on_path.add(child)
-        walk.append((child, iter(child_item.get("depends_on") or [])))
+        walk.append((child, iter(list(_iter_dep_ids(child_item)))))
     return False
 
 
@@ -1718,7 +1919,10 @@ def _autostop_overlapping_peers(items, target, *, raw_reason):
             continue
         if peer.get("status") not in RUNNING_STATUSES:
             continue
-        if not _scope_sets_overlap(peer.get("scope", []), target_scope):
+        if not _scope_sets_overlap(
+            _serializing_scope(peer.get("scope", [])),
+            _serializing_scope(target_scope),
+        ):
             continue
 
         # Capture BEFORE mutating: _agent_id_for_queue uses claude-watch's
@@ -1873,6 +2077,67 @@ def cmd_queue_add(args):
     fh, data = _queue_open_locked("rw")
     try:
         items = data["items"]
+
+        # Parse --depends-on (comma-separated) and validate the targets
+        # exist NOW. Each dep is materialized as a `task:<id>` scope token
+        # (added 2026-05-08). The legacy `depends_on` field is no longer
+        # written; the read-time migration in `_queue_open_locked`
+        # translates pre-existing entries on next load.
+        deps_raw = getattr(args, "depends_on", None) or []
+        deps_split: list[str] = []
+        seen_dep = set()
+        for raw in deps_raw:
+            for piece in str(raw).split(","):
+                piece = piece.strip()
+                if not piece:
+                    continue
+                if piece in seen_dep:
+                    continue
+                seen_dep.add(piece)
+                deps_split.append(piece)
+        # Pull any task: tokens already supplied via --scope into the same
+        # bucket so they share validation + dedupe with --depends-on. We
+        # leave them in the scope list either way; dedupe below ensures we
+        # don't double-stamp.
+        scope_task_targets: list[str] = []
+        for tok in scope:
+            tgt = _task_token_target(tok)
+            if tgt and tgt not in seen_dep:
+                seen_dep.add(tgt)
+                scope_task_targets.append(tgt)
+        all_dep_targets = deps_split + scope_task_targets
+        if all_dep_targets:
+            existing_ids_now = {it["id"] for it in items}
+            unknown = [d for d in all_dep_targets if d not in existing_ids_now]
+            if unknown:
+                fcntl.flock(fh, fcntl.LOCK_UN)
+                fh.close()
+                print(
+                    f"ERROR: --depends-on references unknown queue id(s): "
+                    f"{','.join(unknown)}",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+
+        # Materialize --depends-on as task: scope tokens. Append rather
+        # than prepend so user-supplied --scope ordering is preserved as
+        # the head of the list. Skip targets already present as task:
+        # tokens (so --scope task:q-A --depends-on q-A is a no-op union).
+        existing_task_targets = {
+            _task_token_target(t) for t in scope if _is_task_token(t)
+        }
+        for d in deps_split:
+            if d not in existing_task_targets:
+                scope.append(f"task:{d}")
+                existing_task_targets.add(d)
+
+        # Recompute deps_split from scope so downstream display reflects
+        # the canonical dep set (--depends-on entries plus any task:
+        # tokens that came in via --scope).
+        deps_split = [
+            _task_token_target(t) for t in scope if _is_task_token(t)
+        ]
+
         running_conflicts = _running_scope_conflicts(items, scope)
 
         if running_conflicts and not args.force_enqueue:
@@ -1910,34 +2175,6 @@ def cmd_queue_add(args):
         while new_id in existing_ids:
             new_id = _new_id()
 
-        # Parse --depends-on (comma-separated) and validate the targets
-        # exist NOW. Self-deps and unknown ids are rejected at write time;
-        # cycle detection is lazy (read-time) per the architecture brief.
-        deps_raw = getattr(args, "depends_on", None) or []
-        deps_split: list[str] = []
-        seen_dep = set()
-        for raw in deps_raw:
-            for piece in str(raw).split(","):
-                piece = piece.strip()
-                if not piece:
-                    continue
-                if piece in seen_dep:
-                    continue
-                seen_dep.add(piece)
-                deps_split.append(piece)
-        if deps_split:
-            existing_ids_now = {it["id"] for it in items}
-            unknown = [d for d in deps_split if d not in existing_ids_now]
-            if unknown:
-                fcntl.flock(fh, fcntl.LOCK_UN)
-                fh.close()
-                print(
-                    f"ERROR: --depends-on references unknown queue id(s): "
-                    f"{','.join(unknown)}",
-                    file=sys.stderr,
-                )
-                sys.exit(1)
-
         item = {
             "id": new_id,
             "description": args.description,
@@ -1950,10 +2187,6 @@ def cmd_queue_add(args):
             "created_at": _fmt_ts(),
             "created_by": args.created_by or "main-loop",
         }
-        # Self-deps are always rejected at this point (the new id can't be
-        # in existing_ids), so deps_split is safe to attach verbatim.
-        if deps_split:
-            item["depends_on"] = list(deps_split)
         if context is not None:
             item["context"] = context
         items.append(item)
@@ -1966,7 +2199,9 @@ def cmd_queue_add(args):
             key=_sort_key,
         )
         position = next((i + 1 for i, it in enumerate(group_members_sorted) if it["id"] == new_id), -1)
-        ready_now = _item_is_ready(items, item)
+        locked_scopes = data.get("locked_scopes") or {}
+        ready_now = _item_is_ready(items, item, locked_scopes=locked_scopes)
+        lock_blockers = _locked_tokens_blocking_item(item, locked_scopes)
         serialized_after = [it["id"] for it in group_members_sorted if it["id"] != new_id and _sort_key(it) < _sort_key(item)]
         # Also consider in-flight (running or wedged) items in same group
         running_in_group = [it["id"] for it in _group_members(items, group_id) if it.get("status") in RUNNING_STATUSES]
@@ -1997,6 +2232,8 @@ def cmd_queue_add(args):
         spawn_instruction = f"READY: register-and-spawn (session-task queue register {new_id})"
     else:
         parts: list[str] = []
+        if lock_blockers:
+            parts.append("locks: " + ",".join(lock_blockers))
         if dep_blockers:
             parts.append("deps: " + ",".join(dep_blockers))
         if serialized_after:
@@ -2022,6 +2259,7 @@ def cmd_queue_add(args):
             "serialized_after": serialized_after,
             "depends_on": deps_split,
             "dep_blockers": dep_blockers,
+            "lock_blockers": lock_blockers,
             "scope": scope,
             "running_scope_conflicts": running_conflict_info,
             "spawn_instruction": spawn_instruction,
@@ -2031,6 +2269,8 @@ def cmd_queue_add(args):
         print(f"assigned: group={group_id}, position={position}, ready_now={'true' if ready_now else 'false'}, serialized_after={serialized_after}")
         if deps_split:
             print(f"depends_on: {deps_split} (unmet: {dep_blockers})")
+        if lock_blockers:
+            print(f"lock_blockers: {lock_blockers}")
         print(f"spawn_instruction: {spawn_instruction}")
         if running_conflicts:
             # Only reachable via --force-enqueue. Still scream.
@@ -2093,13 +2333,14 @@ def _print_add_conflict_banner(new_scope, running_conflicts):
 def cmd_queue_list(args):
     fh, data = _queue_open_locked("r")
     items = list(data["items"])
+    locked_scopes = data.get("locked_scopes") or {}
     _queue_unlock_readonly(fh)
 
     # Filter
     if args.group:
         items = [it for it in items if it.get("group_id") == args.group]
     if args.ready:
-        items = [it for it in items if _item_is_ready(data["items"], it)]
+        items = [it for it in items if _item_is_ready(data["items"], it, locked_scopes=locked_scopes)]
     elif not args.all:
         # Default view: in-flight items (pending + running + wedged). Wedged
         # included so the operator notices stuck agents at a glance — the
@@ -2151,17 +2392,22 @@ def cmd_queue_list(args):
 def cmd_queue_show(args):
     fh, data = _queue_open_locked("r")
     items = list(data["items"])
+    locked_scopes = data.get("locked_scopes") or {}
     _queue_unlock_readonly(fh)
     for it in items:
         if it["id"] == args.id:
-            ready = _item_is_ready(items, it)
+            ready = _item_is_ready(items, it, locked_scopes=locked_scopes)
             out = dict(it)
             out["ready_now"] = ready
             out["group_scope"] = _group_scope(items, it["group_id"])
+            out["lock_blockers"] = _locked_tokens_blocking_item(it, locked_scopes)
             # Surface dep state + dependents so a single `queue show` is
             # enough to inspect the dependency edges in / out of this item
-            # without re-reading queue.json.
-            deps = list(out.get("depends_on") or [])
+            # without re-reading queue.json. Deps live as `task:<id>` scope
+            # tokens (canonical 2026-05-08+); we expose the legacy
+            # `depends_on` field in the output too so consumers (UI,
+            # tests) keep the same shape.
+            deps = list(_iter_dep_ids(it))
             by_id = {x.get("id"): x for x in items if x.get("id")}
             dep_status = []
             unmet = []
@@ -2175,16 +2421,20 @@ def cmd_queue_show(args):
                     dep_status.append({"id": d, "status": s})
                     if s != "done":
                         unmet.append(d)
+            # Mirror the dep set on the legacy `depends_on` key so existing
+            # UI / tests / scripts keep reading the same field. The on-disk
+            # record stores deps only as task: scope tokens.
+            out["depends_on"] = deps
             out["depends_on_status"] = dep_status
             out["dep_blockers"] = unmet
             out["dep_cycle"] = _has_dep_cycle(items, it["id"]) if deps else False
-            # Reverse-edges: items that name THIS item in their depends_on.
+            # Reverse-edges: items that name THIS item in their deps (via
+            # task: scope token, or legacy depends_on for forward-compat).
             dependents = [
                 x.get("id")
                 for x in items
-                if x.get("id")
-                and isinstance(x.get("depends_on"), list)
-                and it["id"] in x.get("depends_on", [])
+                if x.get("id") and it["id"] in list(_iter_dep_ids(x))
+                and x.get("id") != it["id"]
             ]
             out["dependents"] = dependents
             print(json.dumps(out, indent=2))
@@ -2251,8 +2501,9 @@ def cmd_queue_groups(args):
 def cmd_queue_ready(args):
     fh, data = _queue_open_locked("r")
     items = list(data["items"])
+    locked_scopes = data.get("locked_scopes") or {}
     _queue_unlock_readonly(fh)
-    ready = [it for it in items if _item_is_ready(items, it)]
+    ready = [it for it in items if _item_is_ready(items, it, locked_scopes=locked_scopes)]
     ready.sort(key=_sort_key)
     if args.json:
         print(json.dumps(ready, indent=2))
@@ -2432,6 +2683,7 @@ def cmd_queue_pop(args):
     fh, data = _queue_open_locked("rw")
     try:
         items = data["items"]
+        locked_scopes = data.get("locked_scopes") or {}
         target = None
         if args.id:
             target = next((it for it in items if it["id"] == args.id), None)
@@ -2440,13 +2692,13 @@ def cmd_queue_pop(args):
                 fcntl.flock(fh, fcntl.LOCK_UN)
                 fh.close()
                 sys.exit(1)
-            if not _item_is_ready(items, target):
+            if not _item_is_ready(items, target, locked_scopes=locked_scopes):
                 print(f"not ready: {args.id}", file=sys.stderr)
                 fcntl.flock(fh, fcntl.LOCK_UN)
                 fh.close()
                 sys.exit(1)
         else:
-            ready = [it for it in items if _item_is_ready(items, it)]
+            ready = [it for it in items if _item_is_ready(items, it, locked_scopes=locked_scopes)]
             ready.sort(key=_sort_key)
             if not ready:
                 print("(nothing ready)")
@@ -2461,7 +2713,7 @@ def cmd_queue_pop(args):
         # item got registered through a raced add, or there's an untracked
         # in-flight agent on the same scope (rare but possible). Mirrors the
         # `queue register` invariant so `pop` and `register` behave the same.
-        ok, reasons, conflicts = _spawn_check(items, target)
+        ok, reasons, conflicts = _spawn_check(items, target, locked_scopes=locked_scopes)
         if not ok:
             fcntl.flock(fh, fcntl.LOCK_UN)
             fh.close()
@@ -2499,7 +2751,7 @@ def cmd_queue_pop(args):
     print(json.dumps(popped, indent=2))
 
 
-def _spawn_check(items, item):
+def _spawn_check(items, item, locked_scopes=None):
     """Return (ok, reasons, conflicts) tuple for spawn-gating.
 
     ok (bool):
@@ -2511,21 +2763,43 @@ def _spawn_check(items, item):
     conflicts (list[dict]):
         Running items whose scope overlaps this item's scope (excluding
         the item itself if it's already running).
+
+    locked_scopes (dict|None):
+        Operator-declared lock set (from queue.json `locked_scopes`).
+        If a pending item's scope overlaps any locked token, the spawn
+        is refused with a `lock` reason — distinct from in-flight peers.
     """
     reasons = []
     conflicts = _running_scope_conflicts(
         items, item.get("scope", []), exclude_id=item.get("id"),
     )
 
+    # Manual lock check (added 2026-05-08): a locked scope is an explicit
+    # "park this work" gate. Even if the item is otherwise ready, a lock
+    # forbids spawning. Covers both pending (where _item_is_ready also
+    # returns False) and running edge cases (no-op there since register
+    # already happened — kept here so callers can use spawn-check on
+    # in-flight items defensively).
+    lock_blockers = _locked_tokens_blocking_item(item, locked_scopes)
+    if lock_blockers:
+        reasons.append(
+            "scope is locked: " + ",".join(lock_blockers)
+        )
+
     status = item.get("status")
     if status not in ("pending", "running"):
         reasons.append(f"item status is {status!r} (must be pending or running)")
     elif status == "pending":
-        if not _item_is_ready(items, item):
-            reasons.append(
-                "item is not ready (blocked behind another item in its group "
-                f"{item.get('group_id')!r})"
-            )
+        if not _item_is_ready(items, item, locked_scopes=locked_scopes):
+            # Distinguish lock-blocked from group-head-blocked so the
+            # operator's banner reads cleanly. Lock blockers have already
+            # been captured above; only add the head reason if the item
+            # would otherwise be the head.
+            if not lock_blockers:
+                reasons.append(
+                    "item is not ready (blocked behind another item in its group "
+                    f"{item.get('group_id')!r})"
+                )
 
     # Any cross-group running conflict is a hard reject. Same-group conflicts
     # would be a group-invariant violation (only one running per group).
@@ -2554,6 +2828,7 @@ def _spawn_check(items, item):
 def cmd_queue_spawn_check(args):
     fh, data = _queue_open_locked("r")
     items = list(data["items"])
+    locked_scopes = data.get("locked_scopes") or {}
     _queue_unlock_readonly(fh)
 
     target = next((it for it in items if it["id"] == args.id), None)
@@ -2568,7 +2843,7 @@ def cmd_queue_spawn_check(args):
         print(bar, file=sys.stderr)
         sys.exit(2)
 
-    ok, reasons, conflicts = _spawn_check(items, target)
+    ok, reasons, conflicts = _spawn_check(items, target, locked_scopes=locked_scopes)
     conflict_info = [
         {"id": c["id"], "group_id": c.get("group_id"),
          "status": c.get("status"), "scope": c.get("scope", [])}
@@ -2647,6 +2922,7 @@ def cmd_queue_register(args):
     fh, data = _queue_open_locked("rw")
     try:
         items = data["items"]
+        locked_scopes = data.get("locked_scopes") or {}
         target = next((it for it in items if it["id"] == args.id), None)
         if target is None:
             fcntl.flock(fh, fcntl.LOCK_UN)
@@ -2711,7 +2987,7 @@ def cmd_queue_register(args):
             print(bar, file=sys.stderr)
             sys.exit(2)
 
-        ok, reasons, conflicts = _spawn_check(items, target)
+        ok, reasons, conflicts = _spawn_check(items, target, locked_scopes=locked_scopes)
         if not ok:
             fcntl.flock(fh, fcntl.LOCK_UN)
             fh.close()
@@ -3486,20 +3762,21 @@ def cmd_queue_depend(args):
 
     `session-task queue depend <id> [--add q-AAA] [--remove q-BBB] [--clear]`
 
-    Adjacency-list storage: each pending/running item has ``depends_on:
-    list[str]`` — a set of queue ids it's blocked on. ``ready_now()``
-    flips True only when every dep is ``done``. Cross-group deps are
-    allowed (Andrew 2026-05-02: "explicit specific interjob dependencies
-    (human or bot defined)").
+    Storage (since 2026-05-08): each dep is stored as a `task:<id>` scope
+    token on the dragged item. The legacy `depends_on` field is no longer
+    written; the read-time migration in `_queue_open_locked` translates
+    pre-existing entries on next load. `ready_now` flips True only when
+    every dep is `done`. Cross-group deps are allowed.
 
     Architecture (per Andrew's perf brief): WRITE is just a set
     add/remove on the dragged item. NO transitive-closure cache, NO
     cascade work. Cycles are detected lazily on READ via
     ``_has_dep_cycle``.
 
-    --add / --remove accept comma-separated id lists. --clear wipes the
-    set. Done/abandoned items can't acquire new deps (the deps would be
-    moot — the item is already terminal).
+    --add / --remove accept comma-separated id lists. --clear wipes ALL
+    task: scope tokens (regular scope tokens are preserved). Done/
+    abandoned items can't acquire new deps (the deps would be moot — the
+    item is already terminal).
     """
     add_raw = list(getattr(args, "add", None) or [])
     remove_raw = list(getattr(args, "remove", None) or [])
@@ -3564,22 +3841,33 @@ def cmd_queue_depend(args):
             )
             sys.exit(1)
 
-        before = list(target.get("depends_on") or [])
+        before = list(_iter_dep_ids(target))
+        # Split the target's scope into task: tokens vs everything else
+        # so we can rebuild the task-token slice without disturbing the
+        # rest. --clear wipes only task: tokens; regular scope is left
+        # intact.
+        non_task_scope = [
+            t for t in (target.get("scope") or []) if not _is_task_token(t)
+        ]
         if do_clear:
-            after: list[str] = []
+            after_deps: list[str] = []
         else:
-            after = list(before)
+            after_deps = list(before)
 
         # Removes first, then adds — so `--add x --remove x` is a no-op
         # rather than a delete (callers passing both for the same id is
         # almost certainly a mistake but we don't bake in surprises).
         if to_remove:
-            after = [d for d in after if d not in set(to_remove)]
+            after_deps = [d for d in after_deps if d not in set(to_remove)]
         for a in to_add:
-            if a not in after:
-                after.append(a)
+            if a not in after_deps:
+                after_deps.append(a)
 
-        target["depends_on"] = after
+        # Rewrite scope: regular tokens first (preserves user ordering),
+        # then task: tokens in dep order. Drop the legacy field if a
+        # migration left it lingering.
+        target["scope"] = non_task_scope + [f"task:{d}" for d in after_deps]
+        target.pop("depends_on", None)
         target["depends_on_updated_at"] = _fmt_ts()
         _queue_write_and_unlock(fh, data)
     except Exception:
@@ -3593,16 +3881,21 @@ def cmd_queue_depend(args):
     # Re-read to compute ready_now under the new edge set.
     fh2, data2 = _queue_open_locked("r")
     items2 = list(data2["items"])
+    locked_scopes2 = data2.get("locked_scopes") or {}
     _queue_unlock_readonly(fh2)
     fresh = next((it for it in items2 if it["id"] == args.id), None)
-    ready = _item_is_ready(items2, fresh) if fresh else False
-    cycle = _has_dep_cycle(items2, args.id) if (fresh and fresh.get("depends_on")) else False
+    ready = _item_is_ready(items2, fresh, locked_scopes=locked_scopes2) if fresh else False
+    cycle = (
+        _has_dep_cycle(items2, args.id)
+        if (fresh and list(_iter_dep_ids(fresh)))
+        else False
+    )
 
     if getattr(args, "json", False):
         print(json.dumps(
             {
                 "id": args.id,
-                "depends_on": after,
+                "depends_on": after_deps,
                 "added": to_add,
                 "removed": to_remove,
                 "cleared": do_clear,
@@ -3614,7 +3907,7 @@ def cmd_queue_depend(args):
     else:
         print(f"deps updated: {args.id}")
         print(f"  before : {before}")
-        print(f"  after  : {after}")
+        print(f"  after  : {after_deps}")
         if cycle:
             print(
                 "  WARNING: dependency cycle reachable from this item; "
@@ -3717,8 +4010,9 @@ def cmd_queue_prune(args):
 def cmd_queue_banner(args):
     fh, data = _queue_open_locked("r")
     items = list(data["items"])
+    locked_scopes = data.get("locked_scopes") or {}
     _queue_unlock_readonly(fh)
-    ready = [it for it in items if _item_is_ready(items, it)]
+    ready = [it for it in items if _item_is_ready(items, it, locked_scopes=locked_scopes)]
     ready.sort(key=_sort_key)
     pending = [it for it in items if it.get("status") == "pending"]
     running = [it for it in items if it.get("status") == "running"]
@@ -3754,12 +4048,14 @@ def cmd_queue_banner(args):
     else:
         lines.append("  (no items are READY -- everything is blocked on a running peer or unblocked below)")
 
-    waiting = [it for it in pending if not _item_is_ready(items, it)]
+    waiting = [it for it in pending if not _item_is_ready(items, it, locked_scopes=locked_scopes)]
     if waiting:
         lines.append("")
         lines.append(f"  Waiting behind a group peer: {len(waiting)} item(s)")
     if running:
         lines.append(f"  In progress (running): {len(running)} item(s)")
+    if locked_scopes:
+        lines.append(f"  Locked scopes: {len(locked_scopes)} (see `session-task queue locks`)")
 
     lines.append("#" * 60)
     lines.append("")
@@ -3833,6 +4129,158 @@ def _parse_legacy_queue(text):
         scope = _infer_scope_from_text(full)
         items.append((desc, scope, body))
     return items
+
+
+# ---------------------------------------------------------------------------
+# Manual scope locks (added 2026-05-08)
+#
+# A "lock" is an operator-declared scope token that pauses any pending
+# queue item whose scope overlaps it. Use case: queue a follow-up task
+# that depends on a real-world condition (a hardware install, a manual
+# config change, an out-of-band review) and don't want it to spawn until
+# the operator says go. Distinct from `--depends-on` (which waits on
+# another queue item) and from in-flight scope conflicts (which clear
+# automatically when the running item finishes).
+#
+# Workflow:
+#     session-task queue lock <scope> --reason "wait for hardware"
+#     session-task queue add "..." --scope <scope> --summary "..."
+#     # ... real-world condition met ...
+#     session-task queue unlock <scope>
+#
+# Stored in queue.json under `locked_scopes`, so the lock survives
+# /clear, restart, compaction, and process death.
+# ---------------------------------------------------------------------------
+
+
+def cmd_queue_lock(args):
+    """Add <scope> to the locked-scopes set."""
+    scope = _normalize_token(args.scope)
+    reason = (args.reason or "").strip()
+    fh, data = _queue_open_locked("rw")
+    try:
+        locked = data.get("locked_scopes") or {}
+        was_locked = scope in locked
+        prev_reason = locked.get(scope, {}).get("reason", "") if was_locked else ""
+        prev_locked_at = locked.get(scope, {}).get("locked_at", "") if was_locked else ""
+        if was_locked:
+            # Idempotent: keep the original locked_at; refresh reason only if
+            # a new one was passed (otherwise leave prior reason untouched).
+            new_reason = reason or prev_reason
+            locked[scope] = {
+                "reason": new_reason,
+                "locked_at": prev_locked_at or _fmt_ts(),
+            }
+        else:
+            locked[scope] = {"reason": reason, "locked_at": _fmt_ts()}
+        data["locked_scopes"] = locked
+        _queue_write_and_unlock(fh, data)
+    except Exception:
+        try:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+            fh.close()
+        except Exception:
+            pass
+        raise
+
+    if args.json:
+        print(json.dumps({
+            "scope": scope,
+            "reason": locked[scope]["reason"],
+            "locked_at": locked[scope]["locked_at"],
+            "already_locked": was_locked,
+        }, indent=2))
+        return
+
+    if was_locked:
+        print(f"already locked: {scope} (locked_at={locked[scope]['locked_at']})")
+        if reason and reason != prev_reason:
+            print(f"  reason updated: {reason!r}")
+    else:
+        print(f"locked: {scope}")
+        if reason:
+            print(f"  reason: {reason}")
+        print(f"  locked_at: {locked[scope]['locked_at']}")
+
+
+def cmd_queue_unlock(args):
+    """Remove <scope> from the locked-scopes set.
+
+    No-op (exit 0) if the scope wasn't locked. Items previously
+    blocked-only-by-the-lock become ready immediately on the next
+    readiness evaluation.
+    """
+    scope = _normalize_token(args.scope)
+    fh, data = _queue_open_locked("rw")
+    try:
+        locked = data.get("locked_scopes") or {}
+        was_locked = scope in locked
+        prev = locked.pop(scope, None)
+        data["locked_scopes"] = locked
+        _queue_write_and_unlock(fh, data)
+    except Exception:
+        try:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+            fh.close()
+        except Exception:
+            pass
+        raise
+
+    if args.json:
+        print(json.dumps({
+            "scope": scope,
+            "was_locked": was_locked,
+            "previous_reason": (prev or {}).get("reason", "") if prev else "",
+            "previous_locked_at": (prev or {}).get("locked_at", "") if prev else "",
+        }, indent=2))
+        return
+
+    if was_locked:
+        print(f"unlocked: {scope}")
+    else:
+        print(f"not locked: {scope} (no-op)")
+
+
+def cmd_queue_locks(args):
+    """List currently locked scopes."""
+    fh, data = _queue_open_locked("r")
+    locked = dict(data.get("locked_scopes") or {})
+    items = list(data["items"])
+    _queue_unlock_readonly(fh)
+
+    rows = []
+    for scope, meta in sorted(locked.items()):
+        # Count pending items currently parked behind this lock.
+        held = 0
+        for it in items:
+            if it.get("status") != "pending":
+                continue
+            if scope in _locked_tokens_blocking_item(it, {scope: meta}):
+                held += 1
+        rows.append({
+            "scope": scope,
+            "reason": (meta or {}).get("reason", ""),
+            "locked_at": (meta or {}).get("locked_at", ""),
+            "items_held": held,
+        })
+
+    if args.json:
+        print(json.dumps(rows, indent=2))
+        return
+
+    if not rows:
+        print("(no locked scopes)")
+        return
+
+    print(f"{'SCOPE':40} {'LOCKED_AT':32} {'HELD':4} REASON")
+    for r in rows:
+        scope_str = r["scope"]
+        if len(scope_str) > 39:
+            scope_str = scope_str[:36] + "..."
+        print(
+            f"{scope_str:40} {r['locked_at']:32} {r['items_held']:<4} "
+            f"{r['reason']}"
+        )
 
 
 def cmd_queue_migrate(args):
@@ -4009,10 +4457,14 @@ def build_parser():
         action="append",
         default=[],
         help=(
-            "Queue id(s) this new item is blocked on. Adjacency-set storage "
-            "(no transitive closure). Each dep must be a known queue id at "
-            "add time; ready_now flips True only when every dep is 'done'. "
-            "Comma-separated values and repeated flags both work."
+            "Queue id(s) this new item is blocked on. Sugar for adding "
+            "`task:<id>` scope tokens (the canonical surface as of "
+            "2026-05-08): each dep is materialized as a `task:<id>` token "
+            "in scope. Each dep must be a known queue id at add time; "
+            "ready_now flips True only when every dep is 'done'. The "
+            "lock machinery operates on the same tokens, so "
+            "`queue lock task:<id>` parks every pending item depending "
+            "on <id>. Comma-separated values and repeated flags both work."
         ),
     )
     q_add.add_argument("--json", action="store_true")
@@ -4213,9 +4665,10 @@ def build_parser():
         "depend",
         help=(
             "Edit explicit interjob dependencies on a queue item. "
-            "depends_on is an adjacency set of queue ids; ready_now flips "
-            "True only when every dep is in 'done' state. "
-            "Cross-group deps allowed."
+            "Stored (since 2026-05-08) as `task:<id>` scope tokens; "
+            "ready_now flips True only when every dep is in 'done' state. "
+            "Cross-group deps allowed. --clear strips only task: tokens "
+            "(regular scope is preserved)."
         ),
     )
     q_depend.add_argument("id")
@@ -4249,6 +4702,39 @@ def build_parser():
     q_prune.add_argument("-n", "--dry-run", action="store_true")
 
     qsub.add_parser("banner", help="Top-5 ready items banner")
+
+    # Manual scope locks (added 2026-05-08).
+    q_lock = qsub.add_parser(
+        "lock",
+        help=(
+            "Park any pending item whose scope overlaps <scope> until the "
+            "scope is unlocked. Use to enqueue work that depends on a "
+            "real-world condition (hardware install, manual config, etc.)."
+        ),
+    )
+    q_lock.add_argument("scope", help="Scope token to lock (same syntax as --scope on `queue add`)")
+    q_lock.add_argument(
+        "--reason",
+        help="Free-form note describing why the scope is locked. Surfaces in `queue locks`.",
+    )
+    q_lock.add_argument("--json", action="store_true")
+
+    q_unlock = qsub.add_parser(
+        "unlock",
+        help=(
+            "Remove <scope> from the locked-scopes set. Items previously "
+            "blocked-only-by-the-lock become ready immediately. No-op (exit 0) "
+            "if the scope was not locked."
+        ),
+    )
+    q_unlock.add_argument("scope", help="Scope token to unlock")
+    q_unlock.add_argument("--json", action="store_true")
+
+    q_locks = qsub.add_parser(
+        "locks",
+        help="List currently locked scopes with reason, lock timestamp, and held-item count.",
+    )
+    q_locks.add_argument("--json", action="store_true")
 
     q_mig = qsub.add_parser("migrate", help="Parse legacy /tmp/claude-queued-tasks.txt")
     q_mig.add_argument("--from", dest="from_file", required=True)
@@ -4309,6 +4795,9 @@ def main():
             "depend": cmd_queue_depend,
             "prune": cmd_queue_prune,
             "banner": cmd_queue_banner,
+            "lock": cmd_queue_lock,
+            "unlock": cmd_queue_unlock,
+            "locks": cmd_queue_locks,
             "migrate": cmd_queue_migrate,
         }
         fn = qmap.get(args.qcmd)
