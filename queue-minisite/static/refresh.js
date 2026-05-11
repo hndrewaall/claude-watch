@@ -1,0 +1,603 @@
+// Live refresh tick for the queue minisite.
+//
+// Strategy: every REFRESH_MS we GET /api/queue, build a fresh DOM tree
+// from the JSON in memory, then morphdom-merge it into the live page.
+// Morphdom only touches changed nodes — open modals, in-progress drags,
+// <details> expansion, scroll position, and focus all survive a tick.
+//
+// The Jinja template renders the canonical first paint server-side. This
+// script's buildXxx() functions mirror that markup exactly so the merge
+// is a no-op on unchanged items. Anything that affects the visible UI
+// (data-* attrs, classes, button text, badges) MUST be reflected in
+// both places — see templates/index.html § sections RUNNING/PENDING/
+// DONE/ABANDONED for the source of truth.
+//
+// Escape hatches:
+//   - data-no-morph attribute on an element causes morphdom to skip it
+//     entirely (used on the action-modal and log-modal so they survive
+//     refreshes; both live OUTSIDE #queue-root, so this is belt + braces).
+//   - Elements with an active drag (.dragging) or active drop-target
+//     highlight (.drop-target) are skipped during the merge so a
+//     drag-in-progress isn't rug-pulled by a refresh that lands mid-
+//     gesture.
+//   - <details> open state is explicitly preserved: if the live element
+//     is open, we set the new element open before morphdom diffs them.
+//   - Scroll position is window-level on this page (the .queue-list
+//     containers grow with content rather than scrolling internally), so
+//     no per-section scroll capture is needed — morphdom touches the
+//     subtree without re-laying out the document.
+//
+// On totals/error change we still run the same merge — no full
+// `location.reload()` anymore. The previous behavior (reload on count
+// change) was the disruption Andrew flagged: any open modal would close,
+// scroll position would jump, drag would abort. This rewrite eliminates
+// all of that.
+
+(function () {
+  'use strict';
+  const REFRESH_MS = 5000;
+
+  // Lookup once. The element is required — if it's absent, refresh is a
+  // no-op (avoids throwing on partial DOMs / template rebuilds).
+  const queueRoot = document.getElementById('queue-root');
+  const topbarMeta = document.getElementById('topbar-meta');
+  if (!queueRoot) return;
+
+  // ---------------------------------------------------------------------
+  // HTML escape — we build markup as strings (template-literal style)
+  // because it's easier to keep in lockstep with the Jinja template than
+  // a verbose createElement() ladder. All user-supplied content goes
+  // through esc(); attribute values that may contain quotes go through
+  // attr().
+  // ---------------------------------------------------------------------
+  function esc(s) {
+    if (s === null || s === undefined) return '';
+    return String(s)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;');
+  }
+  function attr(s) {
+    if (s === null || s === undefined) return '';
+    return String(s)
+      .replace(/&/g, '&amp;')
+      .replace(/"/g, '&quot;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;');
+  }
+
+  // ---------------------------------------------------------------------
+  // Section renderers — mirror templates/index.html block-for-block.
+  // Returning HTML strings keeps the diff with the template easy to
+  // eyeball. The outer section element gets a stable id (#section-X) so
+  // morphdom keys the merge correctly.
+  // ---------------------------------------------------------------------
+
+  function renderRunningItem(it) {
+    const owner = it.owner || {};
+    const isStarting = !!it.is_starting;
+    const workloadLabel = it.workload_label || '';
+    const isWorkload = workloadLabel.length > 0;
+    // Workload-bound items render as RUNNING (not starting) regardless of
+    // active-agents.json — they are tailing /tmp/claude-workloads/<label>.output,
+    // not waiting on a subagent JSONL. Orphan badging is also suppressed
+    // for workloads since active-agents tracks subagents, not workload procs.
+    const ownerAlive = owner.alive;
+    const orphan = ownerAlive === false && !isStarting && !isWorkload;
+    const stateCls = (isStarting && !isWorkload) ? 'state-starting' : 'state-running';
+    const isClickable = !isStarting || isWorkload;
+    const cardClasses = [
+      'item',
+      stateCls,
+      'drop-zone',
+      isClickable ? 'log-clickable' : '',
+      orphan ? 'orphan' : '',
+    ].filter(Boolean).join(' ');
+    const startingFlag = (isStarting && !isWorkload) ? '1' : '0';
+    const logMode = isWorkload ? 'workload' : 'live';
+    const logKindLabel = isWorkload ? 'workload' : 'live';
+    const logModeAttr = isClickable
+      ? `data-log-mode="${logMode}" tabindex="0" role="button" aria-label="View ${logKindLabel} log for ${attr(it.id)}" title="Click to view ${isWorkload ? 'workload output' : 'live log'}. Drop a pending item here to set this as its dependency."`
+      : `aria-label="Starting: agent spawning for ${attr(it.id)}" title="Agent spawning — live log unavailable until first event."`;
+    const workloadAttr = isWorkload ? ` data-workload-label="${attr(workloadLabel)}"` : '';
+
+    let head = '';
+    if (isStarting && !isWorkload) {
+      head += '<span class="badge state-starting" title="registered, waiting for agent to emit first event">starting</span>';
+    } else {
+      head += '<span class="badge state-running">running</span>';
+    }
+    if (isWorkload) {
+      head += `<span class="badge workload-badge" title="workload-bound: tails /tmp/claude-workloads/${attr(workloadLabel)}.output">workload</span>`;
+    }
+    if (orphan) head += '<span class="badge state-orphan">orphan</span>';
+    if (it.group_head) head += '<span class="badge ghead" title="head of serialization group">head</span>';
+    head += `<span class="id">${esc(it.id)}</span>`;
+    head += `<span class="prio" title="priority">p${esc(it.priority)}</span>`;
+    head += `<button type="button" class="action-btn stop-btn" data-action="stop" data-id="${attr(it.id)}" data-summary="${attr(it.summary)}" title="Stop this running item">stop</button>`;
+
+    const startedIso = it.started_at_iso || '';
+    const ageLabel = (isStarting && !isWorkload) ? 'registered' : 'running';
+    let ageBlock = '';
+    ageBlock += `<span ${startedIso ? `data-local-time-iso="${attr(startedIso)}" data-local-time-title-only` : ''} title="${attr(startedIso)}">${esc(ageLabel)} ${esc(it.age)}</span>`;
+    ageBlock += '<span class="sep">·</span>';
+    if (isWorkload) {
+      ageBlock += `<span title="workload output tail: /tmp/claude-workloads/${attr(workloadLabel)}.output">workload ${esc(workloadLabel)}</span>`;
+    } else if (isStarting) {
+      ageBlock += '<span class="agent-spawning" title="queue item registered, waiting for agent\'s first JSONL event"><span class="spinner" aria-hidden="true"></span>agent spawning…</span>';
+    } else if (owner.mode === 'agent') {
+      const aid = owner.agent_id || '';
+      const aliveTxt = owner.alive ? 'alive' : 'STALE';
+      ageBlock += `<span title="claude-watch agent transcript mtime (${attr(aid)})">agent ${esc(aid.slice(0, 12))} ${esc(aliveTxt)} (${esc(owner.jsonl_age || '?')})</span>`;
+    } else {
+      ageBlock += '<span title="no matching agent record in claude-watch state">owner unknown</span>';
+    }
+    if (it.created_by) ageBlock += `<span class="sep">·</span><span>by ${esc(it.created_by)}</span>`;
+
+    let scope = '';
+    if (it.scope && it.scope.length) {
+      scope = '<div class="scope">' +
+        it.scope.map((s) => `<span class="chip">${esc(s)}</span>`).join('') +
+        '</div>';
+    }
+
+    let prompt = '';
+    if (it.description) {
+      prompt = '<details class="prompt-toggle">' +
+        `<summary class="prompt-summary">Prompt (${esc(it.description.length)} chars)</summary>` +
+        `<pre class="prompt-body">${esc(it.description)}</pre>` +
+        '</details>';
+    }
+
+    return (
+      `<article class="${cardClasses}" data-queue-id="${attr(it.id)}" data-queue-status="running" data-queue-starting="${startingFlag}" data-queue-summary="${attr(it.summary)}" data-queue-description="${attr(it.description)}" data-agent-id="${attr(owner.agent_id || '')}"${workloadAttr} ${logModeAttr}>` +
+      `<header class="item-head">${head}</header>` +
+      `<p class="summary">${esc(it.summary)}</p>` +
+      `<div class="age">${ageBlock}</div>` +
+      scope +
+      prompt +
+      '</article>'
+    );
+  }
+
+  function renderPendingItem(it) {
+    // Markup MUST mirror the pending block in templates/index.html. Any
+    // drift will cause morphdom to flap on every tick (server's first
+    // paint differs from JS-rendered re-render → diff → repaint), and
+    // can also drop affordances mid-session (Bug q-55b6: previous
+    // version of this function omitted the force-start button + the
+    // dep-link anchor / dep-remove-btn structure; first refresh after
+    // server-rendered initial paint silently stripped them).
+    //
+    // ``ready`` class + ``ready`` badge are gated on the BACKEND's
+    // ``ready_now`` field (group-head AND every depends_on resolved to
+    // ``done``). The older ``group_head`` flag was FIFO-only and ignored
+    // depends_on (Bug q-1b89).
+    const cardClasses = [
+      'item',
+      'state-pending',
+      'drop-zone',
+      'draggable',
+      it.ready_now ? 'ready' : '',
+      (it.depends_on && it.depends_on.length) ? 'has-deps' : '',
+    ].filter(Boolean).join(' ');
+
+    let head = '';
+    head += '<span class="badge state-pending">pending</span>';
+    if (it.ready_now) head += '<span class="badge ghead" title="ready to spawn (group head, all deps done)">ready</span>';
+    head += `<span class="id">${esc(it.id)}</span>`;
+    head += `<span class="prio" title="priority">p${esc(it.priority)}</span>`;
+    if (it.depends_on && it.depends_on.length) {
+      for (const dep of it.depends_on) {
+        // Each dep is a clickable anchor (jumps to the target row)
+        // with an "x" affordance to remove the edge via DELETE — must
+        // match the Jinja template's structure so the page-level click
+        // handlers (.dep-link, .dep-remove-btn) keep working after a
+        // morphdom merge.
+        head += `<span class="badge dep-badge" title="depends on ${attr(dep)} — click to scroll, x to remove">` +
+          `<a class="dep-link" href="#queue-${attr(dep)}" data-dep-target="${attr(dep)}">&rarr; ${esc(dep)}</a>` +
+          `<button type="button" class="dep-remove-btn" data-dep-source="${attr(it.id)}" data-dep-target="${attr(dep)}" title="Remove this dependency" aria-label="Remove dependency on ${attr(dep)}">&times;</button>` +
+          `</span>`;
+      }
+    }
+    head += '<span class="drag-handle" aria-hidden="true" title="drag to set dependency">&#x2630;</span>';
+    head += `<button type="button" class="action-btn force-start-btn" data-action="force-start" data-id="${attr(it.id)}" data-summary="${attr(it.summary)}" title="Override scope-conflict serialization and promote to running">force start</button>`;
+    head += `<button type="button" class="action-btn abandon-btn" data-action="abandon" data-id="${attr(it.id)}" data-summary="${attr(it.summary)}" title="Remove this pending item from the queue">abandon</button>`;
+
+    const createdIso = it.created_at_iso || '';
+    let ageBlock = `<span ${createdIso ? `data-local-time-iso="${attr(createdIso)}" data-local-time-title-only` : ''} title="${attr(createdIso)}">created ${esc(it.age)}</span>`;
+    if (it.created_by) ageBlock += `<span class="sep">·</span><span>by ${esc(it.created_by)}</span>`;
+
+    let scope = '';
+    if (it.scope && it.scope.length) {
+      scope = '<div class="scope">' +
+        it.scope.map((s) => `<span class="chip">${esc(s)}</span>`).join('') +
+        '</div>';
+    }
+
+    let prompt = '';
+    if (it.description) {
+      prompt = '<details class="prompt-toggle">' +
+        `<summary class="prompt-summary">Prompt (${esc(it.description.length)} chars)</summary>` +
+        `<pre class="prompt-body">${esc(it.description)}</pre>` +
+        '</details>';
+    }
+
+    return (
+      `<article id="queue-${attr(it.id)}" class="${cardClasses}" draggable="true" data-queue-id="${attr(it.id)}" data-queue-status="pending" data-queue-summary="${attr(it.summary)}" title="Drag onto another item to set as dependency">` +
+      `<header class="item-head">${head}</header>` +
+      `<p class="summary">${esc(it.summary)}</p>` +
+      `<div class="age">${ageBlock}</div>` +
+      scope +
+      prompt +
+      '</article>'
+    );
+  }
+
+  function renderTerminalItem(it, status) {
+    // Shared renderer for done + abandoned. They differ only in:
+    //   - badge text + class
+    //   - age anchor (completed_at_iso / abandoned_at_iso)
+    //   - aria-label phrasing (archived log link)
+    //   - abandoned has an optional reason paragraph
+    const isDone = status === 'done';
+    const stateCls = isDone ? 'state-done' : 'state-abandoned';
+    const badgeTxt = isDone ? 'done' : 'abandoned';
+    const cardClasses = [
+      'item',
+      stateCls,
+      it.has_archive ? 'log-clickable' : '',
+    ].filter(Boolean).join(' ');
+    const archiveAttr = it.has_archive
+      ? `data-log-mode="archive" tabindex="0" role="button" aria-label="View archived log for ${attr(it.id)}" title="Click to view archived log."`
+      : '';
+
+    let head = `<span class="badge ${stateCls}">${esc(badgeTxt)}</span>` +
+      `<span class="id">${esc(it.id)}</span>`;
+    if (it.has_archive) {
+      head += '<span class="badge log-badge" title="archived agent transcript available">log</span>';
+    }
+
+    const anchorIso = isDone ? it.completed_at_iso : it.abandoned_at_iso;
+    const anchorLabel = isDone ? 'completed' : 'abandoned';
+    let ageBlock = `<span ${anchorIso ? `data-local-time-iso="${attr(anchorIso)}" data-local-time-title-only` : ''} title="${attr(anchorIso || '')}">${esc(anchorLabel)} ${esc(it.age)}</span>`;
+    if (it.created_by) ageBlock += `<span class="sep">·</span><span>by ${esc(it.created_by)}</span>`;
+
+    let reasonHtml = '';
+    if (!isDone && it.abandon_reason) {
+      reasonHtml = `<p class="description">${esc(it.abandon_reason)}</p>`;
+    }
+
+    let prompt = '';
+    if (it.description) {
+      prompt = '<details class="prompt-toggle">' +
+        `<summary class="prompt-summary">Prompt (${esc(it.description.length)} chars)</summary>` +
+        `<pre class="prompt-body">${esc(it.description)}</pre>` +
+        '</details>';
+    }
+
+    return (
+      `<article class="${cardClasses}" data-queue-id="${attr(it.id)}" data-queue-status="${attr(status)}" data-queue-summary="${attr(it.summary)}" data-queue-description="${attr(it.description)}" ${archiveAttr}>` +
+      `<header class="item-head">${head}</header>` +
+      `<p class="summary">${esc(it.summary)}</p>` +
+      reasonHtml +
+      `<div class="age">${ageBlock}</div>` +
+      prompt +
+      '</article>'
+    );
+  }
+
+  function renderRunningSection(state) {
+    const totals = state.totals || {};
+    const items = state.running || [];
+    let body = '';
+    if (!items.length) {
+      body = '<div class="empty-mini">No running items.</div>';
+    }
+    body += items.map(renderRunningItem).join('');
+    return (
+      `<section id="section-running">` +
+      `<h2 class="section-title">Running <span class="section-count">${esc(totals.running ?? items.length)}</span></h2>` +
+      body +
+      '</section>'
+    );
+  }
+
+  function renderPendingSection(state) {
+    const totals = state.totals || {};
+    const items = state.pending || [];
+    let body = '';
+    if (!items.length) {
+      body = '<div class="empty-mini">No pending items.</div>';
+    }
+    body += items.map(renderPendingItem).join('');
+    return (
+      `<section id="section-pending">` +
+      `<h2 class="section-title">Pending <span class="section-count">${esc(totals.pending ?? items.length)}</span></h2>` +
+      body +
+      '</section>'
+    );
+  }
+
+  function renderDoneSection(state) {
+    const totals = state.totals || {};
+    const items = state.done_recent || [];
+    let body = '';
+    if (!items.length) {
+      body = '<div class="empty-mini">No completed items.</div>';
+    }
+    body += items.map((it) => renderTerminalItem(it, 'done')).join('');
+    return (
+      `<section id="section-done">` +
+      `<h2 class="section-title">Done <span class="section-count">${esc(items.length)} / ${esc(totals.done ?? 0)}</span></h2>` +
+      body +
+      '</section>'
+    );
+  }
+
+  function renderAbandonedSection(state) {
+    const totals = state.totals || {};
+    const items = state.abandoned_recent || [];
+    let body = '';
+    if (!items.length) {
+      body = '<div class="empty-mini">No abandoned items.</div>';
+    }
+    body += items.map((it) => renderTerminalItem(it, 'abandoned')).join('');
+    return (
+      `<section id="section-abandoned">` +
+      `<h2 class="section-title">Abandoned <span class="section-count">${esc(items.length)} / ${esc(totals.abandoned ?? 0)}</span></h2>` +
+      body +
+      '</section>'
+    );
+  }
+
+  function buildQueueDOM(state) {
+    // Build a detached <main> with the four sections in order. The merge
+    // target is the live <main id="queue-root"> so we wrap in the same
+    // tag + id.
+    const html =
+      `<main id="queue-root">` +
+      renderRunningSection(state) +
+      renderPendingSection(state) +
+      renderDoneSection(state) +
+      renderAbandonedSection(state) +
+      '</main>';
+    const tpl = document.createElement('template');
+    tpl.innerHTML = html;
+    return tpl.content.firstElementChild;
+  }
+
+  function buildTopbarMetaDOM(state) {
+    // Topbar count pills + dot + timestamp. The Info button (dropdown)
+    // is OUTSIDE this element (it lives next to .meta as a sibling) so
+    // we can rebuild .meta freely without disturbing the dropdown's
+    // open state.
+    //
+    // Wait — re-read template: the .info-wrap IS inside .meta. We must
+    // preserve it. Simplest: re-render the count/dot/ts as the first
+    // children of a fresh .meta, then append a CLONE of the live
+    // .info-wrap so morphdom sees a matching child (id=info-toggle / id=
+    // info-dropdown are stable). Morphdom keys by id for the
+    // info-dropdown so its hidden state is preserved naturally.
+    const totals = state.totals || {};
+    const startingCount = state.starting_count || 0;
+    const orphanCount = state.orphan_count || 0;
+    const fetchedAt = state.fetched_at || '';
+    const cacheAge = state.cache_age_seconds;
+    const errorTxt = state.error;
+
+    let html = '';
+    html += `<span class="count count-running" title="running items">${esc(totals.running ?? 0)} running</span>`;
+    if (startingCount) {
+      html += `<span class="count count-starting" title="registered but agent not yet emitting events">${esc(startingCount)} starting</span>`;
+    }
+    html += `<span class="count count-pending" title="pending items">${esc(totals.pending ?? 0)} pending</span>`;
+    if (orphanCount) {
+      html += `<span class="count count-orphan" title="running items with no live owner">${esc(orphanCount)} orphan</span>`;
+    }
+    html += `<span class="dot ${errorTxt ? 'dot-err' : 'dot-ok'}" title="${errorTxt ? 'fetch error' : 'live'}"></span>`;
+    const tsAttrs = fetchedAt
+      ? ` data-local-time-iso="${attr(fetchedAt)}" data-local-time-fmt="time" data-local-time-tooltip`
+      : '';
+    const tsText = fetchedAt
+      ? `${esc(fetchedAt.substring(11, 19))}Z`
+      : '—';
+    html += `<span class="ts" title="last fetch"${tsAttrs}>${tsText}</span>`;
+
+    // Re-attach the existing info-wrap (so Info dropdown state survives).
+    // We append a string sentinel that morphdom's DOM diff will replace
+    // with the live element via the onBeforeElUpdated hook. Simpler:
+    // include the wrap markup with the SAME ids; morphdom matches by id
+    // and preserves the hidden attr from the destination element.
+    // BUT: open/closed state is driven by `hidden` attr only; if we
+    // emit `hidden` here then morphdom will set `hidden` on the live
+    // dropdown (closing it). We instead leave info-dropdown OFF
+    // entirely from the merge by extracting it from the target before
+    // merging — see onBeforeElUpdated below.
+    html += `<div class="info-wrap">` +
+      `<button type="button" id="info-toggle" class="info-btn" aria-haspopup="true" aria-expanded="false" aria-controls="info-dropdown" title="session info">ⓘ</button>` +
+      `<div id="info-dropdown" class="info-dropdown" role="menu" aria-labelledby="info-toggle" hidden>` +
+      `<div class="info-row"><span class="info-label">user</span><span class="info-value">—</span></div>` +
+      `<div class="info-row"><span class="info-label">cache</span><span class="info-value"><span class="cache-age">${esc(cacheAge !== undefined && cacheAge !== null ? cacheAge : '?')}</span>s</span></div>` +
+      `<div class="info-row"><span class="info-label">api</span><span class="info-value"><a href="/api/queue">/api/queue</a></span></div>` +
+      `</div></div>`;
+
+    const wrapper = document.createElement('div');
+    wrapper.className = 'meta';
+    wrapper.id = 'topbar-meta';
+    wrapper.innerHTML = html;
+    return wrapper;
+  }
+
+  // ---------------------------------------------------------------------
+  // Morphdom merge — single entry point per-tree.
+  //
+  // Skip rules (onBeforeElUpdated):
+  //   - `data-no-morph` attribute — entire subtree skipped.
+  //   - `.dragging` class — drag in progress, leave it alone.
+  //   - `.drop-target` class — drop highlight active, ditto.
+  //   - `#log-modal`, `#action-modal` — defensive (also tagged data-no-morph).
+  //   - `#info-dropdown` — preserve open/hidden state across ticks.
+  //   - <details> open: preserve from-element's open state.
+  //   - <input>/<textarea>/<select>: preserve user input value + focus
+  //     across the merge (morphdom doesn't update form values by default
+  //     for elements with a typed value, but be explicit).
+  // ---------------------------------------------------------------------
+  function shouldSkipElement(fromEl) {
+    if (!(fromEl instanceof Element)) return false;
+    if (fromEl.hasAttribute && fromEl.hasAttribute('data-no-morph')) return true;
+    if (fromEl.id === 'log-modal' || fromEl.id === 'action-modal') return true;
+    // Skip the entire info-wrap subtree — its contents (user email,
+    // cache_age value) update via separate paths and we don't want to
+    // toggle the dropdown's hidden state during a refresh tick.
+    if (fromEl.classList && fromEl.classList.contains('info-wrap')) return true;
+    if (fromEl.id === 'info-toggle' || fromEl.id === 'info-dropdown') return true;
+    if (fromEl.classList && (fromEl.classList.contains('dragging') || fromEl.classList.contains('drop-target'))) return true;
+    return false;
+  }
+
+  function onBeforeElUpdated(fromEl, toEl) {
+    if (shouldSkipElement(fromEl)) return false;
+
+    // Preserve <details> expansion: if the live element is open, mirror
+    // it onto the new element BEFORE morphdom diffs them. Otherwise the
+    // server's `closed` state would slam the user-opened panel shut on
+    // every tick.
+    if (fromEl.tagName === 'DETAILS' && fromEl.open) {
+      toEl.setAttribute('open', '');
+    }
+
+    // Preserve focused input/textarea state — value + focus.
+    if ((fromEl.tagName === 'INPUT' || fromEl.tagName === 'TEXTAREA') &&
+        document.activeElement === fromEl) {
+      toEl.value = fromEl.value;
+    }
+
+    // Preserve LocalTime hydration:
+    //   - LocalTime.hydrate() replaces textContent with a localized
+    //     time string and stamps `data-local-time-rendered=<iso>` to
+    //     stay idempotent on subsequent calls.
+    //   - Morphdom would by default REMOVE the `data-local-time-rendered`
+    //     attr (missing from our renderer) AND replace the localized
+    //     textContent with the server's UTC string, causing flicker.
+    //   - When the iso hasn't changed, copy the rendered marker AND
+    //     keep the live textContent.
+    if (fromEl.hasAttribute && fromEl.hasAttribute('data-local-time-iso')) {
+      const fromIso = fromEl.getAttribute('data-local-time-iso');
+      const toIso = toEl.getAttribute('data-local-time-iso');
+      const fromRendered = fromEl.getAttribute('data-local-time-rendered');
+      if (fromRendered && fromRendered === fromIso && fromIso === toIso) {
+        // Already-hydrated node, iso unchanged — preserve.
+        toEl.setAttribute('data-local-time-rendered', fromRendered);
+        toEl.textContent = fromEl.textContent;
+        if (fromEl.title) toEl.title = fromEl.title;
+      }
+    }
+
+    // Skip identical nodes (cheap fast-path; morphdom does this
+    // internally too but skipping the descent saves a few cycles on
+    // large prompt blobs).
+    if (fromEl.isEqualNode && fromEl.isEqualNode(toEl)) return false;
+    return true;
+  }
+
+  function onBeforeNodeDiscarded(node) {
+    // Don't discard the action / log modals if morphdom encounters them
+    // (it shouldn't, since they're outside #queue-root, but defensive).
+    if (node && node.id === 'log-modal') return false;
+    if (node && node.id === 'action-modal') return false;
+    if (node && node.id === 'info-dropdown') return false;
+    return true;
+  }
+
+  // Morphdom keys nodes by `el.id` by default. Our queue items use
+  // `data-queue-id` (one card → one queue item) — without a custom key
+  // resolver morphdom would match articles by sibling position, which
+  // means moving an item between sections would discard + recreate the
+  // node (losing focus, in-flight state, the .dragging escape hatch).
+  // Returning data-queue-id makes morphdom track the card as a stable
+  // entity across reorders.
+  function getNodeKey(node) {
+    if (node.nodeType !== 1) return undefined;
+    if (node.id) return node.id;
+    if (node.getAttribute) {
+      const qid = node.getAttribute('data-queue-id');
+      if (qid) return 'qid:' + qid;
+    }
+    return undefined;
+  }
+
+  function mergeQueueRoot(state) {
+    const newRoot = buildQueueDOM(state);
+    if (!window.morphdom) return false;
+    window.morphdom(queueRoot, newRoot, {
+      onBeforeElUpdated: onBeforeElUpdated,
+      onBeforeNodeDiscarded: onBeforeNodeDiscarded,
+      getNodeKey: getNodeKey,
+      childrenOnly: false,
+    });
+    return true;
+  }
+
+  function mergeTopbarMeta(state) {
+    if (!topbarMeta) return false;
+    const newMeta = buildTopbarMetaDOM(state);
+    if (!window.morphdom) return false;
+    window.morphdom(topbarMeta, newMeta, {
+      onBeforeElUpdated: onBeforeElUpdated,
+      onBeforeNodeDiscarded: onBeforeNodeDiscarded,
+      getNodeKey: getNodeKey,
+      childrenOnly: false,
+    });
+    return true;
+  }
+
+  // ---------------------------------------------------------------------
+  // Tick — fetch + merge. After a successful merge re-hydrate local-time
+  // so any new timestamp elements are converted to the viewer's tz.
+  // ---------------------------------------------------------------------
+  async function tick() {
+    try {
+      const r = await fetch('/api/queue', { cache: 'no-store' });
+      if (!r.ok) return;
+      const j = await r.json();
+
+      mergeQueueRoot(j);
+      mergeTopbarMeta(j);
+
+      // Update the cache-age value inside the (skipped) info-dropdown so
+      // it stays live without re-rendering the whole subtree.
+      const cacheAgeEl = document.querySelector('.cache-age');
+      if (cacheAgeEl) {
+        cacheAgeEl.textContent =
+          (j.cache_age_seconds !== undefined && j.cache_age_seconds !== null)
+            ? j.cache_age_seconds
+            : '?';
+      }
+
+      if (window.LocalTime && typeof window.LocalTime.hydrate === 'function') {
+        try { window.LocalTime.hydrate(); } catch (_) { /* defensive */ }
+      }
+    } catch (_) {
+      // Network blip — try again next tick.
+    }
+  }
+
+  // Don't fire the first tick immediately on load — the server-rendered
+  // first paint is already correct. Schedule the recurring tick.
+  setInterval(tick, REFRESH_MS);
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden) tick();
+  });
+
+  // Expose internals for the test harness (test.html in the repo). The
+  // production page never reads these but they exist so a smoke test can
+  // exercise buildQueueDOM + the merge with synthetic JSON snapshots.
+  window.__queueRefresh = {
+    buildQueueDOM,
+    buildTopbarMetaDOM,
+    mergeQueueRoot,
+    mergeTopbarMeta,
+    onBeforeElUpdated,
+  };
+})();

@@ -1,0 +1,528 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="light dark">
+  <meta name="theme-color" content="#fdf6e3" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#002b36" media="(prefers-color-scheme: dark)">
+  <title>GB Queue</title>
+  <link rel="shortcut icon" href="{{ url_for('static', filename='favicon.ico') }}">
+  <link rel="icon" type="image/svg+xml" href="{{ url_for('static', filename='logo.svg') }}">
+  <link rel="icon" type="image/png" sizes="16x16" href="{{ url_for('static', filename='favicon-16x16.png') }}">
+  <link rel="icon" type="image/png" sizes="32x32" href="{{ url_for('static', filename='favicon-32x32.png') }}">
+  <link rel="icon" type="image/png" sizes="192x192" href="{{ url_for('static', filename='favicon-192x192.png') }}">
+  <link rel="icon" type="image/png" sizes="512x512" href="{{ url_for('static', filename='favicon-512x512.png') }}">
+  <link rel="apple-touch-icon" sizes="180x180" href="{{ url_for('static', filename='apple-touch-icon.png') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+  {# morphdom — vendored DOM diff/merge library used by refresh.js to
+     update the queue lists without disrupting open modals, drag-in-progress,
+     <details> expansion, scroll position, or focus. Loaded ahead of refresh.js
+     so the global `morphdom` is available before the first tick. #}
+  <script src="{{ url_for('static', filename='vendor/morphdom-2.7.4.min.js') }}"></script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="title"><img src="{{ url_for('static', filename='logo.svg') }}" alt="GB" class="logo"> GB Queue</div>
+    <div class="meta" id="topbar-meta">
+      <span class="count count-running" title="running items">{{ totals.running }} running</span>
+      {% if starting_count %}<span class="count count-starting" title="registered but agent not yet emitting events">{{ starting_count }} starting</span>{% endif %}
+      <span class="count count-pending" title="pending items">{{ totals.pending }} pending</span>
+      {% if orphan_count %}<span class="count count-orphan" title="running items with no live owner">{{ orphan_count }} orphan</span>{% endif %}
+      <span class="dot {% if error %}dot-err{% else %}dot-ok{% endif %}" title="{{ 'fetch error' if error else 'live' }}"></span>
+      <span
+        class="ts"
+        title="last fetch"
+        {% if fetched_at %}data-local-time-iso="{{ fetched_at }}" data-local-time-fmt="time" data-local-time-tooltip{% endif %}
+      >{{ fetched_at[11:19] if fetched_at else '—' }}{% if fetched_at %}Z{% endif %}</span>
+      <div class="info-wrap">
+        <button
+          type="button"
+          id="info-toggle"
+          class="info-btn"
+          aria-haspopup="true"
+          aria-expanded="false"
+          aria-controls="info-dropdown"
+          title="session info">&#9432;</button>
+        <div
+          id="info-dropdown"
+          class="info-dropdown"
+          role="menu"
+          aria-labelledby="info-toggle"
+          hidden>
+          <div class="info-row">
+            <span class="info-label">user</span>
+            <span class="info-value">{% if user %}{{ user }}{% else %}&mdash;{% endif %}</span>
+          </div>
+          <div class="info-row">
+            <span class="info-label">cache</span>
+            <span class="info-value"><span class="cache-age">{{ cache_age_seconds if cache_age_seconds is not none else '?' }}</span>s</span>
+          </div>
+          <div class="info-row">
+            <span class="info-label">api</span>
+            <span class="info-value"><a href="/api/queue">/api/queue</a></span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </header>
+
+  {% if error %}
+    <div class="banner banner-err">
+      Queue read failed: {{ error }}
+      {% if running or pending %}<br><small>Showing last-good cached snapshot.</small>{% endif %}
+    </div>
+  {% endif %}
+
+  <main id="queue-root">
+
+    {# ---------- RUNNING ---------- #}
+    <section id="section-running">
+      <h2 class="section-title">Running <span class="section-count">{{ totals.running }}</span></h2>
+      {% if not running %}
+        <div class="empty-mini">No running items.</div>
+      {% endif %}
+      {% for it in running %}
+        {% set owner = it.owner %}
+        {% set is_starting = it.is_starting %}
+        {% set is_workload = it.workload_label|length > 0 %}
+        {# Workload-bound items are clickable even when no agent record
+           exists — the live-log endpoint dispatches to the workload tail
+           branch instead of looking up an agent. #}
+        {% set is_clickable = (not is_starting) or is_workload %}
+        {% set log_mode = 'workload' if is_workload else 'live' %}
+        <article
+          id="queue-{{ it.id }}"
+          class="item {% if is_starting and not is_workload %}state-starting{% else %}state-running{% endif %} drop-zone {% if is_clickable %}log-clickable{% endif %} {% if owner.alive == False and not is_starting and not is_workload %}orphan{% endif %}"
+          data-queue-id="{{ it.id }}"
+          data-queue-status="running"
+          data-queue-starting="{{ '1' if (is_starting and not is_workload) else '0' }}"
+          data-queue-summary="{{ it.summary }}"
+          data-queue-description="{{ it.description }}"
+          data-agent-id="{{ owner.agent_id }}"
+          {% if is_workload %}data-workload-label="{{ it.workload_label }}"{% endif %}
+          {% if is_clickable %}data-log-mode="{{ log_mode }}" tabindex="0" role="button" aria-label="View {% if is_workload %}workload{% else %}live{% endif %} log for {{ it.id }}" title="Click to view {% if is_workload %}workload output{% else %}live log{% endif %}. Drop a pending item here to set this as its dependency."{% else %}aria-label="Starting: agent spawning for {{ it.id }}" title="Agent spawning — live log unavailable until first event."{% endif %}>
+          <header class="item-head">
+            {% if is_starting and not is_workload %}
+              <span class="badge state-starting" title="registered, waiting for agent to emit first event">starting</span>
+            {% else %}
+              <span class="badge state-running">running</span>
+            {% endif %}
+            {% if is_workload %}<span class="badge workload-badge" title="workload-bound: tails /tmp/claude-workloads/{{ it.workload_label }}.output">workload</span>{% endif %}
+            {% if owner.alive == False and not is_starting and not is_workload %}<span class="badge state-orphan">orphan</span>{% endif %}
+            {% if it.group_head %}<span class="badge ghead" title="head of serialization group">head</span>{% endif %}
+            <span class="id">{{ it.id }}</span>
+            <span class="prio" title="priority">p{{ it.priority }}</span>
+            <button
+              type="button"
+              class="action-btn stop-btn"
+              data-action="stop"
+              data-id="{{ it.id }}"
+              data-summary="{{ it.summary }}"
+              title="Stop this running item">stop</button>
+          </header>
+          <p class="summary">{{ it.summary }}</p>
+          <div class="age">
+            <span
+              {% if it.started_at_iso %}data-local-time-iso="{{ it.started_at_iso }}" data-local-time-title-only{% endif %}
+              title="{{ it.started_at_iso }}">{% if is_starting %}registered{% else %}running{% endif %} {{ it.age }}</span>
+            <span class="sep">·</span>
+            {% if is_workload %}
+              <span title="workload output tail: /tmp/claude-workloads/{{ it.workload_label }}.output">workload {{ it.workload_label }}</span>
+            {% elif is_starting %}
+              <span class="agent-spawning" title="queue item registered, waiting for agent's first JSONL event"><span class="spinner" aria-hidden="true"></span>agent spawning…</span>
+            {% elif owner.mode == 'agent' %}
+              <span title="claude-watch agent transcript mtime ({{ owner.agent_id }})">agent {{ owner.agent_id[:12] }} {{ 'alive' if owner.alive else 'STALE' }} ({{ owner.jsonl_age }})</span>
+            {% else %}
+              <span title="no matching agent record in claude-watch state">owner unknown</span>
+            {% endif %}
+            {% if it.created_by %}<span class="sep">·</span><span>by {{ it.created_by }}</span>{% endif %}
+          </div>
+          {% if it.scope %}
+            <div class="scope">
+              {% for s in it.scope %}<span class="chip">{{ s }}</span>{% endfor %}
+            </div>
+          {% endif %}
+          {% if it.description %}
+            <details class="prompt-toggle">
+              <summary class="prompt-summary">Prompt ({{ it.description|length }} chars)</summary>
+              <pre class="prompt-body">{{ it.description }}</pre>
+            </details>
+          {% endif %}
+        </article>
+      {% endfor %}
+    </section>
+
+    {# ---------- PENDING ---------- #}
+    <section id="section-pending">
+      <h2 class="section-title">Pending <span class="section-count">{{ totals.pending }}</span></h2>
+      {% if not pending %}
+        <div class="empty-mini">No pending items.</div>
+      {% endif %}
+      {% for it in pending %}
+        <article
+          id="queue-{{ it.id }}"
+          class="item state-pending drop-zone draggable {% if it.ready_now %}ready{% endif %} {% if it.depends_on %}has-deps{% endif %}"
+          draggable="true"
+          data-queue-id="{{ it.id }}"
+          data-queue-status="pending"
+          data-queue-summary="{{ it.summary }}"
+          title="Drag onto another item to set as dependency">
+          <header class="item-head">
+            <span class="badge state-pending">pending</span>
+            {# READY badge is gated on the BACKEND's ``ready_now`` field
+               (group-head AND every depends_on resolved to ``done``). The
+               older ``group_head`` flag was FIFO-only and ignored
+               depends_on, leading to false-READY on items still waiting
+               on a running blocker (Bug q-1b89). #}
+            {% if it.ready_now %}<span class="badge ghead" title="ready to spawn (group head, all deps done)">ready</span>{% endif %}
+            <span class="id">{{ it.id }}</span>
+            <span class="prio" title="priority">p{{ it.priority }}</span>
+            {# depends-on badge — depends_on landed 2026-05-02.
+               Each dep is a clickable anchor (jumps to the target row)
+               with an "x" affordance to remove the edge via DELETE. #}
+            {% if it.depends_on %}
+              {% for dep in it.depends_on %}
+                <span class="badge dep-badge" title="depends on {{ dep }} — click to scroll, x to remove">
+                  <a class="dep-link" href="#queue-{{ dep }}" data-dep-target="{{ dep }}">&rarr; {{ dep }}</a>
+                  <button
+                    type="button"
+                    class="dep-remove-btn"
+                    data-dep-source="{{ it.id }}"
+                    data-dep-target="{{ dep }}"
+                    title="Remove this dependency"
+                    aria-label="Remove dependency on {{ dep }}">&times;</button>
+                </span>
+              {% endfor %}
+            {% endif %}
+            <span class="drag-handle" aria-hidden="true" title="drag to set dependency">&#x2630;</span>
+            <button
+              type="button"
+              class="action-btn force-start-btn"
+              data-action="force-start"
+              data-id="{{ it.id }}"
+              data-summary="{{ it.summary }}"
+              title="Override scope-conflict serialization and promote to running">force start</button>
+            <button
+              type="button"
+              class="action-btn abandon-btn"
+              data-action="abandon"
+              data-id="{{ it.id }}"
+              data-summary="{{ it.summary }}"
+              title="Remove this pending item from the queue">abandon</button>
+          </header>
+          <p class="summary">{{ it.summary }}</p>
+          <div class="age">
+            <span
+              {% if it.created_at_iso %}data-local-time-iso="{{ it.created_at_iso }}" data-local-time-title-only{% endif %}
+              title="{{ it.created_at_iso }}">created {{ it.age }}</span>
+            {% if it.created_by %}<span class="sep">·</span><span>by {{ it.created_by }}</span>{% endif %}
+          </div>
+          {% if it.scope %}
+            <div class="scope">
+              {% for s in it.scope %}<span class="chip">{{ s }}</span>{% endfor %}
+            </div>
+          {% endif %}
+          {% if it.description %}
+            <details class="prompt-toggle">
+              <summary class="prompt-summary">Prompt ({{ it.description|length }} chars)</summary>
+              <pre class="prompt-body">{{ it.description }}</pre>
+            </details>
+          {% endif %}
+        </article>
+      {% endfor %}
+    </section>
+
+    {# ---------- DONE (recent) ---------- #}
+    <section id="section-done">
+      <h2 class="section-title">Done <span class="section-count">{{ done_recent|length }} / {{ totals.done }}</span></h2>
+      {% if not done_recent %}
+        <div class="empty-mini">No completed items.</div>
+      {% endif %}
+      {% for it in done_recent %}
+        <article
+          class="item state-done {% if it.has_archive %}log-clickable{% endif %}"
+          data-queue-id="{{ it.id }}"
+          data-queue-status="done"
+          data-queue-summary="{{ it.summary }}"
+          data-queue-description="{{ it.description }}"
+          {% if it.has_archive %}data-log-mode="archive" tabindex="0" role="button" aria-label="View archived log for {{ it.id }}" title="Click to view archived log."{% endif %}>
+          <header class="item-head">
+            <span class="badge state-done">done</span>
+            <span class="id">{{ it.id }}</span>
+            {% if it.has_archive %}
+              <span class="badge log-badge" title="archived agent transcript available">log</span>
+            {% endif %}
+          </header>
+          <p class="summary">{{ it.summary }}</p>
+          <div class="age">
+            <span
+              {% if it.completed_at_iso %}data-local-time-iso="{{ it.completed_at_iso }}" data-local-time-title-only{% endif %}
+              title="{{ it.completed_at_iso }}">completed {{ it.age }}</span>
+            {% if it.created_by %}<span class="sep">·</span><span>by {{ it.created_by }}</span>{% endif %}
+          </div>
+          {% if it.description %}
+            <details class="prompt-toggle">
+              <summary class="prompt-summary">Prompt ({{ it.description|length }} chars)</summary>
+              <pre class="prompt-body">{{ it.description }}</pre>
+            </details>
+          {% endif %}
+        </article>
+      {% endfor %}
+    </section>
+
+    {# ---------- ABANDONED (recent) ---------- #}
+    <section id="section-abandoned">
+      <h2 class="section-title">Abandoned <span class="section-count">{{ abandoned_recent|length }} / {{ totals.abandoned }}</span></h2>
+      {% if not abandoned_recent %}
+        <div class="empty-mini">No abandoned items.</div>
+      {% endif %}
+      {% for it in abandoned_recent %}
+        <article
+          class="item state-abandoned {% if it.has_archive %}log-clickable{% endif %}"
+          data-queue-id="{{ it.id }}"
+          data-queue-status="abandoned"
+          data-queue-summary="{{ it.summary }}"
+          data-queue-description="{{ it.description }}"
+          {% if it.has_archive %}data-log-mode="archive" tabindex="0" role="button" aria-label="View archived log for {{ it.id }}" title="Click to view archived log."{% endif %}>
+          <header class="item-head">
+            <span class="badge state-abandoned">abandoned</span>
+            <span class="id">{{ it.id }}</span>
+            {% if it.has_archive %}
+              <span class="badge log-badge" title="archived agent transcript available">log</span>
+            {% endif %}
+          </header>
+          <p class="summary">{{ it.summary }}</p>
+          {% if it.abandon_reason %}<p class="description">{{ it.abandon_reason }}</p>{% endif %}
+          <div class="age">
+            <span
+              {% if it.abandoned_at_iso %}data-local-time-iso="{{ it.abandoned_at_iso }}" data-local-time-title-only{% endif %}
+              title="{{ it.abandoned_at_iso }}">abandoned {{ it.age }}</span>
+            {% if it.created_by %}<span class="sep">·</span><span>by {{ it.created_by }}</span>{% endif %}
+          </div>
+          {% if it.description %}
+            <details class="prompt-toggle">
+              <summary class="prompt-summary">Prompt ({{ it.description|length }} chars)</summary>
+              <pre class="prompt-body">{{ it.description }}</pre>
+            </details>
+          {% endif %}
+        </article>
+      {% endfor %}
+    </section>
+  </main>
+
+  {# ---------- ACTION CONFIRMATION MODAL (stop / abandon — hidden by default) ---------- #}
+  {# data-no-morph: refresh.js' morphdom merge skips this subtree so an
+     open modal is never disturbed by a refresh tick (input focus, value,
+     and busy-state preserved). #}
+  <div
+    id="action-modal"
+    class="modal"
+    role="dialog"
+    aria-modal="true"
+    aria-labelledby="action-modal-title"
+    aria-describedby="action-modal-body"
+    data-action=""
+    data-no-morph
+    hidden>
+    <div class="modal-backdrop" data-modal-dismiss></div>
+    <div class="modal-panel" role="document">
+      <h2 id="action-modal-title" class="modal-title">Stop running item?</h2>
+      <div id="action-modal-body" class="modal-body">
+        <p class="modal-target">
+          <span class="modal-target-label">id</span>
+          <code id="action-modal-id" class="id"></code>
+        </p>
+        <p class="modal-target">
+          <span class="modal-target-label">summary</span>
+          <span id="action-modal-summary" class="modal-summary"></span>
+        </p>
+        <p
+          id="action-modal-warning-stop"
+          class="modal-warning modal-warning-stop"
+          data-show-for="stop">
+          This abandons the queue item. The owning agent will be denied on
+          its next non-exempt tool call (queue id no longer
+          <code>running</code>) and any in-progress work will be lost.
+        </p>
+        <p
+          id="action-modal-warning-abandon"
+          class="modal-warning modal-warning-abandon"
+          data-show-for="abandon"
+          hidden>
+          Removes this item from the queue. No work has started yet, so
+          nothing is lost.
+        </p>
+        <p
+          id="action-modal-warning-force-start"
+          class="modal-warning modal-warning-force-start"
+          data-show-for="force-start"
+          hidden>
+          Overrides scope-conflict serialization for this item and
+          promotes it to <code>running</code> immediately. Use only when
+          you have consciously decided that this work is independent of
+          the running blocker(s) (or that the blocker is wedged). The
+          override is recorded in
+          <code>~/.config/claude/queue-force-start.log</code>.
+        </p>
+        <label class="modal-reason-label" for="action-modal-reason" id="action-modal-reason-label">Reason (optional)</label>
+        <input
+          id="action-modal-reason"
+          type="text"
+          maxlength="500"
+          placeholder="why?"
+          autocomplete="off">
+        <p id="action-modal-error" class="modal-error" hidden></p>
+      </div>
+      <div class="modal-actions">
+        <button
+          type="button"
+          id="action-modal-cancel"
+          class="modal-btn modal-btn-secondary"
+          data-modal-dismiss>Cancel</button>
+        <button
+          type="button"
+          id="action-modal-confirm"
+          class="modal-btn modal-btn-danger">Stop</button>
+      </div>
+    </div>
+  </div>
+
+  {# ---------- LIVE LOG STREAM MODAL (hidden by default) ----------
+
+       Opened by clicking on a running item card. live-log.js connects
+       an EventSource to /api/queue/<id>/stream and appends pretty-printed
+       events to the <pre> as they arrive. Esc / backdrop / close button
+       all close the stream and restore focus.
+   #}
+  <div
+    id="log-modal"
+    class="modal log-modal"
+    role="dialog"
+    aria-modal="true"
+    aria-labelledby="log-modal-title"
+    aria-describedby="log-modal-stream"
+    data-mode="live"
+    data-no-morph
+    hidden>
+    <div class="modal-backdrop" data-modal-dismiss></div>
+    <div class="modal-panel log-modal-panel" role="document">
+      <header class="log-modal-head">
+        <h2 id="log-modal-title" class="modal-title">
+          <span id="log-modal-mode-label">Live log</span>
+          <code id="log-modal-id" class="id"></code>
+        </h2>
+        <div class="log-modal-meta">
+          <span id="log-modal-status" class="log-status log-status-pending">connecting…</span>
+          <button
+            type="button"
+            id="log-modal-jump-top"
+            class="log-jump-btn"
+            title="Jump to top (g)"
+            aria-label="Jump to top">&#x2912;</button>
+          <button
+            type="button"
+            id="log-modal-jump-bottom"
+            class="log-jump-btn"
+            title="Jump to bottom (G)"
+            aria-label="Jump to bottom">&#x2913;</button>
+          <button
+            type="button"
+            id="log-modal-autoscroll"
+            class="log-toggle-btn"
+            aria-pressed="true"
+            title="Auto-scroll to newest events">auto-scroll</button>
+          <button
+            type="button"
+            id="log-modal-close"
+            class="modal-btn modal-btn-secondary"
+            data-modal-dismiss
+            title="Close (Esc)">&times;</button>
+        </div>
+      </header>
+      <p class="log-modal-summary" id="log-modal-summary"></p>
+      {# Per-modal top-of-page summary block — populated by live-log.js
+         from /api/queue/<id>/meta on open. Mirrors the top-level lines
+         the Claude Code curses TUI shows for an agent: status pill,
+         queue scope chips, runtime, dep chain, created_by, return text
+         (for done items), token usage / tool count. The visible HEADLINE
+         lines (status, scope, runtime, deps) stay uncollapsed so the
+         answer to "what did this agent do?" is one glance away. The
+         agent's full return text is collapsible-but-default-open for
+         done items — Andrew flagged the agent return value as the most
+         frequently-missing piece (2026-05-11). #}
+      <section
+        class="log-modal-meta-summary"
+        id="log-modal-meta-summary"
+        aria-label="Queue item summary"
+        hidden>
+        <div class="log-meta-row" id="log-meta-row-status" hidden>
+          <span class="log-meta-label">status</span>
+          <span class="log-meta-value" id="log-meta-status"></span>
+        </div>
+        <div class="log-meta-row" id="log-meta-row-runtime" hidden>
+          <span class="log-meta-label">runtime</span>
+          <span class="log-meta-value" id="log-meta-runtime"></span>
+        </div>
+        <div class="log-meta-row" id="log-meta-row-times" hidden>
+          <span class="log-meta-label">timestamps</span>
+          <span class="log-meta-value" id="log-meta-times"></span>
+        </div>
+        <div class="log-meta-row" id="log-meta-row-scope" hidden>
+          <span class="log-meta-label">scope</span>
+          <span class="log-meta-value" id="log-meta-scope"></span>
+        </div>
+        <div class="log-meta-row" id="log-meta-row-deps" hidden>
+          <span class="log-meta-label">depends on</span>
+          <span class="log-meta-value" id="log-meta-deps"></span>
+        </div>
+        <div class="log-meta-row" id="log-meta-row-dependents" hidden>
+          <span class="log-meta-label">dependents</span>
+          <span class="log-meta-value" id="log-meta-dependents"></span>
+        </div>
+        <div class="log-meta-row" id="log-meta-row-by" hidden>
+          <span class="log-meta-label">created by</span>
+          <span class="log-meta-value" id="log-meta-by"></span>
+        </div>
+        <div class="log-meta-row" id="log-meta-row-group" hidden>
+          <span class="log-meta-label">group</span>
+          <span class="log-meta-value" id="log-meta-group"></span>
+        </div>
+        <div class="log-meta-row" id="log-meta-row-usage" hidden>
+          <span class="log-meta-label">usage</span>
+          <span class="log-meta-value" id="log-meta-usage"></span>
+        </div>
+        <div class="log-meta-row" id="log-meta-row-abandon" hidden>
+          <span class="log-meta-label">abandon reason</span>
+          <span class="log-meta-value" id="log-meta-abandon"></span>
+        </div>
+        {# Agent return text — default-open for done items so the
+           answer the user is looking for is right there. Hidden when
+           there's no recorded return text (running items, foreground
+           agents where the text is inlined into the parent transcript
+           and not surfaced via task-notification). #}
+        <details class="prompt-toggle log-modal-return" id="log-modal-return" hidden open>
+          <summary class="prompt-summary"><span id="log-modal-return-label">Agent return value</span></summary>
+          <pre class="prompt-body" id="log-modal-return-body"></pre>
+        </details>
+      </section>
+      {# Collapsible Prompt section — populated by live-log.js from the
+         row's data-queue-description attribute. Click summary to
+         expand. Closed by default so the transcript stays the focus. #}
+      <details class="prompt-toggle log-modal-prompt" id="log-modal-prompt" hidden>
+        <summary class="prompt-summary"><span id="log-modal-prompt-label">Prompt</span></summary>
+        <pre class="prompt-body" id="log-modal-prompt-body"></pre>
+      </details>
+      <pre id="log-modal-stream" class="log-stream" tabindex="0" aria-live="polite"></pre>
+    </div>
+  </div>
+
+  <script src="{{ url_for('static', filename='local-time.js') }}" defer></script>
+  <script src="{{ url_for('static', filename='refresh.js') }}" defer></script>
+  <script src="{{ url_for('static', filename='action.js') }}" defer></script>
+  <script src="{{ url_for('static', filename='depend.js') }}" defer></script>
+  <script src="{{ url_for('static', filename='info.js') }}" defer></script>
+  <script src="{{ url_for('static', filename='live-log.js') }}" defer></script>
+  <script src="{{ url_for('static', filename='keyboard.js') }}" defer></script>
+</body>
+</html>
