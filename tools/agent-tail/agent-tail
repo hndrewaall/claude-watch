@@ -216,17 +216,23 @@ def resolve_agent_id(
 
 
 class FormatOpts:
-    __slots__ = ("max_lines", "max_chars", "show_ts")
+    __slots__ = ("max_lines", "max_chars", "show_ts", "verbose")
 
     def __init__(
         self,
         max_lines: int = DEFAULT_TOOL_RESULT_MAX_LINES,
         max_chars: int = DEFAULT_TOOL_RESULT_MAX_CHARS,
         show_ts: bool = True,
+        verbose: bool = False,
     ) -> None:
         self.max_lines = max_lines
         self.max_chars = max_chars
         self.show_ts = show_ts
+        # When set, each record renders an extra indented metadata
+        # block exposing model / usage / requestId / stop_reason /
+        # uuid / parentUuid / attributionAgent / agentId / slug / etc.
+        # Default off — the headline stays terminal-friendly.
+        self.verbose = verbose
 
 
 def _format_ts(obj: dict[str, Any]) -> str:
@@ -253,6 +259,81 @@ def _content_to_text(content: Any) -> str:
     return "\n".join(parts)
 
 
+def _meta_lines(obj: dict[str, Any]) -> list[str]:
+    """Build verbose-mode metadata footer lines for a record.
+
+    Lists every per-record field that's useful for debugging but noisy
+    by default: model / usage / stop_reason / requestId /
+    attributionAgent / agentId / slug / uuid / parentUuid / caller /
+    sourceToolAssistantUUID / cwd / gitBranch / etc. Returns each
+    field as ``  <key>: <value>`` (two-space indent so it visually
+    nests under the headline line).
+    """
+    if not isinstance(obj, dict):
+        return []
+    out: list[str] = []
+    msg = obj.get("message")
+    msg = msg if isinstance(msg, dict) else {}
+    if msg.get("model"):
+        out.append(f"  model: {msg.get('model')}")
+    if msg.get("stop_reason"):
+        out.append(f"  stop_reason: {msg.get('stop_reason')}")
+    if msg.get("stop_sequence"):
+        out.append(f"  stop_sequence: {msg.get('stop_sequence')}")
+    if msg.get("stop_details"):
+        out.append(f"  stop_details: {one_line_args(msg.get('stop_details'))}")
+    usage = msg.get("usage")
+    if isinstance(usage, dict):
+        parts: list[str] = []
+        if usage.get("input_tokens") is not None:
+            parts.append(f"in={usage.get('input_tokens')}")
+        if usage.get("output_tokens") is not None:
+            parts.append(f"out={usage.get('output_tokens')}")
+        if usage.get("cache_creation_input_tokens"):
+            parts.append(f"cache_create={usage.get('cache_creation_input_tokens')}")
+        if usage.get("cache_read_input_tokens"):
+            parts.append(f"cache_read={usage.get('cache_read_input_tokens')}")
+        if usage.get("service_tier"):
+            parts.append(f"tier={usage.get('service_tier')}")
+        if parts:
+            out.append("  usage: " + " ".join(parts))
+        cc = usage.get("cache_creation")
+        if isinstance(cc, dict):
+            cc_parts: list[str] = []
+            if cc.get("ephemeral_5m_input_tokens") is not None:
+                cc_parts.append(f"5m={cc['ephemeral_5m_input_tokens']}")
+            if cc.get("ephemeral_1h_input_tokens") is not None:
+                cc_parts.append(f"1h={cc['ephemeral_1h_input_tokens']}")
+            if cc_parts:
+                out.append("  cache_creation: " + " ".join(cc_parts))
+    for key in (
+        "requestId",
+        "attributionAgent",
+        "agentId",
+        "slug",
+        "uuid",
+        "parentUuid",
+        "sourceToolAssistantUUID",
+        "logicalParentUuid",
+        "promptId",
+        "sessionId",
+        "gitBranch",
+        "cwd",
+        "version",
+        "userType",
+        "entrypoint",
+    ):
+        val = obj.get(key)
+        if val:
+            out.append(f"  {key}: {val}")
+    # isSidechain / isMeta default to False — only show when non-default
+    for key in ("isSidechain", "isMeta"):
+        val = obj.get(key)
+        if val:
+            out.append(f"  {key}: {val}")
+    return out
+
+
 def format_record(obj: dict[str, Any], opts: FormatOpts) -> Iterator[str]:
     """Yield zero or more pretty-printed lines for one JSONL record.
 
@@ -268,18 +349,22 @@ def format_record(obj: dict[str, Any], opts: FormatOpts) -> Iterator[str]:
             ts_prefix = f"[{ts}] "
 
     if rtype == "user":
-        # User content is either a bare string (the spawn prompt) or a list
-        # of {type: tool_result, ...} blocks (model handing back tool output).
+        # User content is either a bare string (the spawn prompt), a list
+        # of {type: tool_result, ...} blocks (model handing back tool output),
+        # or a list of {type: image, source: {...}} blocks.
         content = msg.get("content")
         if isinstance(content, str):
             text = truncate_lines(content, opts.max_lines, opts.max_chars)
             yield f"{ts_prefix}USER: {text}"
+            if opts.verbose:
+                yield from _meta_lines(obj)
             return
         if isinstance(content, list):
             for c in content:
                 if not isinstance(c, dict):
                     continue
-                if c.get("type") == "tool_result":
+                ct = c.get("type")
+                if ct == "tool_result":
                     tu_id = c.get("tool_use_id", "?")
                     inner = c.get("content")
                     is_error = bool(c.get("is_error"))
@@ -289,17 +374,44 @@ def format_record(obj: dict[str, Any], opts: FormatOpts) -> Iterator[str]:
                     yield f"{ts_prefix}{tag} [{tu_id}]"
                     for ln in body.split("\n"):
                         yield f"  {ln}"
+                    # Side-channel summary stashed at the top level. When
+                    # it diverges from `content`, surface it — the
+                    # obligation-gate denial path uses this to ship a
+                    # clean `Error: ...` separate from the wrapped
+                    # `<tool_use_error>` blob inside `content`.
+                    side = obj.get("toolUseResult")
+                    if side and isinstance(side, str) and side != body:
+                        yield "  toolUseResult:"
+                        for ln in truncate_lines(side, opts.max_lines, opts.max_chars).split("\n"):
+                            yield f"    {ln}"
+                    elif isinstance(side, dict):
+                        yield f"  toolUseResult: {one_line_args(side)}"
+                elif ct == "image":
+                    src = c.get("source") or {}
+                    mt = src.get("media_type", "image/?")
+                    stype = src.get("type", "unknown")
+                    data = src.get("data") or ""
+                    yield f"{ts_prefix}USER_IMAGE [{mt} / {stype}] ({len(data)} base64 chars)"
+                elif ct == "text":
+                    text = truncate_lines(str(c.get("text", "")), opts.max_lines, opts.max_chars)
+                    yield f"{ts_prefix}USER: {text}"
                 else:
-                    yield f"{ts_prefix}USER[{c.get('type', '?')}]: {one_line_args(c)}"
+                    yield f"{ts_prefix}USER[{ct or '?'}]: {one_line_args(c)}"
+            if opts.verbose:
+                yield from _meta_lines(obj)
             return
         # Fallback: dump repr.
         yield f"{ts_prefix}USER: {one_line_args(msg)}"
+        if opts.verbose:
+            yield from _meta_lines(obj)
         return
 
     if rtype == "assistant":
         content = msg.get("content")
         if not isinstance(content, list):
             yield f"{ts_prefix}ASSISTANT: {one_line_args(msg)}"
+            if opts.verbose:
+                yield from _meta_lines(obj)
             return
         for c in content:
             if not isinstance(c, dict):
@@ -313,17 +425,110 @@ def format_record(obj: dict[str, Any], opts: FormatOpts) -> Iterator[str]:
                 name = c.get("name", "?")
                 tu_id = c.get("id", "?")
                 args = one_line_args(c.get("input"))
-                yield f"{ts_prefix}TOOL_CALL {name}({args})  [{tu_id}]"
+                caller = c.get("caller")
+                caller_tag = ""
+                if isinstance(caller, dict) and caller.get("type"):
+                    caller_tag = f"  via={caller['type']}"
+                yield f"{ts_prefix}TOOL_CALL {name}({args})  [{tu_id}]{caller_tag}"
             elif ct == "thinking":
                 text = str(c.get("thinking", ""))
                 text = truncate_lines(text, opts.max_lines, opts.max_chars)
                 yield f"{ts_prefix}THINKING: {text}"
+                # `signature` is an opaque hash — only worth printing
+                # in verbose mode for full traceability.
+                if opts.verbose and c.get("signature"):
+                    yield f"  signature: {c['signature']}"
             else:
                 yield f"{ts_prefix}ASSISTANT[{ct or '?'}]: {one_line_args(c)}"
+        if opts.verbose:
+            yield from _meta_lines(obj)
+        return
+
+    if rtype == "progress":
+        data = obj.get("data") if isinstance(obj.get("data"), dict) else {}
+        dtype = data.get("type", "?")
+        parts = [f"type={dtype}"]
+        for key in ("hookEvent", "hookName", "command"):
+            if data.get(key):
+                parts.append(f"{key}={data[key]}")
+        if obj.get("toolUseID"):
+            parts.append(f"toolUseID={obj['toolUseID']}")
+        yield f"{ts_prefix}PROGRESS: " + " ".join(parts)
+        if opts.verbose:
+            yield from _meta_lines(obj)
+        return
+
+    if rtype == "system":
+        subtype = obj.get("subtype", "")
+        parts: list[str] = []
+        if subtype:
+            parts.append(f"subtype={subtype}")
+        if obj.get("durationMs") is not None:
+            parts.append(f"duration={obj['durationMs'] / 1000:.2f}s")
+        if obj.get("level"):
+            parts.append(f"level={obj['level']}")
+        if obj.get("toolUseID"):
+            parts.append(f"toolUseID={obj['toolUseID']}")
+        if obj.get("hookCount") is not None:
+            parts.append(f"hookCount={obj['hookCount']}")
+        if obj.get("preventedContinuation") is not None:
+            parts.append(f"preventedContinuation={obj['preventedContinuation']}")
+        headline = " ".join(parts) if parts else "(no subtype)"
+        content = obj.get("content")
+        yield f"{ts_prefix}SYSTEM: {headline}"
+        if isinstance(content, str) and content:
+            body = truncate_lines(content, opts.max_lines, opts.max_chars)
+            for ln in body.split("\n"):
+                yield f"  {ln}"
+        elif isinstance(content, (list, dict)) and content:
+            yield f"  content: {one_line_args(content)}"
+        if opts.verbose:
+            yield from _meta_lines(obj)
+        return
+
+    if rtype == "attachment":
+        att = obj.get("attachment") if isinstance(obj.get("attachment"), dict) else {}
+        atype = att.get("type", "?")
+        # Compact headline + selected highlights for the common attachment
+        # shapes (deferred_tools_delta, skill_listing, hook_additional_context).
+        yield f"{ts_prefix}ATTACHMENT [{atype}]"
+        if atype == "deferred_tools_delta":
+            added = att.get("addedNames") or []
+            removed = att.get("removedNames") or []
+            if added:
+                yield f"  added ({len(added)}): {', '.join(added[:8])}" + (
+                    f"...+{len(added) - 8}" if len(added) > 8 else ""
+                )
+            if removed:
+                yield f"  removed ({len(removed)}): {', '.join(removed[:8])}" + (
+                    f"...+{len(removed) - 8}" if len(removed) > 8 else ""
+                )
+        elif atype in ("skill_listing", "hook_additional_context"):
+            cnt = att.get("content")
+            if isinstance(cnt, str):
+                body = truncate_lines(cnt, opts.max_lines, opts.max_chars)
+                for ln in body.split("\n"):
+                    yield f"  {ln}"
+            elif isinstance(cnt, list):
+                for line in cnt[: opts.max_lines if opts.max_lines > 0 else len(cnt)]:
+                    body = truncate_lines(str(line), opts.max_lines, opts.max_chars)
+                    for ln in body.split("\n"):
+                        yield f"  {ln}"
+        else:
+            # Unknown attachment shape — dump a one-liner.
+            yield f"  {one_line_args(att)}"
+        if att.get("hookName"):
+            yield f"  hookName: {att['hookName']}"
+        if att.get("toolUseID"):
+            yield f"  toolUseID: {att['toolUseID']}"
+        if opts.verbose:
+            yield from _meta_lines(obj)
         return
 
     # System events / unknown shapes — dump a one-line repr.
     yield f"{ts_prefix}{(rtype or 'EVENT').upper()}: {one_line_args(obj)}"
+    if opts.verbose:
+        yield from _meta_lines(obj)
 
 
 def _tool_result_body(inner: Any) -> str:
@@ -509,6 +714,7 @@ def cmd_tail(args: argparse.Namespace) -> int:
         max_lines=args.truncate_tool_result if args.truncate_tool_result is not None else DEFAULT_TOOL_RESULT_MAX_LINES,
         max_chars=args.truncate_chars if args.truncate_chars is not None else DEFAULT_TOOL_RESULT_MAX_CHARS,
         show_ts=not args.no_ts,
+        verbose=bool(args.verbose),
     )
 
     # Phase 1: dump existing content (filtered by --since).
@@ -643,6 +849,18 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-ts",
         action="store_true",
         help="omit the leading [timestamp] prefix.",
+    )
+    p.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help=(
+            "emit per-record metadata after each headline (model, "
+            "usage tokens, stop_reason, requestId, attributionAgent, "
+            "agentId, slug, uuid, parentUuid, sourceToolAssistantUUID, "
+            "cwd, gitBranch, etc.). Defaults off to keep terminal "
+            "output readable."
+        ),
     )
     p.add_argument(
         "--path",
@@ -868,6 +1086,144 @@ def _run_embedded_tests() -> int:
             lines = list(format_record(obj, self.opts))
             self.assertEqual(len(lines), 1)
             self.assertTrue(lines[0].startswith("WEIRDO:"))
+
+        def test_tool_use_with_caller(self):
+            obj = {
+                "type": "assistant",
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_C",
+                            "name": "Bash",
+                            "input": {"command": "ls"},
+                            "caller": {"type": "subagent"},
+                        }
+                    ],
+                },
+            }
+            lines = list(format_record(obj, self.opts))
+            self.assertTrue(any("via=subagent" in ln for ln in lines))
+
+        def test_tool_result_with_side_channel(self):
+            obj = {
+                "type": "user",
+                "message": {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_S",
+                            "content": "<tool_use_error>Blocked: ...</tool_use_error>",
+                            "is_error": True,
+                        }
+                    ],
+                },
+                "toolUseResult": "Error: Blocked: ...",
+            }
+            lines = list(format_record(obj, self.opts))
+            self.assertTrue(any("toolUseResult" in ln for ln in lines))
+            self.assertTrue(any("Error: Blocked" in ln for ln in lines))
+
+        def test_user_image_block(self):
+            obj = {
+                "type": "user",
+                "message": {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/png",
+                                "data": "AAAA",
+                            },
+                        }
+                    ],
+                },
+            }
+            lines = list(format_record(obj, self.opts))
+            self.assertTrue(any("USER_IMAGE" in ln and "image/png" in ln for ln in lines))
+
+        def test_progress_event(self):
+            obj = {
+                "type": "progress",
+                "data": {
+                    "type": "hook_progress",
+                    "hookEvent": "PostToolUse",
+                    "hookName": "PostToolUse:Read",
+                    "command": "callback",
+                },
+                "toolUseID": "toolu_X",
+            }
+            lines = list(format_record(obj, self.opts))
+            self.assertEqual(len(lines), 1)
+            self.assertTrue(lines[0].startswith("PROGRESS:"))
+            self.assertIn("hookEvent=PostToolUse", lines[0])
+
+        def test_system_event_turn_duration(self):
+            obj = {
+                "type": "system",
+                "subtype": "turn_duration",
+                "durationMs": 236989,
+            }
+            lines = list(format_record(obj, self.opts))
+            self.assertTrue(any(ln.startswith("SYSTEM:") for ln in lines))
+            self.assertTrue(any("turn_duration" in ln for ln in lines))
+            self.assertTrue(any("236.99s" in ln for ln in lines))
+
+        def test_attachment_deferred_tools(self):
+            obj = {
+                "type": "attachment",
+                "attachment": {
+                    "type": "deferred_tools_delta",
+                    "addedNames": ["Foo", "Bar", "Baz"],
+                    "removedNames": [],
+                },
+            }
+            lines = list(format_record(obj, self.opts))
+            self.assertTrue(any("ATTACHMENT [deferred_tools_delta]" in ln for ln in lines))
+            self.assertTrue(any("Foo" in ln and "Bar" in ln and "Baz" in ln for ln in lines))
+
+        def test_verbose_emits_metadata(self):
+            verbose = FormatOpts(max_lines=10, max_chars=400, show_ts=False, verbose=True)
+            obj = {
+                "type": "assistant",
+                "message": {
+                    "model": "claude-opus-4-7",
+                    "content": [{"type": "text", "text": "hi"}],
+                    "usage": {"input_tokens": 5, "output_tokens": 3},
+                    "stop_reason": "end_turn",
+                },
+                "requestId": "req_abc",
+                "attributionAgent": "torrent-process",
+                "uuid": "u-1",
+            }
+            lines = list(format_record(obj, verbose))
+            joined = "\n".join(lines)
+            self.assertIn("model: claude-opus-4-7", joined)
+            self.assertIn("usage:", joined)
+            self.assertIn("in=5", joined)
+            self.assertIn("out=3", joined)
+            self.assertIn("stop_reason: end_turn", joined)
+            self.assertIn("requestId: req_abc", joined)
+            self.assertIn("attributionAgent: torrent-process", joined)
+
+        def test_non_verbose_omits_metadata(self):
+            obj = {
+                "type": "assistant",
+                "message": {
+                    "model": "claude-opus-4-7",
+                    "content": [{"type": "text", "text": "hi"}],
+                    "usage": {"input_tokens": 5, "output_tokens": 3},
+                },
+                "requestId": "req_abc",
+            }
+            lines = list(format_record(obj, self.opts))
+            joined = "\n".join(lines)
+            self.assertNotIn("model:", joined)
+            self.assertNotIn("requestId:", joined)
+            self.assertNotIn("usage:", joined)
 
         def test_show_ts_true(self):
             opts = FormatOpts(show_ts=True)
