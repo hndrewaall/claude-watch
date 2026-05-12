@@ -9,6 +9,8 @@ End-to-end `docker compose` example that wires:
 
 Drop into a freshly cloned setup, run one command, get the integrated experience: a containerised Claude Code shell, a web UI for its work queue at `http://localhost:8000/`, a semantic-search web UI at `http://localhost:8001/`, and a browser terminal at `http://localhost:7681/`.
 
+Looking for periodic event emissions instead? See [`examples/cron/`](../cron/README.md) for a cron-driven `claude-event` example.
+
 ## Prerequisites
 
 - Docker Engine (Linux) or Docker Desktop (macOS / Windows). Compose v2 (the `docker compose` subcommand, not legacy `docker-compose`).
