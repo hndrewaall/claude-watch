@@ -1,0 +1,1424 @@
+/* queue-minisite — Solarized palette via prefers-color-scheme.
+ * Mirrors alerts-minisite/static/style.css; tweaks for queue states.
+ *
+ * base03  #002b36 (dark bg)        base02  #073642
+ * base01  #586e75                  base00  #657b83
+ * base0   #839496                  base1   #93a1a1
+ * base2   #eee8d5                  base3   #fdf6e3 (light bg)
+ * yellow  #b58900   orange  #cb4b16   red     #dc322f
+ * magenta #d33682   violet  #6c71c4   blue    #268bd2
+ * cyan    #2aa198   green   #859900
+ */
+
+:root {
+  --bg:        #fdf6e3;
+  --bg-alt:    #eee8d5;
+  --fg:        #586e75;
+  --fg-emph:   #073642;
+  --fg-mute:   #93a1a1;
+  --line:      #eee8d5;
+  --link:      #268bd2;
+  --running:   #2aa198; /* cyan */
+  --starting:  #cb4b16; /* orange — queue-running but no agent yet */
+  --pending:   #b58900; /* yellow */
+  --done:      #859900; /* green */
+  --abandoned: #93a1a1; /* base1 */
+  --orphan:    #dc322f; /* red */
+  --ready:     #6c71c4; /* violet */
+  --ok:        #859900;
+  --critical:  #dc322f;
+  --shadow:    0 1px 0 rgba(0,0,0,0.06);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg:        #002b36;
+    --bg-alt:    #073642;
+    --fg:        #93a1a1;
+    --fg-emph:   #eee8d5;
+    --fg-mute:   #586e75;
+    --line:      #073642;
+    --link:      #268bd2;
+    --running:   #2aa198;
+    --starting:  #cb4b16;
+    --pending:   #b58900;
+    --done:      #859900;
+    --abandoned: #586e75;
+    --orphan:    #dc322f;
+    --ready:     #6c71c4;
+    --ok:        #859900;
+    --critical:  #dc322f;
+    --shadow:    0 1px 0 rgba(0,0,0,0.4);
+  }
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  padding: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  font-size: 16px;
+  line-height: 1.4;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+a { color: var(--link); }
+
+main {
+  max-width: 760px;
+  margin: 0 auto;
+  padding: 12px 12px 24px 12px;
+}
+
+/* ------- top bar ------- */
+
+.topbar {
+  position: sticky;
+  top: 0;
+  z-index: 5;
+  background: var(--bg-alt);
+  color: var(--fg-emph);
+  border-bottom: 1px solid var(--line);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 16px;
+  font-weight: 600;
+  box-shadow: var(--shadow);
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.topbar .title {
+  font-size: 1.05rem;
+  letter-spacing: 0.02em;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.topbar .title .logo {
+  width: 28px;
+  height: 28px;
+  border-radius: 4px;
+  object-fit: cover;
+  display: block;
+}
+
+.topbar .meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 500;
+  font-size: 0.85rem;
+  flex-wrap: wrap;
+}
+
+.count {
+  padding: 4px 10px;
+  border-radius: 999px;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  color: var(--fg-emph);
+  min-height: 28px;
+  display: inline-flex;
+  align-items: center;
+}
+
+.count-running  { color: var(--running);  border-color: var(--running); }
+.count-starting { color: var(--starting); border-color: var(--starting); }
+.count-pending  { color: var(--pending);  border-color: var(--pending); }
+.count-orphan   { color: var(--orphan);   border-color: var(--orphan); }
+
+.dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  display: inline-block;
+}
+.dot-ok  { background: var(--ok); }
+.dot-err { background: var(--critical); }
+
+.ts {
+  font-variant-numeric: tabular-nums;
+  color: var(--fg-mute);
+}
+
+/* ------- banner ------- */
+
+.banner {
+  margin: 12px;
+  padding: 12px 16px;
+  border-radius: 6px;
+  font-size: 0.92rem;
+}
+.banner-err {
+  background: var(--critical);
+  color: #fff;
+}
+
+/* ------- section ------- */
+
+.section-title {
+  margin: 18px 4px 8px 4px;
+  font-size: 0.95rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--fg-mute);
+}
+
+.section-title .section-count {
+  margin-left: 6px;
+  color: var(--fg);
+  font-weight: 500;
+  text-transform: none;
+  letter-spacing: 0;
+  font-size: 0.85rem;
+}
+
+.empty-mini {
+  margin: 0 0 10px 0;
+  padding: 10px 14px;
+  color: var(--fg-mute);
+  font-size: 0.9rem;
+  background: var(--bg-alt);
+  border-radius: 6px;
+  border: 1px dashed var(--line);
+}
+
+/* ------- item card ------- */
+
+.item {
+  background: var(--bg-alt);
+  border: 1px solid var(--line);
+  border-left: 4px solid var(--fg-mute);
+  border-radius: 6px;
+  margin: 0 0 10px 0;
+  padding: 12px 14px;
+  box-shadow: var(--shadow);
+}
+
+.item.state-running   { border-left-color: var(--running); }
+.item.state-starting  { border-left-color: var(--starting); background: color-mix(in srgb, var(--starting) 6%, var(--bg-alt)); }
+.item.state-pending   { border-left-color: var(--pending); }
+.item.state-pending.ready { border-left-color: var(--ready); }
+.item.state-done      { border-left-color: var(--done); opacity: 0.75; }
+.item.state-abandoned { border-left-color: var(--abandoned); opacity: 0.6; }
+.item.orphan          { border-left-color: var(--orphan); background: color-mix(in srgb, var(--orphan) 8%, var(--bg-alt)); }
+
+.item-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+
+.id {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 0.8rem;
+  color: var(--fg-emph);
+  background: var(--bg);
+  padding: 2px 6px;
+  border-radius: 3px;
+  border: 1px solid var(--line);
+}
+
+.prio {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 0.78rem;
+  color: var(--fg-mute);
+}
+
+/* ------- badges ------- */
+
+.badge {
+  display: inline-block;
+  padding: 3px 8px;
+  border-radius: 4px;
+  font-size: 0.72rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: #fff;
+  background: var(--fg-mute);
+  white-space: nowrap;
+}
+
+.badge.state-running   { background: var(--running); }
+.badge.state-starting  { background: var(--starting); color: #fff; }
+.badge.state-pending   { background: var(--pending); color: #000; }
+.badge.state-done      { background: var(--done); }
+.badge.state-abandoned { background: var(--abandoned); }
+.badge.state-orphan    { background: var(--orphan); }
+.badge.ghead {
+  background: transparent;
+  color: var(--ready);
+  border: 1px solid var(--ready);
+}
+
+/* ------- item body ------- */
+
+.summary {
+  margin: 4px 0 4px 0;
+  font-weight: 500;
+  color: var(--fg-emph);
+  word-break: break-word;
+}
+
+.description {
+  margin: 4px 0 6px 0;
+  color: var(--fg);
+  font-size: 0.9rem;
+  font-style: italic;
+}
+
+.age {
+  font-size: 0.82rem;
+  color: var(--fg-mute);
+  font-variant-numeric: tabular-nums;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 6px;
+}
+
+.age .sep { color: var(--line); }
+
+/* ------- starting state — spawn-race window between
+ *         `session-task queue register` and the agent's first JSONL
+ *         event reaching claude-watch's active-agents poller. -------
+ * Follows the project's pill/card pattern (see Queue States in the
+ * design notes). Inline spinner replaces the
+ * "agent X alive (...)" line. */
+.agent-spawning {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--starting);
+}
+
+.spinner {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  border: 2px solid color-mix(in srgb, var(--starting) 30%, transparent);
+  border-top-color: var(--starting);
+  animation: spin 0.9s linear infinite;
+  vertical-align: -2px;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .spinner {
+    animation: none;
+    border-top-color: var(--starting);
+  }
+}
+
+.scope {
+  margin-top: 8px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.chip {
+  display: inline-block;
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 0.72rem;
+  color: var(--fg-emph);
+  background: var(--bg);
+  padding: 2px 6px;
+  border-radius: 3px;
+  border: 1px solid var(--line);
+}
+
+/* ------- info dropdown (top-right of topbar) -------
+ *
+ * Replaces the old fixed bottombar — same content (auth user, cache age,
+ * /api/queue link) but lives in a dropdown anchored to the ⓘ button so
+ * it doesn't take up persistent screen real estate. Toggled by info.js;
+ * .cache-age is updated live by refresh.js. */
+
+.info-wrap {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+}
+
+.info-btn {
+  background: transparent;
+  border: 1px solid var(--line);
+  color: var(--fg-mute);
+  width: 28px;
+  height: 28px;
+  border-radius: 999px;
+  font-size: 0.95rem;
+  line-height: 1;
+  cursor: pointer;
+  font-family: inherit;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+}
+
+.info-btn:hover,
+.info-btn:focus-visible {
+  color: var(--fg-emph);
+  border-color: var(--link);
+  outline: none;
+}
+
+.info-btn[aria-expanded="true"] {
+  color: var(--fg-emph);
+  border-color: var(--link);
+  background: var(--bg);
+}
+
+.info-dropdown {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  min-width: 220px;
+  z-index: 10;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.18);
+  padding: 8px 10px;
+  font-size: 0.82rem;
+  font-weight: 500;
+  color: var(--fg);
+}
+
+.info-dropdown[hidden] { display: none; }
+
+.info-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 12px;
+  padding: 4px 2px;
+}
+
+.info-row + .info-row {
+  border-top: 1px dashed var(--line);
+}
+
+.info-label {
+  color: var(--fg-mute);
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.info-value {
+  color: var(--fg-emph);
+  font-variant-numeric: tabular-nums;
+  word-break: break-all;
+  text-align: right;
+}
+
+.info-value a {
+  color: var(--link);
+  text-decoration: none;
+}
+
+.info-value a:hover { text-decoration: underline; }
+
+/* ------- narrow viewport tweaks ------- */
+
+@media (max-width: 480px) {
+  main { padding: 8px 8px 16px 8px; }
+  .item { padding: 10px 12px; border-radius: 4px; }
+  .topbar { padding: 10px 12px; }
+  .topbar .title { font-size: 0.95rem; }
+  .topbar .meta { font-size: 0.78rem; }
+  .info-dropdown { min-width: 180px; font-size: 0.78rem; }
+}
+
+/* ------- action buttons (stop / abandon) ------- */
+
+.action-btn {
+  margin-left: auto;
+  padding: 4px 12px;
+  border-radius: 4px;
+  background: transparent;
+  font-size: 0.74rem;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  cursor: pointer;
+  font-family: inherit;
+}
+
+/* Stop is destructive — RUNNING items lose in-progress agent work. */
+.stop-btn {
+  border: 1px solid var(--critical);
+  color: var(--critical);
+}
+
+.stop-btn:hover,
+.stop-btn:focus-visible {
+  background: var(--critical);
+  color: #fff;
+  outline: none;
+}
+
+.stop-btn:focus-visible {
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--critical) 35%, transparent);
+}
+
+/* Abandon is cleanup — PENDING items haven't started yet. Use the
+ * orange "warn" tone (--pending family) to signal "less alarming than
+ * stop, still a queue mutation". */
+.abandon-btn {
+  border: 1px solid var(--pending);
+  color: var(--pending);
+}
+
+.abandon-btn:hover,
+.abandon-btn:focus-visible {
+  background: var(--pending);
+  color: #000;
+  outline: none;
+}
+
+.abandon-btn:focus-visible {
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--pending) 35%, transparent);
+}
+
+/* Force-start is an auditable scope-conflict OVERRIDE — pending item
+ * promoted to running while bypassing serialization. Shares the warn
+ * tone (pending family) but keeps the abandon button adjacent so the
+ * two pending-item actions look related. The CONFIRM step requires a
+ * reason; the button itself just opens the modal. */
+.force-start-btn {
+  border: 1px solid var(--pending);
+  color: var(--pending);
+}
+
+.force-start-btn:hover,
+.force-start-btn:focus-visible {
+  background: var(--pending);
+  color: #000;
+  outline: none;
+}
+
+.force-start-btn:focus-visible {
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--pending) 35%, transparent);
+}
+
+/* ------- modal ------- */
+
+body.modal-open { overflow: hidden; }
+
+.modal {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+}
+
+.modal[hidden] { display: none; }
+
+.modal-backdrop {
+  position: absolute;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.55);
+}
+
+.modal-panel {
+  position: relative;
+  z-index: 1;
+  background: var(--bg);
+  color: var(--fg);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.35);
+  padding: 18px 18px 14px 18px;
+  width: min(440px, 100%);
+}
+
+.modal-title {
+  margin: 0 0 10px 0;
+  font-size: 1.05rem;
+  color: var(--fg-emph);
+  font-weight: 700;
+}
+
+.modal-target {
+  margin: 6px 0;
+  font-size: 0.88rem;
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  flex-wrap: wrap;
+}
+
+.modal-target-label {
+  color: var(--fg-mute);
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  min-width: 60px;
+}
+
+.modal-summary {
+  color: var(--fg-emph);
+  word-break: break-word;
+}
+
+.modal-warning {
+  margin: 10px 0;
+  padding: 8px 10px;
+  border-radius: 4px;
+  border-left: 3px solid var(--critical);
+  background: color-mix(in srgb, var(--critical) 8%, var(--bg-alt));
+  color: var(--fg-emph);
+  font-size: 0.86rem;
+  line-height: 1.4;
+}
+
+/* Stop variant — keep the destructive red. */
+.modal-warning-stop {
+  border-left-color: var(--critical);
+  background: color-mix(in srgb, var(--critical) 8%, var(--bg-alt));
+}
+
+/* Abandon variant — orange/yellow, less alarming. */
+.modal-warning-abandon {
+  border-left-color: var(--pending);
+  background: color-mix(in srgb, var(--pending) 10%, var(--bg-alt));
+}
+
+.modal-warning code {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 0.78rem;
+  background: var(--bg);
+  padding: 1px 4px;
+  border-radius: 3px;
+  border: 1px solid var(--line);
+}
+
+.modal-reason-label {
+  display: block;
+  margin: 8px 0 4px 0;
+  font-size: 0.72rem;
+  color: var(--fg-mute);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+#action-modal-reason {
+  width: 100%;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--bg-alt);
+  color: var(--fg-emph);
+  font-family: inherit;
+  font-size: 0.92rem;
+}
+
+#action-modal-reason:focus-visible {
+  outline: none;
+  border-color: var(--link);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--link) 35%, transparent);
+}
+
+.modal-error {
+  margin: 10px 0 0 0;
+  padding: 8px 10px;
+  background: var(--critical);
+  color: #fff;
+  border-radius: 4px;
+  font-size: 0.86rem;
+  word-break: break-word;
+}
+
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 14px;
+}
+
+.modal-btn {
+  padding: 8px 16px;
+  border-radius: 4px;
+  border: 1px solid var(--line);
+  background: var(--bg-alt);
+  color: var(--fg-emph);
+  font-family: inherit;
+  font-size: 0.88rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.modal-btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.modal-btn:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--link) 35%, transparent);
+}
+
+.modal-btn-secondary { /* default style above */ }
+
+.modal-btn-danger {
+  background: var(--critical);
+  border-color: var(--critical);
+  color: #fff;
+}
+
+.modal-btn-danger:focus-visible {
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--critical) 35%, transparent);
+}
+
+/* Warn variant — orange/yellow, used for the Abandon confirm button. */
+.modal-btn-warn {
+  background: var(--pending);
+  border-color: var(--pending);
+  color: #000;
+}
+
+.modal-btn-warn:focus-visible {
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--pending) 35%, transparent);
+}
+
+/* ------- drag and drop (dependency UI) -------
+ *
+ * Pending rows are draggable; pending OR running rows are drop targets.
+ * The drag-handle glyph in the row header signals the affordance — the
+ * action buttons (stop/abandon) keep their normal click behavior so the
+ * two interactions don't conflict.
+ */
+
+.draggable {
+  cursor: grab;
+}
+
+.draggable:active {
+  cursor: grabbing;
+}
+
+/* While a row is mid-drag — translucent so the user sees both the
+ * source row and the cursor's drop preview. */
+.item.dragging {
+  opacity: 0.5;
+  outline: 2px dashed var(--link);
+  outline-offset: -2px;
+}
+
+/* The currently-hovered drop target — violet highlight, distinct from
+ * regular hover. */
+.item.drop-target {
+  outline: 2px solid var(--ready);
+  outline-offset: -2px;
+  background: color-mix(in srgb, var(--ready) 10%, var(--bg-alt));
+}
+
+/* Inline drag handle in the row header — visual cue only, picked up by
+ * the article-level draggable=true. Hidden on running rows (not
+ * draggable). */
+.drag-handle {
+  display: none;
+  font-size: 0.95rem;
+  color: var(--fg-mute);
+  margin-left: 4px;
+  user-select: none;
+}
+
+.draggable .drag-handle {
+  display: inline;
+}
+
+/* Depends-on badge — "→ q-XXXX". Distinct from state badges; uses the
+ * violet (--ready) family so it visually pairs with the drop-target
+ * highlight. The badge wraps a clickable anchor (jumps to the dep
+ * target) and an "x" remove button so an operator can untangle a
+ * mis-dragged edge inline. */
+.badge.dep-badge {
+  background: transparent;
+  color: var(--ready);
+  border: 1px solid var(--ready);
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  font-weight: 600;
+  text-transform: none;
+  letter-spacing: 0;
+  font-size: 0.7rem;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 6px;
+}
+
+.badge.dep-badge .dep-link {
+  color: inherit;
+  text-decoration: none;
+}
+
+.badge.dep-badge .dep-link:hover {
+  text-decoration: underline;
+}
+
+.badge.dep-badge .dep-remove-btn {
+  background: transparent;
+  border: none;
+  color: var(--ready);
+  cursor: pointer;
+  font-size: 0.85rem;
+  line-height: 1;
+  padding: 0 2px;
+  font-weight: 700;
+  opacity: 0.7;
+}
+
+.badge.dep-badge .dep-remove-btn:hover {
+  opacity: 1;
+  color: var(--critical);
+}
+
+/* When a pending item has unmet dependencies, give it a faint left
+ * border accent so the "blocked by an explicit dep" state is visually
+ * distinct from "blocked by queue head". */
+.item.has-deps {
+  border-left: 3px solid var(--ready);
+}
+
+/* Brief flash applied by depend.js when scrolling to a dep target so
+ * the user sees where the link landed them. */
+@keyframes dep-flash {
+  0% { background: rgba(180, 120, 220, 0.35); }
+  100% { background: transparent; }
+}
+.item.dep-flash {
+  animation: dep-flash 1.2s ease-out;
+}
+
+/* Inline error toast surfaced when /api/queue/depend rejects. Slides
+ * in at the top, auto-dismisses after a few seconds. */
+.depend-toast {
+  position: fixed;
+  top: 64px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 200;
+  background: var(--critical);
+  color: #fff;
+  padding: 10px 16px;
+  border-radius: 6px;
+  font-size: 0.9rem;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+  max-width: 90%;
+  text-align: center;
+}
+
+.depend-toast.depend-toast-info {
+  background: var(--ready);
+}
+
+/* ------- live log stream modal -------
+ *
+ * Click on a running item card -> opens this modal which subscribes
+ * to /api/queue/<id>/stream (SSE) and pretty-prints each new transcript
+ * line as it arrives. Distinct from the action confirmation modal: this
+ * one is a viewer (no confirm/cancel), close-only. Wider panel because
+ * the content is monospace log output, not a confirmation form.
+ */
+
+/* Make running rows look clickable. The cursor + outline-on-hover
+ * affordance signals the click target without changing the layout. */
+.log-clickable {
+  cursor: pointer;
+}
+
+.log-clickable:hover {
+  outline: 1px solid var(--link);
+  outline-offset: -1px;
+}
+
+.log-clickable:focus-visible {
+  outline: 2px solid var(--link);
+  outline-offset: -2px;
+}
+
+/* The log modal is wider than the action modal — the stream pre needs
+ * room. Mobile viewports fall back to nearly full-width via the min(). */
+.log-modal-panel {
+  width: min(900px, 100%);
+  max-height: 90vh;
+  display: flex;
+  flex-direction: column;
+}
+
+.log-modal-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 6px;
+}
+
+.log-modal-head .modal-title {
+  margin: 0;
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.log-modal-meta {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.log-modal-meta .modal-btn {
+  /* The big × close button — keep it compact. */
+  padding: 4px 10px;
+  font-size: 1.05rem;
+  line-height: 1;
+}
+
+.log-modal-summary {
+  margin: 4px 0 8px 0;
+  color: var(--fg);
+  font-size: 0.85rem;
+  font-style: italic;
+  word-break: break-word;
+}
+
+/* Per-modal summary header block — keys/values laid out as a vertical
+ * key:value list so each datum sits on its own line and the eye can
+ * scan top-down. Populated from /api/queue/<id>/meta by live-log.js;
+ * rows for absent fields are kept hidden. */
+.log-modal-meta-summary {
+  margin: 4px 0 10px 0;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--bg-alt);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 0.82rem;
+  line-height: 1.35;
+}
+
+.log-meta-row {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.log-meta-label {
+  color: var(--fg-mute);
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  min-width: 84px;
+  flex: 0 0 84px;
+}
+
+.log-meta-value {
+  color: var(--fg);
+  word-break: break-word;
+  flex: 1 1 auto;
+  min-width: 0;
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  align-items: baseline;
+}
+
+.log-meta-value .chip {
+  /* Reuse the scope-chip look from the home page so the modal feels
+   * connected to the row it was opened from. */
+  background: var(--bg);
+}
+
+.log-meta-dep {
+  color: var(--link);
+  text-decoration: none;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 0.78rem;
+}
+
+.log-meta-dep:hover {
+  text-decoration: underline;
+}
+
+.log-meta-dep-status {
+  color: var(--fg-mute);
+  font-style: italic;
+}
+
+/* The agent-return <details> sits inside the meta block. Override the
+ * generic prompt-toggle defaults so the disclosure feels integrated
+ * with the surrounding rows rather than floating on its own. */
+.log-modal-meta-summary .log-modal-return {
+  margin-top: 4px;
+}
+
+.log-modal-meta-summary .log-modal-return .prompt-body {
+  max-height: 320px;
+  overflow: auto;
+  font-size: 0.85rem;
+}
+
+.log-status {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  border: 1px solid var(--line);
+  color: var(--fg-mute);
+  background: var(--bg-alt);
+}
+
+.log-status-ok   { color: var(--ok); border-color: var(--ok); }
+.log-status-pending { color: var(--fg-mute); }
+.log-status-warn { color: var(--pending); border-color: var(--pending); }
+.log-status-err  { color: var(--critical); border-color: var(--critical); }
+
+.log-toggle-btn {
+  padding: 3px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: var(--bg-alt);
+  color: var(--fg-mute);
+  font-family: inherit;
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  cursor: pointer;
+}
+
+.log-toggle-btn[aria-pressed="true"] {
+  background: var(--running);
+  color: #fff;
+  border-color: var(--running);
+}
+
+.log-toggle-btn:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--link) 35%, transparent);
+}
+
+/* Jump-to-top / jump-to-bottom buttons in the log modal header. Same
+   pill shape as .log-toggle-btn but momentary (not aria-pressed). */
+.log-jump-btn {
+  padding: 3px 9px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: var(--bg-alt);
+  color: var(--fg-mute);
+  font-family: inherit;
+  font-size: 0.85rem;
+  font-weight: 700;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.log-jump-btn:hover {
+  color: var(--fg);
+  border-color: var(--link);
+}
+
+.log-jump-btn:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--link) 35%, transparent);
+}
+
+/* The scrolling stream pane — monospace, dark/light per palette. */
+.log-stream {
+  flex: 1 1 auto;
+  min-height: 280px;
+  max-height: 70vh;
+  overflow-y: auto;
+  margin: 0;
+  padding: 10px 12px;
+  background: var(--bg-alt);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 0.78rem;
+  line-height: 1.5;
+  color: var(--fg);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.log-stream:focus-visible {
+  outline: none;
+  border-color: var(--link);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--link) 35%, transparent);
+}
+
+/* Each event renders as a div — keep them tight. */
+.log-line {
+  padding: 2px 0;
+  border-bottom: 1px dashed transparent;
+}
+
+.log-line + .log-line {
+  border-top: 1px dashed color-mix(in srgb, var(--fg-mute) 15%, transparent);
+}
+
+/* ------- per-event one-liner stream (task-watch parity) -------
+ *
+ * Each event in the log stream renders as a <details class="log-event">
+ * with a <summary class="log-headline"> top row (timestamp + label chip
+ * + concise content preview) and a <div class="log-event-body"> with
+ * the expanded body (text, code blocks, metadata disclosures, tool
+ * result preview, etc.). Closed by default so the modal opens as a
+ * stream of one-liners — click any line to disclose its full body.
+ * Mirrors agent-tail's `TOOL_CALL Bash(...)` / `ASSISTANT: ...` /
+ * `TOOL_RESULT [id] ...` per-line format. */
+.log-event {
+  margin: 0;
+}
+
+.log-event > .log-headline {
+  cursor: pointer;
+  list-style: none;
+  display: block;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  padding: 1px 0;
+}
+
+.log-event > .log-headline::-webkit-details-marker { display: none; }
+
+.log-event > .log-headline::before {
+  content: "▸";
+  display: inline-block;
+  width: 0.9em;
+  color: var(--fg-mute);
+  transition: transform 0.12s ease-out;
+}
+
+.log-event[open] > .log-headline::before {
+  transform: rotate(90deg);
+}
+
+.log-event > .log-headline:hover {
+  background: color-mix(in srgb, var(--link) 8%, transparent);
+}
+
+.log-headline-text {
+  color: var(--fg);
+}
+
+/* When opened, the body sits indented under the headline so the
+ * visual hierarchy reads top-down (headline → details). Slight
+ * top-margin separates it from the headline row. */
+.log-event-body {
+  margin: 4px 0 4px 1.2em;
+  padding-left: 6px;
+  border-left: 1px dotted color-mix(in srgb, var(--fg-mute) 30%, transparent);
+  white-space: normal;
+}
+
+.log-ts {
+  color: var(--fg-mute);
+  font-variant-numeric: tabular-nums;
+}
+
+.log-label {
+  display: inline-block;
+  min-width: 84px;
+  padding: 0 4px;
+  font-weight: 700;
+  color: var(--fg-emph);
+}
+
+.log-body {
+  color: var(--fg);
+}
+
+.log-body code {
+  background: var(--bg);
+  padding: 1px 4px;
+  border-radius: 3px;
+  border: 1px solid var(--line);
+  color: var(--fg-emph);
+  word-break: break-word;
+  white-space: pre-wrap;
+}
+
+.log-inline-pre {
+  margin: 4px 0 0 0;
+  padding: 6px 8px;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  font-family: inherit;
+  font-size: 0.74rem;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--fg-emph);
+  max-height: 200px;
+  overflow: auto;
+}
+
+/* Per-event-kind tinting via the left border. Same family as the
+ * item state colors so the visual language stays consistent. */
+.log-line.log-user            { border-left: 3px solid var(--pending); padding-left: 6px; }
+.log-line.log-assistant       { border-left: 3px solid var(--running); padding-left: 6px; }
+.log-line.log-tool-use        { border-left: 3px solid var(--link);    padding-left: 6px; }
+.log-line.log-tool-result     { border-left: 3px solid var(--done);    padding-left: 6px; }
+.log-line.log-tool-error,
+.log-line.log-tool-result.log-tool-error
+                              { border-left: 3px solid var(--critical); padding-left: 6px; }
+.log-line.log-attachment      { border-left: 3px solid var(--ready);   padding-left: 6px; }
+.log-line.log-system          { border-left: 3px solid var(--fg-mute); padding-left: 6px; }
+.log-line.log-progress        { border-left: 3px dashed var(--fg-mute); padding-left: 6px; color: var(--fg-mute); }
+.log-line.log-thinking-line   { border-left: 3px dashed var(--running); padding-left: 6px; color: var(--fg-mute); font-style: italic; }
+.log-line.log-user-image      { border-left: 3px solid var(--pending); padding-left: 6px; }
+.log-line.log-meta-line       { color: var(--fg-mute); font-style: italic; }
+.log-line.log-error-line      { color: var(--critical); }
+.log-line.log-raw-line        { color: var(--fg-mute); }
+
+/* Inline thinking block inside an assistant turn (when text + thinking
+ * blocks co-occur in one record). Slightly indented + muted so the
+ * thinking is visually separated from the assistant's actual text. */
+.log-thinking {
+  display: block;
+  margin-top: 2px;
+  margin-left: 1ch;
+  color: var(--fg-mute);
+  font-style: italic;
+  border-left: 2px dashed var(--fg-mute);
+  padding-left: 6px;
+}
+.log-thinking-label {
+  font-weight: 600;
+  font-style: normal;
+  color: var(--fg-mute);
+  margin-right: 4px;
+}
+
+/* Compact badges used inside tool_use / tool_result bodies. */
+.log-caller {
+  color: var(--fg-mute);
+  font-size: 0.85em;
+  padding: 0 4px;
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  margin-left: 4px;
+}
+.log-tool-id {
+  color: var(--fg-mute);
+  font-family: monospace;
+  font-size: 0.85em;
+  margin-left: 4px;
+}
+
+/* Inline thumbnail for user-image content blocks. Keep small so the
+ * stream isn't dominated by a single screenshot; users can right-click
+ * → "Open image in new tab" for full size. */
+.log-image-thumb {
+  max-width: 240px;
+  max-height: 180px;
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  vertical-align: middle;
+  margin: 0 4px;
+}
+
+.log-meta { color: var(--fg-mute); font-style: italic; }
+.log-error { color: var(--critical); font-weight: 600; }
+.log-raw   { color: var(--fg-mute); }
+
+/* ------- archived-log badge (Done / Abandoned cards) -------
+ *
+ * Subtle indicator that the queue item has a saved transcript and
+ * clicking the card opens the archive replay. Distinct from the
+ * state badges (running/pending/done/abandoned) — this one's about
+ * affordance, not status. */
+.badge.log-badge {
+  background: var(--bg);
+  color: var(--fg-mute);
+  border: 1px solid var(--line);
+}
+
+/* ------- workload badge (running cards bound to `workload run`) -------
+ *
+ * Surfaces that the live-log endpoint will tail
+ * /tmp/claude-workloads/<label>.output instead of an agent JSONL.
+ * Distinct from the state-running badge so the operator can tell at a
+ * glance which running items are workload-driven (no subagent). */
+.badge.workload-badge {
+  background: var(--link);
+  color: #fff;
+}
+
+/* ------- vim-style keyboard selection (j/k) -------
+ *
+ * Painted by static/keyboard.js when the user navigates with j/k. The
+ * ring is a 2px outline (not a border-width change — that would shift
+ * layout) plus a subtle tint matching the existing dark/light theme.
+ * Layered after .item.* state rules so it wins regardless of the
+ * underlying state-XXX class. */
+.item.kbd-selected {
+  outline: 2px solid var(--link);
+  outline-offset: -1px;
+  background: color-mix(in srgb, var(--link) 8%, var(--bg-alt));
+}
+
+/* ------- workload log line (live-log modal in workload mode) -------
+ *
+ * Workload tail emits plain stdout/stderr lines, no per-line label.
+ * Render compact (no left border accent, full width) so the modal
+ * reads like a terminal tail. */
+.log-line.log-workload-line {
+  border-left: 3px solid var(--link);
+  padding-left: 6px;
+  color: var(--fg);
+}
+.log-line.log-workload-line .log-inline-pre {
+  margin: 0;
+}
+
+/* ------- prompt-toggle (collapsible "Prompt" section) -------
+ *
+ * Surfaces the full agent prompt (queue item description) on every
+ * card across all states, plus inside the live-log modal. Closed by
+ * default; <summary> click toggles it open. The body is monospace
+ * with preserved line breaks so multi-paragraph prompts read like
+ * the original text the main loop passed to `queue add`. */
+.prompt-toggle {
+  margin-top: 8px;
+  border-top: 1px dashed var(--line);
+  padding-top: 6px;
+}
+
+.prompt-toggle .prompt-summary {
+  cursor: pointer;
+  font-size: 0.78rem;
+  color: var(--fg-mute);
+  user-select: none;
+  list-style: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.prompt-toggle .prompt-summary::-webkit-details-marker { display: none; }
+
+.prompt-toggle .prompt-summary::before {
+  content: "▸";
+  display: inline-block;
+  width: 0.9em;
+  transition: transform 0.12s ease-out;
+}
+
+.prompt-toggle[open] .prompt-summary::before {
+  transform: rotate(90deg);
+}
+
+.prompt-toggle .prompt-summary:hover {
+  color: var(--fg);
+}
+
+.prompt-body {
+  margin: 6px 0 0 0;
+  padding: 8px;
+  border-radius: 4px;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 0.78rem;
+  line-height: 1.4;
+  color: var(--fg);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 40vh;
+  overflow-y: auto;
+}
+
+/* Inside the modal the prompt panel sits between the summary line and
+ * the log stream — pad slightly less than the card variant so the
+ * dashed separator doesn't double-up with the modal's own borders. */
+.log-modal .log-modal-prompt {
+  margin: 4px 0 8px 0;
+  padding-top: 4px;
+}
+.log-modal .log-modal-prompt .prompt-body {
+  max-height: 28vh;
+}
+
+/* In-stream expandable disclosures (.log-expand) reuse the prompt-toggle
+ * structure but live inside individual log lines, so they need tighter
+ * vertical chrome (no top border, smaller margin) and a fixed pixel
+ * max-height per the design spec — ~400px scrollable. The inline
+ * disclosure caret stays compact next to the inline summary text. */
+.log-expand {
+  margin-top: 2px;
+  border-top: none;
+  padding-top: 0;
+  display: inline-block;
+  vertical-align: top;
+  max-width: 100%;
+}
+
+.log-expand .prompt-summary {
+  font-size: 0.74rem;
+  color: var(--fg-mute);
+}
+
+.log-expand .prompt-body {
+  margin: 4px 0 4px 0;
+  font-size: 0.74rem;
+  max-height: 400px;
+}
+
+/* When the expand is opened inside a log line, give it a hairline left
+ * accent matching the line's family color so the expanded body feels
+ * "owned" by the parent line, not floating loose. */
+.log-line .log-expand[open] .prompt-body {
+  border-left-width: 2px;
+}
+
+@media (max-width: 480px) {
+  .log-modal-panel {
+    max-height: 94vh;
+  }
+  .log-stream {
+    font-size: 0.72rem;
+    max-height: 75vh;
+  }
+  .log-label {
+    min-width: 60px;
+  }
+  .prompt-body {
+    font-size: 0.72rem;
+    max-height: 50vh;
+  }
+}
