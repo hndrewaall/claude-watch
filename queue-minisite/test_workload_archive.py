@@ -209,6 +209,30 @@ class WorkloadArchiveEndpointTest(unittest.TestCase):
         self.assertTrue(non_meta, events)
         self.assertNotEqual(non_meta[0].get("kind"), "workload_line")
 
+    # ---------- direct_passthrough=True bytes-encoding regression ----------
+
+    def test_format_sse_returns_bytes(self):
+        """``_format_sse`` and ``_format_sse_comment`` must return bytes.
+
+        The streaming Response is created with ``direct_passthrough=True``
+        so werkzeug emits each yielded chunk to the WSGI socket verbatim
+        (no buffering, no flush coalescing). WSGI requires byte chunks
+        per PEP-3333; yielding strs raises
+        ``TypeError('...' is not a byte')`` from gunicorn's
+        gthread worker write() path and the SSE stream silently 200s
+        with an empty body. Regression guard.
+        """
+        b = self.appmod._format_sse({"type": "meta", "kind": "test"})
+        self.assertIsInstance(b, bytes, f"_format_sse returned {type(b).__name__}, expected bytes")
+        # Round-trip: bytes start with `data: ` and end with `\n\n`.
+        self.assertTrue(b.startswith(b"data: "), b)
+        self.assertTrue(b.endswith(b"\n\n"), b)
+
+        c = self.appmod._format_sse_comment("ka 1s")
+        self.assertIsInstance(c, bytes, f"_format_sse_comment returned {type(c).__name__}, expected bytes")
+        self.assertTrue(c.startswith(b": "), c)
+        self.assertTrue(c.endswith(b"\n\n"), c)
+
     # ---------- 404 paths ----------
 
     def test_archive_404_when_no_archive_stamp(self):

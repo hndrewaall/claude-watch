@@ -515,20 +515,32 @@ fn build_wrapper_script(
          # whole process group (negative pid) so any in-flight `sleep` dies\n\
          # alongside the loop subshell.\n\
          trap 'if [ -n \"$HEARTBEAT_PID\" ]; then kill -TERM -\"$HEARTBEAT_PID\" 2>/dev/null || kill \"$HEARTBEAT_PID\" 2>/dev/null || true; fi' EXIT\n\
-         # Force libc stdio to line-buffer the workload command's stdout+stderr.\n\
+         # Force line-buffered stdio for the workload command's stdout+stderr.\n\
          # Without this, programs whose stdout is a pipe (everything here, since\n\
-         # we redirect through `>(ts | tee)`) flip libc to BLOCK buffering by\n\
-         # default — Python's `print(...)`, glibc `printf`, and friends will\n\
-         # accumulate ~4-8KB before flushing. The .output file then grows in\n\
-         # chunks and the SSE tail through queue-minisite arrives in chunks at\n\
-         # the browser. stdbuf works via LD_PRELOAD=libstdbuf.so + _STDBUF_O=L\n\
-         # _STDBUF_E=L; LD_PRELOAD is inherited by children so a single wrap\n\
-         # at the outer `bash` covers the whole subtree. Only affects programs\n\
-         # that use libc stdio (no help for Rust/Go binaries that bypass libc,\n\
-         # or programs that call setvbuf themselves) but it's the right\n\
-         # default for the common case. WORKLOAD_LINE_BUFFER=0 opts out.\n\
+         # we redirect through `>(ts | tee)`) flip to BLOCK buffering by\n\
+         # default — `printf`/`puts` accumulate 4-8KB before flushing. The\n\
+         # .output file then grows in chunks and the SSE tail through\n\
+         # queue-minisite arrives in chunks at the browser.\n\
+         #\n\
+         # Two layers, since different runtimes use different buffers:\n\
+         #   * `stdbuf -oL -eL` flips libc stdio to line-buffered via\n\
+         #     `LD_PRELOAD=libstdbuf.so`. Covers C/C++ programs using\n\
+         #     libc stdio (printf, fwrite, puts) — Bash builtins, most\n\
+         #     coreutils, common CLI tools. LD_PRELOAD propagates to\n\
+         #     children so a single wrap at the outer `bash` covers the\n\
+         #     whole subtree.\n\
+         #   * `PYTHONUNBUFFERED=1` (env, inherited by children). Python\n\
+         #     uses its OWN io buffer, not libc stdio, so stdbuf is a\n\
+         #     no-op for it; this env var is the Python-specific flip.\n\
+         #     `PYTHONUNBUFFERED=1` is equivalent to `python -u`.\n\
+         #\n\
+         # Neither helps Rust/Go binaries that bypass libc (they use\n\
+         # direct write() syscalls + their own buffers) or programs\n\
+         # that explicitly call setvbuf() — but it's the right default\n\
+         # for the common case (Python, shell, C tools).\n\
+         # WORKLOAD_LINE_BUFFER=0 opts out of both.\n\
          if [ \"${{WORKLOAD_LINE_BUFFER:-1}}\" != \"0\" ] && command -v stdbuf >/dev/null 2>&1; then\n\
-             setsid --wait stdbuf -oL -eL bash -c {cmd_q}\n\
+             PYTHONUNBUFFERED=1 setsid --wait stdbuf -oL -eL bash -c {cmd_q}\n\
          else\n\
              setsid --wait bash -c {cmd_q}\n\
          fi\n\
@@ -2075,7 +2087,11 @@ mod tests {
         );
         assert!(
             script.contains("stdbuf -oL -eL bash -c"),
-            "wrapper must wrap the inner bash with `stdbuf -oL -eL`:\n{script}"
+            "wrapper must wrap the inner bash with `stdbuf -oL -eL` for libc-stdio programs:\n{script}"
+        );
+        assert!(
+            script.contains("PYTHONUNBUFFERED=1"),
+            "wrapper must set PYTHONUNBUFFERED=1 so Python children flush per-line:\n{script}"
         );
         assert!(
             script.contains("WORKLOAD_LINE_BUFFER"),
