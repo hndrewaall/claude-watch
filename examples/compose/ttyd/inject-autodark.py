@@ -13,14 +13,25 @@
 #      ttyd run + wget — see Dockerfile).
 #   2. Injects a <style> block that uses @media (prefers-color-scheme)
 #      to recolor the body / html background using the Solarized palette
-#      (Ethan Schoonover's public-domain base03 / base3).
-#   3. Injects a tiny <script> that flips the xterm.js theme to match
-#      the system color-scheme on page load, and reapplies the theme on
-#      a setInterval poll because ttyd's WebSocket sends a
-#      SET_PREFERENCES message AFTER the initial connect that
-#      overwrites whatever theme the page set. Without the reapply, the
-#      terminal flashes to its compile-time default a second after
-#      load.
+#      (Ethan Schoonover's public-domain base03 / base3). This handles
+#      the page chrome around the xterm.js terminal — margins, scrollbar
+#      gutter, area visible during initial load.
+#   3. Injects a <script> (applyAutodarkTheme) that ALSO flips the
+#      xterm.js Terminal instance's theme (window.term.options.theme)
+#      to match the system color-scheme. This is required because the
+#      xterm.js canvas renderer paints its OWN background color over
+#      the body chrome — a CSS-only flip leaves the visible terminal
+#      area unchanged even though getComputedStyle on the body reports
+#      the right color (this was the v7 bug caught by the workbot
+#      browser-side probe). The script:
+#        - reads prefers-color-scheme on initial load,
+#        - reapplies on a setInterval poll because ttyd's WebSocket
+#          sends a SET_PREFERENCES message AFTER the initial connect
+#          that overwrites whatever theme the page set (without the
+#          reapply, the terminal flashes to its compile-time default
+#          a second after load),
+#        - listens for matchMedia change events so live OS theme flips
+#          propagate without a page reload.
 #
 # Output is written in place: index.html is overwritten.
 
@@ -104,49 +115,57 @@ DARK_THEME_JSON = """{
 JS = f"""<script id="autodark-injected">
 (function() {{
     'use strict';
-    var LIGHT = {LIGHT_THEME_JSON};
-    var DARK = {DARK_THEME_JSON};
+    var SOLARIZED_LIGHT = {LIGHT_THEME_JSON};
+    var SOLARIZED_DARK = {DARK_THEME_JSON};
 
     function preferredTheme() {{
         try {{
             return window.matchMedia('(prefers-color-scheme: light)').matches
-                ? LIGHT : DARK;
-        }} catch (e) {{ return DARK; }}
+                ? SOLARIZED_LIGHT : SOLARIZED_DARK;
+        }} catch (e) {{ return SOLARIZED_DARK; }}
     }}
 
     function findTerm() {{
-        // ttyd / xterm.js attaches the Terminal to a div.xterm. Walk
-        // the DOM for the first one and pull the JS-side instance off
-        // its _core property. The exact internal path varies across
-        // xterm.js minor versions, so we feature-detect setOption /
-        // options.theme setters.
-        var nodes = document.querySelectorAll('.xterm');
-        for (var i = 0; i < nodes.length; i++) {{
-            var el = nodes[i];
-            // xterm.js stores the instance reference under various
-            // names depending on version; try a few.
-            var t = el._xterm || el.terminal || null;
-            if (t) return t;
-        }}
-        // Fallback: ttyd exposes the top-level App component on the
-        // body via Preact render. The Terminal is usually at
-        // window.term in dev builds but the prod bundle minifies the
-        // name — best-effort.
-        if (window.term && typeof window.term.setOption === 'function') {{
-            return window.term;
-        }}
+        // ttyd 1.7.7's bundled JS contains the literal assignment
+        // `window.term = t` where `t` is the xterm.js Terminal
+        // instance (verified by grepping the served HTML). That's the
+        // canonical accessor; we use it directly rather than trying
+        // to dig through `.xterm` DOM nodes (the prod bundle does NOT
+        // stash the instance on the DOM element).
+        //
+        // Both xterm.js v4 (setOption) and v5 (options.theme setter)
+        // are supported by applyAutodarkTheme below — DO NOT gate this lookup
+        // on either API existing, because v5 dropped setOption and an
+        // early gate would return null on every tick.
+        if (window.term) return window.term;
         return null;
     }}
 
-    function applyTheme() {{
+    function applyAutodarkTheme() {{
         var theme = preferredTheme();
+        // Body chrome (visible during initial load, around the
+        // canvas while resizing, and on margin/scrollbar regions).
+        try {{
+            document.body.style.backgroundColor = theme.background;
+            document.documentElement.style.backgroundColor = theme.background;
+        }} catch (e) {{ /* DOM may not be ready yet */ }}
+        // xterm.js canvas — without this, the terminal renderer
+        // paints its own background OVER the body chrome regardless
+        // of CSS, so a CSS-only flip leaves the visible terminal
+        // area unchanged. THIS is what was missing in the original
+        // injection: the CSS rule was firing (workbot confirmed
+        // getComputedStyle returned base3) but the canvas covered
+        // it.
         var t = findTerm();
         if (!t) return false;
         try {{
-            if (typeof t.setOption === 'function') {{
-                t.setOption('theme', theme);
-            }} else if (t.options) {{
+            // xterm.js v5: options.theme setter triggers a repaint.
+            // v4 fallback: setOption('theme', …). Try v5 first since
+            // ttyd 1.7.7 bundles v5.x; setOption was removed in v5.
+            if (t.options) {{
                 t.options.theme = theme;
+            }} else if (typeof t.setOption === 'function') {{
+                t.setOption('theme', theme);
             }}
             return true;
         }} catch (e) {{ return false; }}
@@ -154,20 +173,20 @@ JS = f"""<script id="autodark-injected">
 
     // 1. Initial paint — apply as soon as the DOM has the xterm node.
     if (document.readyState === 'loading') {{
-        document.addEventListener('DOMContentLoaded', applyTheme);
+        document.addEventListener('DOMContentLoaded', applyAutodarkTheme);
     }} else {{
-        applyTheme();
+        applyAutodarkTheme();
     }}
 
     // 2. Race-condition reapply. ttyd's WS SET_PREFERENCES arrives
     //    after WS open and overwrites our theme; poll every 2s to
     //    restamp. Negligible cost; survives all xterm.js version skews.
-    setInterval(applyTheme, 2000);
+    setInterval(applyAutodarkTheme, 2000);
 
     // 3. Live swap when the user toggles system dark mode.
     try {{
         var mql = window.matchMedia('(prefers-color-scheme: light)');
-        var onChange = function() {{ applyTheme(); }};
+        var onChange = function() {{ applyAutodarkTheme(); }};
         if (mql.addEventListener) {{
             mql.addEventListener('change', onChange);
         }} else if (mql.addListener) {{
