@@ -1,0 +1,196 @@
+# container/
+
+This directory is part of claude-watch — see the [top-level README](../README.md) for context.
+
+Containerized deployment of Claude Code + `claude-watch` + tmux as a single Docker image. Goal: a portable Claude Code environment that runs the same way on Linux servers and macOS work laptops, and that can replace a native install on a host as the default deployment mode.
+
+## Quick start
+
+The host-side launcher is [`bin/claude-tmux`](bin/claude-tmux). Install it once with:
+
+```
+ln -sf "$(pwd)/bin/claude-tmux" ~/bin/claude-tmux
+```
+
+(Run from this directory, or substitute the absolute path.)
+
+Then from any directory:
+
+```
+claude-tmux               # launch the tmux session via the image ENTRYPOINT
+claude-tmux bash          # debug shell inside the container
+claude-tmux --help        # usage + mount/env surface
+```
+
+The wrapper auto-detects docker access: it tries bare `docker` first, then `sudo docker`. If your invoking user is not in the `docker` group, `sudo docker` with NOPASSWD is the supported fallback path; if `sudo -n docker ps` stops working the wrapper will error with a fix-it pointer.
+
+Override the image tag via `CLAUDE_CONTAINER_IMAGE` (default: `claude-container:dev`).
+
+## Build
+
+```
+docker build -t claude-container:dev -f container/Dockerfile container/
+```
+
+Or `cd container && docker build -t claude-container:dev .` if you prefer.
+
+The Dockerfile is a multi-stage build:
+
+- **Stage 1 (`claude-watch-builder`)**: `rust:1-bookworm` clones
+  [`hndrewaall/claude-watch`](https://github.com/hndrewaall/claude-watch)
+  at a pinned commit (build-arg `CLAUDE_WATCH_REF`) and runs
+  `cargo build --release`. Output: `/build/target/release/claude-watch`,
+  stripped + LTO-optimised via the upstream `Cargo.toml`'s
+  `[profile.release]`.
+- **Stage 2 (final)**: `debian:bookworm-slim` copies just
+  `/usr/local/bin/claude-watch` from stage 1. Builder and runtime share the
+  bookworm libc, so the binary runs without glibc-mismatch surprises.
+
+To pin to a different upstream revision:
+
+```
+docker build --build-arg CLAUDE_WATCH_REF=<sha-or-tag> -t claude-container:dev container/
+```
+
+The `entrypoint.sh` runs the real `claude-watch` daemon in pane 1.
+See the "Run" section below for the resulting pane layout.
+
+## Run (without the wrapper)
+
+```
+sudo -E docker compose -f container/compose.yml run --rm claude-container
+```
+
+Or detached for `docker exec` smoke tests:
+
+```
+sudo -E docker compose -f container/compose.yml up -d
+```
+
+**The `-E` flag is required**. `compose.yml` uses `${HOME}` interpolation to
+keep the file host-portable, but `sudo` strips the caller's environment by
+default — bare `sudo docker compose up` expands `${HOME}` to `/root` (sudo's
+environment), silently pointing the bind mounts at `/root/.claude` /
+`/root/repos` and breaking JSONL discovery + auth chain. `sudo -E` preserves
+the invoking user's environment, including `HOME`. Equivalent:
+`sudo HOME=$HOME docker compose up -d` if you want to forward only `HOME` and
+nothing else. The `claude-tmux` wrapper handles this transparently by passing
+`-v "$HOME/.claude:..."` to `docker run` (no compose interpolation in the
+sudo'd shell), which is why the wrapper is the recommended entrypoint.
+
+Or for one-off debugging without the tmux entrypoint:
+
+```
+docker run --rm -it claude-container:dev bash
+```
+
+## Pane layout
+
+The entrypoint creates a tmux session named `claude-container` with two panes:
+
+- **Pane 0 (`claude-container:0.0`, left, ~75%)** — `claude` running
+  interactively. This is the pane the user types into.
+- **Pane 1 (`claude-container:0.1`, right, ~25%)** — the in-container
+  `claude-watch` daemon (bare `claude-watch` invocation). Reads pane 0 via
+  in-container `tmux capture-pane`, enforces token-stall / heartbeat /
+  context-warning checks against the in-container claude.
+
+The daemon picks up its config from `/etc/claude-watch/config.toml` (baked
+into the image, sourced from `claude-watch.config.toml` in this directory).
+Container-specific deltas from a typical host config:
+
+- `[tmux] dashboard_pane = "claude-container:0.0"` / `dashboard_session =
+  "claude-container"` — pinned to the in-container tmux session, not a host
+  `dashboard` session.
+- Logs land at `/tmp/claude-watch.jsonl` (uid 1000 writable, ephemeral).
+- `watcher_monitor`, `auto_update`, `reauth`, `task_watch`, `hybrid`
+  disabled — those depend on host integrations.
+
+To inspect pane 1 from another shell on the host:
+
+```
+sudo docker exec -it <container> tmux attach -t claude-container
+sudo docker exec <container> tmux capture-pane -t claude-container:0.1 -p
+sudo docker exec <container> cat /tmp/claude-watch.jsonl
+```
+
+If the daemon fails to start (config parse error, etc.) pane 1 drops to a
+bash prompt with the exit code printed, so the failure is visible on
+`tmux attach` instead of disappearing into a closed pane.
+
+## In-container user name
+
+The container runs as a user literally named `hndrewaall` (uid 1000, gid 1000).
+This is an *in-container* identity only — the HOST user can have any name; the
+bind mounts use `${HOME}` on the left side so the right (container) side is the
+only place the username matters. The image hardcodes uid 1000 so bind-mounted
+files round-trip without root-owned artifacts on hosts where the invoking user
+is also uid 1000 (the typical case).
+
+If your host user is not uid 1000, override at build time (extend the Dockerfile
+to `useradd --uid $HOSTUID`) or rebuild with matching uid/gid; otherwise
+bind-mounted writes will produce files owned by uid 1000 from the host's
+perspective.
+
+## Blast radius
+
+The `claude-tmux` wrapper passes EXACTLY the following surface into the container — nothing else from the host is visible.
+
+**Bind mounts** (host -> container, read-write, all uid 1000):
+- `~/.claude` -> `/home/hndrewaall/.claude` — session JSONL, credentials, project state
+- `~/repos` -> `/home/hndrewaall/repos` — code (all git repos)
+- `$PWD` -> `/workspace` — the directory `claude-tmux` was invoked from
+
+**Named volumes** (managed by docker, not bind-mounted from the host):
+- `claude-container-versions` -> `/home/hndrewaall/.local/share/claude` — persists the in-container claude binary's auto-updated `versions/<ver>/` directories across `--rm` container exits. Without this, every container restart resets to the image-baked claude version. See "Volume management" below.
+
+**Env vars passed in** (only forwarded if set on the host; everything else is filtered):
+- `CLAUDE_CODE_SSE_PORT` — VSCode IDE integration port (HTTP/SSE on host loopback, load-bearing)
+- `CLAUDE_CODE_IDE_HOST_OVERRIDE` — host the claude binary dials for SSE; defaults to `host.docker.internal` if unset (the wrapper supplies the default)
+- `ANTHROPIC_API_KEY` — only if set on the host
+- `CLAUDE_*` / `ANTHROPIC_*` — any other vars matching these prefixes are forwarded automatically
+
+**Network policy**: default **bridge networking** with an explicit
+host-loopback alias. The wrapper invokes
+`docker run --add-host=host.docker.internal:host-gateway ...` (no
+`--network host`); compose.yml uses `extra_hosts:
+["host.docker.internal:host-gateway"]`. The in-container claude binary reads
+`CLAUDE_CODE_IDE_HOST_OVERRIDE=host.docker.internal` and dials that name for
+its SSE upstream, which the bridge resolves to the host-gateway IP.
+
+`host.docker.internal` is provided natively by Docker Desktop on macOS and
+Windows; the `--add-host=host.docker.internal:host-gateway` flag is what makes
+it work on Linux too (Docker Engine 20.10+ honors the `host-gateway` magic
+value).
+
+**User**: container runs as `hndrewaall` (uid 1000, gid 1000) — matches a
+host UID-1000 user so bind-mounted files round-trip without root-owned
+artifacts.
+
+**Signal handling**: the wrapper traps `SIGTERM`/`SIGINT` on the host and forwards them via `docker kill --signal=...` to a per-PID container name (`claude-tmux-$$`), so `Ctrl-C` from the host cleanly tears down the in-container tmux session.
+
+## Volume management
+
+The `claude-container-versions` named docker volume holds the in-container claude binary's auto-updated `versions/<ver>/` tree at `/home/hndrewaall/.local/share/claude/`. It is created on first `claude-tmux` invocation (or first `docker compose up`) and persists across `--rm` exits — that's its whole purpose.
+
+Inspect existence + size + driver:
+
+```
+docker volume ls --filter name=claude-container-versions
+docker volume inspect claude-container-versions
+```
+
+Peek inside without launching the full container:
+
+```
+docker run --rm -v claude-container-versions:/data alpine ls -la /data
+docker run --rm -v claude-container-versions:/data alpine ls -la /data/versions/
+```
+
+Nuke (forces fallback to image-baked claude on next launch, then re-populates as the in-container claude auto-updates):
+
+```
+docker volume rm claude-container-versions
+```
+
+**Drift risk**: the image bakes a known-good claude (`/usr/local/bin/claude`). The named volume captures whatever the in-container claude has self-installed on top. The `~/.local/bin/claude` symlink inside the volume (if present from a prior auto-update) wins on PATH because `~/.local/bin` precedes `/usr/local/bin` — that's expected. If the volume gets torn (partial download, dangling symlink), nuke it; the image-baked floor still works.

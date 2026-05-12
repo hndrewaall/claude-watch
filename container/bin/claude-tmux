@@ -1,0 +1,202 @@
+#!/usr/bin/env bash
+# claude-tmux — host-side wrapper that launches the claude-container image
+# with the right bind mounts, env passthrough, signal handling, and tty.
+#
+# See container/README.md "Blast radius" for the full mount + env surface.
+#
+# Usage:
+#   claude-tmux                 # launch the tmux session via image ENTRYPOINT
+#   claude-tmux bash            # debug shell inside the container
+#   claude-tmux --help          # show usage and exit (no docker invoked)
+#
+# Env var overrides:
+#   CLAUDE_CONTAINER_IMAGE      # image tag (default: claude-container:dev)
+#
+# Env vars passed through to the container (only if set on the host):
+#   CLAUDE_CODE_SSE_PORT        # load-bearing for VSCode IDE integration
+#   CLAUDE_CODE_IDE_HOST_OVERRIDE  # host the claude binary connects to for SSE
+#   ANTHROPIC_API_KEY           # API key, if not using Pro auth via ~/.claude
+#   CLAUDE_* / ANTHROPIC_*      # any other matching env vars
+#
+# Bind mounts (rw):
+#   ~/.claude  -> /home/hndrewaall/.claude    (session state, credentials)
+#   ~/repos    -> /home/hndrewaall/repos      (code; needed for in-container git)
+#   $PWD       -> /workspace                  (the cwd you invoked from)
+#
+# Named volume (Phase 1d, q-2026-05-11-c0b9):
+#   claude-container-versions -> /home/hndrewaall/.local/share/claude
+#     Persists the in-container claude binary's auto-updated versions/<ver>/
+#     across `--rm`. Without this, every container restart resets to the
+#     image-baked claude. Inspect: `docker volume inspect
+#     claude-container-versions`. Nuke: `docker volume rm
+#     claude-container-versions`.
+#
+# Network policy — bridge networking with explicit host-loopback plumbing:
+#   bridge mode           — default docker networking, container in its own netns
+#   --add-host alias      — host.docker.internal resolves to the host-gateway IP
+#   IDE_HOST_OVERRIDE env — claude binary skips its 127.0.0.1 default and dials
+#                           host.docker.internal:$CLAUDE_CODE_SSE_PORT for SSE
+# Empirically verified by Phase 0d's 4-test matrix (q-4acf); see project doc
+# §8 "Phase 0d". Docker Desktop on macOS/Windows provides host.docker.internal
+# natively; on Linux the --add-host=host.docker.internal:host-gateway flag is
+# what makes it resolvable (Docker Engine 20.10+).
+#
+# Docker invocation: tries bare `docker` first, falls back to `sudo docker` for
+# hosts where the invoking user is not in the docker group. `sudo docker` with
+# NOPASSWD is the supported fallback path.
+
+set -euo pipefail
+
+# -----------------------------------------------------------------------------
+# Configuration
+# -----------------------------------------------------------------------------
+
+IMAGE="${CLAUDE_CONTAINER_IMAGE:-claude-container:dev}"
+CONTAINER_NAME="claude-tmux-$$"
+
+# -----------------------------------------------------------------------------
+# --help / -h handling — runs BEFORE any docker probe so it works offline.
+# -----------------------------------------------------------------------------
+
+usage() {
+    cat <<'EOF'
+claude-tmux — launch the claude-container image with host bind mounts.
+
+Usage:
+  claude-tmux              Launch the tmux session via the image ENTRYPOINT.
+  claude-tmux bash         Debug shell inside the container (skips entrypoint).
+  claude-tmux --help       Show this help and exit.
+
+Environment overrides:
+  CLAUDE_CONTAINER_IMAGE   Image tag (default: claude-container:dev).
+
+Environment passthrough (only if set on the host):
+  CLAUDE_CODE_SSE_PORT     VSCode IDE integration port (load-bearing).
+  ANTHROPIC_API_KEY        API key if not using ~/.claude credentials.
+  CLAUDE_* / ANTHROPIC_*   Any other matching env vars.
+
+Bind mounts (read-write):
+  ~/.claude   -> /home/hndrewaall/.claude    Session state, credentials.
+  ~/repos     -> /home/hndrewaall/repos      Code, all git repos.
+  $PWD        -> /workspace                  Workspace at invoking cwd.
+
+Named volume (Phase 1d):
+  claude-container-versions -> /home/hndrewaall/.local/share/claude
+    Persists in-container claude auto-updated versions/<ver>/ across --rm.
+    Inspect: docker volume inspect claude-container-versions
+    Nuke:    docker volume rm claude-container-versions
+
+Network: bridge + --add-host=host.docker.internal:host-gateway, with
+         CLAUDE_CODE_IDE_HOST_OVERRIDE=host.docker.internal forwarded so the
+         in-container claude binary dials the host for SSE (Phase 1c).
+User:    container runs as uid 1000 / gid 1000 (matches a UID-1000 host user).
+
+Docker: uses `docker` if accessible, else `sudo docker`. If neither works,
+add your user to the docker group OR ensure `sudo -n docker` works (NOPASSWD).
+EOF
+}
+
+if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
+    usage
+    exit 0
+fi
+
+# -----------------------------------------------------------------------------
+# Pick a docker invocation that works: bare first, sudo fallback.
+# -----------------------------------------------------------------------------
+
+DOCKER_CMD=()
+if docker ps >/dev/null 2>&1; then
+    DOCKER_CMD=(docker)
+elif sudo -n docker ps >/dev/null 2>&1; then
+    DOCKER_CMD=(sudo docker)
+else
+    cat >&2 <<'EOF'
+claude-tmux: cannot reach the Docker daemon.
+
+Tried `docker ps` (failed) and `sudo -n docker ps` (failed).
+
+Fix one of:
+  - Add your user to the docker group:  sudo usermod -aG docker $USER  (then re-login)
+  - Ensure sudo docker works without a password (NOPASSWD entry in sudoers).
+EOF
+    exit 1
+fi
+
+# -----------------------------------------------------------------------------
+# Build env-passthrough list. Only forwards vars that are SET in the calling
+# shell — empty/unset stays empty/unset inside the container.
+# -----------------------------------------------------------------------------
+
+env_args=()
+
+# Explicit named pass-throughs (always try, only forward if set).
+for v in CLAUDE_CODE_SSE_PORT ANTHROPIC_API_KEY; do
+    if [ -n "${!v-}" ]; then
+        env_args+=(-e "$v=${!v}")
+    fi
+done
+
+# CLAUDE_CODE_IDE_HOST_OVERRIDE — load-bearing for bridge networking. Default to
+# host.docker.internal so the in-container claude binary dials the host over the
+# --add-host alias below; if the caller set it explicitly, preserve their value.
+env_args+=(-e "CLAUDE_CODE_IDE_HOST_OVERRIDE=${CLAUDE_CODE_IDE_HOST_OVERRIDE:-host.docker.internal}")
+
+# Wildcard CLAUDE_* / ANTHROPIC_* — capture any other branded vars without
+# duplicating ones already forwarded above.
+while IFS= read -r name; do
+    case "$name" in
+        CLAUDE_CODE_SSE_PORT|ANTHROPIC_API_KEY|CLAUDE_CODE_IDE_HOST_OVERRIDE) continue ;;
+    esac
+    if [ -n "${!name-}" ]; then
+        env_args+=(-e "$name=${!name}")
+    fi
+done < <(env | grep -E '^(CLAUDE|ANTHROPIC)_' | cut -d= -f1 | sort -u || true)
+
+# -----------------------------------------------------------------------------
+# Signal handling — forward SIGTERM/SIGINT to the container so it can exit
+# cleanly. The trap fires the kill in the background; the main `docker run`
+# call then returns naturally with the container's exit code.
+# -----------------------------------------------------------------------------
+
+forward_signal() {
+    local sig="$1"
+    # Best-effort. If the container is already gone, docker kill is a no-op.
+    "${DOCKER_CMD[@]}" kill --signal="$sig" "$CONTAINER_NAME" >/dev/null 2>&1 || true
+}
+
+trap 'forward_signal TERM' TERM
+trap 'forward_signal INT' INT
+
+# -----------------------------------------------------------------------------
+# Run.
+#
+# --rm so the container is disposed after exit (state lives on host bind mounts).
+# -i always (need stdin for the tmux UI / debug shell).
+# -t only if stdout is actually a TTY — non-tty callers (CI, agents running
+#   `claude-tmux bash -c "..."` via a captured pipe) would otherwise fail with
+#   "cannot attach stdin to a TTY-enabled container because stdin is not a terminal".
+# --name <fixed> so the trap above can target the right container.
+# Bridge networking (Docker's default) + --add-host=host.docker.internal:host-gateway
+# so the in-container claude can dial the host's SSE listener via the env-var
+# override (see header). Docker Desktop populates host.docker.internal natively
+# on macOS/Windows; --add-host is harmless there and required on Linux.
+# -w /workspace: matches Dockerfile WORKDIR; explicit here for safety.
+# -----------------------------------------------------------------------------
+
+tty_flag=()
+if [ -t 0 ] && [ -t 1 ]; then
+    tty_flag=(-t)
+fi
+
+"${DOCKER_CMD[@]}" run --rm -i "${tty_flag[@]}" \
+    --name "$CONTAINER_NAME" \
+    --add-host=host.docker.internal:host-gateway \
+    -v "${HOME}/.claude:/home/hndrewaall/.claude" \
+    -v "${HOME}/repos:/home/hndrewaall/repos" \
+    -v "${PWD}:/workspace" \
+    --mount type=volume,src=claude-container-versions,dst=/home/hndrewaall/.local/share/claude \
+    -w /workspace \
+    "${env_args[@]}" \
+    "$IMAGE" \
+    "$@"
