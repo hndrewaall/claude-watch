@@ -910,7 +910,10 @@ body.modal-open { overflow: hidden; }
 /* Per-modal summary header block — keys/values laid out as a vertical
  * key:value list so each datum sits on its own line and the eye can
  * scan top-down. Populated from /api/queue/<id>/meta by live-log.js;
- * rows for absent fields are kept hidden. */
+ * rows for absent fields are kept hidden. The 10 metadata rows live
+ * inside a nested <details class="log-meta-toggle"> for collapse/expand;
+ * the agent-return <details> is a sibling so it stays visible when the
+ * metadata block is collapsed. */
 .log-modal-meta-summary {
   margin: 4px 0 10px 0;
   padding: 8px 10px;
@@ -922,6 +925,48 @@ body.modal-open { overflow: hidden; }
   gap: 4px;
   font-size: 0.82rem;
   line-height: 1.35;
+}
+
+/* Inner row container inside .log-meta-toggle. Restores the vertical
+ * key:value stack that .log-modal-meta-summary used to apply directly
+ * to its row children, now that the rows sit inside the disclosure. */
+.log-meta-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 6px;
+}
+
+/* The Metadata disclosure wrapper — overrides the generic prompt-toggle
+ * defaults so the summary header lines up flush with the surrounding
+ * meta block (no top dashed border, no top margin) and the clickable
+ * area spans the full row width for fat-finger mobile taps. */
+.log-modal-meta-summary .log-meta-toggle {
+  margin-top: 0;
+  border-top: none;
+  padding-top: 0;
+}
+
+.log-modal-meta-summary .log-meta-toggle > .prompt-summary {
+  /* Full-row clickable target — match the visual weight of the meta
+   * labels (uppercase, mute) so the disclosure reads as "this whole
+   * block toggles" rather than as another label row. */
+  display: flex;
+  width: 100%;
+  font-size: 0.72rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--fg-mute);
+  padding: 2px 0;
+}
+
+.log-modal-meta-summary .log-meta-toggle > .prompt-summary:hover {
+  color: var(--fg);
+}
+
+.log-modal-meta-summary .log-meta-toggle > .prompt-summary .log-meta-toggle-label {
+  flex: 1 1 auto;
 }
 
 .log-meta-row {
