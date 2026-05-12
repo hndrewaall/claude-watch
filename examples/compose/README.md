@@ -143,12 +143,12 @@ The container will see the updated index next request — no restart required (s
 
 In-container paths (right-hand side of `volumes:`) hardcode `/home/hndrewaall/...` because the `hndrewaall` user is baked into the `claude-container` and `eichi-search` Dockerfiles at uid 1000. Your **host** user can be anything — bind-mount left-hand sides use `${HOME}` interpolation. If your host UID is not 1000, the bind-mounted state directories will look root-owned to the container; the cleanest fix is to add `user: "$(id -u):$(id -g)"` to each service and `chown` the host directories before launching.
 
-### macOS UID
+### macOS — host UID 501 vs container UID 1000
 
-The container images bake the in-container user at uid/gid `1000:1000`. macOS user accounts default to **uid 501** (not 1000), and the `queue-minisite` / `eichi-search` services in this compose file pin `user: "1000:1000"`. The two don't match — and yet the stack works on macOS without manual fixup. Why:
+macOS user accounts default to **uid 501**, not 1000 — and the container images bake the in-container user at uid/gid `1000:1000` (with `queue-minisite` / `eichi-search` pinning `user: "1000:1000"` in this compose file). The two don't match, and yet the stack works on macOS without any manual fixup. Why:
 
 - **Docker Desktop (macOS / Windows)** runs the engine inside a hidden VM and routes bind mounts through a userland file-sharing layer (gRPC-FUSE / VirtioFS). That layer transparently remaps file ownership so the container sees its expected uid (1000) regardless of the host file's actual owner on the Mac filesystem. Reads + writes round-trip without permission errors. This is purely a Docker Desktop convenience and does NOT apply to Linux.
-- **Linux dev boxes** run the engine natively against the host kernel — bind mounts pass through unchanged, so a uid-1000 container process writing to a host directory owned by uid 1500 will produce files literally owned by uid 1000 on the host, and reading host-owned files may EACCES depending on mode bits.
+- **Linux dev boxes** (native Docker Engine, no Docker Desktop) run the engine directly against the host kernel — bind mounts pass through unchanged, so a uid-1000 container process writing to a host directory owned by uid 1500 will produce files literally owned by uid 1000 on the host, and reading host-owned files may EACCES depending on mode bits.
 
 If you're on a Linux box with a non-1000 host UID, you have three options, in order of decreasing effort:
 
