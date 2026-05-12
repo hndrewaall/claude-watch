@@ -62,7 +62,17 @@ Scope tokens (2026-05-08): scope is a list of `<type>:<value>` tokens that
 serve as the single substrate for serialization, group-merge, locks, AND
 explicit cross-queue dependencies. Token types:
     file:<path>       prefix-match (`**` suffix is readability sugar)
-    repo:<name>       exact-match
+    repo:<name>       exact-match -- claims the WHOLE repo; overlaps any
+                      `path:<name>/...` token in the same repo.
+    path:<repo>/<subdir>
+                      finer-grained claim WITHIN a repo (added 2026-05-11
+                      to fix over-serialization when work in disjoint
+                      subtrees of the same repo collides on `repo:`).
+                      Prefix-match within the same repo: `path:X/a` and
+                      `path:X/a/b` overlap, siblings `path:X/a` vs
+                      `path:X/b` do NOT. Cross-repo `path:X/a` vs
+                      `path:Y/a` never overlap. `repo:X` overlaps EVERY
+                      `path:X/...` (the broad claim still wins).
     resource:<name>   exact-match
     book:<name>       exact-match
     agent-proto:<name> exact-match
@@ -709,6 +719,17 @@ def _new_group_id():
 # --- scope tokens --------------------------------------------------------
 
 _TYPED_TOKEN_RE = re.compile(r"^(repo|resource|book|agent-proto):")
+# `path:<repo>/<subdir>` scope tokens (added 2026-05-11 to fix
+# over-serialization within large repos -- e.g. docker-gomorrah's
+# monitoring/ vs queue-minisite/ subtrees both tagging `repo:docker-gomorrah`
+# even though their files are disjoint). Semantics: a `path:` token is a
+# finer-grained claim WITHIN a repo. The first segment is the repo name;
+# everything after is a path within that repo.
+#  - Two `path:X/...` tokens overlap iff one path is a prefix of the other
+#    (segment-wise) -- siblings are disjoint.
+#  - `repo:X` overlaps every `path:X/...` (the broad claim still wins).
+#  - `path:X/...` and `path:Y/...` never overlap (different repo).
+_PATH_TOKEN_PREFIX = "path:"
 # `task:<queue-id>` scope tokens (added 2026-05-08 to unify --depends-on with
 # scope). Semantics: an item carrying `task:<id>` in its scope is blocked
 # until queue id <id> reaches a terminal state (done). The token is INERT
@@ -740,6 +761,11 @@ def _normalize_token(tok):
       kept purely as readability sugar in prompts).
     - Leave '*' alone.
     - Typed tokens (repo:/resource:/book:/agent-proto:) are exact-match.
+    - `path:<repo>/<subdir>` tokens (since 2026-05-11) normalize the suffix:
+      collapse repeated slashes, strip leading/trailing slashes, and reject
+      empty / repo-only forms (`path:X` must use `repo:X` instead). The
+      stored form is always `path:<repo>/<a>/<b>/...` with single-slash
+      separators and no trailing slash.
     - `task:<id>` tokens (since 2026-05-08) are exact-match and inert for
       scope-conflict purposes; their semantics live in _item_is_ready.
     """
@@ -761,6 +787,19 @@ def _normalize_token(tok):
         # matches file:/foo/bar. We do NOT force or strip trailing slash --
         # prefix match handles both file:/foo and file:/foo/.
         return f"file:{path}"
+    if tok.startswith(_PATH_TOKEN_PREFIX):
+        body = tok[len(_PATH_TOKEN_PREFIX):]
+        # Collapse repeated separators and strip leading/trailing /.
+        segments = [s for s in body.split("/") if s]
+        if len(segments) < 2:
+            # `path:` is meant for sub-repo claims. A bare `path:X` would be
+            # indistinguishable from `repo:X` and would muddle the overlap
+            # rules -- force callers to use `repo:X` for the whole-repo claim.
+            raise ValueError(
+                f"path: tokens require a repo AND a subpath "
+                f"(use repo:<name> for the whole repo): {tok!r}"
+            )
+        return f"{_PATH_TOKEN_PREFIX}{'/'.join(segments)}"
     if _TYPED_TOKEN_RE.match(tok):
         return tok
     if _is_task_token(tok):
@@ -769,11 +808,37 @@ def _normalize_token(tok):
     return tok
 
 
+def _is_path_token(tok):
+    return isinstance(tok, str) and tok.startswith(_PATH_TOKEN_PREFIX)
+
+
+def _path_token_segments(tok):
+    """Return the segment list of a normalized `path:<repo>/<a>/<b>` token.
+
+    First element is the repo; remainder is the within-repo path. Caller is
+    expected to pass an already-normalized token (so segments are non-empty
+    and >= 2 long).
+    """
+    body = tok[len(_PATH_TOKEN_PREFIX):]
+    return body.split("/")
+
+
+def _path_token_repo(tok):
+    """Return the repo name embedded in a `path:` token."""
+    return _path_token_segments(tok)[0]
+
+
 def _tokens_overlap(a, b):
     """Return True if two normalized scope tokens overlap.
 
     - '*' overlaps everything (including task: tokens).
     - Two file: tokens overlap if one is a prefix of the other.
+    - Two `path:` tokens overlap iff they share the same repo AND one
+      within-repo path is a (segment-wise) prefix of the other. Siblings
+      (`path:X/a` vs `path:X/b`) are disjoint.
+    - `repo:X` overlaps every `path:X/...` -- the broad whole-repo claim
+      still wins over any narrower sub-claim. Cross-repo is never an
+      overlap (`repo:X` vs `path:Y/...` is disjoint).
     - `task:<id>` tokens overlap only with the same exact `task:<id>` token
       (and '*'). They never overlap regular scope tokens. Lock machinery
       uses this so `queue lock task:q-XXXX` parks any pending item that
@@ -806,7 +871,31 @@ def _tokens_overlap(a, b):
         # Either is a directory-prefix of the other, OR one is an exact file
         # that lives under the other's directory.
         return wa.startswith(wb) or wb.startswith(wa)
-    # Mixed types or two non-file tokens: exact match only.
+    a_is_path = _is_path_token(a)
+    b_is_path = _is_path_token(b)
+    if a_is_path and b_is_path:
+        # Same repo + segment-wise prefix => overlap. Siblings disjoint.
+        sa = _path_token_segments(a)
+        sb = _path_token_segments(b)
+        if sa[0] != sb[0]:
+            return False
+        # Compare the within-repo segments (everything after the repo name).
+        ra = sa[1:]
+        rb = sb[1:]
+        # One must be a (possibly equal) segment-wise prefix of the other.
+        # Since both are normalized non-empty and the repo matched, this is
+        # the standard prefix check.
+        if len(ra) <= len(rb):
+            return rb[: len(ra)] == ra
+        return ra[: len(rb)] == rb
+    # `repo:X` overlaps any `path:X/...`: the broad whole-repo claim wins.
+    a_is_repo = a.startswith("repo:")
+    b_is_repo = b.startswith("repo:")
+    if a_is_repo and b_is_path:
+        return a[len("repo:"):] == _path_token_repo(b)
+    if b_is_repo and a_is_path:
+        return b[len("repo:"):] == _path_token_repo(a)
+    # Mixed types or two non-file/non-path tokens: exact match only.
     return a == b
 
 
@@ -4760,7 +4849,23 @@ def build_parser():
 
     q_add = qsub.add_parser("add", help="Add item")
     q_add.add_argument("description")
-    q_add.add_argument("--scope", action="append", required=True)
+    q_add.add_argument(
+        "--scope",
+        action="append",
+        required=True,
+        help=(
+            "Scope token(s) for serialization. Repeatable; comma-separated "
+            "values also accepted. Token types: "
+            "file:<path> (prefix-match), "
+            "repo:<name> (whole-repo claim -- overlaps any path:<name>/... "
+            "in the same repo), "
+            "path:<repo>/<subdir> (sub-repo claim; siblings disjoint, "
+            "prefix-match within the same repo), "
+            "resource:<name>, book:<name>, agent-proto:<name>, "
+            "task:<queue-id> (inert dep marker -- see --depends-on), "
+            "'*' (universal -- use sparingly)."
+        ),
+    )
     q_add.add_argument(
         "--summary",
         help=(
