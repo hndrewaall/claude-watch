@@ -1,4 +1,4 @@
-.PHONY: test test-verbose test-unit test-e2e test-live test-session-task test-hooks test-agent-msg test-agent-tail test-claude-event test-self-clear test-watchers test-dashboard build deploy install install-hooks clean
+.PHONY: test test-verbose test-unit test-e2e test-live test-session-task test-hooks test-agent-msg test-agent-tail test-claude-event test-self-clear test-watchers test-dashboard build deploy install install-hooks compose-up compose-down compose-build bootstrap clean
 
 # Default: run all tests in parallel via nextest (preferred) or cargo test
 test:
@@ -146,6 +146,32 @@ install-hooks:
 	@rm -f .git/hooks/pre-commit
 	@ln -s ../../scripts/git-hooks/pre-commit .git/hooks/pre-commit
 	@echo "Pre-commit hook installed (symlink -> scripts/git-hooks/pre-commit)."
+
+# --- examples/compose targets -----------------------------------------
+# Convenience wrappers around the integrated docker-compose example at
+# examples/compose/. The compose file wires claude-container +
+# queue-minisite + eichi-search; see examples/compose/README.md for
+# prerequisites (Docker, ANTHROPIC_API_KEY, sibling eichi clone).
+
+# Run the bootstrap helper that checks prereqs, clones eichi sibling,
+# and seeds examples/compose/.env from .env.example.
+bootstrap:
+	@bash examples/compose/bootstrap.sh
+
+# Build the compose stack images (skip the sibling eichi build context
+# if eichi isn't cloned next door — `docker compose build` will surface
+# the missing-context error if so).
+compose-build:
+	@cd examples/compose && docker compose build
+
+# Bring the integrated compose stack up in the foreground.
+compose-up:
+	@cd examples/compose && docker compose up
+
+# Tear down the compose stack (volumes survive; add -v to nuke
+# claude-container-versions).
+compose-down:
+	@cd examples/compose && docker compose down
 
 # Clean build artifacts
 clean:

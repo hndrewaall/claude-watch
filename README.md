@@ -6,6 +6,38 @@
 
 A Rust daemon that monitors [Claude Code](https://claude.ai/code) sessions running in tmux. Detects activity states, recovers from stalls, and manages the tmux layout.
 
+## Quick start
+
+Fresh-laptop path (Docker, no native install required):
+
+```bash
+git clone https://github.com/hndrewaall/claude-watch.git
+cd claude-watch
+make bootstrap              # checks prereqs, clones eichi sibling, seeds .env
+# edit examples/compose/.env (set ANTHROPIC_API_KEY)
+make compose-up             # docker compose up against examples/compose/
+```
+
+Open <http://localhost:8000/> for the queue UI and <http://localhost:8001/>
+for semantic search. Full walkthrough (caveats, sibling-repo layout,
+first-run indexing): [`examples/compose/README.md`](examples/compose/README.md).
+
+Native install (build from source):
+
+```bash
+make build                  # cargo build --release
+make install                # copies daemon + tools into $BIN_DIR (default ~/bin)
+make install-hooks          # opt-in: warning-free build + unit-tests pre-commit gate
+```
+
+Prerequisites: `cargo` + `rustc` (1.74+), `tmux`, Python 3.11+ for the
+`tools/` scripts.
+
+Agent-onboarding files at the repo root (`CLAUDE.md`, `AGENTS.md`,
+`.cursorrules`, `.github/copilot-instructions.md`) all point to a single
+canonical source: [`CLAUDE.md`](CLAUDE.md). Drop a coding agent in this
+repo and it will know the build + test loop without further setup.
+
 ## What it does
 
 claude-watch captures the Claude Code tmux pane every few seconds and parses it to determine what Claude is doing:

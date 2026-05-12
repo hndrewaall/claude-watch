@@ -1,0 +1,1 @@
+See [`CLAUDE.md`](./CLAUDE.md) for agent-facing repo guidance (build, test, layout, dev loop).
