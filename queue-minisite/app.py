@@ -1380,17 +1380,27 @@ def _find_agent_jsonl(agent_id: str) -> Path | None:
     return best[1] if best else None
 
 
-def _format_sse(data: dict[str, Any]) -> str:
-    """Encode a dict as a single SSE `data:` event."""
-    return "data: " + json.dumps(data, separators=(",", ":")) + "\n\n"
+def _format_sse(data: dict[str, Any]) -> bytes:
+    """Encode a dict as a single SSE `data:` event.
+
+    Returns bytes so the surrounding Response can use
+    ``direct_passthrough=True`` (which requires byte chunks per WSGI
+    PEP-3333). Without this, gunicorn raises
+    ``TypeError('...' is not a byte')`` on every yielded frame.
+    """
+    return ("data: " + json.dumps(data, separators=(",", ":")) + "\n\n").encode("utf-8")
 
 
-def _format_sse_comment(text: str) -> str:
-    """SSE comment line — used as a keep-alive ping. Browsers ignore it."""
-    return f": {text}\n\n"
+def _format_sse_comment(text: str) -> bytes:
+    """SSE comment line — used as a keep-alive ping. Browsers ignore it.
+
+    Returns bytes for ``direct_passthrough=True`` compatibility (same
+    rationale as ``_format_sse``).
+    """
+    return f": {text}\n\n".encode("utf-8")
 
 
-def _tail_jsonl(path: Path) -> Iterator[str]:
+def _tail_jsonl(path: Path) -> Iterator[bytes]:
     """Generator yielding SSE events for a tailed agent JSONL.
 
     Opens the file in tail mode: backfill the last ``SSE_TAIL_BACKFILL_LINES``
@@ -1484,7 +1494,7 @@ def _tail_jsonl(path: Path) -> Iterator[str]:
             pass
 
 
-def _tail_workload_output(label: str) -> Iterator[str]:
+def _tail_workload_output(label: str) -> Iterator[bytes]:
     """Generator yielding SSE events for a tailed workload output file.
 
     Workload files are line-oriented plain text (NOT JSONL); each appended
@@ -1519,7 +1529,7 @@ def _tail_workload_output(label: str) -> Iterator[str]:
         yield _format_sse({"type": "error", "kind": "open-failed", "error": str(exc)})
         return
 
-    def _emit_end(reason: str) -> Iterator[str]:
+    def _emit_end(reason: str) -> Iterator[bytes]:
         # Best-effort exit code surfacing — short read of the .exit file
         # if present. Non-fatal if read fails.
         exit_code: Any = None
@@ -1743,7 +1753,7 @@ def api_queue_stream(qid: str) -> Any:
         # No agent record for this queue id — emit a one-shot error
         # event then close. Stream-shaped error keeps the client logic
         # simple (it always opens an EventSource).
-        def _no_agent() -> Iterator[str]:
+        def _no_agent() -> Iterator[bytes]:
             yield _format_sse({
                 "type": "error",
                 "kind": "no-agent",
@@ -1765,7 +1775,7 @@ def api_queue_stream(qid: str) -> Any:
     jsonl_path = _find_agent_jsonl(agent_id) if agent_id else None
 
     if jsonl_path is None:
-        def _no_jsonl() -> Iterator[str]:
+        def _no_jsonl() -> Iterator[bytes]:
             yield _format_sse({
                 "type": "error",
                 "kind": "no-jsonl",
@@ -1809,7 +1819,7 @@ def api_queue_stream(qid: str) -> Any:
 # live and archived modes.
 
 
-def _replay_jsonl(path: Path) -> Iterator[str]:
+def _replay_jsonl(path: Path) -> Iterator[bytes]:
     """Generator that streams an archived JSONL as SSE frames and stops at EOF.
 
     Reads the file line-by-line so we never load the whole transcript
@@ -1852,7 +1862,7 @@ def _replay_jsonl(path: Path) -> Iterator[str]:
     })
 
 
-def _replay_workload_output(path: Path) -> Iterator[str]:
+def _replay_workload_output(path: Path) -> Iterator[bytes]:
     """Generator that streams an archived workload .output file as SSE frames.
 
     Workload files are plain line-oriented stdout/stderr — NOT JSONL.
