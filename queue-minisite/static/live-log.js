@@ -72,6 +72,62 @@
   const returnDetailsEl = document.getElementById('log-modal-return');
   const returnLabelEl = document.getElementById('log-modal-return-label');
   const returnBodyEl = document.getElementById('log-modal-return-body');
+  // Collapse/expand wrapper around the 10 metadata rows. Default state
+  // is viewer-controlled (persisted in localStorage); first-visit
+  // fallback is collapsed on mobile, expanded otherwise. See
+  // setMetaToggleInitialState() / persistMetaToggleState() below.
+  const metaToggleEl = document.getElementById('log-meta-toggle');
+
+  // localStorage key + helpers for the metadata-block expanded state.
+  // Guarded against private-mode / disabled-storage environments — the
+  // getter returns null and the setter no-ops on any thrown error, so
+  // the section still toggles, just won't survive a reload. The
+  // narrow-viewport breakpoint matches the brief (< 768px = mobile-ish).
+  const META_TOGGLE_STORAGE_KEY = 'queue-minisite.metadataExpanded';
+  const META_TOGGLE_MOBILE_BREAKPOINT_PX = 768;
+
+  function readMetaToggleStored() {
+    try {
+      const v = window.localStorage.getItem(META_TOGGLE_STORAGE_KEY);
+      if (v === '1' || v === 'true') return true;
+      if (v === '0' || v === 'false') return false;
+      return null;
+    } catch (_e) {
+      return null;
+    }
+  }
+
+  function writeMetaToggleStored(isOpen) {
+    try {
+      window.localStorage.setItem(META_TOGGLE_STORAGE_KEY, isOpen ? '1' : '0');
+    } catch (_e) {
+      /* private mode / quota / disabled — silently degrade to session-only */
+    }
+  }
+
+  // Apply the persisted-or-default state to the metadata <details> on
+  // modal open. Called from resetMetaSummary() so every open re-syncs
+  // with current localStorage (handles the case where the user toggled
+  // in another tab / window).
+  function setMetaToggleInitialState() {
+    if (!metaToggleEl) return;
+    const stored = readMetaToggleStored();
+    if (stored === null) {
+      // First visit — collapse on narrow viewports, expand otherwise.
+      const w = window.innerWidth || document.documentElement.clientWidth || 0;
+      metaToggleEl.open = w >= META_TOGGLE_MOBILE_BREAKPOINT_PX;
+    } else {
+      metaToggleEl.open = stored;
+    }
+  }
+
+  // Persist on every toggle. Wired once on script load (the listener
+  // outlives any number of modal open/close cycles).
+  if (metaToggleEl) {
+    metaToggleEl.addEventListener('toggle', () => {
+      writeMetaToggleStored(metaToggleEl.open);
+    });
+  }
 
   let triggerEl = null;
   let evtSource = null;
@@ -194,7 +250,9 @@
 
   // Clear every meta-summary row + return block + the section's hidden
   // flag. Called on modal open BEFORE the fetch lands so a slow request
-  // doesn't show stale data from the previous opening.
+  // doesn't show stale data from the previous opening. Also re-applies
+  // the persisted metadata-collapse state so a fresh open reflects the
+  // viewer's latest choice (including a toggle made in another tab).
   function resetMetaSummary() {
     if (metaSummaryEl) metaSummaryEl.hidden = true;
     Object.keys(metaRowEls).forEach((k) => setMetaRow(k, ''));
@@ -203,6 +261,7 @@
       returnDetailsEl.open = true;
     }
     if (returnBodyEl) returnBodyEl.textContent = '';
+    setMetaToggleInitialState();
   }
 
   // Apply a parsed /api/queue/<id>/meta payload to the summary block.
@@ -1287,5 +1346,8 @@
     headlinePreview,
     renderEvent,
     appendLine,
+    setMetaToggleInitialState,
+    readMetaToggleStored,
+    writeMetaToggleStored,
   };
 })();
