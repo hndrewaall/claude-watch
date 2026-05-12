@@ -21,6 +21,25 @@
 
 services:
   # ---------------------------------------------------------------------
+  # tmux-socket-init — one-shot bootstrap that chowns the shared tmux
+  # socket dir to uid 1000 mode 0700 before claude-container or ttyd
+  # mount it. Necessary because Docker Desktop (macOS, Windows) does
+  # NOT copy image-side directory perms into a fresh named volume the
+  # way native Linux Docker does, so the volume otherwise comes up
+  # root-owned and tmux refuses to bind its socket as a non-owner.
+  #
+  # Linux: harmless no-op (perms already correct from the claude-
+  # container image's pre-created dir).
+  # ---------------------------------------------------------------------
+  tmux-socket-init:
+    image: alpine:3.20
+    command: >-
+      sh -c "chown 1000:1000 /tmp/tmux-1000 && chmod 0700 /tmp/tmux-1000 && echo 'tmux-socket-init: chowned 1000:1000 0700'"
+    volumes:
+      - "claude-tmux-socket:/tmp/tmux-1000"
+    restart: "no"
+
+  # ---------------------------------------------------------------------
   # claude-container — Claude Code + claude-watch + tmux in one image.
   #
   # In-repo build context: container/ lives at the repo root (absorbed
@@ -31,6 +50,9 @@ services:
       context: ../../container
       dockerfile: Dockerfile
     image: claude-container:dev
+    depends_on:
+      tmux-socket-init:
+        condition: service_completed_successfully
     extra_hosts:
       # Required so the in-container claude binary can dial the host's
       # VSCode SSE listener via CLAUDE_CODE_IDE_HOST_OVERRIDE.
@@ -172,7 +194,10 @@ services:
       - "7681:7681"
     user: "1000:1000"
     depends_on:
-      - claude-container
+      tmux-socket-init:
+        condition: service_completed_successfully
+      claude-container:
+        condition: service_started
     environment:
       # UTF-8 locale: tmux downgrades non-ASCII output to literal
       # underscores when the client locale is C. Alpine ttyd lacks
