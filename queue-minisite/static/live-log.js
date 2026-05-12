@@ -653,9 +653,26 @@
     // The headline summary is the most-useful field per tool — Bash
     // command, file path, search pattern. Path-style fields are kept
     // intact (no truncation) so users can read the whole filename.
+    //
+    // Bash callers usually pass a short imperative `description` field
+    // alongside `command` (e.g. {"command": "ls ...", "description":
+    // "List MKV files in season dir"}). When present we prefer the
+    // description for the inline summary — it's purpose-written for a
+    // human glance and matches what the task-watch dashboard renders
+    // as the green `$ <description>` line (see
+    // src/task_filters.rs::format_line — Bash branch). This keeps the
+    // queue-minisite live-log headline at parity with task-watch.
     let summary = '';
+    let summarySource = '';
     if (name === 'Bash') {
-      summary = input.command || '';
+      const desc = typeof input.description === 'string' ? input.description.trim() : '';
+      if (desc) {
+        summary = desc;
+        summarySource = 'description';
+      } else {
+        summary = input.command || '';
+        summarySource = 'command';
+      }
     } else if (name === 'Read' || name === 'Edit' || name === 'Write') {
       summary = input.file_path || '';
     } else if (name === 'Grep' || name === 'Glob') {
@@ -677,15 +694,31 @@
       ? '<code>' + esc(summary) + '</code>'
       : bodyOrExpandable(summary, 240, 100, name);
     let body = inline;
+    // For Bash with a description-driven headline, also surface the
+    // actual `command` inline (right after the description) so users
+    // don't have to expand "full input" just to see what ran. Mirrors
+    // how task-watch shows the green `$ <description>` line and then
+    // bash_progress output below — here the command itself fills that
+    // "what actually ran" slot.
+    if (name === 'Bash' && summarySource === 'description' &&
+        typeof input.command === 'string' && input.command.length > 0) {
+      const cmd = input.command;
+      const isShortCmd = cmd.length <= 240 && !cmd.includes('\n');
+      const cmdInline = isShortCmd
+        ? '<code>' + esc(cmd) + '</code>'
+        : bodyOrExpandable(cmd, 240, 100, 'Bash');
+      body += ' <span class="log-tool-cmd">$ ' + cmdInline + '</span>';
+    }
     // Only attach the "full input" disclosure if there's more than the
-    // single headline field — avoids redundant <details> for Bash where
-    // input.command IS the entire input.
+    // headline field(s) we've already surfaced inline — avoids redundant
+    // <details> for Bash where input.command IS the entire input.
     const inputKeys = Object.keys(input);
-    const headlineField = (name === 'Bash') ? 'command'
-      : (name === 'Read' || name === 'Edit' || name === 'Write') ? 'file_path'
-      : (name === 'Grep' || name === 'Glob') ? (input.pattern ? 'pattern' : 'glob')
-      : null;
-    const hasExtra = inputKeys.some((k) => k !== headlineField);
+    const headlineFields = (name === 'Bash')
+      ? (summarySource === 'description' ? ['command', 'description'] : ['command'])
+      : (name === 'Read' || name === 'Edit' || name === 'Write') ? ['file_path']
+      : (name === 'Grep' || name === 'Glob') ? [input.pattern ? 'pattern' : 'glob']
+      : [];
+    const hasExtra = inputKeys.some((k) => !headlineFields.includes(k));
     if (hasExtra && inputKeys.length > 0) {
       const fullJson = JSON.stringify(input, null, 2);
       body += ' ' + expandable(
