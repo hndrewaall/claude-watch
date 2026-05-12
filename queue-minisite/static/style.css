@@ -1467,3 +1467,17 @@ body.modal-open { overflow: hidden; }
     max-height: 50vh;
   }
 }
+
+/* Whitelabel brand footer — rendered only when QUEUE_SITE_BRAND is set.
+   Solarized-styled, low-contrast, sits at the bottom of the page. */
+.brand-footer {
+  margin-top: 2rem;
+  padding: 0.75rem 1rem;
+  text-align: center;
+  font-size: 0.75rem;
+  color: var(--base01, #586e75);
+  opacity: 0.6;
+}
+.brand-footer .brand {
+  letter-spacing: 0.04em;
+}

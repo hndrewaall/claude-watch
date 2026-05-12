@@ -32,6 +32,8 @@ docker build -t queue-minisite .
 docker run --rm -p 8000:8000 \
   -e QUEUE_JSON=/queue-home/.config/session/queue.json \
   -e AGENT_STATE_JSON=/agents-state/active-agents.json \
+  -e QUEUE_SITE_TITLE="my queue" \
+  -e QUEUE_SITE_LOGO_DEFAULT=1 \
   -v "$HOME/.config/session:/queue-home/.config/session:rw" \
   -v "$HOME/claude-events:/queue-home/claude-events:rw" \
   -v "/var/lib/claude-watch:/agents-state:ro" \
@@ -41,6 +43,24 @@ docker run --rm -p 8000:8000 \
 ```
 
 Then open `http://localhost:8000/`.
+
+## Branding
+
+The minisite ships a generic `claude-watch` build with the bundled eye-glyph
+logo at `static/claude-watch-logo.png`. The page title defaults to `queue`
+and no header logo is rendered unless one of the following is set.
+
+To swap in a private brand without forking, set the `QUEUE_SITE_*` env
+vars below — typically by mounting an `env_file` on the container so the
+brand identity lives outside the public image.
+
+| Var | Default | Purpose |
+|-----|---------|---------|
+| `QUEUE_SITE_TITLE` | `queue` | `<title>` + header label. |
+| `QUEUE_SITE_LOGO_URL` | (empty) | Header logo URL (absolute or under `/static/`). Empty = no logo unless `QUEUE_SITE_LOGO_DEFAULT=1`. |
+| `QUEUE_SITE_LOGO_DEFAULT` | (unset) | Set to `1`/`true` to render the bundled `static/claude-watch-logo.png` when `QUEUE_SITE_LOGO_URL` is empty. |
+| `QUEUE_SITE_BRAND` | (empty) | Footer brand string. Empty = no footer. |
+| `QUEUE_SITE_FAVICON_URL` | (empty) | Favicon override. Empty falls back to the bundled generic favicons. |
 
 ## Environment
 

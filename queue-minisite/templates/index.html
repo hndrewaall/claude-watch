@@ -6,14 +6,18 @@
   <meta name="color-scheme" content="light dark">
   <meta name="theme-color" content="#fdf6e3" media="(prefers-color-scheme: light)">
   <meta name="theme-color" content="#002b36" media="(prefers-color-scheme: dark)">
-  <title>GB Queue</title>
+  <title>{{ site_title }}</title>
+  {% if site_favicon_url %}
+  <link rel="shortcut icon" href="{{ site_favicon_url }}">
+  <link rel="icon" href="{{ site_favicon_url }}">
+  {% else %}
   <link rel="shortcut icon" href="{{ url_for('static', filename='favicon.ico') }}">
-  <link rel="icon" type="image/svg+xml" href="{{ url_for('static', filename='logo.svg') }}">
   <link rel="icon" type="image/png" sizes="16x16" href="{{ url_for('static', filename='favicon-16x16.png') }}">
   <link rel="icon" type="image/png" sizes="32x32" href="{{ url_for('static', filename='favicon-32x32.png') }}">
   <link rel="icon" type="image/png" sizes="192x192" href="{{ url_for('static', filename='favicon-192x192.png') }}">
   <link rel="icon" type="image/png" sizes="512x512" href="{{ url_for('static', filename='favicon-512x512.png') }}">
   <link rel="apple-touch-icon" sizes="180x180" href="{{ url_for('static', filename='apple-touch-icon.png') }}">
+  {% endif %}
   <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
   {# morphdom — vendored DOM diff/merge library used by refresh.js to
      update the queue lists without disrupting open modals, drag-in-progress,
@@ -23,7 +27,14 @@
 </head>
 <body>
   <header class="topbar">
-    <div class="title"><img src="{{ url_for('static', filename='logo.svg') }}" alt="GB" class="logo"> GB Queue</div>
+    <div class="title">
+      {% if site_logo_url %}
+        <img src="{{ site_logo_url }}" alt="" class="logo">
+      {% elif site_logo_default %}
+        <img src="{{ url_for('static', filename='claude-watch-logo.png') }}" alt="" class="logo">
+      {% endif %}
+      {{ site_title }}
+    </div>
     <div class="meta" id="topbar-meta">
       <span class="count count-running" title="running items">{{ totals.running }} running</span>
       {% if starting_count %}<span class="count count-starting" title="registered but agent not yet emitting events">{{ starting_count }} starting</span>{% endif %}
@@ -536,6 +547,12 @@
       <pre id="log-modal-stream" class="log-stream" tabindex="0" aria-live="polite"></pre>
     </div>
   </div>
+
+  {% if site_brand %}
+  <footer class="brand-footer" role="contentinfo">
+    <span class="brand">{{ site_brand }}</span>
+  </footer>
+  {% endif %}
 
   <script src="{{ url_for('static', filename='local-time.js') }}" defer></script>
   <script src="{{ url_for('static', filename='refresh.js') }}" defer></script>
