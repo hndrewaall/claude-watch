@@ -1,0 +1,112 @@
+# claude-watch configuration — in-container default.
+#
+# Shipped at /etc/claude-watch/config.toml in the image. The entrypoint
+# exports CLAUDE_WATCH_CONFIG to point at this file so the bare
+# `claude-watch` daemon invocation in pane 1 picks it up regardless of
+# whether the host's ~/.config/claude-watch/ is bind-mounted.
+#
+# Differences from a typical host config:
+#   - dashboard_session = "claude-container"  (the in-container tmux session
+#     that entrypoint.sh creates, not the host's "dashboard" session).
+#   - dashboard_pane = "claude-container:0.0" (the claude pane is left/main,
+#     pane 1 — this one — is the sidecar reading pane 0).
+#   - All file paths live under /tmp/ or /home/hndrewaall/, never /var/log/
+#     or /var/run/ (no root-owned host dirs in the container).
+#   - watcher_monitor disabled (Phase 1 has no watchers inside the container;
+#     Phase 2 will move them in).
+#   - auto_update / reauth / hybrid hooks disabled (host integrations).
+#   - task_watch disabled (no in-container `tasks` session yet).
+# Phase 1e (q-2026-05-11-8a96).
+
+[general]
+check_interval = 10
+state_file = "/home/hndrewaall/.cache/claude-watch/state.json"
+log_file = "/tmp/claude-watch.jsonl"
+legacy_log_file = "/tmp/claude-watch.log"
+post_interrupt_cooldown_secs = 60
+
+[tmux]
+# Pin to the in-container tmux session created by entrypoint.sh.
+# Pane 0.0 is the claude pane; pane 0.1 (where this daemon runs) is the
+# sidecar. claude-watch reads pane 0.0 via `tmux capture-pane`.
+dashboard_pane = "claude-container:0.0"
+dashboard_session = "claude-container"
+post_escape_settle_ms = 0
+
+[claude]
+max_context_tokens = 1000000
+heartbeat_file = "/tmp/claude-heartbeat"
+relaunch_script = "/tmp/claude-relaunch.sh"
+
+[dead_process]
+checks_required = 3
+restart_cooldown = 300
+fresh_inject_checks = 5
+
+[fresh_clear]
+min_tokens = 2000
+max_tokens = 5000
+detections_required = 2
+cooldown = 120
+
+[heartbeat]
+stale_minutes = 10
+
+[alerts]
+initial_cooldown = 600
+escalation_tiers = [600, 600, 1800, 3600, 3600, 3600]
+max_pingme_alerts = 6
+resume_prompt = "[CLAUDE-WATCH] (in-container) Daemon detected stuck state."
+
+[foreground_monitor]
+enabled = true
+threshold_seconds = 300
+check_interval = 3
+interrupt_enabled = true
+interrupt_message = "The foreground command was backgrounded by claude-watch because it exceeded the timeout. Use run_in_background for long commands."
+thinking_backoff_multiplier = 3
+
+[watcher_monitor]
+# Disabled in Phase 1 — no in-container watchers yet (Phase 2 line item).
+enabled = false
+watchers_config = "/home/hndrewaall/.config/watchmen/watchers.conf"
+expected_watchmen = 0
+
+[context_monitor]
+enabled = true
+threshold_margin = 100000
+threshold_percent = 75
+compact_trigger_percent = 5
+grace_period = 300
+cooldown = 300
+
+[auto_update]
+# Disabled — host integration. Phase 2+ work item.
+enabled = false
+
+[reauth]
+# Disabled — host integration (Pushover alerts). Phase 2+ work item.
+enabled = false
+
+[task_watch]
+# Disabled — no in-container `tasks` session yet.
+enabled = false
+
+[suppression]
+max_consecutive_suppressions = 3
+max_suppression_window_secs = 600
+
+[api_retry]
+enabled = true
+consecutive = 1
+max_stuck_secs = 1800
+
+[hybrid]
+# Disabled — host integration (SessionStart/Stop/PreCompact hooks fire
+# `claude-watch hook-fire` from the host's settings.json; inside the
+# container the in-container claude inherits those hooks via the
+# ~/.claude bind mount but the binary path resolution happens against
+# the in-container PATH, where /usr/local/bin/claude-watch now lives
+# (Phase 1b). Keep the daemon-side hybrid OFF until we audit the
+# in-container hook-fire path end-to-end in Phase 2.
+enabled = false
