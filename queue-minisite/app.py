@@ -1307,7 +1307,18 @@ def api_queue_depend_remove(queue_id: str) -> Any:
 #
 # nginx default: `proxy_buffering on` would buffer the SSE stream. We set
 # `X-Accel-Buffering: no` on the response which nginx honors as an
-# explicit per-response disable — no nginx config change needed.
+# explicit per-response disable. Operators running their own reverse
+# proxy should also set `proxy_buffering off` (and `gzip off` if their
+# vhost gzips `text/event-stream`) on the SSE location as a belt-and-
+# suspenders measure — the `X-Accel-Buffering` header only fires the
+# nginx-internal `proxy_buffering` disable; it does NOT defeat the gzip
+# filter or any third-party output filter that aggregates writes.
+#
+# All Response() instances below pass `direct_passthrough=True` so that
+# werkzeug emits each `yield`-ed string to the WSGI socket verbatim
+# instead of buffering them through its iter-wrap. Without this, small
+# SSE frames can sit in werkzeug's internal buffer until the generator
+# yields enough bytes to trigger a flush.
 
 # How long to wait between file polls when EOF is hit.
 SSE_TAIL_POLL_SECONDS = float(os.environ.get("SSE_TAIL_POLL_SECONDS", "0.5"))
@@ -1722,6 +1733,7 @@ def api_queue_stream(qid: str) -> Any:
         return Response(
             stream_with_context(_tail_workload_output(workload_label)),
             headers=headers,
+            direct_passthrough=True,
         )
 
     agent_by_qid = _agents_by_qid(_load_state(AGENT_STATE_PATH))
@@ -1743,7 +1755,11 @@ def api_queue_stream(qid: str) -> Any:
                 ),
             })
 
-        return Response(stream_with_context(_no_agent()), headers=headers)
+        return Response(
+            stream_with_context(_no_agent()),
+            headers=headers,
+            direct_passthrough=True,
+        )
 
     agent_id = rec.get("agent_id", "")
     jsonl_path = _find_agent_jsonl(agent_id) if agent_id else None
@@ -1762,11 +1778,16 @@ def api_queue_stream(qid: str) -> Any:
                 ),
             })
 
-        return Response(stream_with_context(_no_jsonl()), headers=headers)
+        return Response(
+            stream_with_context(_no_jsonl()),
+            headers=headers,
+            direct_passthrough=True,
+        )
 
     return Response(
         stream_with_context(_tail_jsonl(jsonl_path)),
         headers=headers,
+        direct_passthrough=True,
     )
 
 
@@ -1973,8 +1994,13 @@ def api_queue_archive(qid: str) -> Any:
         return Response(
             stream_with_context(_replay_workload_output(path)),
             headers=headers,
+            direct_passthrough=True,
         )
-    return Response(stream_with_context(_replay_jsonl(path)), headers=headers)
+    return Response(
+        stream_with_context(_replay_jsonl(path)),
+        headers=headers,
+        direct_passthrough=True,
+    )
 
 
 # ---------------------------------------------------------------------------

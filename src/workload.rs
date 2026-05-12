@@ -515,7 +515,23 @@ fn build_wrapper_script(
          # whole process group (negative pid) so any in-flight `sleep` dies\n\
          # alongside the loop subshell.\n\
          trap 'if [ -n \"$HEARTBEAT_PID\" ]; then kill -TERM -\"$HEARTBEAT_PID\" 2>/dev/null || kill \"$HEARTBEAT_PID\" 2>/dev/null || true; fi' EXIT\n\
-         setsid --wait bash -c {cmd_q}\n\
+         # Force libc stdio to line-buffer the workload command's stdout+stderr.\n\
+         # Without this, programs whose stdout is a pipe (everything here, since\n\
+         # we redirect through `>(ts | tee)`) flip libc to BLOCK buffering by\n\
+         # default — Python's `print(...)`, glibc `printf`, and friends will\n\
+         # accumulate ~4-8KB before flushing. The .output file then grows in\n\
+         # chunks and the SSE tail through queue-minisite arrives in chunks at\n\
+         # the browser. stdbuf works via LD_PRELOAD=libstdbuf.so + _STDBUF_O=L\n\
+         # _STDBUF_E=L; LD_PRELOAD is inherited by children so a single wrap\n\
+         # at the outer `bash` covers the whole subtree. Only affects programs\n\
+         # that use libc stdio (no help for Rust/Go binaries that bypass libc,\n\
+         # or programs that call setvbuf themselves) but it's the right\n\
+         # default for the common case. WORKLOAD_LINE_BUFFER=0 opts out.\n\
+         if [ \"${{WORKLOAD_LINE_BUFFER:-1}}\" != \"0\" ] && command -v stdbuf >/dev/null 2>&1; then\n\
+             setsid --wait stdbuf -oL -eL bash -c {cmd_q}\n\
+         else\n\
+             setsid --wait bash -c {cmd_q}\n\
+         fi\n\
          EC=$?\n\
          echo ''\n\
          echo \"=== DONE (exit $EC) at $(date -Iseconds) ===\"\n\
@@ -2042,6 +2058,38 @@ mod tests {
     }
 
     #[test]
+    fn wrapper_script_line_buffers_via_stdbuf() {
+        // Workload output reaching the .output file (and from there the
+        // queue-minisite SSE tail and the browser) must arrive per-line,
+        // not in 4-8KB stdio chunks. The wrapper must prepend `stdbuf
+        // -oL -eL` to the inner `bash -c` so libc stdio in the workload's
+        // child process tree line-buffers stdout/stderr.
+        let script = build_wrapper_script(
+            "lb",
+            "echo hi",
+            Path::new("/tmp/lb.output"),
+            Path::new("/tmp/lb.exit"),
+            Path::new("/tmp/lb.heartbeat"),
+            "/usr/bin/claude-watch",
+            None,
+        );
+        assert!(
+            script.contains("stdbuf -oL -eL bash -c"),
+            "wrapper must wrap the inner bash with `stdbuf -oL -eL`:\n{script}"
+        );
+        assert!(
+            script.contains("WORKLOAD_LINE_BUFFER"),
+            "wrapper must honor the WORKLOAD_LINE_BUFFER opt-out env:\n{script}"
+        );
+        // The opt-out branch must still run the bare `setsid --wait bash -c`
+        // (no `stdbuf` prefix) so tests can disable the wrapper.
+        assert!(
+            script.contains("setsid --wait bash -c "),
+            "wrapper must retain a bare `setsid --wait bash -c` fallback:\n{script}"
+        );
+    }
+
+    #[test]
     fn wrapper_script_no_queue_id_omits_arg() {
         // When the workload has no queue binding, the emit-done call
         // must NOT include `--queue-id` (legacy event shape).
@@ -2160,6 +2208,117 @@ mod tests {
         assert!(
             body.contains("=== DONE (exit 0)"),
             "expected DONE line in output:\n{body}"
+        );
+    }
+
+    /// End-to-end: a Python child process inside the wrapper must
+    /// flush its stdout per-line (not in 4-8KB block-buffer chunks).
+    /// Verifies the `stdbuf -oL -eL bash -c ...` wrap actually
+    /// propagates through libc stdio to the workload's children.
+    ///
+    /// Strategy: emit 10 short lines from a Python child with `sleep 0.05`
+    /// between each (total ~0.5s). With libc block-buffering the file
+    /// would stay empty until Python exits and the buffer flushes; with
+    /// line-buffering the file should reach its full size mid-flight.
+    /// We sample the file size at half the runtime and assert it's
+    /// already grown substantially.
+    #[test]
+    fn wrapper_script_runtime_line_buffers_python_child() {
+        // Skip if python3 isn't on PATH — keeps the test friendly to
+        // minimal CI images.
+        if Command::new("sh")
+            .args(["-c", "command -v python3 >/dev/null"])
+            .status()
+            .map(|s| !s.success())
+            .unwrap_or(true)
+        {
+            eprintln!("python3 not on PATH; skipping line-buffer runtime test");
+            return;
+        }
+        // Likewise stdbuf — without it the wrapper's opt-in branch
+        // silently falls back to bare `bash -c` and the test would
+        // race on the platform default (almost always block-buffered).
+        if Command::new("sh")
+            .args(["-c", "command -v stdbuf >/dev/null"])
+            .status()
+            .map(|s| !s.success())
+            .unwrap_or(true)
+        {
+            eprintln!("stdbuf not on PATH; skipping line-buffer runtime test");
+            return;
+        }
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let out_path = tmp.path().join("lb.output");
+        let exit_path = tmp.path().join("lb.exit");
+        let hb_path = tmp.path().join("lb.heartbeat");
+        let script_path = tmp.path().join("lb.sh");
+
+        // 10 short lines, 100ms apart — total ~1s. Without stdbuf the
+        // file stays empty until the python interpreter exits; with
+        // stdbuf -oL we should see the file grow line-by-line.
+        // Use a semicolon-joined one-liner so we don't have to fight
+        // Python indentation through shell quoting.
+        let inner = "python3 -c 'import time\n\
+for i in range(10): print(\"py-line-\" + str(i)); time.sleep(0.1)\n'";
+
+        let script_full = build_wrapper_script(
+            "lb",
+            inner,
+            &out_path,
+            &exit_path,
+            &hb_path,
+            "/bin/true",
+            None,
+        );
+        let script = script_full.replace("sleep 30\n", "sleep 0\n");
+
+        std::fs::write(&script_path, &script).expect("write script");
+        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o700))
+            .expect("chmod");
+
+        let mut child = Command::new("bash")
+            .arg(&script_path)
+            // Defeat the heartbeat sidecar — we don't want its writes
+            // showing up in the .output sampling window.
+            .env("WORKLOAD_HEARTBEAT", "0")
+            .spawn()
+            .expect("spawn wrapper");
+
+        // Sample the file size halfway through the python run (~500ms
+        // in). If line-buffering is working, the file should already
+        // have several lines worth of bytes by now.
+        std::thread::sleep(Duration::from_millis(500));
+        let mid_size = std::fs::metadata(&out_path).map(|m| m.len()).unwrap_or(0);
+
+        let _ = child.wait();
+        std::thread::sleep(Duration::from_millis(200));
+        let final_size = std::fs::metadata(&out_path).map(|m| m.len()).unwrap_or(0);
+        let body = std::fs::read_to_string(&out_path).unwrap_or_default();
+
+        // Sanity: the run produced output.
+        assert!(
+            body.contains("py-line-9"),
+            "expected python output in .output file:\n{body}"
+        );
+        assert!(
+            final_size > 0,
+            "final size should be > 0; body:\n{body}"
+        );
+
+        // Core assertion: at the mid-point, the file should already
+        // contain a substantial fraction of the final output. We allow
+        // generous slack (≥25%) because timing on CI is noisy, but a
+        // block-buffered run would have ~0 bytes (just the wrapper's
+        // header lines, written before python starts).
+        let mid_fraction = mid_size as f64 / final_size as f64;
+        assert!(
+            mid_fraction > 0.25,
+            "mid-run file size was {mid_size}/{final_size} bytes \
+             ({:.0}% of final) — expected >25% if line-buffering works; \
+             a block-buffered python child would dump everything at once. \
+             body:\n{body}",
+            mid_fraction * 100.0,
         );
     }
 
