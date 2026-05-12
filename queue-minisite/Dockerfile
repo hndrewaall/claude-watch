@@ -7,9 +7,9 @@
 # only and does NOT enforce access control internally.
 
 # Build context is the claude-watch repo root (NOT queue-minisite/) so
-# this Dockerfile can COPY from sibling tools/. See
-# docker-gomorrah/docker-compose.yml queue-minisite.build for the
-# matching context/dockerfile pair.
+# this Dockerfile can COPY from sibling tools/. See the consumer
+# docker-compose.yml's queue-minisite.build entry for the matching
+# context/dockerfile pair.
 
 FROM python:3.12-alpine
 

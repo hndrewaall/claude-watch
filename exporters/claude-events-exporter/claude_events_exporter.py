@@ -64,7 +64,6 @@ KNOWN_SOURCES = {
 # (with a separator) to map to itself. Otherwise → "other".
 KNOWN_TAGS = {
     "tv-check",
-    "embiguity-validate",
     "security-check",
     "security-scan",
     "queue-added",
