@@ -230,8 +230,18 @@ services:
     # ttyd args from the command it runs (tmux with `-u` for UTF-8 +
     # `-S` for the shared socket).
     command:
+      # `-I /usr/local/share/ttyd/index.html` serves the autodark-patched
+      # HTML built into the image (ttyd/Dockerfile html-builder stage),
+      # which adds @media (prefers-color-scheme) page-chrome CSS plus a
+      # runtime xterm.js theme swap so macOS Safari / dark-mode users
+      # don't see a white frame around the dark terminal. The injected
+      # script also restamps the theme on a setInterval poll to defend
+      # against ttyd's post-connect SET_PREFERENCES overwrite (full
+      # race comment in inject-autodark.py).
       - ttyd
       - --writable
+      - -I
+      - /usr/local/share/ttyd/index.html
       - -t
       - 'theme={"background":"#002b36","foreground":"#93a1a1","cursor":"#93a1a1","cursorAccent":"#002b36","selectionBackground":"#073642","selectionForeground":"#eee8d5","selectionInactiveBackground":"#073642","black":"#073642","red":"#dc322f","green":"#859900","yellow":"#b58900","blue":"#268bd2","magenta":"#d33682","cyan":"#2aa198","white":"#eee8d5","brightBlack":"#002b36","brightRed":"#cb4b16","brightGreen":"#586e75","brightYellow":"#657b83","brightBlue":"#839496","brightMagenta":"#6c71c4","brightCyan":"#93a1a1","brightWhite":"#fdf6e3"}'
       - -t
