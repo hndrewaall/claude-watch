@@ -1,0 +1,144 @@
+# Fresh-laptop developer stack — wires claude-container + queue-minisite +
+# eichi search-minisite into a single `docker compose up`.
+#
+# Prerequisites + setup walkthrough live in the sibling README.md. Short
+# version: clone claude-watch and eichi as siblings, then run
+# `docker compose up` from this directory.
+#
+# Sibling-repo layout assumed by the build contexts below:
+#
+#   <root>/
+#     claude-watch/        (this repo)
+#       container/         (claude-container source, this-repo subdir)
+#       examples/compose/  (this file)
+#     eichi/               (https://github.com/hndrewaall/eichi)
+#
+# In-container paths hardcode the `hndrewaall` user because that is the
+# UID-1000 user baked into the claude-container and eichi search-minisite
+# Dockerfiles. The HOST user can be anything — bind-mounts use `${HOME}`
+# on the left side so the right (container) side is the only place the
+# username matters. README "Caveats" elaborates.
+
+services:
+  # ---------------------------------------------------------------------
+  # claude-container — Claude Code + claude-watch + tmux in one image.
+  #
+  # In-repo build context: container/ lives at the repo root (absorbed
+  # from the now-merged claude-container sibling repo).
+  # ---------------------------------------------------------------------
+  claude-container:
+    build:
+      context: ../../container
+      dockerfile: Dockerfile
+    image: claude-container:dev
+    extra_hosts:
+      # Required so the in-container claude binary can dial the host's
+      # VSCode SSE listener via CLAUDE_CODE_IDE_HOST_OVERRIDE.
+      - "host.docker.internal:host-gateway"
+    environment:
+      CLAUDE_CODE_IDE_HOST_OVERRIDE: host.docker.internal
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      # Forwarded if set on the host (VSCode IDE port).
+      CLAUDE_CODE_SSE_PORT: ${CLAUDE_CODE_SSE_PORT:-}
+    volumes:
+      # Host $HOME -> in-container /home/hndrewaall. The right-hand side
+      # is fixed: the container's UID-1000 user is named `hndrewaall` in
+      # the Dockerfile, regardless of what your host user is called.
+      - "${HOME}/.claude:/home/hndrewaall/.claude"
+      - "${HOME}/repos:/home/hndrewaall/repos"
+      # Persists the in-container claude binary's auto-updates across
+      # `--rm` restarts so you don't reset to the image-baked version
+      # every time the container exits.
+      - "claude-container-versions:/home/hndrewaall/.local/share/claude"
+    stdin_open: true
+    tty: true
+
+  # ---------------------------------------------------------------------
+  # queue-minisite — Flask UI for the session-task work queue.
+  #
+  # Build context is the claude-watch repo root so the Dockerfile can
+  # COPY from sibling tools/. The host-side session-task script is
+  # bind-mounted read-only at /app/session-task so the container always
+  # runs the upstream version without rebuilding on every PR.
+  # ---------------------------------------------------------------------
+  queue-minisite:
+    build:
+      context: ../..
+      dockerfile: queue-minisite/Dockerfile
+    image: queue-minisite:dev
+    ports:
+      - "8000:8000"
+    user: "1000:1000"
+    environment:
+      # HOME drives where the vendored session-task / claude-event /
+      # obligations CLIs read + write — they all use Path.home().
+      HOME: /queue-home
+      QUEUE_JSON: /queue-home/.config/session/queue.json
+      AGENTS_JSONL_ROOT: /agents-jsonl
+      CACHE_TTL_SECONDS: "5"
+      # Silence pingme + claude-event chatter from the Stop button path
+      # (the UI itself is the acknowledgment). Set to 0 to re-enable.
+      PINGME_SESSION_TASK: "1"
+      CLAUDE_EVENT_SESSION_TASK: "1"
+    volumes:
+      # session-task queue.json — rw because the Stop button mutates it
+      # via session-task (atomic tmp+rename + flock).
+      - "${HOME}/.config/session:/queue-home/.config/session:rw"
+      # ~/claude-events/ — rw so queue-abandoned events land where the
+      # host's claude-event-watch picks them up.
+      - "${HOME}/claude-events:/queue-home/claude-events:rw"
+      # Per-session agent JSONL transcripts — the SSE live-log endpoint
+      # tails these.
+      - "${HOME}/.claude/projects:/agents-jsonl:ro"
+      # Host obligations.json — rw because the Force-start button
+      # registers a hard-gate row that the host main loop reads.
+      - "${HOME}/.config/claude:/queue-home/.config/claude:rw"
+      # Canonical session-task script — bind-mounted read-only so the
+      # container always runs the upstream version. Path is relative to
+      # the build context (claude-watch repo root).
+      - "../../tools/session-task/session-task:/app/session-task:ro"
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------
+  # eichi-search — Flask UI for the eichi local semantic-search CLI.
+  #
+  # Sibling-repo build context. The eichi venv (heavy ML deps) is
+  # bind-mounted from the host into the container at the SAME path so
+  # the venv's editable .pth (which uses an absolute path) keeps
+  # resolving. This means the host's eichi clone MUST live at
+  # ${HOME}/repos/eichi — see README "Sibling-repo layout".
+  #
+  # After first launch you'll want to populate the index DB. See
+  # README "First-run indexing" — the empty container will serve a
+  # working UI but return zero results until you've indexed something.
+  # ---------------------------------------------------------------------
+  eichi-search:
+    build:
+      context: ../../../eichi
+      dockerfile: minisite/Dockerfile
+    image: eichi-search:dev
+    ports:
+      - "8001:8000"
+    user: "1000:1000"
+    environment:
+      EICHI_DB: /home/hndrewaall/.local/share/eichi/index.db
+      EICHI_PYTHON: /home/hndrewaall/repos/eichi/.venv/bin/python
+    volumes:
+      # Host eichi repo at the matching path so the venv's editable .pth
+      # (absolute /home/hndrewaall/repos/eichi/src) resolves inside.
+      - "${HOME}/repos/eichi:/home/hndrewaall/repos/eichi:ro"
+      # Index DB. Read-write because eichi.store.open_db unconditionally
+      # runs CREATE TABLE IF NOT EXISTS on connect. Actual writes are
+      # limited to SQLite journal/WAL housekeeping.
+      - "${HOME}/.local/share/eichi:/home/hndrewaall/.local/share/eichi:rw"
+      # HuggingFace model cache — first query needs the embedding model
+      # (~400 MB). Pre-warmed by `eichi index` on the host before first
+      # launch; otherwise the container tries to download on cold start.
+      - "${HOME}/.cache/huggingface:/home/hndrewaall/.cache/huggingface:ro"
+    restart: unless-stopped
+
+volumes:
+  # In-container claude binary's auto-updated versions/ tree. First
+  # launch the volume is empty and the container falls through to the
+  # image-baked claude. Subsequent self-updates persist here.
+  claude-container-versions:
