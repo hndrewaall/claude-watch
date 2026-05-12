@@ -83,6 +83,18 @@ RUN groupadd --gid 1000 hndrewaall \
 RUN mkdir -p /home/hndrewaall/.local/share/claude \
     && chown -R 1000:1000 /home/hndrewaall/.local
 
+# Pre-create the tmux default socket dir for uid 1000 with the
+# permissions tmux requires (owner-writable, not world-writable).
+# This is the path tmux uses on the default socket when the server
+# is started by uid 1000. examples/compose/docker-compose.yml mounts
+# a named volume here so a sibling ttyd service can attach to the
+# same in-container session; mounting on a path that already exists
+# in the image with correct ownership propagates those perms into
+# the fresh named volume on first use (Docker's bind-mount copy-up
+# behaviour). Without this, the volume directory is root-owned 0755
+# and tmux refuses to start with "directory has unsafe permissions".
+RUN install -d -m 0700 -o 1000 -g 1000 /tmp/tmux-1000
+
 # Install Claude Code CLI globally. Package name confirmed via `npm view`
 # 2026-05-11. In Phase 1+ this is replaced by a bind-mount of host npm-global,
 # so prefer installing into a path a bind-mount can shadow cleanly.
