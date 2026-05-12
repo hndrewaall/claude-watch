@@ -39,6 +39,14 @@ pub struct WatcherEntry {
     pub min_count: u32,
     pub enabled: bool,
     pub start_cmd: Option<String>,
+    /// Optional restart-handler command (shell-style). If set, runs
+    /// immediately before the watcher's start_cmd whenever a stale PID
+    /// file is present (i.e. the watcher previously exited and is being
+    /// brought back up). Lets operators wire site-specific
+    /// "show me what I missed" behavior (e.g. dump the last N minutes
+    /// of message history) without baking integration names into the
+    /// daemon.
+    pub on_restart_cmd: Option<String>,
 }
 
 /// Pure function: parse status bar fields from pane capture text.
@@ -540,7 +548,8 @@ pub async fn check_process_count(pattern: &str) -> u32 {
     out.parse().unwrap_or(0)
 }
 
-/// Parse watchers config file. Format: `name|pattern|min_count|enabled|start_cmd`
+/// Parse watchers config file. Format:
+/// `name|pattern|min_count|enabled|start_cmd[|on_restart_cmd]`
 pub fn parse_watchers_config(path: &str) -> Vec<WatcherEntry> {
     let content = match std::fs::read_to_string(path) {
         Ok(c) => c,
@@ -568,12 +577,17 @@ pub(crate) fn parse_watchers_config_str(content: &str) -> Vec<WatcherEntry> {
                 .get(4)
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty());
+            let on_restart_cmd = parts
+                .get(5)
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
             Some(WatcherEntry {
                 name,
                 pattern,
                 min_count,
                 enabled,
                 start_cmd,
+                on_restart_cmd,
             })
         })
         .collect()
@@ -835,7 +849,7 @@ mod tests {
         // status bar is replaced with a panel that reads:
         //     Background tasks
         //     4 active shells
-        //     watcher-ctl run signal-wait-dm (running)
+        //     watcher-ctl run alerts-watcher (running)
         //     ...
         // Previously bash_re didn't tolerate the "active" qualifier, so the
         // count was lost AND has_status_bar didn't detect the panel, so
@@ -845,10 +859,10 @@ mod tests {
                      \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n\
                        Background tasks\n\
                        4 active shells\n\
-                         watcher-ctl run signal-wait-dm (running)\n\
+                         watcher-ctl run alerts-watcher (running)\n\
                          watcher-ctl run claude-event-watch (running)\n\
                          watcher-ctl run memory-remind (running)\n\
-                       \u{276f} watcher-ctl run signal-wait-group (running)\n\
+                       \u{276f} watcher-ctl run events-watcher (running)\n\
                        \u{2191}/\u{2193} to select \u{00b7} Enter to view \u{00b7} x to stop \u{00b7} \u{2190}/Esc to close";
         let parsed = parse_status_bar(input);
         assert_eq!(parsed.bashes, Some(4));
@@ -863,9 +877,9 @@ mod tests {
         //     Background tasks
         //     3 active shells · 1 active agent
         //       Shells (3)
-        //         watcher-ctl run signal-wait-dm (running)
+        //         watcher-ctl run alerts-watcher (running)
         //         watcher-ctl run memory-remind (running)
-        //         watcher-ctl run signal-wait-group (running)
+        //         watcher-ctl run events-watcher (running)
         //       Local agents (1)
         //         Execute startup-context-trim (running)
         //       ↑/↓ to select · Enter to view · ...
@@ -888,9 +902,9 @@ mod tests {
 \n\
      Shells (3)\n\
 \n\
-   \u{276f} watcher-ctl run signal-wait-dm (running)\n\
+   \u{276f} watcher-ctl run alerts-watcher (running)\n\
      watcher-ctl run memory-remind (running)\n\
-     watcher-ctl run signal-wait-group (running)\n\
+     watcher-ctl run events-watcher (running)\n\
      Local agents (1)\n\
      Execute startup-context-trim (running)\n\
    \u{2191}/\u{2193} to select \u{00b7} Enter to view \u{00b7} x to stop \u{00b7} ctrl+x ctrl+k to stop all agents \u{00b7} \u{2190}/Esc\n\
@@ -958,7 +972,7 @@ mod tests {
 \n\
      Shells (1)\n\
 \n\
-     watcher-ctl run signal-wait-dm (running)\n\
+     watcher-ctl run alerts-watcher (running)\n\
    \u{2191}/\u{2193} to select \u{00b7} Enter to view \u{00b7} x to stop \u{00b7} \u{2190}/Esc to close";
         let parsed = parse_status_bar(input);
         assert_eq!(parsed.bashes, Some(1));
@@ -1213,22 +1227,35 @@ mod tests {
 
     #[test]
     fn test_parse_watchers_basic() {
-        let config = "signal-wait|signal-wait$|1|true|watcher-ctl run signal-wait\n\
+        let config = "alerts-watcher|alerts-watcher$|1|true|watcher-ctl run alerts-watcher\n\
                        torrent-wait|torrent-wait$|1|true|watcher-ctl run torrent-wait";
         let entries = parse_watchers_config_str(config);
         assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].name, "signal-wait");
-        assert_eq!(entries[0].pattern, "signal-wait$");
+        assert_eq!(entries[0].name, "alerts-watcher");
+        assert_eq!(entries[0].pattern, "alerts-watcher$");
         assert_eq!(entries[0].min_count, 1);
         assert!(entries[0].enabled);
         assert_eq!(
             entries[0].start_cmd.as_deref(),
-            Some("watcher-ctl run signal-wait")
+            Some("watcher-ctl run alerts-watcher")
         );
         assert_eq!(entries[1].name, "torrent-wait");
         assert_eq!(
             entries[1].start_cmd.as_deref(),
             Some("watcher-ctl run torrent-wait")
+        );
+        // Sixth pipe-separated field is optional on_restart_cmd; default None.
+        assert!(entries[0].on_restart_cmd.is_none());
+    }
+
+    #[test]
+    fn test_parse_watchers_on_restart_cmd() {
+        let config = "demo|demo$|1|true|run-demo|history-dump --since 5m";
+        let entries = parse_watchers_config_str(config);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].on_restart_cmd.as_deref(),
+            Some("history-dump --since 5m"),
         );
     }
 

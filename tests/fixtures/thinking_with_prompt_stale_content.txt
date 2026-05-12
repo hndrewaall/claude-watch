@@ -1,6 +1,6 @@
-● Andrew says detection is still broken and wants an e2e test.
+● Operator says detection is still broken and wants an e2e test.
 
-● Bash(cat << 'EOF' | signal-send --dm andrew --force
+● Bash(cat << 'EOF' | notify --dm someone --force
       On it -- launching agent to create an e2e test.
       EOF)
   ⎿  Sent (timestamp: 1773720719612)

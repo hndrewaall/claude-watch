@@ -247,7 +247,8 @@ def test_force_start_writes_audit_log():
 
 def test_force_start_emits_claude_event():
     """The lifecycle emit should include `force_started=true` in the data
-    block so downstream consumers (work-queue-exporter, signal bot, etc.)
+    block so downstream consumers (work-queue-exporter, external messaging
+    integrations, etc.)
     can branch on the override path. We assert by reading the emitted
     JSON file out of the per-test claude-events dir.
     """

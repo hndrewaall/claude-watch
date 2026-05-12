@@ -606,12 +606,29 @@ pub enum CompactionStatsDue {
 }
 
 /// Path to the compaction stats timestamp file.
+///
+/// Lives under `~/.config/claude-watch/compaction-stats/` by default;
+/// the legacy `~/.config/signal-stats/` location is honored if it
+/// exists, so existing deployments don't lose their last-post timestamp
+/// across the rename.
 fn compaction_stats_timestamp_path() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/home/user".to_string());
-    PathBuf::from(home)
+    let new_path = PathBuf::from(&home)
+        .join(".config")
+        .join("claude-watch")
+        .join("compaction-stats")
+        .join("last-post");
+    if new_path.exists() {
+        return new_path;
+    }
+    let legacy = PathBuf::from(&home)
         .join(".config")
         .join("signal-stats")
-        .join("last-compaction-post")
+        .join("last-compaction-post");
+    if legacy.exists() {
+        return legacy;
+    }
+    new_path
 }
 
 /// Check if the daily compaction stats DM is due (>=24h since last post).

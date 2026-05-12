@@ -1983,13 +1983,13 @@ mod tests {
 
     #[test]
     fn test_exit_teardown_background_stopped() {
-        let output = "some output\nGoodbye!\nBackground command was stopped: signal-wait\nBackground command was stopped: torrent-wait\n";
+        let output = "some output\nGoodbye!\nBackground command was stopped: alerts-watcher\nBackground command was stopped: torrent-wait\n";
         assert!(check_lines_for_exit_teardown(output));
     }
 
     #[test]
     fn test_exit_teardown_only_background_stopped() {
-        let output = "some output\nBackground command was stopped: signal-wait\n";
+        let output = "some output\nBackground command was stopped: alerts-watcher\n";
         assert!(check_lines_for_exit_teardown(output));
     }
 

@@ -45,7 +45,8 @@ ENV DEBIAN_FRONTEND=noninteractive \
 # Base toolchain: tmux for the entrypoint UI, build-essential for native npm deps,
 # python3 because claude-watch and many host tools shell out to python,
 # vim for in-container emergency edits, curl/ca-certs for NodeSource bootstrap.
-# Atuin is intentionally omitted — host integration is a Phase 2 deliverable.
+# Host-specific shell-history integrations are intentionally omitted —
+# layer them on via a downstream image if you need them.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         tmux \
         git \
