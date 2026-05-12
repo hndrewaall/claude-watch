@@ -3,7 +3,7 @@
 
 The full self-clear flow requires a live tmux pane running Claude Code,
 which we can't reproduce in unit tests. These tests cover the *portable*
-parts that previously had hardcoded gomorrah-specific paths:
+parts that previously had hardcoded host-specific paths:
 
   * Default log path falls under XDG_STATE_HOME (or ~/.local/state) when
     no env var is set.
@@ -118,7 +118,7 @@ class DefaultsTest(unittest.TestCase):
         mod = _import_self_clear()
         prompt = mod.RESUME_PROMPT
         self.assertIn("[SELF-CLEAR-RESUME]", prompt)
-        # The portable default must NOT bake in a gomorrah-specific path.
+        # The portable default must NOT bake in a host-specific path.
         self.assertNotIn("hndrewaall", prompt)
         self.assertNotIn("/.claude/projects/", prompt)
 

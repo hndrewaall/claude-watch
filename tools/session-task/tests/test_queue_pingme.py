@@ -394,7 +394,7 @@ def test_summary_appears_in_pingme_register_message():
         _install_fake_pingme(bin_dir, log)
         env = _env_for_tmp(tmp, extra_path_dir=bin_dir)
 
-        summary_text = "roll kavita after ebook ingest"
+        summary_text = "roll the search index after ebook ingest"
         r1 = _add(env, "register-with-summary", ["repo:summary-a"],
                   "--summary", summary_text)
         d1 = json.loads(r1.stdout)

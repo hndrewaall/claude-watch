@@ -4,10 +4,10 @@ A single source of truth for "what is an agent_id" and "how do I look up
 liveness for a queue item's owning agent" across the Python tools that
 need to consume `claude-watch active-agents` output:
 
-  - agent-msg                 (claude-config/bin/agent-msg)
   - work-queue-exporter       (claude-watch/exporters/work-queue-exporter/)
-  - queue-minisite            (docker-gomorrah/queue-minisite/)
-  - cron-queue-check          (server-config/bin/cron-queue-check)
+  - queue-minisite            (claude-watch/queue-minisite/)
+  - any external agent-message / cron-queue-check tooling that needs
+    to enrich queue rows with the owning agent's liveness state.
 
 Canonical agent_id format: the JSONL filename stem WITHOUT the `agent-`
 prefix and without the `.jsonl` suffix. Example:
