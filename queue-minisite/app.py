@@ -165,14 +165,36 @@ class _Cache:
 _cache = _Cache()
 
 
+def _empty_queue() -> dict[str, Any]:
+    """Canonical empty queue.json skeleton.
+
+    Mirrors `_queue_empty()` in tools/session-task/session-task so the
+    front-end and downstream readers (`_render_payload`, `_classify_owner`,
+    etc.) see the same shape as a freshly-written queue with no items.
+
+    `schema_version` is intentionally omitted here — it's only meaningful
+    on a real on-disk queue. Callers that need it read via
+    `data.get("schema_version")`, which returns None for the empty case.
+    """
+    return {"items": [], "locked_scopes": {}}
+
+
 def _read_queue() -> tuple[dict[str, Any], str | None]:
-    """Read queue.json from the bind mount. Returns (data, error)."""
+    """Read queue.json from the bind mount. Returns (data, error).
+
+    A missing queue.json (ENOENT) is treated as an empty queue — this is
+    the legitimate fresh-install / fresh-laptop state, not an error. The
+    front-end renders an empty list rather than a red error banner.
+    Other OSErrors (permission denied, I/O errors) still surface as errors.
+    """
     try:
         with open(QUEUE_PATH, "r") as f:
             data = json.load(f)
         if not isinstance(data, dict):
             return {}, f"unexpected queue.json shape: {type(data).__name__}"
         return data, None
+    except FileNotFoundError:
+        return _empty_queue(), None
     except OSError as exc:
         return {}, f"queue.json unreadable: {exc}"
     except ValueError as exc:
