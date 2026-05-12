@@ -207,6 +207,8 @@ The mechanism is a small `/etc/profile.d/claude-tools.sh` fragment baked into th
 
 Operational tooling that the operator runs on the **host** (alerting, monitoring, media post-processing, ingest pipelines, etc.) is intentionally NOT installed in the container. The image is meant to be a generic Claude Code + claude-watch sandbox; host-specific tooling stays on the host where it has the right environment, credentials, and filesystem layout. Layer that in via your own image or a sibling bind-mount when you need it.
 
+The [example compose stack](../examples/compose/) takes that "sibling bind-mount" path further by mounting `~/bin` (read-only) alongside `~/repos`, so host-installed CLI symlinks resolve inside the container. See [examples/compose/README.md](../examples/compose/README.md) "Host state bind-mounts" for the full table of mounts the example wires up (claude-events, atuin, signal-queue, etc.) and the macOS graceful-no-op behavior for paths that don't exist on the host.
+
 ## Volume management
 
 The `claude-container-versions` named docker volume holds the in-container claude binary's auto-updated `versions/<ver>/` tree at `/home/hndrewaall/.local/share/claude/`. It is created on first `claude-tmux` invocation (or first `docker compose up`) and persists across `--rm` exits — that's its whole purpose.
