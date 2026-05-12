@@ -9,18 +9,39 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-/// Known watcher command patterns — children matching these are NOT agents.
+/// Built-in watcher command patterns — children matching these are
+/// classified as long-running watchers, NOT subagents. `watcher-ctl`
+/// covers the canonical supervisor form (`watcher-ctl run <name>`).
+/// The remaining `*-wait` / `*-remind` / `*-watch` entries cover the
+/// stock watcher binaries shipped under `tools/watchers/`, plus the
+/// generic `request-wait` / `task-watch` wrappers.
+///
+/// Operators with additional site-specific watcher names should extend
+/// this list via `CLAUDE_WATCH_EXTRA_WATCHER_PATTERNS` (colon-separated)
+/// — see `is_watcher` for the merge logic.
 pub const WATCHER_PATTERNS: &[&str] = &[
-    "signal-wait",
-    "torrent-wait",
-    "tv-remind",
-    "memory-remind",
-    "context-watch",
     "watcher-ctl",
     "watchmen",
-    "request-wait",
+    "memory-remind",
+    "context-watch",
     "task-watch",
+    "request-wait",
 ];
+
+/// Read additional watcher patterns from the
+/// `CLAUDE_WATCH_EXTRA_WATCHER_PATTERNS` env var (colon-separated).
+/// Returns an empty Vec when unset / empty.
+pub fn extra_watcher_patterns() -> Vec<String> {
+    std::env::var("CLAUDE_WATCH_EXTRA_WATCHER_PATTERNS")
+        .ok()
+        .map(|s| {
+            s.split(':')
+                .map(|p| p.trim().to_string())
+                .filter(|p| !p.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
 
 /// Claude tasks base directory PARENT (per-uid).
 ///
@@ -95,11 +116,18 @@ pub fn extract_eval_command(cmd: &str) -> String {
     cmd.to_string()
 }
 
-/// Check if a command matches known watcher patterns.
+/// Check if a command matches known watcher patterns. Honors both the
+/// built-in `WATCHER_PATTERNS` and any operator-supplied additions
+/// via `CLAUDE_WATCH_EXTRA_WATCHER_PATTERNS`.
 pub fn is_watcher(cmd: &str) -> bool {
     let eval_cmd = extract_eval_command(cmd);
     for pattern in WATCHER_PATTERNS {
         if eval_cmd.starts_with(pattern) || eval_cmd.starts_with(&format!("'{}", pattern)) {
+            return true;
+        }
+    }
+    for pattern in extra_watcher_patterns() {
+        if eval_cmd.starts_with(&pattern) || eval_cmd.starts_with(&format!("'{}", pattern)) {
             return true;
         }
     }
@@ -855,8 +883,8 @@ mod tests {
 
     #[test]
     fn test_extract_eval_command_single_quotes() {
-        let cmd = "zsh -c eval 'signal-wait --dm' < /dev/null 2>&1";
-        assert_eq!(extract_eval_command(cmd), "signal-wait --dm");
+        let cmd = "zsh -c eval 'watcher-ctl run alerts-watcher' < /dev/null 2>&1";
+        assert_eq!(extract_eval_command(cmd), "watcher-ctl run alerts-watcher");
     }
 
     #[test]
@@ -878,14 +906,14 @@ mod tests {
     }
 
     #[test]
-    fn test_is_watcher_signal_wait() {
-        assert!(is_watcher("zsh -c eval 'signal-wait --dm' < /dev/null"));
-        assert!(is_watcher("signal-wait"));
-    }
-
-    #[test]
-    fn test_is_watcher_torrent_wait() {
-        assert!(is_watcher("zsh -c eval 'torrent-wait' < /dev/null"));
+    fn test_is_watcher_via_watcher_ctl() {
+        // `watcher-ctl run <name>` is the canonical supervisor wrapper,
+        // so any watcher invoked through it is recognised regardless of
+        // the watcher's own name.
+        assert!(is_watcher(
+            "zsh -c eval 'watcher-ctl run alerts-watcher' < /dev/null"
+        ));
+        assert!(is_watcher("watcher-ctl run torrent-wait"));
     }
 
     #[test]
@@ -896,6 +924,26 @@ mod tests {
     #[test]
     fn test_is_watcher_context_watch() {
         assert!(is_watcher("context-watch --foo"));
+    }
+
+    #[test]
+    fn test_is_watcher_extra_patterns_env_var() {
+        // Site-specific watcher names extend the built-in list via env var.
+        let prev = std::env::var("CLAUDE_WATCH_EXTRA_WATCHER_PATTERNS").ok();
+        // SAFETY: tests run in parallel but env vars are process-global.
+        // We restore on the way out; collisions across tests would just
+        // produce a flake here, not silently miscompile.
+        std::env::set_var(
+            "CLAUDE_WATCH_EXTRA_WATCHER_PATTERNS",
+            "my-bespoke-watcher:another-watcher",
+        );
+        assert!(is_watcher("my-bespoke-watcher --flag"));
+        assert!(is_watcher("zsh -c eval 'another-watcher' < /dev/null"));
+        assert!(!is_watcher("some-other-cmd"));
+        match prev {
+            Some(v) => std::env::set_var("CLAUDE_WATCH_EXTRA_WATCHER_PATTERNS", v),
+            None => std::env::remove_var("CLAUDE_WATCH_EXTRA_WATCHER_PATTERNS"),
+        }
     }
 
     #[test]

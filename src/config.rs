@@ -241,8 +241,9 @@ pub struct WatcherMonitorConfig {
     pub active_window_secs: u64,
     /// Grace period (seconds) after `last_seen_running` during which a
     /// missing watcher is NOT counted toward `consecutive_missing`. Short-
-    /// lived watchers (e.g. signal-wait that exits when a message arrives)
-    /// have a natural gap between exit and the main loop's restart, so we
+    /// lived watchers (e.g. a `*-wait` watcher that exits when an event
+    /// arrives) have a natural gap between exit and the main loop's
+    /// restart, so we
     /// avoid firing spurious "watcher missing" alerts every time a message
     /// arrives. Default: 90 seconds. Lowered to 0 in e2e tests so a freshly
     /// killed watcher fires within the inject_threshold window.

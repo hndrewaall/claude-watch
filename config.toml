@@ -149,7 +149,7 @@ event_consumer_watcher_name = "claude-event-watch"
 enabled = true
 # Fixed token margin from max: trigger when tokens >= max - margin (overrides threshold_percent)
 # 100K margin (trigger at 900K / 90%) gives headroom for accumulated image
-# attachments (e.g., Signal photos we Read into context). Large images consume many tokens
+# attachments (e.g., messaging-app photos we Read into context). Large images consume many tokens
 # AND count against Anthropic's per-request image-dimension limit — firing the self-clear
 # earlier prevents sessions from hitting the "image exceeds dimension limit for many-image
 # requests" wall before the clear can land.

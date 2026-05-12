@@ -64,11 +64,11 @@ pub(crate) fn thinking_backoff_threshold_with_multiplier(
 /// `cooldown_secs` seconds. Used to suppress cascading interrupts across
 /// the prolonged-thinking and context-warning fire paths.
 ///
-/// NOTE (2026-04-28): The watcher-down inject path is intentionally
-/// EXEMPT from this gate. A down watcher (signal-wait, claude-event-
-/// watch, torrent-wait, etc.) is a hard liveness failure — silence in
-/// the cooldown window means inbound messages, events, and torrents go
-/// unprocessed for as long as it takes to clear. The watcher-down
+/// NOTE: The watcher-down inject path is intentionally EXEMPT from
+/// this gate. A down watcher (any of the `*-wait` / `claude-event-
+/// watch` / torrent-wait family) is a hard liveness failure — silence
+/// in the cooldown window means inbound events go unprocessed for as
+/// long as it takes to clear. The watcher-down
 /// inject must be allowed to fire even when another interrupt fired
 /// recently. The per-watcher `last_watcher_inject` cooldown
 /// (`watcher_monitor.inject_cooldown`, default 60s) still rate-limits
@@ -471,8 +471,9 @@ async fn restart_claude(pane: &str, state: &mut State, config: &crate::config::C
     // process (survives /clear), causing misleading messages on subsequent context clears.
     // The resume prompt injection handles session startup instead.
     // --dangerously-skip-permissions: harness-managed instances run in
-    // permanent permission-bypass mode. The harness's own gates (obligations,
-    // queue, signal-ack) provide finer-grained safety than per-tool prompts.
+    // permanent permission-bypass mode. The harness's own gates
+    // (obligations, queue, etc.) provide finer-grained safety than
+    // per-tool prompts.
     let launch = if let Some(ref sid) = session_id {
         info!(session_id = %sid, "restarting Claude Code with --resume");
         format!("claude --dangerously-skip-permissions --resume {}", sid)
@@ -2891,10 +2892,11 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
             } else {
                 // Grace period: if the watcher was seen running within the
                 // configured grace_secs, don't count this as a miss. Short-
-                // lived watchers (e.g. signal-wait exits when a message
-                // arrives) have a natural gap between exit and the main
-                // loop's restart. Without this grace period we fire spurious
-                // "watcher missing" alerts every time a message is received.
+                // lived watchers (e.g. an `*-wait` watcher that exits when
+                // an event arrives) have a natural gap between exit and
+                // the main loop's restart. Without this grace period we
+                // fire spurious "watcher missing" alerts every time an
+                // event is received.
                 // Default 90s; tunable via [watcher_monitor].grace_secs (0 in
                 // the e2e auto-restart test for fast firing).
                 let grace_secs = config.watcher_monitor.grace_secs as f64;
@@ -3016,12 +3018,12 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
         // the Claude Code pane so the main loop spawns the watcher in its
         // own process tree. The daemon never spawns watchers directly.
         //
-        // NOTE (2026-04-28, PR #44): The watcher-down inject path is
-        // intentionally EXEMPT from `interrupt_in_global_cooldown`. A down
-        // watcher is a hard liveness failure — we have no signal-wait, no
-        // claude-event-watch, no torrent-wait — and silence here means
-        // messages / events / completions sit unprocessed for the cooldown
-        // window. Prior systemd-run supervision attempt (q-2026-04-28-6602)
+        // NOTE: The watcher-down inject path is intentionally EXEMPT from
+        // `interrupt_in_global_cooldown`. A down watcher is a hard
+        // liveness failure — none of the configured `*-wait` /
+        // claude-event-watch / torrent-wait watchers are running — and
+        // silence here means events / completions sit unprocessed for the
+        // cooldown window. A prior systemd-run supervision attempt
         // violated the heartbeat-liveness invariant and was reverted. The
         // correct shape is: keep the spawn target in the main-loop tmux
         // pane (watchers must die when the main loop dies), and let the
@@ -5255,7 +5257,7 @@ max_stuck_secs = {max_stuck}
         // (still emit, but without the consumer's name) so the event
         // can't be the seed of its own self-feedback loop.
         let affected = vec![
-            "signal-wait-dm".to_string(),
+            "alerts-watcher".to_string(),
             "claude-event-watch".to_string(),
             "torrent-wait".to_string(),
         ];
@@ -5263,7 +5265,7 @@ max_stuck_secs = {max_stuck}
         assert_eq!(
             result,
             Some(vec![
-                "signal-wait-dm".to_string(),
+                "alerts-watcher".to_string(),
                 "torrent-wait".to_string(),
             ]),
             "non-consumer watchers must still emit; consumer must be filtered out"
@@ -5274,7 +5276,7 @@ max_stuck_secs = {max_stuck}
     fn test_filter_consumer_for_event_emit_consumer_absent_returns_unchanged() {
         // Consumer not in the list: pass through unchanged.
         let affected = vec![
-            "signal-wait-dm".to_string(),
+            "alerts-watcher".to_string(),
             "torrent-wait".to_string(),
         ];
         let result = filter_consumer_for_event_emit(&affected, "claude-event-watch");

@@ -231,9 +231,10 @@ pub fn should_respawn(
 ///
 /// **Heuristic**: a subagent is active iff it appears as a live child PID
 /// of the Claude Code main process AND its command does NOT match a known
-/// watcher pattern (signal-wait, torrent-wait, etc.) AND it is not one of
-/// our own introspection commands (agent-ctl / claude-watch agent / ps).
-/// This mirrors the existing `agent-ctl list` / `agent-ctl kill-all` logic.
+/// watcher pattern (any `watcher-ctl run <name>` supervisor or one of
+/// the built-in `WATCHER_PATTERNS`) AND it is not one of our own
+/// introspection commands (agent-ctl / claude-watch agent / ps). This
+/// mirrors the existing `agent-ctl list` / `agent-ctl kill-all` logic.
 ///
 /// We deliberately use **live child processes** rather than `agent-*.meta.json`
 /// files on disk, because meta.json files persist after the subagent process

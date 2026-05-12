@@ -85,7 +85,7 @@ cooldown = 300
 enabled = false
 
 [reauth]
-# Disabled — host integration (Pushover alerts). Phase 2+ work item.
+# Disabled — host push-notification integration. Phase 2+ work item.
 enabled = false
 
 [task_watch]

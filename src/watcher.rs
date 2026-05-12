@@ -88,9 +88,9 @@ pub async fn process_pids(pattern: &str) -> Vec<u32> {
 /// `watcher-ctl` (or its multicall alias `claude-watch`).
 ///
 /// This returns the canonical list of live supervisors. Length > 1 means a
-/// duplicate supervisor stack — the bug pattern Andrew caught on 2026-04-27,
-/// where multiple nested `watcher-ctl run signal-wait-dm` parents stay alive
-/// `wait()`ing on the same descendant.
+/// duplicate supervisor stack — the bug pattern caught on a prior
+/// regression, where multiple nested `watcher-ctl run <name>` parents
+/// stay alive `wait()`ing on the same descendant.
 pub async fn supervisor_pids(name: &str) -> Vec<u32> {
     let pattern = format!("watcher-ctl run {}", name);
     let candidates = process_pids(&pattern).await;
@@ -129,12 +129,12 @@ pub fn watcher_list(config_path: &str) -> Vec<WatcherEntry> {
 /// Both fans run as `tokio::spawn` tasks so the wall-clock per status call
 /// stays near one pgrep round-trip even with many watchers configured.
 ///
-/// The supervisor lookup catches the bug pattern Andrew flagged 2026-04-27:
-/// nested `watcher-ctl run signal-wait-dm` parents accumulating because
-/// each redundant `watcher-ctl run` invocation spawns a fresh wrapper that
-/// doesn't clean up its predecessors. The PID-file check that
-/// `watcher-status` USED to do was completely blind to this — we'd report
-/// `ok` while four supervisors raced on the same PID file.
+/// The supervisor lookup catches a known regression pattern: nested
+/// `watcher-ctl run <name>` parents accumulating because each redundant
+/// `watcher-ctl run` invocation spawns a fresh wrapper that doesn't
+/// clean up its predecessors. The PID-file check that `watcher-status`
+/// USED to do was completely blind to this — we'd report `ok` while
+/// four supervisors raced on the same PID file.
 pub async fn watcher_status(config_path: &str) -> Vec<WatcherStatus> {
     let entries = parse_watchers_config(config_path);
 
@@ -253,18 +253,16 @@ pub async fn watcher_run(config_path: &str, name: &str) -> Result<i32, String> {
     // Print history on restart (PID file exists from previous run)
     let pid_file = format!("{}/{}.pid", PID_DIR, name);
     if std::path::Path::new(&pid_file).exists() {
-        // Fire handler: print relevant history so it appears in task output
-        match name {
-            "signal-wait-group" => {
-                let _ = run_cmd_any(&["signal-history", "--group", "--since", "5m"], 10).await;
+        // Fire the watcher's optional on_restart_cmd handler so its
+        // recent state lands in the task output. Operators wire whatever
+        // history-dumping command makes sense for their integration via
+        // the 6th `|`-separated field in `watchers.conf`. Daemon stays
+        // integration-agnostic.
+        if let Some(on_restart_cmd) = entry.on_restart_cmd.as_deref() {
+            let parts: Vec<&str> = on_restart_cmd.split_whitespace().collect();
+            if !parts.is_empty() {
+                let _ = run_cmd_any(&parts, 10).await;
             }
-            "signal-wait-dm" => {
-                let _ = run_cmd_any(&["signal-history", "--dm", "--since", "5m"], 10).await;
-            }
-            "torrent-wait" => {
-                let _ = run_cmd_any(&["torrent-check"], 10).await;
-            }
-            _ => {}
         }
     }
 
@@ -593,9 +591,9 @@ pub fn format_list(entries: &[WatcherEntry]) -> String {
 /// Output shape:
 ///
 /// ```text
-/// signal-wait-dm       ok        (1/1)  783136
+/// alerts-watcher       ok        (1/1)  783136
 /// claude-event-watch   DOWN      (0/1)
-/// signal-wait-dm       DUPLICATE (3/1)  783136 1234567 8901234
+/// alerts-watcher       DUPLICATE (3/1)  783136 1234567 8901234
 ///                      duplicate pollers: 783136 1234567 8901234
 ///                      duplicate supervisors: 358036 359170 705775
 /// ```
@@ -731,11 +729,12 @@ mod tests {
     fn test_format_list_basic() {
         let entries = vec![
             WatcherEntry {
-                name: "sig".to_string(),
-                pattern: "sig$".to_string(),
+                name: "alerts".to_string(),
+                pattern: "alerts$".to_string(),
                 min_count: 1,
                 enabled: true,
-                start_cmd: Some("signal-wait".to_string()),
+                start_cmd: Some("alerts-watcher".to_string()),
+                on_restart_cmd: None,
             },
             WatcherEntry {
                 name: "torrent".to_string(),
@@ -743,10 +742,11 @@ mod tests {
                 min_count: 1,
                 enabled: false,
                 start_cmd: None,
+                on_restart_cmd: None,
             },
         ];
         let output = format_list(&entries);
-        assert!(output.contains("sig"));
+        assert!(output.contains("alerts"));
         assert!(output.contains("torrent"));
         assert!(output.contains("true"));
         assert!(output.contains("false"));
@@ -782,7 +782,7 @@ mod tests {
 
     #[test]
     fn test_format_status_all_ok() {
-        let statuses = vec![ok_status("sig", 1, 1, "1234")];
+        let statuses = vec![ok_status("alerts", 1, 1, "1234")];
         let output = format_status(&statuses);
         assert!(output.contains("ok"));
         assert!(output.contains("All watchers healthy."));
@@ -794,7 +794,7 @@ mod tests {
 
     #[test]
     fn test_format_status_some_down() {
-        let statuses = vec![ok_status("sig", 1, 1, "1234"), down_status("torrent", 1)];
+        let statuses = vec![ok_status("alerts", 1, 1, "1234"), down_status("torrent", 1)];
         let output = format_status(&statuses);
         assert!(output.contains("DOWN"));
         assert!(output.contains("WARNING: Some watchers are down or duplicated!"));
@@ -821,22 +821,22 @@ mod tests {
     #[test]
     fn test_rewrite_config_enable() {
         let config =
-            "# comment\nsig|sig$|1|false|signal-wait\ntorrent|torrent$|1|true|torrent-wait\n";
-        let result = rewrite_config_toggle(config, "sig", true).unwrap();
-        assert!(result.contains("sig|sig$|1|true|signal-wait"));
+            "# comment\nalerts|alerts$|1|false|alerts-watcher\ntorrent|torrent$|1|true|torrent-wait\n";
+        let result = rewrite_config_toggle(config, "alerts", true).unwrap();
+        assert!(result.contains("alerts|alerts$|1|true|alerts-watcher"));
         assert!(result.contains("torrent|torrent$|1|true|torrent-wait"));
     }
 
     #[test]
     fn test_rewrite_config_disable() {
-        let config = "sig|sig$|1|true|signal-wait\n";
-        let result = rewrite_config_toggle(config, "sig", false).unwrap();
-        assert!(result.contains("sig|sig$|1|false|signal-wait"));
+        let config = "alerts|alerts$|1|true|alerts-watcher\n";
+        let result = rewrite_config_toggle(config, "alerts", false).unwrap();
+        assert!(result.contains("alerts|alerts$|1|false|alerts-watcher"));
     }
 
     #[test]
     fn test_rewrite_config_not_found() {
-        let config = "sig|sig$|1|true|signal-wait\n";
+        let config = "alerts|alerts$|1|true|alerts-watcher\n";
         let result = rewrite_config_toggle(config, "nonexistent", true);
         assert!(result.is_none());
     }
@@ -859,9 +859,9 @@ mod tests {
 
     #[test]
     fn test_rewrite_config_minimal_fields() {
-        let config = "sig|sig$\n";
-        let result = rewrite_config_toggle(config, "sig", false).unwrap();
-        assert!(result.contains("sig|sig$|1|false|"));
+        let config = "alerts|alerts$\n";
+        let result = rewrite_config_toggle(config, "alerts", false).unwrap();
+        assert!(result.contains("alerts|alerts$|1|false|"));
     }
 
     #[test]
@@ -873,19 +873,19 @@ mod tests {
         assert_eq!(output.lines().count(), 2);
     }
 
-    // --- DUPLICATE detection tests (2026-04-27) -------------------------
+    // --- DUPLICATE detection tests -------------------------
     //
-    // These guard the bug pattern Andrew caught: nested `watcher-ctl run
-    // signal-wait-dm` supervisors accumulating, all alive, racing on one
-    // PID file. The old `watcher-status` was completely blind because it
-    // only checked the single PID written to /var/run/claude/<name>.pid.
+    // These guard the regression pattern where nested `watcher-ctl run
+    // <name>` supervisors accumulate, all alive, racing on one PID file.
+    // The old `watcher-status` was completely blind because it only
+    // checked the single PID written to /var/run/claude/<name>.pid.
 
     #[test]
     fn test_format_status_duplicate_pollers() {
         // 3 pollers running when min_count is 1 → DUPLICATE row + a
         // "duplicate pollers:" detail line listing all three PIDs.
         let statuses = vec![WatcherStatus {
-            name: "signal-wait-dm".to_string(),
+            name: "alerts-watcher".to_string(),
             status: "DUPLICATE".to_string(),
             count: 3,
             required: 1,
@@ -914,7 +914,7 @@ mod tests {
         // parents, all alive). Status is DUPLICATE; the offending wrapper
         // PIDs are listed.
         let statuses = vec![WatcherStatus {
-            name: "signal-wait-dm".to_string(),
+            name: "alerts-watcher".to_string(),
             status: "DUPLICATE".to_string(),
             count: 1,
             required: 1,
@@ -939,7 +939,7 @@ mod tests {
         // Pathological: dup pollers AND dup supervisors. Both detail lines
         // must appear under the affected watcher.
         let statuses = vec![WatcherStatus {
-            name: "signal-wait-dm".to_string(),
+            name: "alerts-watcher".to_string(),
             status: "DUPLICATE".to_string(),
             count: 2,
             required: 1,
@@ -960,7 +960,7 @@ mod tests {
         // top-line status to show DOWN (more urgent) yet still print the
         // supervisor-dup detail line so Andrew sees the full picture.
         let statuses = vec![WatcherStatus {
-            name: "signal-wait-dm".to_string(),
+            name: "alerts-watcher".to_string(),
             status: "DOWN".to_string(),
             count: 0,
             required: 1,
@@ -1051,7 +1051,7 @@ mod tests {
     #[test]
     fn test_format_status_duplicate_suggests_watcher_restart() {
         let statuses = vec![WatcherStatus {
-            name: "signal-wait-dm".to_string(),
+            name: "alerts-watcher".to_string(),
             status: "DUPLICATE".to_string(),
             count: 3,
             required: 1,
@@ -1125,7 +1125,7 @@ mod tests {
         let statuses = vec![
             down_status("claude-event-watch", 1),
             WatcherStatus {
-                name: "signal-wait-dm".to_string(),
+                name: "alerts-watcher".to_string(),
                 status: "DUPLICATE".to_string(),
                 count: 3,
                 required: 1,
@@ -1152,7 +1152,7 @@ mod tests {
     fn test_format_status_healthy_no_recovery_footer() {
         // The recovery hints must only appear when something is wrong;
         // an all-healthy run should print only "All watchers healthy."
-        let statuses = vec![ok_status("signal-wait-dm", 1, 1, "1234")];
+        let statuses = vec![ok_status("alerts-watcher", 1, 1, "1234")];
         let output = format_status(&statuses);
         assert!(output.contains("All watchers healthy."));
         assert!(

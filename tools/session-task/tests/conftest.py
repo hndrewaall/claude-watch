@@ -1,19 +1,18 @@
 """pytest auto-config for session-task tests.
 
-Suppress real ``pingme`` Pushover notifications for ALL tests in this
-dir.
+Suppress real ``pingme`` push notifications for ALL tests in this dir.
 
 Several tests build their subprocess env from ``dict(os.environ)``
 without explicitly setting ``PINGME_SESSION_TASK=0``. If the outer
 shell didn't set it either, the spawned ``session-task`` process will
-shell out to the real ``pingme`` (Pushover) binary -- producing real
+shell out to the real ``pingme`` binary -- producing real push
 notifications on every ``queue register`` / ``queue done`` /
 ``queue abandon`` during a test run.
 
 Setting ``PINGME_SESSION_TASK=0`` via ``setdefault`` here means:
 
 * Tests that DON'T explicitly manage this var inherit ``=0`` and stay
-  silent (no Pushover noise to the maintainer's phone).
+  silent (no push-notification noise to the maintainer's phone).
 * ``test_queue_pingme.py`` keeps working because it explicitly DELETES
   the var when it wants pingme to fire AND installs a fake ``pingme``
   shim onto a controlled PATH -- so the un-suppressed code path can't

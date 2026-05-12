@@ -53,7 +53,7 @@ In `~/.claude/settings.json` (after `make install` puts the binaries in
 | `pre-agent-queue-gate-hook` | PreToolUse | `Agent` | Refuses `Agent` spawns missing a `Queue item: q-XXXX` marker, or whose marker isn't `running` in the queue. |
 | `pre-tool-obligations-gate-hook` | PreToolUse | `*` | Calls `obligations check`; denies when a gate-mode obligation's predicate is unsatisfied. Also enforces a built-in cardinal rule against bare `watcher-ctl run` (must be invoked via the harness `run_in_background:true`). |
 | `post-tool-obligations-update-hook` | PostToolUse | `*` | Runs `obligations post-tool` (satisfy-by-completion + inform-mode advisories) and manages a sidecar registry for `no_pending_watcher_outputs`. |
-| `post-tool-mark-attachment-read-hook` | PostToolUse | `Read` | Auto-marks Signal attachments as read via `signal-mark-read` when Claude opens a file under `~/signal-queue/attachments/` (host-specific; safe no-op elsewhere). |
+| `post-tool-mark-attachment-read-hook` | PostToolUse | `Read` | Auto-marks external-messaging attachments as read via a host-specific `*-mark-read` shim when Claude opens a file under a configured attachment dir. Host-specific integration; safe no-op when neither the shim nor the dir is present. |
 
 All hooks default-open on internal error. A broken hook must NEVER blackhole
 the loop.
@@ -187,10 +187,12 @@ bypasses to `~/.config/claude/obligations-bypass.log`. Surfaces in
 `obligations list` as "ACTIVE OVERRIDES". Inform-mode advisories are NOT
 silenced (overrides gate forward progress, not visibility).
 
-Override creation also fires a low-priority Pushover notification via
+Override creation also fires a low-priority push notification via
 `pingme` (when present on `$PATH`) carrying `<ov-id> (<duration>): <reason>`,
 so an audited bypass surfaces on the operator's phone in addition to the
-log. Suppress in tests / CI via `OBLIGATIONS_DISABLE_PINGME=1`.
+log. The `pingme` shim is host-pluggable — point it at whatever
+notification service you use. Suppress in tests / CI via
+`OBLIGATIONS_DISABLE_PINGME=1`.
 
 ### Emergency bypass (legacy)
 

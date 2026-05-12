@@ -44,7 +44,7 @@ claude-watch captures the Claude Code tmux pane every few seconds and parses it 
 
 - **Activity detection**: Thinking, Writing, ToolRunning, Idle, ForegroundBash, ShellPrompt
 - **Health monitoring**: Detects zombie sessions (no heartbeat), token stalls (context exhaustion), prolonged thinking, and foreground blocks
-- **Recovery actions**: Injects prompts to resume stalled sessions, triggers context clears, sends alerts via Pushover
+- **Recovery actions**: Injects prompts to resume stalled sessions, triggers context clears, sends push-notification alerts (via a pluggable `pingme` shim — wire it to whatever notification service you prefer)
 - **Fresh session detection**: Detects when Claude Code starts fresh (via `dashboard --recreate --fresh`) and injects a resume prompt
 - **Task monitoring**: Watches Claude Code's background task output files, tracks agent lifecycle, cleans up orphaned tmux panes
 
@@ -74,7 +74,7 @@ claude-watch (systemd service)
 | `state.rs` | Persistent state (JSON): dead checks, inject flags, history |
 | `status.rs` | Status bar parsing (tokens, bashes, compact %) |
 | `task_watch.rs` | Background task and agent lifecycle monitoring |
-| `alert.rs` | Pushover notifications |
+| `alert.rs` | Push notifications (via the `pingme` shim) |
 | `config.rs` | TOML configuration |
 
 ### Dashboard scripts
@@ -171,16 +171,16 @@ fresh deployments self-contained.
 | `claude-event` + `claude-event-tail` | [`tools/claude-event/`](tools/claude-event/) | Source-agnostic JSON event bus (emitter + ring-buffer reader). See [`docs/events.md`](docs/events.md). |
 | `claude-event-watch` + `self-clear` | [`tools/watchers/`](tools/watchers/) | Watcher script (inotify-blocking event surfacer) and the `/clear` + resume-prompt injector. See [`docs/watchers.md`](docs/watchers.md). |
 | `queue-minisite` | [`queue-minisite/`](queue-minisite/) | Mobile-friendly Flask UI for the `session-task` work queue. Renders running/pending/blocked items with Stop / Abandon / Force-start buttons. Designed to sit behind an upstream auth proxy. See [`queue-minisite/README.md`](queue-minisite/README.md). |
-| `container` | [`container/`](container/) | Containerized deployment of Claude Code + the `claude-watch` daemon + tmux as a single Docker image, plus a host-side `claude-tmux` wrapper with bind mounts, env passthrough, signal handling, and TTY. Lets the same Claude Code environment run identically on Linux servers and macOS work laptops. See [`container/README.md`](container/README.md). |
+| `container` | [`container/`](container/) | Containerized deployment of Claude Code + the `claude-watch` daemon + tmux as a single Docker image, plus a host-side `claude-tmux` wrapper with bind mounts, env passthrough, POSIX signal handling, and TTY. Lets the same Claude Code environment run identically on Linux servers and macOS work laptops. See [`container/README.md`](container/README.md). |
 
 `make install` builds the daemon and copies all of the above into
 `$BIN_DIR` (default `~/bin/`). Each subsystem has its own README, tests
 under `tests/`, and a public-facing reference doc in `docs/`.
 
 What the daemon plus tools still don't cover by design: a host-specific
-resume checklist, a request tracker, signal/messaging integrations, and
-any other site-specific surface. Those belong in your own dotfiles or
-ops repo and call into these tools as primitives.
+resume checklist, a request tracker, external messaging integrations,
+and any other site-specific surface. Those belong in your own dotfiles
+or ops repo and call into these tools as primitives.
 
 ## Build & run
 
@@ -229,8 +229,12 @@ thinking_interrupt_secs = 180  # prolonged thinking threshold
 fg_block_secs = 15             # foreground bash block threshold
 
 [alerts]
-pushover_user = "..."
-pushover_token = "..."
+# Push notifications are delegated to an external `pingme` shim on
+# PATH. Configure your notification service of choice (Pushover,
+# ntfy, Apprise, a homebrew script, etc.) by providing a `pingme`
+# executable that accepts `pingme [-p PRIORITY] <message> [title]`.
+# Cap the number of pings per stuck-state to avoid notification storms:
+max_pingme_alerts = 6
 ```
 
 Claude Code stores task output in `/tmp/claude-<UID>/<HOME>/UUID/tasks/`. claude-watch auto-discovers this path via `/proc/<PID>/fd` scanning. The path changes on every Claude Code restart (new UUID), so auto-discovery is the default. A manual override (`tasks_dir`) is useful for testing or non-standard setups.
