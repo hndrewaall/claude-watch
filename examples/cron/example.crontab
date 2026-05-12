@@ -1,0 +1,77 @@
+# Example crontab: wire periodic claude-event emissions into a host's cron.
+#
+# Each line below uses the `claude-event` CLI (from this repo, under
+# tools/claude-event/) to drop a JSON event into ~/claude-events/. The
+# `claude-event-watch` watcher picks events up automatically and surfaces a
+# one-liner to the running Claude Code session. See ../../tools/claude-event/
+# for the CLI's own README.
+#
+# ----------------------------------------------------------------------
+# Installation
+# ----------------------------------------------------------------------
+#
+#   System cron (root-installed, all users): copy this file in place. It
+#   MUST be a regular file owned by root — cron rejects symlinks with
+#   "WRONG FILE OWNER" and refuses to load them.
+#
+#       sudo cp examples/cron/example.crontab /etc/cron.d/claude-events-example
+#       sudo chown root:root /etc/cron.d/claude-events-example
+#       sudo chmod 644       /etc/cron.d/claude-events-example
+#
+#   User cron (per-user, no root needed): paste the rows below into your
+#   own crontab via `crontab -e`, and DROP the USER column from each row.
+#
+# ----------------------------------------------------------------------
+# Prerequisites
+# ----------------------------------------------------------------------
+#
+#   1. The `claude-event` CLI must be on PATH. After cloning the repo, a
+#      common pattern is to symlink it into a directory cron's PATH covers:
+#
+#          sudo ln -s /path/to/claude-watch/tools/claude-event/claude-event \
+#                     /usr/local/bin/claude-event
+#
+#      Adjust the absolute paths in the rows below if you installed it
+#      somewhere else.
+#
+#   2. The `claude-event-watch` watcher must be running for emissions to
+#      reach Claude Code. See tools/watchers/claude-event-watch.
+#
+#   3. Replace every literal `USER` below with the username that should
+#      execute the job (e.g. `alice`). System cron rows REQUIRE the USER
+#      column between the schedule fields and the command; user-crontab
+#      rows do NOT have it.
+#
+# ----------------------------------------------------------------------
+# PATH
+# ----------------------------------------------------------------------
+#
+# Cron's default PATH is minimal (/usr/bin:/bin). Set an explicit PATH so
+# /usr/local/bin and ~/bin are reachable.
+PATH=/usr/local/bin:/usr/bin:/bin:/home/USER/bin
+
+# ----------------------------------------------------------------------
+# Pattern 1 — direct one-liner heartbeat
+# ----------------------------------------------------------------------
+# Use when the cron line itself is the entire signal you want to emit.
+# The tag is freeform; pick something descriptive and either route it in
+# your own claude-event routing table or just watch it land via
+# `claude-event-tail`.
+0 * * * * USER /usr/local/bin/claude-event "hourly heartbeat" --tag generic-heartbeat --source cron
+
+# ----------------------------------------------------------------------
+# Pattern 2 — script wrapper that checks then conditionally emits
+# ----------------------------------------------------------------------
+# Use when the emission depends on some external state (disk space,
+# service health, queue depth, etc.). The script does the check and
+# only emits when there's something to surface. See
+# examples/cron/disk-space-check.sh for a working example.
+*/10 * * * * USER /home/USER/repos/claude-watch/examples/cron/disk-space-check.sh
+
+# ----------------------------------------------------------------------
+# Pattern 3 — daily heartbeat with structured metadata
+# ----------------------------------------------------------------------
+# `--data KEY=VAL` is repeatable; each pair is recorded under the event's
+# `data` field. Use it for state the consumer might want to pivot on
+# (window, severity hints, source IDs, etc.).
+0 9 * * * USER /usr/local/bin/claude-event "daily morning ping" --tag morning-ping --source cron --data window=morning --data timezone=local
