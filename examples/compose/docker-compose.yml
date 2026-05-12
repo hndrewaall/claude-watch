@@ -215,10 +215,11 @@ services:
         condition: service_started
     environment:
       # UTF-8 locale: tmux downgrades non-ASCII output to literal
-      # underscores when the client locale is C. Alpine ttyd lacks
-      # glibc locale data so LANG/LC_ALL alone is insufficient under
-      # musl; we also pass `-u` to tmux in the command list below to
-      # force UTF-8 regardless of the locale environment.
+      # underscores when the client locale is C. The bookworm-based
+      # ttyd image (see ttyd/Dockerfile) ships glibc but not by-default
+      # generated locales, so LANG/LC_ALL alone isn't enough — we also
+      # pass `-u` to tmux in the command list below to force UTF-8
+      # regardless of the locale environment.
       LANG: en_US.UTF-8
       LC_ALL: en_US.UTF-8
     volumes:
