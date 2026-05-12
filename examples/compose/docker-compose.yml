@@ -74,44 +74,79 @@ services:
       # no-op behavior when these paths are absent on the host (typical
       # on a fresh macOS workbot).
       #
+      # Every Phase-2 mount source is overridable via a CLAUDE_HOST_*
+      # env var. Defaults below resolve to the standard ${HOME}-rooted
+      # Linux paths. macOS users (whose Claude Code managed-settings live
+      # at a different system path, or who keep operator tooling outside
+      # ${HOME}/bin etc.) can set the overrides in .env without editing
+      # this file. See README "Host paths on non-default layouts" and
+      # .env.example for the full per-tier table.
+      #
+      # The mount set covers three of the four Claude Code settings tiers
+      # documented at https://code.claude.com/docs/en/settings
+      # (precedence, highest priority first):
+      #
+      #   1. Managed / enterprise — CLAUDE_HOST_MANAGED_SETTINGS_DIR.
+      #      Linux default /etc/claude-code/, macOS default
+      #      /Library/Application Support/ClaudeCode/. Mounted ro into
+      #      the container's /etc/claude-code/ so the in-container claude
+      #      reads the host's managed policy.
+      #   2. (CLI args — not a mount; supplied at invocation time.)
+      #   3. Project-local / project — comes for free via the
+      #      ${CLAUDE_HOST_REPOS_DIR:-${HOME}/repos} mount (each repo's
+      #      .claude/ is part of the tree).
+      #   4. User-global ~/.claude/ — CLAUDE_HOST_CONFIG_DIR (defaults
+      #      to ${HOME}/.claude); plus the user-global top-level config
+      #      file ~/.claude.json — CLAUDE_HOST_CONFIG_FILE (defaults to
+      #      ${HOME}/.claude.json).
+      #
+      # Managed-settings dir — ro: the in-container claude resolves
+      # /etc/claude-code/managed-settings.json (its Linux managed-config
+      # path) so host-level MDM / enterprise policy applied on the host
+      # carries into the container. Default source on Linux is
+      # /etc/claude-code/; macOS hosts override to
+      # `/Library/Application Support/ClaudeCode` (no escaping needed
+      # when set via .env). Missing dir = empty mount = "no managed
+      # policy" — same graceful-no-op as the other mounts.
+      - "${CLAUDE_HOST_MANAGED_SETTINGS_DIR:-/etc/claude-code}:/etc/claude-code:ro"
       # ~/.claude — rw: Claude Code writes session JSONLs, project state,
       # cache, telemetry here on every interaction. Also the location of
       # agent definition files (~/.claude/agents/*.md) the in-container
       # claude needs to dispatch sub-agents.
-      - "${HOME}/.claude:/home/hndrewaall/.claude:rw"
+      - "${CLAUDE_HOST_CONFIG_DIR:-${HOME}/.claude}:/home/hndrewaall/.claude:rw"
       # ~/.claude.json — rw: top-level Claude Code config (MCP server
       # registry, model preferences, project allow-lists). Claude updates
       # this on settings changes.
-      - "${HOME}/.claude.json:/home/hndrewaall/.claude.json:rw"
+      - "${CLAUDE_HOST_CONFIG_FILE:-${HOME}/.claude.json}:/home/hndrewaall/.claude.json:rw"
       # ~/repos — ro: host repo trees so in-container scripts under
       # ~/bin (next mount) can resolve their symlink targets. Read-only
       # because in-container edits should be confined to /workspace or
       # explicit clones; we don't want the container scribbling on the
       # operator's working trees.
-      - "${HOME}/repos:/home/hndrewaall/repos:ro"
+      - "${CLAUDE_HOST_REPOS_DIR:-${HOME}/repos}:/home/hndrewaall/repos:ro"
       # ~/bin — ro: host launcher / shim scripts (mostly symlinks into
       # ~/repos/*/bin). Lets the in-container claude-watch shell out to
       # the same tools the host operator runs. Read-only because these
       # are operator-curated; the container has no reason to install
       # into ~/bin.
-      - "${HOME}/bin:/home/hndrewaall/bin:ro"
+      - "${CLAUDE_HOST_BIN_DIR:-${HOME}/bin}:/home/hndrewaall/bin:ro"
       # ~/claude-events — rw: claude-event JSONL spool. Host cron /
       # alertmanager / queue producers write here; the in-container
       # claude-event-watch reads + acks them. rw because the watcher
       # rewrites/truncates the spool as it consumes events.
-      - "${HOME}/claude-events:/home/hndrewaall/claude-events:rw"
+      - "${CLAUDE_HOST_EVENTS_DIR:-${HOME}/claude-events}:/home/hndrewaall/claude-events:rw"
       # ~/.local/share/atuin — ro: shell history DB. The atuin daemon
       # runs on the host (it's a host-only CLI per container/README.md);
       # the container only reads it for command-recall queries from
       # in-container tooling that supports `atuin search`. Read-only
       # because writes would corrupt the host daemon's SQLite WAL.
-      - "${HOME}/.local/share/atuin:/home/hndrewaall/.local/share/atuin:ro"
+      - "${CLAUDE_HOST_ATUIN_DIR:-${HOME}/.local/share/atuin}:/home/hndrewaall/.local/share/atuin:ro"
       # ~/signal-queue — ro: Signal attachment files (images, voice
       # notes) referenced by signal-history output. Read-only because
       # the host signal-api container is the sole writer; the
       # in-container claude only needs to open the files for inline
       # review.
-      - "${HOME}/signal-queue:/home/hndrewaall/signal-queue:ro"
+      - "${CLAUDE_HOST_SIGNAL_QUEUE_DIR:-${HOME}/signal-queue}:/home/hndrewaall/signal-queue:ro"
       # Host ~/.config/session/queue.json — rw so session-task adds/removes
       # from inside claude-container flow to the SAME host file the
       # queue-minisite reads (it bind-mounts the same host path into its
