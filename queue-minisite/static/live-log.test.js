@@ -184,6 +184,78 @@ console.log('\nfmtToolUse — Bash');
   }
 }
 
+console.log('\nfmtToolUse — Bash with description (headline parity with task-watch)');
+{
+  // Bash callers usually pass a short imperative `description` alongside
+  // `command`. The task-watch dashboard renders this as the green
+  // `$ <description>` line (see src/task_filters.rs Bash branch). The
+  // queue-minisite headline must match — show the description, not the
+  // full command, so users see the same human-readable summary in both
+  // surfaces. Regression report: green `$ <description>` lines visible
+  // in the task-watch tmux dashboard never made it to the web modal.
+  const payload = {
+    type: 'event',
+    kind: 'tool_use',
+    rec: {
+      timestamp: '2026-05-11T17:30:01.500Z',
+      message: {
+        content: [{
+          type: 'tool_use',
+          id: 'toolu_desc1',
+          name: 'Bash',
+          input: {
+            command: 'mv "/srv/media/Show/Season 00/file 1.mkv" "/srv/media/Show/Season 00/Show - S00E01 - Episode One.mkv"',
+            description: 'Rename episode file to canonical name',
+          },
+        }],
+      },
+    },
+  };
+  const line = render(payload);
+  const parts = assertEventShape('tool_use Bash w/ description', line);
+  if (parts) {
+    const hl = parts.headline.textContent;
+    assert('headline shows the description, not the command',
+      hl.includes('Bash(Rename episode file to canonical name)'),
+      'got: ' + hl);
+    assert('headline does NOT show raw mv command in summary',
+      !hl.includes('mv "/srv/media'),
+      'got: ' + hl);
+    // Body should still show the actual command so users can drill in.
+    const bodyText = parts.body.textContent;
+    assert('body still surfaces the actual command',
+      bodyText.includes('mv "/srv/media'),
+      'got: ' + bodyText.slice(0, 200));
+  }
+}
+
+console.log('\nfmtToolUse — Bash with empty/whitespace description falls back to command');
+{
+  const payload = {
+    type: 'event',
+    kind: 'tool_use',
+    rec: {
+      timestamp: '2026-05-11T17:30:01.700Z',
+      message: {
+        content: [{
+          type: 'tool_use',
+          id: 'toolu_desc2',
+          name: 'Bash',
+          input: { command: 'ls /tmp', description: '   ' },
+        }],
+      },
+    },
+  };
+  const line = render(payload);
+  const parts = assertEventShape('tool_use Bash w/ blank description', line);
+  if (parts) {
+    const hl = parts.headline.textContent;
+    assert('blank description does not override command',
+      hl.includes('Bash(ls /tmp)'),
+      'got: ' + hl);
+  }
+}
+
 console.log('\nfmtToolUse — Read');
 {
   const payload = {
