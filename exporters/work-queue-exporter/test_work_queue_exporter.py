@@ -142,6 +142,26 @@ def make_pending_item(iid, summary, *, age_seconds=120):
     }
 
 
+def make_blocked_item(iid, summary, *, block_reason="awaiting greenlight"):
+    """Build a queue item dict with status=blocked."""
+    now = datetime.now(timezone.utc)
+    return {
+        "id": iid,
+        "summary": summary,
+        "scope": ["repo:test"],
+        "group_id": f"g-{iid}",
+        "group_head": True,
+        "status": "blocked",
+        "priority": 5,
+        "created_at": now.isoformat(),
+        "created_by": "test",
+        "started_at": now.isoformat(),
+        "registered_at": now.isoformat(),
+        "blocked_at": now.isoformat(),
+        "block_reason": block_reason,
+    }
+
+
 def run_scenarios():
     failures = []
 
@@ -415,6 +435,78 @@ def run_scenarios():
     mod.collect()
     ra10 = find_any_sample(mod, "worktask_queue_item_ready_age_seconds", "q-s10")
     check("S10 ready_age emitted normally", ra10 is not None and ra10 >= 60, f"got {ra10!r}")
+
+    # ---- Scenario 11: blocked item -- has_live_owner labelled status="blocked"
+    # so the WorkQueueOrphaned alert (which filters status="running") does
+    # NOT fire on it. By design a blocked item has no live agent.
+    print("\nScenario 11: blocked item -> has_live_owner emitted with status='blocked'")
+    items = [make_blocked_item("q-s11", "scenario 11 blocked")]
+    # Use a stale agent record so alive=False -- if the alert wasn't
+    # filtering on status it'd fire here.
+    agents = [{
+        "agent_id": "agent-block11",
+        "queue_id": "q-s11",
+        "alive": False,
+        "jsonl_age_seconds": 600,
+    }]
+    write_queue(qjson, items)
+    write_agent_state(astate, agents)
+    mod = load_exporter(env)
+    mod.collect()
+    v_running = find_sample(
+        mod, "worktask_queue_item_has_live_owner",
+        {"id": "q-s11", "status": "running"},
+    )
+    v_blocked = find_sample(
+        mod, "worktask_queue_item_has_live_owner",
+        {"id": "q-s11", "status": "blocked"},
+    )
+    check(
+        "S11 has_live_owner emitted with status='blocked'",
+        v_blocked == 0.0,
+        f"got blocked={v_blocked!r}",
+    )
+    check(
+        "S11 has_live_owner NOT emitted with status='running' (filtered out by status label)",
+        v_running is None,
+        f"got running={v_running!r}",
+    )
+    # status counts gauge should report blocked=1
+    blocked_total = find_sample(
+        mod, "worktask_queue_items_total", {"status": "blocked"},
+    )
+    check(
+        "S11 worktask_queue_items_total{status='blocked'} == 1",
+        blocked_total == 1.0,
+        f"got {blocked_total!r}",
+    )
+
+    # ---- Scenario 12: running item still has status='running' label.
+    # Verify the running case isn't accidentally relabelled as blocked.
+    print("\nScenario 12: running item -> has_live_owner labelled status='running'")
+    items = [make_running_item("q-s12", "scenario 12 running")]
+    agents = [{
+        "agent_id": "agent-run12",
+        "queue_id": "q-s12",
+        "alive": True,
+        "jsonl_age_seconds": 3,
+    }]
+    write_queue(qjson, items)
+    write_agent_state(astate, agents)
+    mod = load_exporter(env)
+    mod.collect()
+    v12 = find_sample(
+        mod, "worktask_queue_item_has_live_owner",
+        {"id": "q-s12", "status": "running"},
+    )
+    check("S12 has_live_owner emitted with status='running'", v12 == 1.0,
+          f"got {v12!r}")
+    v12_block = find_sample(
+        mod, "worktask_queue_item_has_live_owner",
+        {"id": "q-s12", "status": "blocked"},
+    )
+    check("S12 has_live_owner NOT emitted with status='blocked'",
+          v12_block is None, f"got {v12_block!r}")
 
     print()
     if failures:
