@@ -50,17 +50,23 @@ const initialHTML = `<!doctype html>
       <summary><span id="log-modal-prompt-label"></span></summary>
       <pre id="log-modal-prompt-body"></pre>
     </details>
-    <div id="log-modal-meta-summary" hidden></div>
-    <div id="log-meta-row-status"></div>
-    <div id="log-meta-row-runtime"></div>
-    <div id="log-meta-row-times"></div>
-    <div id="log-meta-row-scope"></div>
-    <div id="log-meta-row-deps"></div>
-    <div id="log-meta-row-dependents"></div>
-    <div id="log-meta-row-by"></div>
-    <div id="log-meta-row-group"></div>
-    <div id="log-meta-row-usage"></div>
-    <div id="log-meta-row-abandon"></div>
+    <div id="log-modal-meta-summary" hidden>
+      <details id="log-meta-toggle">
+        <summary>Metadata</summary>
+        <div id="log-meta-rows">
+          <div id="log-meta-row-status"></div>
+          <div id="log-meta-row-runtime"></div>
+          <div id="log-meta-row-times"></div>
+          <div id="log-meta-row-scope"></div>
+          <div id="log-meta-row-deps"></div>
+          <div id="log-meta-row-dependents"></div>
+          <div id="log-meta-row-by"></div>
+          <div id="log-meta-row-group"></div>
+          <div id="log-meta-row-usage"></div>
+          <div id="log-meta-row-abandon"></div>
+        </div>
+      </details>
+    </div>
     <span id="log-meta-status"></span>
     <span id="log-meta-runtime"></span>
     <span id="log-meta-times"></span>
