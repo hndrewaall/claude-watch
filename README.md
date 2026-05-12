@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/logo.png" alt="claude-watch" width="160">
+</p>
+
 # claude-watch
 
 A Rust daemon that monitors [Claude Code](https://claude.ai/code) sessions running in tmux. Detects activity states, recovers from stalls, and manages the tmux layout.
