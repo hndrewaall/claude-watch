@@ -37,6 +37,11 @@ Usage:
     session-task queue heartbeat <id> [--pid N]  # refresh liveness on running item
     session-task queue wedge <id> --reason TEXT  # flag a stuck running item
     session-task queue unwedge <id>              # mark wedged item recovered
+    session-task queue block <id> --reason TEXT  # park a running item on an
+                                                 # external blocker (human
+                                                 # decision, third-party API,
+                                                 # branch-protection, etc.)
+    session-task queue unblock <id>              # blocked -> running
     session-task queue spawn-check <id> [--json] # "am I clear to spawn?" check
     session-task queue force-start <id> --reason TEXT  # MANUAL OVERRIDE: promote
                                                        # blocked-pending to running
@@ -116,15 +121,29 @@ QUEUE_SCHEMA_VERSION = 2
 #                 wedge without scrolling logs. Set via `queue wedge <id>
 #                 --reason ...`. Cleared via `queue unwedge <id>` (back to
 #                 running) or `queue abandon <id>` (operator gives up).
+#   blocked    -- the agent has done all the work it can autonomously and is
+#                 waiting on an EXTERNAL blocker (human greenlight,
+#                 third-party API, branch-protection toggle, etc.). NOT the
+#                 same as wedged (which is for items the system can't progress
+#                 through code/state-machine issues). Still owns its scope
+#                 so peers can't grab it. Distinguished from running in the
+#                 exporter so the WorkQueueOrphaned alert (which fires on
+#                 "running without live agent") does NOT fire on blocked
+#                 items -- by design, blocked items have no live agent.
+#                 Set via `queue block <id> --reason ...`. Cleared via
+#                 `queue unblock <id>` (back to running), `queue done <id>`
+#                 (work was actually complete) or `queue abandon <id>`.
 #   done       -- terminal: completed successfully
 #   abandoned  -- terminal: gave up (with optional reason)
 #
 # `ACTIVE_STATUSES` is the canonical "in-flight" set used by serialization
 # and spawn-gating. `RUNNING_STATUSES` is the subset that owns a slot
-# (running OR wedged); `wedged` is included precisely because a wedge is
-# transient and the agent still holds the scope.
-ACTIVE_STATUSES = ("pending", "running", "wedged")
-RUNNING_STATUSES = ("running", "wedged")
+# (running, wedged, OR blocked); wedged is included precisely because a wedge
+# is transient and the agent still holds the scope. Blocked is included
+# because the queue item is still parked on its scope until the external
+# blocker resolves -- letting a peer grab the scope would race the unblock.
+ACTIVE_STATUSES = ("pending", "running", "wedged", "blocked")
+RUNNING_STATUSES = ("running", "wedged", "blocked")
 
 # Agent-transcript archive directory. At queue-done / queue-abandon time the
 # spawning subagent's JSONL transcript (if locatable) is copied here so it
@@ -2357,15 +2376,30 @@ def cmd_queue_list(args):
         print("(no items)")
         return
 
-    # Tabular. WEDGED items get a leading `!` marker on the head column so
-    # the eye catches them in a long list. Status column shows `wedged`
-    # verbatim so JSON consumers and grepping operators see the same word.
+    # Tabular. WEDGED items get a leading `!` marker on the head column;
+    # BLOCKED items get a leading `~` marker (distinct so the eye catches
+    # the difference: `!` = system stuck, `~` = parked on external). Status
+    # column shows `wedged` / `blocked` verbatim so JSON consumers and
+    # grepping operators see the same word.
+    # ANSI color (TTY only) further distinguishes: red for wedged
+    # (system broken), yellow for blocked (waiting on external). Other
+    # rows render plain.
+    is_tty = sys.stdout.isatty()
+    RED = "\033[31m" if is_tty else ""
+    YELLOW = "\033[33m" if is_tty else ""
+    RESET = "\033[0m" if is_tty else ""
     print(f"{'ID':22} {'GROUP':14} {'ST':8} {'PR':3} {'H':1} {'SCOPE'}")
     for it in items:
-        if it.get("status") == "wedged":
+        status = it.get("status")
+        if status == "wedged":
             head_mark = "!"
+            color, color_reset = RED, RESET
+        elif status == "blocked":
+            head_mark = "~"
+            color, color_reset = YELLOW, RESET
         else:
             head_mark = "*" if it.get("group_head") else " "
+            color, color_reset = "", ""
         scope_str = ",".join(it.get("scope", []))
         if len(scope_str) > 48:
             scope_str = scope_str[:45] + "..."
@@ -2376,17 +2410,19 @@ def cmd_queue_list(args):
         if len(desc) > 80:
             desc = desc[:77] + "..."
         print(
-            f"{it['id']:22} {it.get('group_id',''):14} "
+            f"{color}{it['id']:22} {it.get('group_id',''):14} "
             f"{it.get('status',''):8} {it.get('priority',5):<3} {head_mark} "
-            f"{scope_str}"
+            f"{scope_str}{color_reset}"
         )
         print(f"  summary: {summary}")
         print(f"  desc   : {desc}")
-        # Surface the wedge reason inline so `queue list` is the one-stop
-        # diagnosis surface — no need to drill into `queue show` for the
-        # most common operator question ("why is this stuck?").
-        if it.get("status") == "wedged" and it.get("wedged_reason"):
+        # Surface the wedge / block reason inline so `queue list` is the
+        # one-stop diagnosis surface -- no need to drill into `queue show`
+        # for the most common operator question ("why is this stuck?").
+        if status == "wedged" and it.get("wedged_reason"):
             print(f"  wedged : {it.get('wedged_reason')}")
+        if status == "blocked" and it.get("block_reason"):
+            print(f"  blocked: {it.get('block_reason')}")
 
 
 def cmd_queue_show(args):
@@ -2473,6 +2509,7 @@ def cmd_queue_groups(args):
         running = [m for m in members if m.get("status") == "running"]
         pending = [m for m in members if m.get("status") == "pending"]
         wedged = [m for m in members if m.get("status") == "wedged"]
+        blocked = [m for m in members if m.get("status") == "blocked"]
         head = _group_head(items, gid)
         out.append({
             "group_id": gid,
@@ -2480,6 +2517,7 @@ def cmd_queue_groups(args):
             "running_count": len(running),
             "pending_count": len(pending),
             "wedged_count": len(wedged),
+            "blocked_count": len(blocked),
             "head_id": head["id"] if head else None,
             "members": [m["id"] for m in sorted(members, key=_sort_key)],
         })
@@ -2493,7 +2531,8 @@ def cmd_queue_groups(args):
         return
     for g in out:
         wedged_str = f"  wedged={g['wedged_count']}" if g.get("wedged_count") else ""
-        print(f"{g['group_id']}  running={g['running_count']}  pending={g['pending_count']}{wedged_str}  head={g['head_id']}")
+        blocked_str = f"  blocked={g['blocked_count']}" if g.get("blocked_count") else ""
+        print(f"{g['group_id']}  running={g['running_count']}  pending={g['pending_count']}{wedged_str}{blocked_str}  head={g['head_id']}")
         print(f"  scope: {','.join(g['scope'])}")
         print(f"  members: {','.join(g['members'])}")
 
@@ -2984,6 +3023,31 @@ def cmd_queue_register(args):
             wr = target.get("wedged_reason")
             if wr:
                 print(f"!! WEDGED REASON: {wr}", file=sys.stderr)
+            print(bar, file=sys.stderr)
+            sys.exit(2)
+
+        if target.get("status") == "blocked":
+            # A blocked item is parked on an external blocker but still
+            # owns its scope. Operator must explicitly unblock (back to
+            # running) or move to a terminal state first. Re-registering
+            # would lose the block_reason audit trail and race with
+            # whatever external action is in flight.
+            fcntl.flock(fh, fcntl.LOCK_UN)
+            fh.close()
+            print("", file=sys.stderr)
+            bar = "!" * 72
+            print(bar, file=sys.stderr)
+            print(f"!! REGISTER REFUSED: {args.id} IS BLOCKED.", file=sys.stderr)
+            print("!! THE ITEM IS PARKED ON AN EXTERNAL BLOCKER AND STILL OWNS THE SCOPE.",
+                  file=sys.stderr)
+            print("!! UNBLOCK OR ABANDON BEFORE REGISTERING A REPLACEMENT:",
+                  file=sys.stderr)
+            print(f"!!   session-task queue unblock {args.id}", file=sys.stderr)
+            print(f"!!   session-task queue abandon {args.id} --reason '...'",
+                  file=sys.stderr)
+            br = target.get("block_reason")
+            if br:
+                print(f"!! BLOCK REASON: {br}", file=sys.stderr)
             print(bar, file=sys.stderr)
             sys.exit(2)
 
@@ -3719,6 +3783,252 @@ def cmd_queue_unwedge(args):
         )
 
 
+def cmd_queue_block(args):
+    """Flip a running queue item to status=blocked with a reason.
+
+    Blocked is a "parked on external blocker" state. The agent has done
+    all the work it can autonomously and is waiting on something the
+    queue/agent system cannot resolve: a human greenlight, a third-party
+    API window, a branch-protection toggle, etc.
+
+    Distinct from `wedged`:
+      * `wedged`  -- the system can't progress (stuck agent, context
+                     limit, prolonged thinking). Implies action.
+      * `blocked` -- the system did its part; an EXTERNAL party needs to
+                     do something. No live agent expected.
+
+    Distinct from `running`:
+      * `running` -- agent actively working, expected to have a live
+                     transcript. The WorkQueueOrphaned alert fires when
+                     a running item has no live owner.
+      * `blocked` -- no live agent expected by design. Exporter labels
+                     this state separately so orphan-detection skips it.
+
+    Recovery:
+      * `queue unblock <id>` -- blocked -> running (blocker cleared)
+      * `queue done <id>`    -- blocked -> done (work was actually
+                                complete, just needed acknowledgement)
+      * `queue abandon <id>` -- blocked -> abandoned (operator gives up)
+
+    Behavior:
+      * Item must exist and be in status=running. Any other status
+        (pending, wedged, blocked, done, abandoned) refuses. Pick a
+        coherent state machine: only running -> blocked is supported.
+        If you want to express "this item is parked before any work
+        starts", use `queue lock <scope>` (real-world-condition locks
+        on pending items).
+      * `--reason TEXT` is REQUIRED -- a block without a reason defeats
+        the operator-attention purpose. Common reasons:
+          - "awaiting human greenlight"
+          - "awaiting branch-protection toggle"
+          - "third-party API rate-limited until $WHEN"
+          - "awaiting hardware install"
+      * Stamps `blocked_at` (ISO timestamp), `block_reason`. Preserves
+        `started_at`, `last_heartbeat_at`, `pid` for post-mortem.
+      * Emits a `queue-blocked` claude-event so dashboards / banners can
+        surface the block prominently.
+      * Pingme notification fires by default; --silent suppresses it.
+    """
+    raw_reason = (args.reason or "").strip()
+    if not raw_reason:
+        print(
+            "ERROR: --reason is required for block "
+            "(common values: 'awaiting human greenlight', "
+            "'awaiting branch-protection toggle', "
+            "'third-party API rate-limited').",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    fh, data = _queue_open_locked("rw")
+    try:
+        items = data["items"]
+        target = next((it for it in items if it["id"] == args.id), None)
+        if target is None:
+            print(f"not found: {args.id}", file=sys.stderr)
+            fcntl.flock(fh, fcntl.LOCK_UN)
+            fh.close()
+            sys.exit(1)
+        status = target.get("status")
+        if status != "running":
+            print(
+                f"block refused: {args.id} status={status!r} (must be running)",
+                file=sys.stderr,
+            )
+            fcntl.flock(fh, fcntl.LOCK_UN)
+            fh.close()
+            sys.exit(1)
+
+        target["status"] = "blocked"
+        target["blocked_at"] = _fmt_ts()
+        target["block_reason"] = raw_reason
+        # group_head stays as-is -- a blocked item is still the in-flight
+        # head of its group. _recompute_group_heads will confirm.
+        _recompute_group_heads(items)
+        updated = dict(target)
+        _queue_write_and_unlock(fh, data)
+    except Exception:
+        fcntl.flock(fh, fcntl.LOCK_UN)
+        fh.close()
+        raise
+
+    log_completed(
+        f"[queue {target['id']} BLOCKED] {target.get('description','')} "
+        f"(reason: {raw_reason})",
+        extra={
+            "source": "queue",
+            "event": "block",
+            "id": target["id"],
+            "group_id": target.get("group_id"),
+            "reason": raw_reason,
+        },
+    )
+
+    # Pingme: block IS an attention-required event (an external party
+    # needs to do something). Normal priority -- distinct from a wedge
+    # which is "system broken, fix me NOW".
+    _pingme_notify(
+        title=f"queue BLOCKED: {target['id']}",
+        message=(
+            f"{_item_summary(target)}\n"
+            f"reason: {raw_reason} | "
+            f"scope: {','.join(target.get('scope', []))}"
+        ),
+        priority="normal",
+        silent=getattr(args, "silent", False),
+    )
+
+    # Claude-event emit: queue-blocked. Dashboards / status banner can
+    # surface the block; the main loop can route the event to the
+    # appropriate "ping the operator" handler.
+    _claude_event_notify(
+        tag="queue-blocked",
+        message=(
+            f"queue BLOCKED: {target['id']} ({_item_summary(target)}) "
+            f"-- reason: {raw_reason}"
+        ),
+        data={
+            "queue_id": target["id"],
+            "group_id": target.get("group_id"),
+            "scope": target.get("scope", []),
+            "summary": _item_summary(target),
+            "block_reason": raw_reason,
+            "blocked_at": target["blocked_at"],
+        },
+        priority="normal",
+        silent=getattr(args, "silent", False),
+    )
+
+    if args.json:
+        print(json.dumps(updated, indent=2))
+    else:
+        print(
+            f"blocked: {args.id} reason={raw_reason!r} "
+            f"blocked_at={target['blocked_at']}"
+        )
+
+
+def cmd_queue_unblock(args):
+    """Flip a blocked queue item back to status=running.
+
+    Used when the external blocker clears -- Andrew greenlit, the
+    branch-protection toggle landed, the third-party API window opened,
+    etc. The agent (or a fresh agent registered against this id) can
+    resume work.
+
+    Behavior:
+      * Item must exist and be in status=blocked. Any other status
+        refuses.
+      * Flips status=running. Refreshes `last_heartbeat_at` so the
+        exporter doesn't immediately re-flag the item as stale.
+      * Records `unblocked_at` (ISO timestamp). Preserves `blocked_at` /
+        `block_reason` on the row for post-mortem -- they are now the
+        audit trail, not current state.
+      * Emits a `queue-unblocked` claude-event so dashboards can clear
+        the block banner.
+      * Pingme is opt-out via --silent (default fires; you want to
+        confirm the recovery landed).
+    """
+    fh, data = _queue_open_locked("rw")
+    try:
+        items = data["items"]
+        target = next((it for it in items if it["id"] == args.id), None)
+        if target is None:
+            print(f"not found: {args.id}", file=sys.stderr)
+            fcntl.flock(fh, fcntl.LOCK_UN)
+            fh.close()
+            sys.exit(1)
+        status = target.get("status")
+        if status != "blocked":
+            print(
+                f"unblock refused: {args.id} status={status!r} (must be blocked)",
+                file=sys.stderr,
+            )
+            fcntl.flock(fh, fcntl.LOCK_UN)
+            fh.close()
+            sys.exit(1)
+
+        prior_reason = target.get("block_reason") or "(unspecified)"
+        now = _fmt_ts()
+        target["status"] = "running"
+        target["unblocked_at"] = now
+        target["last_heartbeat_at"] = now
+        # Intentionally preserve blocked_at + block_reason on the row --
+        # they are now the audit trail, not current state.
+        _recompute_group_heads(items)
+        updated = dict(target)
+        _queue_write_and_unlock(fh, data)
+    except Exception:
+        fcntl.flock(fh, fcntl.LOCK_UN)
+        fh.close()
+        raise
+
+    log_completed(
+        f"[queue {target['id']} UNBLOCKED] {target.get('description','')}",
+        extra={
+            "source": "queue",
+            "event": "unblock",
+            "id": target["id"],
+            "group_id": target.get("group_id"),
+            "prior_reason": prior_reason,
+        },
+    )
+
+    _pingme_notify(
+        title=f"queue unblocked: {target['id']}",
+        message=(
+            f"{_item_summary(target)}\n"
+            f"prior reason: {prior_reason} | "
+            f"scope: {','.join(target.get('scope', []))}"
+        ),
+        priority="low",
+        silent=getattr(args, "silent", False),
+    )
+
+    _claude_event_notify(
+        tag="queue-unblocked",
+        message=f"queue unblocked: {target['id']} ({_item_summary(target)})",
+        data={
+            "queue_id": target["id"],
+            "group_id": target.get("group_id"),
+            "scope": target.get("scope", []),
+            "summary": _item_summary(target),
+            "prior_reason": prior_reason,
+            "unblocked_at": now,
+        },
+        priority="low",
+        silent=getattr(args, "silent", False),
+    )
+
+    if args.json:
+        print(json.dumps(updated, indent=2))
+    else:
+        print(
+            f"unblocked: {args.id} prior_reason={prior_reason!r} "
+            f"unblocked_at={now}"
+        )
+
+
 def cmd_queue_set_summary(args):
     """Add / replace the one-line summary on an existing queue item.
 
@@ -4017,8 +4327,9 @@ def cmd_queue_banner(args):
     pending = [it for it in items if it.get("status") == "pending"]
     running = [it for it in items if it.get("status") == "running"]
     wedged = [it for it in items if it.get("status") == "wedged"]
+    blocked = [it for it in items if it.get("status") == "blocked"]
 
-    if not ready and not pending and not running and not wedged:
+    if not ready and not pending and not running and not wedged and not blocked:
         return  # silent when empty -- banner only when something to show
 
     lines = [
@@ -4035,6 +4346,17 @@ def cmd_queue_banner(args):
             wr = it.get("wedged_reason") or "no reason"
             lines.append(
                 f"     - [{it['id']}] {it.get('description','')[:70]}  ({wr[:40]})"
+            )
+        lines.append("")
+    # Blocked items: parked on an external blocker. Lower urgency than
+    # wedged (system isn't broken) but still surfaces in the banner so the
+    # operator remembers what's waiting on their decision.
+    if blocked:
+        lines.append(f"  ~~ BLOCKED: {len(blocked)} item(s) parked on external blocker")
+        for it in blocked[:5]:
+            br = it.get("block_reason") or "no reason"
+            lines.append(
+                f"     - [{it['id']}] {it.get('description','')[:70]}  ({br[:40]})"
             )
         lines.append("")
     if ready:
@@ -4619,6 +4941,53 @@ def build_parser():
         help="Suppress the pingme + claude-event notifications for this operation.",
     )
 
+    q_block = qsub.add_parser(
+        "block",
+        help=(
+            "Flip a running item to status=blocked with a reason. Use when "
+            "the agent has done all autonomous work and is parked on an "
+            "EXTERNAL blocker (human greenlight, branch-protection toggle, "
+            "third-party API window, etc.). Distinct from `wedged` (system "
+            "stuck) -- blocked means the system did its part and waits on "
+            "someone else. The exporter labels this state separately so the "
+            "WorkQueueOrphaned alert (which fires on running-without-owner) "
+            "does NOT fire on blocked items. Recover via `unblock`, `done`, "
+            "or `abandon`."
+        ),
+    )
+    q_block.add_argument("id")
+    q_block.add_argument(
+        "--reason",
+        required=True,
+        help=(
+            "Why is the agent blocked? Common values: 'awaiting human "
+            "greenlight', 'awaiting branch-protection toggle', "
+            "'third-party API rate-limited until $WHEN'. Recorded on the "
+            "item as `block_reason` and surfaced in CLI/exporter/UI."
+        ),
+    )
+    q_block.add_argument("--json", action="store_true")
+    q_block.add_argument(
+        "--silent", action="store_true",
+        help="Suppress the pingme + claude-event notifications for this operation.",
+    )
+
+    q_unblock = qsub.add_parser(
+        "unblock",
+        help=(
+            "Flip a blocked item back to status=running. Use when the "
+            "external blocker clears (operator greenlit, branch-protection "
+            "toggle landed, API window opened). Preserves blocked_at + "
+            "block_reason as audit trail."
+        ),
+    )
+    q_unblock.add_argument("id")
+    q_unblock.add_argument("--json", action="store_true")
+    q_unblock.add_argument(
+        "--silent", action="store_true",
+        help="Suppress the pingme + claude-event notifications for this operation.",
+    )
+
     q_spawn = qsub.add_parser(
         "spawn-check",
         help=("Check whether it is safe to spawn an agent for this item. "
@@ -4788,6 +5157,8 @@ def main():
             "heartbeat": cmd_queue_heartbeat,
             "wedge": cmd_queue_wedge,
             "unwedge": cmd_queue_unwedge,
+            "block": cmd_queue_block,
+            "unblock": cmd_queue_unblock,
             "spawn-check": cmd_queue_spawn_check,
             "force-start": cmd_queue_force_start,
             "promote": cmd_queue_promote,

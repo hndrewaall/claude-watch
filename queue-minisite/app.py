@@ -405,10 +405,15 @@ def _shape(
     completed = _parse_iso(item.get("completed_at"))
     abandoned = _parse_iso(item.get("abandoned_at"))
 
+    blocked_at = _parse_iso(item.get("blocked_at"))
+
     # Pick the most-relevant "age anchor" for the visible age string.
     if status == "running" and started:
         age_anchor = started
         age_label = "running"
+    elif status == "blocked" and blocked_at:
+        age_anchor = blocked_at
+        age_label = "blocked"
     elif status == "pending" and created:
         age_anchor = created
         age_label = "pending"
@@ -502,12 +507,14 @@ def _shape(
         "priority": item.get("priority", ""),
         "created_by": item.get("created_by", ""),
         "abandon_reason": item.get("abandon_reason", ""),
+        "block_reason": item.get("block_reason", ""),
         "depends_on": depends_on,
         "depends_on_status": depends_on_status,
         "created_at_iso": item.get("created_at", ""),
         "started_at_iso": (item.get("registered_at") or item.get("started_at") or ""),
         "completed_at_iso": item.get("completed_at", ""),
         "abandoned_at_iso": item.get("abandoned_at", ""),
+        "blocked_at_iso": item.get("blocked_at", ""),
         "age": _humanize_age(age_secs),
         "age_label": age_label,
         "age_seconds": age_secs,
@@ -556,7 +563,7 @@ def _render_payload() -> dict[str, Any]:
     now = datetime.now(timezone.utc)
     agent_by_qid = _load_agent_state()
 
-    running, pending, done, abandoned = [], [], [], []
+    running, pending, blocked, done, abandoned = [], [], [], [], []
     for it in items:
         # Pass the full items list so _shape can compute ready_now
         # (depends_on resolution requires the full graph) and decorate
@@ -565,6 +572,8 @@ def _render_payload() -> dict[str, Any]:
         st = s["status"]
         if st == "running":
             running.append(s)
+        elif st == "blocked":
+            blocked.append(s)
         elif st == "pending":
             pending.append(s)
         elif st == "done":
@@ -578,6 +587,9 @@ def _render_payload() -> dict[str, Any]:
     #   done      — most-recently-completed first
     #   abandoned — most-recently-abandoned first
     running.sort(key=lambda a: (-(a["age_seconds"] or 0)))
+    # Blocked order: oldest-blocked first (longest-waiting external blocker
+    # is the most likely to need operator attention).
+    blocked.sort(key=lambda a: (-(a["age_seconds"] or 0)))
     # Pending order:
     #   1. ready_now=True items first (operator can spawn now)
     #   2. then non-ready group-heads (FIFO leader, blocked by deps)
@@ -611,11 +623,13 @@ def _render_payload() -> dict[str, Any]:
 
     return {
         "running": running,
+        "blocked": blocked,
         "pending": pending,
         "done_recent": done_recent,
         "abandoned_recent": abandoned_recent,
         "totals": {
             "running": len(running),
+            "blocked": len(blocked),
             "pending": len(pending),
             "done": len(done),
             "abandoned": len(abandoned),
