@@ -125,14 +125,19 @@ g_running_elapsed = Gauge(
 g_has_live_owner = Gauge(
     "worktask_queue_item_has_live_owner",
     (
-        "1 if the running queue item has a live agent owner, 0 if "
+        "1 if the queue item has a live agent owner, 0 if "
         "orphaned. Source: claude-watch active-agents JSON state file. "
         "Matched by `queue_id` parsed from the agent JSONL's first user "
         "message (`Queue item: q-XXXX` marker). Items with no matching "
         "agent record are absent from this gauge entirely (no signal "
-        "beats false-alert OR false-healthy)."
+        "beats false-alert OR false-healthy). "
+        "The `status` label is the queue item's current state: "
+        "`running` (alert candidate) or `blocked` (parked on external "
+        "blocker, NOT an alert candidate -- no live agent expected by "
+        "design). Alert rules MUST filter on {status='running'} to "
+        "avoid firing on blocked items."
     ),
-    ["id", "summary", "agent_id"],
+    ["id", "summary", "agent_id", "status"],
     registry=REG,
 )
 g_agent_jsonl_age = Gauge(
@@ -140,9 +145,11 @@ g_agent_jsonl_age = Gauge(
     (
         "Age in seconds of the owning agent's JSONL transcript, mirrored "
         "from claude-watch active-agents. Useful for graphing transcript "
-        "freshness and tuning the alive threshold."
+        "freshness and tuning the alive threshold. The `status` label "
+        "mirrors `worktask_queue_item_has_live_owner` (`running` or "
+        "`blocked`)."
     ),
-    ["id", "summary", "agent_id"],
+    ["id", "summary", "agent_id", "status"],
     registry=REG,
 )
 g_ready_age = Gauge(
@@ -272,7 +279,10 @@ def collect():
     g_ready_age.clear()
     g_locked_age.clear()
 
-    status_counts = {"pending": 0, "running": 0, "done": 0, "abandoned": 0}
+    status_counts = {
+        "pending": 0, "running": 0, "wedged": 0, "blocked": 0,
+        "done": 0, "abandoned": 0,
+    }
     priority_counts = {}
     group_counts = {}
     now = datetime.now(timezone.utc)
@@ -295,28 +305,36 @@ def collect():
             _seen_forced_ids.add(it.get("id"))
             c_scope_conflicts.inc()
 
-        # Running-item elapsed gauge + agent liveness gauges
-        if status == "running":
+        # Running-item elapsed gauge + agent liveness gauges. We emit the
+        # liveness gauges for BOTH `running` AND `blocked` items but the
+        # `status` label distinguishes them so the WorkQueueOrphaned alert
+        # rule can filter to `{status="running"}` and not fire on the
+        # blocked case (which by design has no live agent).
+        if status in ("running", "blocked"):
             reg_ts = _parse_ts(it.get("registered_at") or it.get("started_at"))
             summary = (it.get("summary") or "")[:80] or "(no summary)"
             iid = it.get("id", "")
-            if reg_ts:
+            if reg_ts and status == "running":
+                # running_elapsed stays running-only -- a blocked item
+                # isn't burning agent time, so its "elapsed" is the
+                # wrong shape for the dashboard panel that consumes
+                # this metric.
                 elapsed = max(0.0, (now - reg_ts).total_seconds())
                 g_running_elapsed.labels(id=iid, summary=summary).set(elapsed)
 
             # Look up agent by queue_id. Emit has_live_owner ONLY when we
-            # have an agent record — silent on no-signal items.
+            # have an agent record -- silent on no-signal items.
             agent = agent_by_qid.get(iid)
             if agent is not None:
                 aid = agent.get("agent_id", "")
                 alive = 1 if agent.get("alive") else 0
                 g_has_live_owner.labels(
-                    id=iid, summary=summary, agent_id=aid,
+                    id=iid, summary=summary, agent_id=aid, status=status,
                 ).set(alive)
                 age = agent.get("jsonl_age_seconds")
                 if age is not None:
                     g_agent_jsonl_age.labels(
-                        id=iid, summary=summary, agent_id=aid,
+                        id=iid, summary=summary, agent_id=aid, status=status,
                     ).set(age)
 
         # Ready-stuck / locked-age gauges.

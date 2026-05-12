@@ -21,6 +21,7 @@
   --running:   #2aa198; /* cyan */
   --starting:  #cb4b16; /* orange — queue-running but no agent yet */
   --pending:   #b58900; /* yellow */
+  --blocked:   #d33682; /* magenta — parked on external blocker */
   --done:      #859900; /* green */
   --abandoned: #93a1a1; /* base1 */
   --orphan:    #dc322f; /* red */
@@ -42,6 +43,7 @@
     --running:   #2aa198;
     --starting:  #cb4b16;
     --pending:   #b58900;
+    --blocked:   #d33682;
     --done:      #859900;
     --abandoned: #586e75;
     --orphan:    #dc322f;
@@ -131,6 +133,7 @@ main {
 
 .count-running  { color: var(--running);  border-color: var(--running); }
 .count-starting { color: var(--starting); border-color: var(--starting); }
+.count-blocked  { color: var(--blocked);  border-color: var(--blocked); }
 .count-pending  { color: var(--pending);  border-color: var(--pending); }
 .count-orphan   { color: var(--orphan);   border-color: var(--orphan); }
 
@@ -205,6 +208,7 @@ main {
 
 .item.state-running   { border-left-color: var(--running); }
 .item.state-starting  { border-left-color: var(--starting); background: color-mix(in srgb, var(--starting) 6%, var(--bg-alt)); }
+.item.state-blocked   { border-left-color: var(--blocked); background: color-mix(in srgb, var(--blocked) 6%, var(--bg-alt)); }
 .item.state-pending   { border-left-color: var(--pending); }
 .item.state-pending.ready { border-left-color: var(--ready); }
 .item.state-done      { border-left-color: var(--done); opacity: 0.75; }
@@ -252,6 +256,7 @@ main {
 
 .badge.state-running   { background: var(--running); }
 .badge.state-starting  { background: var(--starting); color: #fff; }
+.badge.state-blocked   { background: var(--blocked); color: #fff; }
 .badge.state-pending   { background: var(--pending); color: #000; }
 .badge.state-done      { background: var(--done); }
 .badge.state-abandoned { background: var(--abandoned); }
