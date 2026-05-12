@@ -80,6 +80,34 @@ else
 fi
 
 echo
+echo "session-task queue state"
+# Belt-and-suspenders with queue-minisite's ENOENT graceful-empty-state
+# (the UI renders an empty queue when this file is missing). Seeding it
+# explicitly here ALSO makes the host-side `session-task` CLI happy on a
+# fresh laptop where neither `claude-watch` nor `session-task` has been
+# run yet, since the read-time lock + parent-mkdir path only runs when
+# someone first invokes a queue subcommand.
+SESSION_DIR="$HOME/.config/session"
+QUEUE_JSON="$SESSION_DIR/queue.json"
+mkdir -p "$SESSION_DIR"
+if [ -f "$QUEUE_JSON" ]; then
+    ok "existing queue.json at $QUEUE_JSON (not modified)"
+else
+    # Canonical empty shape -- mirrors `_queue_empty()` in
+    # tools/session-task/session-task. schema_version is the on-disk
+    # marker (currently 2); items + locked_scopes are the two top-level
+    # collections every queue operation indexes into.
+    cat > "$QUEUE_JSON" <<'JSON'
+{
+  "schema_version": 2,
+  "items": [],
+  "locked_scopes": {}
+}
+JSON
+    ok "seeded empty queue.json at $QUEUE_JSON"
+fi
+
+echo
 echo "Next steps"
 echo "  1. Edit $ENV_FILE (set ANTHROPIC_API_KEY if you want the claude-container service to talk to the API)."
 echo "  2. (Optional) bootstrap an eichi index on the host:"

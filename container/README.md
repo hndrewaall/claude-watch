@@ -169,6 +169,19 @@ artifacts.
 
 **Signal handling**: the wrapper traps `SIGTERM`/`SIGINT` on the host and forwards them via `docker kill --signal=...` to a per-PID container name (`claude-tmux-$$`), so `Ctrl-C` from the host cleanly tears down the in-container tmux session.
 
+## Host-only CLIs
+
+The image bakes exactly two binaries:
+
+- `claude` — the Claude Code CLI (installed via `npm install -g @anthropic-ai/claude-code`).
+- `claude-watch` — the Rust daemon, built from source in the multi-stage `claude-watch-builder` stage and copied into `/usr/local/bin/claude-watch`.
+
+Everything else from the claude-watch source tree — including the Python CLIs under `tools/` (`session-task`, `claude-event`, `obligations`) — is NOT installed into the image. They're discoverable on `PATH` only when the operator bind-mounts `~/repos/claude-watch` into the container at `/home/hndrewaall/repos/claude-watch` (which the [example compose](../examples/compose/) does by default).
+
+The mechanism is a small `/etc/profile.d/claude-tools.sh` fragment baked into the image (see `claude-tools.profile.sh` in this directory). At login / new-shell time it checks for each tool dir under `${HOME}/repos/claude-watch/tools/` and prepends it to `PATH` if present. Missing dirs are silently skipped, so a stripped-down `docker run` with no bind mount still gets a working shell — the bind-mounted CLIs just won't be on `PATH`.
+
+Operational tooling that the operator runs on the **host** (alerting, monitoring, media post-processing, ingest pipelines, etc.) is intentionally NOT installed in the container. The image is meant to be a generic Claude Code + claude-watch sandbox; host-specific tooling stays on the host where it has the right environment, credentials, and filesystem layout. Layer that in via your own image or a sibling bind-mount when you need it.
+
 ## Volume management
 
 The `claude-container-versions` named docker volume holds the in-container claude binary's auto-updated `versions/<ver>/` tree at `/home/hndrewaall/.local/share/claude/`. It is created on first `claude-tmux` invocation (or first `docker compose up`) and persists across `--rm` exits — that's its whole purpose.

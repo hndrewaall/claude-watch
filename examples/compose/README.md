@@ -94,6 +94,21 @@ The container will see the updated index next request — no restart required (s
 
 In-container paths (right-hand side of `volumes:`) hardcode `/home/hndrewaall/...` because the `hndrewaall` user is baked into the `claude-container` and `eichi-search` Dockerfiles at uid 1000. Your **host** user can be anything — bind-mount left-hand sides use `${HOME}` interpolation. If your host UID is not 1000, the bind-mounted state directories will look root-owned to the container; the cleanest fix is to add `user: "$(id -u):$(id -g)"` to each service and `chown` the host directories before launching.
 
+### macOS UID
+
+The container images bake the in-container user at uid/gid `1000:1000`. macOS user accounts default to **uid 501** (not 1000), and the `queue-minisite` / `eichi-search` services in this compose file pin `user: "1000:1000"`. The two don't match — and yet the stack works on macOS without manual fixup. Why:
+
+- **Docker Desktop (macOS / Windows)** runs the engine inside a hidden VM and routes bind mounts through a userland file-sharing layer (gRPC-FUSE / VirtioFS). That layer transparently remaps file ownership so the container sees its expected uid (1000) regardless of the host file's actual owner on the Mac filesystem. Reads + writes round-trip without permission errors. This is purely a Docker Desktop convenience and does NOT apply to Linux.
+- **Linux dev boxes** run the engine natively against the host kernel — bind mounts pass through unchanged, so a uid-1000 container process writing to a host directory owned by uid 1500 will produce files literally owned by uid 1000 on the host, and reading host-owned files may EACCES depending on mode bits.
+
+If you're on a Linux box with a non-1000 host UID, you have three options, in order of decreasing effort:
+
+1. **Run as a uid-1000 user.** Easiest if you're setting up a dedicated dev account anyway — `useradd -u 1000 ...` (or repurpose the existing user) and everything just works.
+2. **Override `user:` on each service.** Replace the `user: "1000:1000"` lines in `docker-compose.yml` with `user: "$(id -u):$(id -g)"` (or expand the literal numbers) and `chown -R` the bind-mounted host directories to that same uid/gid before launching. The container's named user (`hndrewaall`) is still uid 1000 inside the image; the override only changes which uid the process runs as.
+3. **Rebuild the images with matching uid/gid.** Pass `--build-arg HOSTUID=$(id -u) --build-arg HOSTGID=$(id -g)` through and extend the Dockerfile's `useradd` line. Heaviest path, only worth it for long-lived deployments.
+
+The `claude-container` service does NOT pin a `user:` directive — it inherits from the Dockerfile's `USER hndrewaall` (uid 1000) directly. On Linux with a non-1000 host UID, bind-mounted `~/.claude` / `~/repos` will look root-owned to the container; same options apply.
+
 ### Skipping services
 
 `claude-container`, `queue-minisite`, and `eichi-search` are independent — comment any one out in `docker-compose.yml` and the rest still work. For example, `docker compose up queue-minisite eichi-search` skips the heavy Rust + Node build of the claude-container image.
