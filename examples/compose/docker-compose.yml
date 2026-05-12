@@ -188,8 +188,10 @@ services:
   # `claude-tmux-socket` mounted at /tmp/tmux-1000 (the tmux default
   # socket dir for uid 1000). claude-container's entrypoint creates the
   # session before ttyd would have anything to attach to, so a manual
-  # `depends_on` keeps the cold-start ordering sane — but ttyd will
-  # also retry its `attach-session` on reconnect.
+  # `depends_on` keeps the cold-start ordering sane — but ttyd uses
+  # `tmux new-session -A` which attaches if the session exists and
+  # creates it otherwise, so it's resilient to startup races and
+  # reconnects.
   #
   # Security note: published on localhost:7681 unauthenticated by
   # design for local development. Do NOT expose publicly without an
@@ -240,8 +242,9 @@ services:
       - -u
       - -S
       - /tmp/tmux-1000/default
-      - attach-session
-      - -t
+      - new-session
+      - -A
+      - -s
       - claude-container
     restart: unless-stopped
 

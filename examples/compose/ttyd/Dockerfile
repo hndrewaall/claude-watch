@@ -8,4 +8,4 @@
 # tag (e.g. `1.7.7-alpine`) if you need reproducible builds.
 FROM tsl0922/ttyd:alpine
 
-RUN apk add --no-cache tmux bash
+RUN apk add --no-cache tmux bash ncurses-terminfo
