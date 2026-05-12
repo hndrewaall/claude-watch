@@ -417,7 +417,7 @@ mod tests {
     fn build_metrics_watcher_health() {
         let state = json!({
             "watcher_health": {
-                "signal-wait": {"enabled": true, "consecutive_missing": 0},
+                "alerts-watcher": {"enabled": true, "consecutive_missing": 0},
                 "torrent-wait": {"enabled": true, "consecutive_missing": 5},
                 "dead-one": {"enabled": false, "consecutive_missing": 10},
             },

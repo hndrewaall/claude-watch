@@ -72,7 +72,7 @@ Environment defaults (all overridable via flag):
 
 `session-resume` is intentionally NOT migrated — it's a host-specific
 resume-checklist driver that calls site-local CLIs (request tracker,
-system health-check, Signal history, etc.). The portable equivalent is the
+system health-check, messaging-history, etc.). The portable equivalent is the
 `claude-watch hook-fire` system + the resume-prompt that `self-clear`
 injects, plus whatever per-host resume-checklist the operator writes.
 

@@ -32,15 +32,15 @@ use claude_watch::tmux::{detect_activity, ClaudeActivity};
 ///     -- INSERT --⏵⏵ ...                   <-- status bar
 const REAL_CAPTURE_THINKING_FERMENTING: &str = "\
      correctly (was 0, now 10). Thinking detection updated.\n\
-     - **AT Distant Lands** downloading from IPT (25.4GB BluRay batch, about 12h ETA at\n\
+     - **task** progressing (some payload, about 12h ETA at\n\
      current speed).\n\
-       [2026-03-17T04:11:35.117325+00:00] [sig_ts:1773720694959] Andrew Hall (he/him):\n\
+       [2026-03-17T04:11:35.117325+00:00] [msg_ts:1773720694959] Operator:\n\
      detection is still broken. please have an agent create an e2e test that actually\n\
      repros this issue\n\
 \n\
-\u{25cf} Andrew says detection is still broken and wants an e2e test. Let me launch an agent for that.\n\
+\u{25cf} Operator says detection is still broken and wants an e2e test. Let me launch an agent for that.\n\
 \n\
-\u{25cf} Bash(cat << 'EOF' | signal-send --dm andrew --force\n\
+\u{25cf} Bash(cat << 'EOF' | notify --dm someone --force\n\
       On it -- launching agent to create an e2e test that captures the actual tmux pane output\n\
       during thinking and verifies detection.\n\
       EOF)\n\
@@ -411,9 +411,9 @@ fn writing_without_prompt_should_be_writing() {
 const REAL_CAPTURE_BETWEEN_TOOL_CALLS: &str = "\
      correctly (was 0, now 10). Thinking detection updated.\n\
 \n\
-\u{25cf} Andrew says detection is still broken and wants an e2e test. Let me launch an agent for that.\n\
+\u{25cf} Operator says detection is still broken and wants an e2e test. Let me launch an agent for that.\n\
 \n\
-\u{25cf} Bash(cat << 'EOF' | signal-send --dm andrew --force\n\
+\u{25cf} Bash(cat << 'EOF' | notify --dm someone --force\n\
       On it -- launching agent to create an e2e test.\n\
       EOF)\n\
   \u{23bf}  Sent (timestamp: 1773720719612)\n\

@@ -4,19 +4,41 @@
 
 use std::path::Path;
 
-/// Known watcher/service command patterns — processes matching these are persistent
-/// services, not ephemeral tasks.
+/// Built-in watcher/service command patterns — processes matching these
+/// are classified as persistent services, not ephemeral tasks.
+/// `watcher-ctl` covers the canonical supervisor form (any watcher run
+/// via `watcher-ctl run <name>`). The remaining entries cover stock
+/// watcher binaries shipped under `tools/watchers/` plus the generic
+/// `request-wait` / `task-watch` wrappers.
+///
+/// Operators with additional site-specific watcher names should extend
+/// this list via `CLAUDE_WATCH_EXTRA_WATCHER_PATTERNS` (colon-separated)
+/// — see `extra_service_patterns` for the merge logic.
 pub const SERVICE_PATTERNS: &[&str] = &[
-    "signal-wait",
-    "torrent-wait",
-    "tv-remind",
+    "watcher-ctl",
+    "watchmen",
     "memory-remind",
     "context-watch",
-    "watchmen",
-    "watcher-ctl",
     "task-watch",
     "request-wait",
 ];
+
+/// Read additional watcher/service patterns from the
+/// `CLAUDE_WATCH_EXTRA_WATCHER_PATTERNS` env var (colon-separated).
+/// Returns an empty Vec when unset / empty. Mirrors the same env var
+/// used by `agent::extra_watcher_patterns` so a single operator-set
+/// list covers both call sites.
+pub fn extra_service_patterns() -> Vec<String> {
+    std::env::var("CLAUDE_WATCH_EXTRA_WATCHER_PATTERNS")
+        .ok()
+        .map(|s| {
+            s.split(':')
+                .map(|p| p.trim().to_string())
+                .filter(|p| !p.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
 
 /// Output file content signatures — fallback for orphaned processes whose
 /// parent chain is broken (reparented to init). Matched against first line.
@@ -95,6 +117,10 @@ pub fn is_service_process(pid: &str) -> bool {
         visited.insert(current.clone());
         if let Some(cmdline) = get_pid_cmdline(&current) {
             if SERVICE_PATTERNS.iter().any(|pat| cmdline.contains(pat)) {
+                return true;
+            }
+            let extras = extra_service_patterns();
+            if extras.iter().any(|pat| cmdline.contains(pat)) {
                 return true;
             }
         }

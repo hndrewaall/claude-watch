@@ -2,9 +2,9 @@
 //!
 //! Writes structured JSON events into `~/claude-events/` so that
 //! `claude-event-watch` surfaces them to the main loop. This is an
-//! ADDITIVE third alert sink alongside Pushover (`pingme`) and the
-//! tmux-inject prompt — those paths must keep firing whether or not
-//! event emission succeeds.
+//! ADDITIVE third alert sink alongside the push-notification path
+//! (`pingme`) and the tmux-inject prompt — those paths must keep firing
+//! whether or not event emission succeeds.
 //!
 //! Field shape mirrors what `~/bin/claude-event` (Python helper) writes
 //! so the consumer (`claude-event-watch`) needs no special-case logic.
@@ -19,7 +19,7 @@
 //!   "source_name": "claude-watch",
 //!   "tag": "claude-watch-alert",
 //!   "priority": "low|normal|high|urgent",
-//!   "message": "<full human-readable, same as Pushover body>",
+//!   "message": "<full human-readable, same as push-notification body>",
 //!   "data": {
 //!       "alert_type":        "<heartbeat-stale|prolonged-thinking|...>",
 //!       "stuck_reason":      "<short human-readable>",
@@ -35,8 +35,7 @@
 //! Note: `source` is **`claude-watch`**, which is outside the canonical
 //! source enum used by the Python helper (`cron|alertmanager|queue|...`).
 //! `claude-event-watch` itself doesn't validate `source` — it dispatches
-//! by `tag`. The new tag is `claude-watch-alert`; see
-//! `~/.claude/projects/-home-hndrewaall/memory/claude-event-routing.md`.
+//! by `tag`. The new tag is `claude-watch-alert`.
 //!
 //! Writes are atomic (tmp file in same dir + rename). Filename:
 //! `<unix_ns>_claude-watch-alert.json` (matches Python helper convention).
@@ -44,14 +43,14 @@
 //! On any error the function logs and returns — never panics, never
 //! propagates failure to the caller. Same default-open principle as the
 //! obligations PreToolUse hook: a broken alert sink must not blackhole
-//! Pushover or tmux-inject.
+//! the push-notification path or tmux-inject.
 
 use serde::Serialize;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Severity levels that map cleanly onto Pushover priority and downstream
-/// triage decisions in the routing table.
+/// Severity levels that map cleanly onto push-notification priority and
+/// downstream triage decisions in the routing table.
 #[derive(Debug, Clone, Copy, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Severity {
@@ -92,10 +91,10 @@ pub struct ClaudeWatchAlert<'a> {
     /// Names of watchers known to be missing (only meaningful for
     /// `watcher-down`; empty elsewhere).
     pub affected_watchers: Vec<String>,
-    /// Severity tier driving Pushover priority + dispatch routing.
+    /// Severity tier driving push-notification priority + dispatch routing.
     pub severity: Severity,
     /// Full human-readable message, byte-for-byte the same string sent
-    /// to Pushover so log/event/push all agree.
+    /// to the push-notification shim so log/event/push all agree.
     pub message: &'a str,
 }
 
@@ -152,7 +151,7 @@ pub fn queue_dir() -> PathBuf {
 
 /// Emit a claude-event JSON file into the queue dir. Default-open: any
 /// I/O failure is logged at warn level and swallowed. The caller's
-/// Pushover + tmux-inject paths must remain unaffected.
+/// push-notification + tmux-inject paths must remain unaffected.
 pub fn emit(alert: &ClaudeWatchAlert<'_>) {
     let dir = queue_dir();
     if let Err(e) = std::fs::create_dir_all(&dir) {
@@ -409,11 +408,11 @@ mod tests {
     fn build_event_json_handles_watcher_down() {
         let alert = ClaudeWatchAlert {
             alert_type: "watcher-down",
-            stuck_reason: "2 watcher(s) missing: signal-wait, torrent-wait",
+            stuck_reason: "2 watcher(s) missing: alerts-watcher, torrent-wait",
             stale_minutes: None,
-            affected_watchers: vec!["signal-wait".to_string(), "torrent-wait".to_string()],
+            affected_watchers: vec!["alerts-watcher".to_string(), "torrent-wait".to_string()],
             severity: Severity::Medium,
-            message: "watchers down: signal-wait, torrent-wait",
+            message: "watchers down: alerts-watcher, torrent-wait",
         };
 
         let v = build_event_json(&alert);
@@ -422,14 +421,14 @@ mod tests {
         assert!(v["data"]["stale_minutes"].is_null());
         let watchers = v["data"]["affected_watchers"].as_array().unwrap();
         assert_eq!(watchers.len(), 2);
-        assert_eq!(watchers[0], "signal-wait");
+        assert_eq!(watchers[0], "alerts-watcher");
         assert_eq!(watchers[1], "torrent-wait");
         assert_eq!(v["priority"], "normal");
     }
 
     #[test]
     fn build_event_json_handles_minimal_alert() {
-        // Pushover-only paths (e.g. auto-update-complete) carry no
+        // Push-notification-only paths (e.g. auto-update-complete) carry no
         // structured stale/watcher data — verify the optional fields
         // serialise cleanly as null/empty.
         let alert = ClaudeWatchAlert {

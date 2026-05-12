@@ -428,9 +428,9 @@ mod tests {
     #[test]
     fn filter_subagent_pids_excludes_watchers() {
         let children = vec![
-            cp(100, "zsh -c eval 'signal-wait --dm' < /dev/null"),
+            cp(100, "zsh -c eval 'watcher-ctl run alerts-watcher' < /dev/null"),
             cp(200, "python3 /home/user/.claude/sidechain-agent.py"),
-            cp(300, "zsh -c eval 'torrent-wait' < /dev/null"),
+            cp(300, "zsh -c eval 'watcher-ctl run torrent-wait' < /dev/null"),
         ];
         // 100 + 300 are watchers; only 200 should remain.
         assert_eq!(filter_subagent_pids(&children), vec![200]);
@@ -465,7 +465,7 @@ mod tests {
     #[test]
     fn filter_subagent_pids_all_watchers() {
         let children = vec![
-            cp(1, "zsh -c eval 'signal-wait' < /dev/null"),
+            cp(1, "zsh -c eval 'watcher-ctl run alerts-watcher' < /dev/null"),
             cp(2, "zsh -c eval 'memory-remind' < /dev/null"),
             cp(3, "zsh -c eval 'context-watch' < /dev/null"),
         ];

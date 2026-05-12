@@ -82,9 +82,12 @@ behavior or claude-watch monitoring.
 | `~/repos` | `CLAUDE_HOST_REPOS_DIR` | `/home/hndrewaall/repos` | `ro` | Host repo trees (also carries project-tier Claude Code config in each repo's `.claude/`). Read-only — confine container edits to `/workspace` or explicit clones. |
 | `~/bin` | `CLAUDE_HOST_BIN_DIR` | `/home/hndrewaall/bin` | `ro` | Launcher / shim scripts (mostly symlinks into `~/repos/*/bin`). Resolves correctly because `~/repos` is also mounted. |
 | `~/claude-events` | `CLAUDE_HOST_EVENTS_DIR` | `/home/hndrewaall/claude-events` | `rw` | claude-event JSONL spool. Host producers write, in-container `claude-event-watch` consumes. |
-| `~/.local/share/atuin` | `CLAUDE_HOST_ATUIN_DIR` | `/home/hndrewaall/.local/share/atuin` | `ro` | Shell history DB. Read-only — concurrent writes would corrupt the host daemon's SQLite WAL. |
-| `~/signal-queue` | `CLAUDE_HOST_SIGNAL_QUEUE_DIR` | `/home/hndrewaall/signal-queue` | `ro` | Signal attachment files. Sole writer is the host signal-api container; the in-container claude only reads. |
 | `~/.config/session` | _(not overridable; shared with queue-minisite)_ | `/home/hndrewaall/.config/session` | `rw` | session-task queue.json (same path the queue-minisite mounts). |
+
+Host-specific integration mounts (shell-history databases, messaging
+attachment dirs, etc.) are intentionally out of scope for this example.
+Add them in a local `docker-compose.override.yml` if your operator setup
+needs them.
 
 ### Host paths on non-default layouts (env-var overrides)
 
@@ -122,16 +125,16 @@ CLAUDE_HOST_MANAGED_SETTINGS_DIR=/Library/Application Support/ClaudeCode
 
 `.env` values support whitespace literally — no quoting needed for the
 embedded space in `Application Support`. If a particular host-state
-path doesn't exist on your machine (e.g. no `~/signal-queue` because
-you don't run the Signal bot), leave it unset — see "macOS graceful
-no-op" below for the bind-mount behavior on missing source paths.
+path doesn't exist on your machine, leave it unset — see "macOS
+graceful no-op" below for the bind-mount behavior on missing source
+paths.
 
 ### macOS graceful no-op
 
 The compose file uses `${HOME}` interpolation on the host side, so the source
 paths resolve to `/Users/<you>/...` on macOS. Most of the host-state paths
-above (`~/claude-events`, `~/.local/share/atuin`, `~/signal-queue`, `~/bin`)
-don't exist on a fresh macOS workbot. Docker Desktop's bind-mount semantics
+above (`~/claude-events`, `~/bin`) don't exist on a fresh macOS
+workbot. Docker Desktop's bind-mount semantics
 auto-create empty directories at the source location when a mount references
 a missing path, so the container sees empty dirs — functionally equivalent to
 "no host state at all". The in-container claude-watch and claude tolerate
@@ -252,6 +255,10 @@ macOS user accounts default to **uid 501**, not 1000 — and the container image
 - **Docker Desktop (macOS / Windows)** runs the engine inside a hidden VM and routes bind mounts through a userland file-sharing layer (gRPC-FUSE / VirtioFS). That layer transparently remaps file ownership so the container sees its expected uid (1000) regardless of the host file's actual owner on the Mac filesystem. Reads + writes round-trip without permission errors. This is purely a Docker Desktop convenience and does NOT apply to Linux.
   - **Caveat for Mac users editing container-written files natively:** the remapping is per-mount, not bidirectional metadata sync. Files the container creates under a bind-mounted path are recorded by the VM as `1000:1000`, and `stat` on the macOS side (uid 501, gid 20 by default) shows them owned by an unknown uid. Reads typically still work via Docker Desktop's permissive defaults, but native editors that check ownership before writing (or any tooling that does `chown` / `chmod`) can complain. Fixes, in order of decreasing effort: (a) `sudo chown -R 501:20 <path>` after the container finishes, (b) add `user: "$(id -u):$(id -g)"` overrides per the Linux instructions below so the container writes as uid 501 directly, or (c) keep editing those files inside the container (via `docker compose exec` or the ttyd console) and treat the host copy as read-only.
 - **Linux dev boxes** (native Docker Engine, no Docker Desktop) run the engine directly against the host kernel — bind mounts pass through unchanged, so a uid-1000 container process writing to a host directory owned by uid 1500 will produce files literally owned by uid 1000 on the host, and reading host-owned files may EACCES depending on mode bits.
+
+#### macOS — Docker Desktop file-sharing allowlist
+
+Docker Desktop on macOS ships with a default file-sharing allowlist (`/Users`, `/tmp`, `/private`, `/var/folders`). Bind-mount source paths outside that list are refused at container-start with a "path not shared from the host" error. The user-tier paths (`~/.claude`, `~/repos`, etc.) live under `/Users/<you>` and just work, but if you override `CLAUDE_HOST_MANAGED_SETTINGS_DIR` to the macOS managed-settings location (`/Library/Application Support/ClaudeCode`), that path is outside the default share list and needs to be explicitly added via Docker Desktop → Settings → Resources → File Sharing → "+" → pick the directory → Apply & Restart. The same applies to any custom `CLAUDE_HOST_*` override pointing outside `/Users`. Paraphrased rule: paths outside Docker Desktop's default share list need to be explicitly added via Docker Desktop → Resources → File Sharing.
 
 If you're on a Linux box with a non-1000 host UID, you have three options, in order of decreasing effort:
 

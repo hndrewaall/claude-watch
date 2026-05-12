@@ -20,21 +20,21 @@ Also covers the 2026-04-19 one-line summary field:
 
   * `queue add --summary "..."` stores the headline on the item.
   * Missing `--summary` warns to stderr and defaults to ``"(no summary)"``.
-  * Summary appears on line 1 of the pingme message body (Pushover preview).
+  * Summary appears on line 1 of the pingme message body (so it
+    surfaces as the push-notification preview on most providers).
   * `queue show` / `queue list` surface the summary for visibility.
   * `queue set-summary <id> "text"` retrofits or edits a summary.
 
 The tests install a fake ``pingme`` shim into a temporary PATH-only
 directory. The shim appends its argv to a log file we can then assert
 against. Tests pass without real pingme installed and never actually
-hit Pushover.
+fire a push notification.
 
 Run:
-    uv run --python 3.11 --with pytest \\
-        pytest ~/repos/config/tests/test_queue_pingme.py -v
+    uv run --python 3.11 --with pytest pytest tests/test_queue_pingme.py -v
 
 Or directly:
-    python3 ~/repos/config/tests/test_queue_pingme.py
+    python3 tests/test_queue_pingme.py
 """
 
 import json
@@ -383,7 +383,7 @@ def test_if_absent_register_noop_does_not_fire_pingme_again():
 
 
 # ---------------------------------------------------------------------------
-# 9. --summary appears in pingme register message (line 1, Pushover preview)
+# 9. --summary appears in pingme register message (line 1, push-notification preview)
 # ---------------------------------------------------------------------------
 
 
@@ -405,7 +405,7 @@ def test_summary_appears_in_pingme_register_message():
         calls = _read_pingme_log(log)
         assert len(calls) == 2, calls
 
-        # register pingme: summary on line 1 (Pushover preview), scope on line 2
+        # register pingme: summary on line 1 (push-notification preview), scope on line 2
         reg = _parse_pingme_argv(calls[0])
         assert reg["title"] == f"queue started: {d1['id']}"
         first_line = (reg["message"] or "").split("\n", 1)[0]
@@ -447,7 +447,7 @@ def test_missing_summary_warns_and_defaults():
         calls = _read_pingme_log(log)
         assert len(calls) == 1, calls
         parsed = _parse_pingme_argv(calls[0])
-        # Placeholder surfaces verbatim as the Pushover preview.
+        # Placeholder surfaces verbatim as the push-notification preview.
         first_line = (parsed["message"] or "").split("\n", 1)[0]
         assert first_line == "(no summary)", (
             f"expected '(no summary)' preview, got: {parsed['message']!r}"

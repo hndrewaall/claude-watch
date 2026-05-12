@@ -16,7 +16,7 @@ blackhole the loop.
 | `pre-agent-queue-gate-hook` | PreToolUse | `Agent` | Refuses Agent spawns missing `Queue item: q-XXXX` markers, or whose marker isn't `running`. |
 | `pre-tool-obligations-gate-hook` | PreToolUse | `*` | Calls `obligations check`; denies when a gate-mode obligation's predicate is unsatisfied. Also enforces the bare-`watcher-ctl run` cardinal rule. |
 | `post-tool-obligations-update-hook` | PostToolUse | `*` | Runs `obligations post-tool` (satisfy-by-completion + inform-mode advisories), and manages the `no_pending_watcher_outputs` sidecar registry. |
-| `post-tool-mark-attachment-read-hook` | PostToolUse | `Read` | Auto-marks Signal attachments as read via `signal-mark-read` when Claude opens a file under `~/signal-queue/attachments/`. |
+| `post-tool-mark-attachment-read-hook` | PostToolUse | `Read` | Auto-marks external-messaging attachments as read via a host-specific `*-mark-read` shim when Claude opens a file under a configured attachment dir. Safe no-op when neither the shim nor the dir is present. |
 
 ## Wiring example
 
@@ -78,7 +78,7 @@ Two test scripts live under `tests/`:
     obligations gate (PreToolUse + PostToolUse) end-to-end against an
     isolated `HOME=$tmpdir` sandbox. 100 cases covering every predicate
     (including `stale_ready_queue_present`), enforcement mode,
-    exempt-patterns, overrides (including the pingme Pushover hook),
-    and the watcher-ctl cardinal-rule gate.
+    exempt-patterns, overrides (including the pingme push-notification
+    hook), and the watcher-ctl cardinal-rule gate.
 
 Run from the repo root with `make test-hooks`.

@@ -372,7 +372,7 @@ mod tests {
             watchmen: 3,
         });
         state.watcher_health.insert(
-            "signal-wait".to_string(),
+            "alerts-watcher".to_string(),
             WatcherState {
                 last_seen_running: Some("2026-03-16T12:00:00-05:00".to_string()),
                 consecutive_missing: 0,
@@ -391,7 +391,7 @@ mod tests {
         assert!(restored.last_failure_detail.is_some());
         assert!(restored.last_status.is_some());
         assert_eq!(restored.watcher_health.len(), 1);
-        assert!(restored.watcher_health.contains_key("signal-wait"));
+        assert!(restored.watcher_health.contains_key("alerts-watcher"));
     }
 
     #[test]

@@ -2,13 +2,15 @@
 //! interrupt-then-inject.
 //!
 //! Three sinks fire from this module:
-//! 1. **Pushover** via `pingme` — Andrew's phone notification.
+//! 1. **Push notification** via `pingme` — operator's phone alert (the
+//!    `pingme` shim is pluggable; route it to whatever push service
+//!    your local setup uses).
 //! 2. **claude-event** via `event_bus::emit` — structured JSON dropped
 //!    into `~/claude-events/` so `claude-event-watch` surfaces the
 //!    alert to the main loop with parseable fields (alert_type,
 //!    stuck_reason, stale_minutes, affected_watchers, severity). The
 //!    reflexive "claude-watch said /cleanup → I run /cleanup without
-//!    looking at the data" failure mode (Andrew flagged 2026-04-27)
+//!    looking at the data" failure mode (flagged on a prior chore)
 //!    only goes away when the loop is forced to read structured fields.
 //! 3. **tmux-inject** — types the resume prompt into Claude Code's
 //!    pane so the agent can recover in-band.
@@ -33,8 +35,8 @@ pub async fn send_pingme_with_priority(message: &str, priority: &str) {
 /// that doesn't need tmux-inject (auto-update progress, reauth alert,
 /// crash notice). For the full stuck-state path use `alert()`.
 ///
-/// Severity controls Pushover priority AND the event's `severity`
-/// data field. Pushover priorities: `low|normal|high|urgent` (mapped
+/// Severity controls the push-notification priority AND the event's
+/// `severity` data field. Priorities: `low|normal|high|urgent` (mapped
 /// from Severity).
 pub async fn notify(alert: ClaudeWatchAlert<'_>) {
     let priority = alert.severity.as_priority();
