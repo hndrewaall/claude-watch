@@ -116,6 +116,28 @@ COPY claude-watch.config.toml /etc/claude-watch/config.toml
 # defensive no-op (the env var is already set) but kept for clarity.
 ENV CLAUDE_WATCH_CONFIG=/etc/claude-watch/config.toml
 
+# /etc/profile.d/claude-tools.sh — discoverability for bind-mounted CLIs.
+#
+# The container bakes ONLY the Claude Code CLI and the claude-watch Rust
+# binary. The Python CLIs that ship in the claude-watch source tree
+# (session-task, claude-event, obligations) are NOT installed into the
+# image — they live next to their source and are discoverable on PATH
+# only when the operator bind-mounts `~/repos/claude-watch` into the
+# container (as the example compose does).
+#
+# This profile-d fragment looks for those tool dirs at login / new-shell
+# time and prepends them to PATH if present. Graceful no-op when the
+# bind-mount is absent (e.g. on a stripped-down `docker run`).
+#
+# Login shells source /etc/profile -> /etc/profile.d/*.sh; interactive
+# non-login shells (e.g. `docker compose exec <c> bash`) source
+# /etc/bash.bashrc, so we also append a one-liner there that pulls this
+# same fragment in.
+COPY claude-tools.profile.sh /etc/profile.d/claude-tools.sh
+RUN chmod 0644 /etc/profile.d/claude-tools.sh \
+    && chown root:root /etc/profile.d/claude-tools.sh \
+    && printf '\n# Pull in claude-watch bind-mounted CLI dirs for non-login shells.\nif [ -r /etc/profile.d/claude-tools.sh ]; then\n    . /etc/profile.d/claude-tools.sh\nfi\n' >> /etc/bash.bashrc
+
 # Entrypoint script — tmux session bootstrap + env passthrough + signal handling.
 # Phase 1e (q-2026-05-11-8a96): pane 1 now runs the real claude-watch daemon
 # instead of the Phase 0 placeholder bash banner. Pane 1 keeps itself open with
