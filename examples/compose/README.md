@@ -5,8 +5,9 @@ End-to-end `docker compose` example that wires:
 - **claude-container** (this repo, under [`container/`](../../container/)) — Claude Code + `claude-watch` + tmux baked into one image.
 - **queue-minisite** (this repo, under `queue-minisite/`) — mobile-friendly Flask UI for the `session-task` work queue.
 - [**eichi**](https://github.com/hndrewaall/eichi) `search-minisite` — Flask UI for the local sqlite-vec + sentence-transformers semantic-search CLI.
+- **ttyd** (this repo, under [`ttyd/`](ttyd/)) — browser-based terminal that attaches to the claude-container's in-container tmux session.
 
-Drop into a freshly cloned setup, run one command, get the integrated experience: a containerised Claude Code shell, a web UI for its work queue at `http://localhost:8000/`, and a semantic-search web UI at `http://localhost:8001/`.
+Drop into a freshly cloned setup, run one command, get the integrated experience: a containerised Claude Code shell, a web UI for its work queue at `http://localhost:8000/`, a semantic-search web UI at `http://localhost:8001/`, and a browser terminal at `http://localhost:7681/`.
 
 ## Prerequisites
 
@@ -61,6 +62,7 @@ Once up:
 
 - **http://localhost:8000/** — queue-minisite UI. Lists pending / running / blocked queue items, exposes Stop / Abandon / Force-start buttons.
 - **http://localhost:8001/** — eichi search UI. Type a natural-language query, get top-K hits across whatever you've indexed.
+- **http://localhost:7681/** — ttyd browser terminal. Drops you directly into the claude-container's tmux session (same view as `docker compose exec claude-container tmux attach`).
 
 ## Use the Claude Code shell
 
@@ -73,6 +75,40 @@ claude
 ```
 
 Or use the standalone `claude-tmux` wrapper at [`container/bin/claude-tmux`](../../container/bin/claude-tmux) — it's a more ergonomic entrypoint than `docker compose exec` for interactive use. See [`container/README.md`](../../container/README.md) for details.
+
+## ttyd web console
+
+After `docker compose up -d`, a browser-attachable terminal is available at
+**http://localhost:7681/** that drops you directly into the claude-container's
+tmux session — the same view as `docker compose exec claude-container tmux
+attach`. Useful when you want a Claude Code shell from a tablet / phone / second
+machine on the LAN without setting up SSH.
+
+### How it's wired
+
+Both `claude-container` and `ttyd` share the named volume `claude-tmux-socket`
+mounted at `/tmp/tmux-1000` — tmux's default socket directory for uid 1000.
+The claude-container entrypoint creates the session on the default socket
+(`tmux new-session -d -s claude-container ...`); ttyd then attaches via
+`tmux -S /tmp/tmux-1000/default attach-session -t claude-container`. Both
+services run as uid 1000 so socket permissions align.
+
+### Theme + font
+
+The default theme is Solarized-dark (Ethan Schoonover's public-domain palette).
+The default font is `Menlo` with fallback to `monospace`. Override either by
+editing the `-t theme=…` / `-t fontFamily=…` flags in the `ttyd.command` list
+in `docker-compose.yml`, or by forking `ttyd/Dockerfile` to bundle a custom
+font into the image.
+
+### Security note
+
+The published port `7681` is unauthenticated by design for local-only
+development. Do **NOT** expose this port publicly without adding an
+authentication layer in front (oauth2-proxy, nginx basic-auth, Cloudflare
+Access, etc.). ttyd's `--writable` flag means anyone reaching the port has
+full shell access to the in-container tmux session — which, by extension,
+has read access to the bind-mounted `~/.claude` and `~/repos`.
 
 ## First-run indexing (eichi)
 
@@ -111,7 +147,7 @@ The `claude-container` service does NOT pin a `user:` directive — it inherits 
 
 ### Skipping services
 
-`claude-container`, `queue-minisite`, and `eichi-search` are independent — comment any one out in `docker-compose.yml` and the rest still work. For example, `docker compose up queue-minisite eichi-search` skips the heavy Rust + Node build of the claude-container image.
+`claude-container`, `queue-minisite`, and `eichi-search` are independent — comment any one out in `docker-compose.yml` and the rest still work. For example, `docker compose up queue-minisite eichi-search` skips the heavy Rust + Node build of the claude-container image. The `ttyd` service has a hard dependency on `claude-container` (nothing to attach to otherwise); skip both together or neither.
 
 ### No upstream auth gate
 
