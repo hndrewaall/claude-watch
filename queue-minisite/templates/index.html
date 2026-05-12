@@ -456,51 +456,71 @@
         id="log-modal-meta-summary"
         aria-label="Queue item summary"
         hidden>
-        <div class="log-meta-row" id="log-meta-row-status" hidden>
-          <span class="log-meta-label">status</span>
-          <span class="log-meta-value" id="log-meta-status"></span>
-        </div>
-        <div class="log-meta-row" id="log-meta-row-runtime" hidden>
-          <span class="log-meta-label">runtime</span>
-          <span class="log-meta-value" id="log-meta-runtime"></span>
-        </div>
-        <div class="log-meta-row" id="log-meta-row-times" hidden>
-          <span class="log-meta-label">timestamps</span>
-          <span class="log-meta-value" id="log-meta-times"></span>
-        </div>
-        <div class="log-meta-row" id="log-meta-row-scope" hidden>
-          <span class="log-meta-label">scope</span>
-          <span class="log-meta-value" id="log-meta-scope"></span>
-        </div>
-        <div class="log-meta-row" id="log-meta-row-deps" hidden>
-          <span class="log-meta-label">depends on</span>
-          <span class="log-meta-value" id="log-meta-deps"></span>
-        </div>
-        <div class="log-meta-row" id="log-meta-row-dependents" hidden>
-          <span class="log-meta-label">dependents</span>
-          <span class="log-meta-value" id="log-meta-dependents"></span>
-        </div>
-        <div class="log-meta-row" id="log-meta-row-by" hidden>
-          <span class="log-meta-label">created by</span>
-          <span class="log-meta-value" id="log-meta-by"></span>
-        </div>
-        <div class="log-meta-row" id="log-meta-row-group" hidden>
-          <span class="log-meta-label">group</span>
-          <span class="log-meta-value" id="log-meta-group"></span>
-        </div>
-        <div class="log-meta-row" id="log-meta-row-usage" hidden>
-          <span class="log-meta-label">usage</span>
-          <span class="log-meta-value" id="log-meta-usage"></span>
-        </div>
-        <div class="log-meta-row" id="log-meta-row-abandon" hidden>
-          <span class="log-meta-label">abandon reason</span>
-          <span class="log-meta-value" id="log-meta-abandon"></span>
-        </div>
+        {# The 10 metadata rows (status / runtime / timestamps / scope /
+           depends on / dependents / created by / group / usage / abandon
+           reason) are wrapped in a native <details> disclosure so the
+           block can be collapsed to reclaim vertical space — important
+           on mobile where the live-log stream sits below it. State is
+           persisted per-viewer in localStorage (key
+           `queue-minisite.metadataExpanded`); first-visit default is
+           collapsed on narrow viewports (<768px), expanded otherwise.
+           See live-log.js setMetaToggleInitialState() for the toggle
+           lifecycle. The agent-return <details> sits OUTSIDE this
+           wrapper so the most-important "what did this agent do?" text
+           stays visible even when metadata is collapsed. #}
+        <details class="prompt-toggle log-meta-toggle" id="log-meta-toggle" open>
+          <summary class="prompt-summary"><span class="log-meta-toggle-label">Metadata</span></summary>
+          <div class="log-meta-rows">
+            <div class="log-meta-row" id="log-meta-row-status" hidden>
+              <span class="log-meta-label">status</span>
+              <span class="log-meta-value" id="log-meta-status"></span>
+            </div>
+            <div class="log-meta-row" id="log-meta-row-runtime" hidden>
+              <span class="log-meta-label">runtime</span>
+              <span class="log-meta-value" id="log-meta-runtime"></span>
+            </div>
+            <div class="log-meta-row" id="log-meta-row-times" hidden>
+              <span class="log-meta-label">timestamps</span>
+              <span class="log-meta-value" id="log-meta-times"></span>
+            </div>
+            <div class="log-meta-row" id="log-meta-row-scope" hidden>
+              <span class="log-meta-label">scope</span>
+              <span class="log-meta-value" id="log-meta-scope"></span>
+            </div>
+            <div class="log-meta-row" id="log-meta-row-deps" hidden>
+              <span class="log-meta-label">depends on</span>
+              <span class="log-meta-value" id="log-meta-deps"></span>
+            </div>
+            <div class="log-meta-row" id="log-meta-row-dependents" hidden>
+              <span class="log-meta-label">dependents</span>
+              <span class="log-meta-value" id="log-meta-dependents"></span>
+            </div>
+            <div class="log-meta-row" id="log-meta-row-by" hidden>
+              <span class="log-meta-label">created by</span>
+              <span class="log-meta-value" id="log-meta-by"></span>
+            </div>
+            <div class="log-meta-row" id="log-meta-row-group" hidden>
+              <span class="log-meta-label">group</span>
+              <span class="log-meta-value" id="log-meta-group"></span>
+            </div>
+            <div class="log-meta-row" id="log-meta-row-usage" hidden>
+              <span class="log-meta-label">usage</span>
+              <span class="log-meta-value" id="log-meta-usage"></span>
+            </div>
+            <div class="log-meta-row" id="log-meta-row-abandon" hidden>
+              <span class="log-meta-label">abandon reason</span>
+              <span class="log-meta-value" id="log-meta-abandon"></span>
+            </div>
+          </div>
+        </details>
         {# Agent return text — default-open for done items so the
            answer the user is looking for is right there. Hidden when
            there's no recorded return text (running items, foreground
            agents where the text is inlined into the parent transcript
-           and not surfaced via task-notification). #}
+           and not surfaced via task-notification). Sits OUTSIDE the
+           Metadata toggle so it remains visible when metadata is
+           collapsed — Andrew flagged this as the most frequently-missing
+           piece (2026-05-11). #}
         <details class="prompt-toggle log-modal-return" id="log-modal-return" hidden open>
           <summary class="prompt-summary"><span id="log-modal-return-label">Agent return value</span></summary>
           <pre class="prompt-body" id="log-modal-return-body"></pre>
