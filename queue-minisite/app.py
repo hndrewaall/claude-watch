@@ -125,6 +125,33 @@ _QUEUE_ID_RE = re.compile(r"^q-[a-z0-9-]{4,64}$")
 # need to allow paragraphs.
 _MAX_REASON_LEN = 500
 
+# Whitelabel branding hooks. All values are read from the environment
+# with empty / generic defaults so the public open-source build renders
+# cleanly without any private branding bleeding through. A deployer
+# overrides them via an env_file mounted on the container.
+#
+#   QUEUE_SITE_TITLE        — <title> + header label. Default: "queue".
+#   QUEUE_SITE_LOGO_URL     — header logo image URL. May be an absolute
+#                             URL or a relative path served by this app
+#                             (anything under /static/). Empty = no logo
+#                             rendered, unless QUEUE_SITE_LOGO_DEFAULT=1
+#                             is set in which case the bundled
+#                             claude-watch eye glyph at
+#                             /static/claude-watch-logo.png is used.
+#   QUEUE_SITE_BRAND        — short brand string rendered in the
+#                             footer. Empty = no brand text.
+#   QUEUE_SITE_FAVICON_URL  — favicon override. Empty falls back to
+#                             the bundled generic favicon.
+SITE_TITLE = os.environ.get("QUEUE_SITE_TITLE", "queue").strip() or "queue"
+SITE_LOGO_URL = os.environ.get("QUEUE_SITE_LOGO_URL", "").strip()
+SITE_BRAND = os.environ.get("QUEUE_SITE_BRAND", "").strip()
+SITE_FAVICON_URL = os.environ.get("QUEUE_SITE_FAVICON_URL", "").strip()
+SITE_LOGO_DEFAULT = os.environ.get("QUEUE_SITE_LOGO_DEFAULT", "").strip() in (
+    "1",
+    "true",
+    "yes",
+)
+
 app = Flask(__name__)
 
 
@@ -607,6 +634,12 @@ def _render_payload() -> dict[str, Any]:
         "schema_version": data.get("schema_version") if isinstance(data, dict) else None,
         "recent_done_limit": RECENT_DONE_LIMIT,
         "recent_abandoned_limit": RECENT_ABANDONED_LIMIT,
+        # Whitelabel branding — see QUEUE_SITE_* env vars above.
+        "site_title": SITE_TITLE,
+        "site_logo_url": SITE_LOGO_URL,
+        "site_logo_default": SITE_LOGO_DEFAULT,
+        "site_brand": SITE_BRAND,
+        "site_favicon_url": SITE_FAVICON_URL,
     }
 
 
