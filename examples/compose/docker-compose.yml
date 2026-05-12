@@ -2,16 +2,16 @@
 # eichi search-minisite into a single `docker compose up`.
 #
 # Prerequisites + setup walkthrough live in the sibling README.md. Short
-# version: clone claude-watch, eichi, and (optionally) claude-container as
-# siblings, then run `docker compose up` from this directory.
+# version: clone claude-watch and eichi as siblings, then run
+# `docker compose up` from this directory.
 #
 # Sibling-repo layout assumed by the build contexts below:
 #
 #   <root>/
 #     claude-watch/        (this repo)
+#       container/         (claude-container source, this-repo subdir)
 #       examples/compose/  (this file)
 #     eichi/               (https://github.com/hndrewaall/eichi)
-#     claude-container/    (private — see README "Caveats")
 #
 # In-container paths hardcode the `hndrewaall` user because that is the
 # UID-1000 user baked into the claude-container and eichi search-minisite
@@ -23,14 +23,12 @@ services:
   # ---------------------------------------------------------------------
   # claude-container — Claude Code + claude-watch + tmux in one image.
   #
-  # Sibling-repo build context. If you don't have access to the
-  # claude-container repo yet (it's not public as of this writing), comment
-  # this service out and run just queue-minisite + eichi-search. The other
-  # two stand on their own.
+  # In-repo build context: container/ lives at the repo root (absorbed
+  # from the now-merged claude-container sibling repo).
   # ---------------------------------------------------------------------
   claude-container:
     build:
-      context: ../../../claude-container
+      context: ../../container
       dockerfile: Dockerfile
     image: claude-container:dev
     extra_hosts:
