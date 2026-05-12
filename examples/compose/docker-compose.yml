@@ -50,6 +50,13 @@ services:
       # `--rm` restarts so you don't reset to the image-baked version
       # every time the container exits.
       - "claude-container-versions:/home/hndrewaall/.local/share/claude"
+      # Shares the in-container tmux socket dir with the sibling ttyd
+      # service so the browser console can attach to the same session
+      # as `docker compose exec claude-container tmux attach`. The
+      # entrypoint creates the session on the default socket as uid
+      # 1000, which lives at /tmp/tmux-1000/default inside the
+      # container.
+      - "claude-tmux-socket:/tmp/tmux-1000"
     stdin_open: true
     tty: true
 
@@ -137,8 +144,76 @@ services:
       - "${HOME}/.cache/huggingface:/home/hndrewaall/.cache/huggingface:ro"
     restart: unless-stopped
 
+  # ---------------------------------------------------------------------
+  # ttyd — browser-based terminal that drops into the claude-container's
+  # tmux session. Same view as `docker compose exec claude-container
+  # tmux attach`, accessible at http://localhost:7681.
+  #
+  # Wiring: both services run as uid 1000 and share the named volume
+  # `claude-tmux-socket` mounted at /tmp/tmux-1000 (the tmux default
+  # socket dir for uid 1000). claude-container's entrypoint creates the
+  # session before ttyd would have anything to attach to, so a manual
+  # `depends_on` keeps the cold-start ordering sane — but ttyd will
+  # also retry its `attach-session` on reconnect.
+  #
+  # Security note: published on localhost:7681 unauthenticated by
+  # design for local development. Do NOT expose publicly without an
+  # auth proxy (oauth2-proxy, basic-auth nginx, Cloudflare Access,
+  # etc.). `--writable` means anyone reaching the port has full shell
+  # access to the in-container tmux session — which, by extension,
+  # has read access to the bind-mounted ~/.claude and ~/repos.
+  # ---------------------------------------------------------------------
+  ttyd:
+    build:
+      context: ./ttyd
+      dockerfile: Dockerfile
+    image: claude-ttyd:dev
+    ports:
+      - "7681:7681"
+    user: "1000:1000"
+    depends_on:
+      - claude-container
+    environment:
+      # UTF-8 locale: tmux downgrades non-ASCII output to literal
+      # underscores when the client locale is C. Alpine ttyd lacks
+      # glibc locale data so LANG/LC_ALL alone is insufficient under
+      # musl; we also pass `-u` to tmux in the command list below to
+      # force UTF-8 regardless of the locale environment.
+      LANG: en_US.UTF-8
+      LC_ALL: en_US.UTF-8
+    volumes:
+      - "claude-tmux-socket:/tmp/tmux-1000"
+    # Single-quoted YAML strings preserve embedded double-quotes
+    # verbatim, which keeps the xterm.js `theme` JSON valid. ttyd's
+    # `-t key=value` flag sets xterm.js client options; `--` separates
+    # ttyd args from the command it runs (tmux with `-u` for UTF-8 +
+    # `-S` for the shared socket).
+    command:
+      - ttyd
+      - --writable
+      - -t
+      - 'theme={"background":"#002b36","foreground":"#93a1a1","cursor":"#93a1a1","cursorAccent":"#002b36","selectionBackground":"#073642","selectionForeground":"#eee8d5","selectionInactiveBackground":"#073642","black":"#073642","red":"#dc322f","green":"#859900","yellow":"#b58900","blue":"#268bd2","magenta":"#d33682","cyan":"#2aa198","white":"#eee8d5","brightBlack":"#002b36","brightRed":"#cb4b16","brightGreen":"#586e75","brightYellow":"#657b83","brightBlue":"#839496","brightMagenta":"#6c71c4","brightCyan":"#93a1a1","brightWhite":"#fdf6e3"}'
+      - -t
+      - 'fontFamily=Menlo,monospace'
+      - -t
+      - 'fontSize=14'
+      - --
+      - tmux
+      - -u
+      - -S
+      - /tmp/tmux-1000/default
+      - attach-session
+      - -t
+      - claude-container
+    restart: unless-stopped
+
 volumes:
   # In-container claude binary's auto-updated versions/ tree. First
   # launch the volume is empty and the container falls through to the
   # image-baked claude. Subsequent self-updates persist here.
   claude-container-versions:
+  # Shares the in-container tmux socket dir between claude-container
+  # and the sibling ttyd service so the browser console can attach to
+  # the same tmux session that `docker compose exec claude-container
+  # tmux attach` would land you in.
+  claude-tmux-socket:
