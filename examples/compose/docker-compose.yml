@@ -66,8 +66,52 @@ services:
       # Host $HOME -> in-container /home/hndrewaall. The right-hand side
       # is fixed: the container's UID-1000 user is named `hndrewaall` in
       # the Dockerfile, regardless of what your host user is called.
-      - "${HOME}/.claude:/home/hndrewaall/.claude"
-      - "${HOME}/repos:/home/hndrewaall/repos"
+      #
+      # Phase-2 host-state surface: bind-mount the high-leverage subset of
+      # the operator's host state so the in-container claude / claude-watch
+      # boot with real config instead of vanilla defaults. See README
+      # "Host state bind-mounts" for the rw/ro rationale + the graceful
+      # no-op behavior when these paths are absent on the host (typical
+      # on a fresh macOS workbot).
+      #
+      # ~/.claude — rw: Claude Code writes session JSONLs, project state,
+      # cache, telemetry here on every interaction. Also the location of
+      # agent definition files (~/.claude/agents/*.md) the in-container
+      # claude needs to dispatch sub-agents.
+      - "${HOME}/.claude:/home/hndrewaall/.claude:rw"
+      # ~/.claude.json — rw: top-level Claude Code config (MCP server
+      # registry, model preferences, project allow-lists). Claude updates
+      # this on settings changes.
+      - "${HOME}/.claude.json:/home/hndrewaall/.claude.json:rw"
+      # ~/repos — ro: host repo trees so in-container scripts under
+      # ~/bin (next mount) can resolve their symlink targets. Read-only
+      # because in-container edits should be confined to /workspace or
+      # explicit clones; we don't want the container scribbling on the
+      # operator's working trees.
+      - "${HOME}/repos:/home/hndrewaall/repos:ro"
+      # ~/bin — ro: host launcher / shim scripts (mostly symlinks into
+      # ~/repos/*/bin). Lets the in-container claude-watch shell out to
+      # the same tools the host operator runs. Read-only because these
+      # are operator-curated; the container has no reason to install
+      # into ~/bin.
+      - "${HOME}/bin:/home/hndrewaall/bin:ro"
+      # ~/claude-events — rw: claude-event JSONL spool. Host cron /
+      # alertmanager / queue producers write here; the in-container
+      # claude-event-watch reads + acks them. rw because the watcher
+      # rewrites/truncates the spool as it consumes events.
+      - "${HOME}/claude-events:/home/hndrewaall/claude-events:rw"
+      # ~/.local/share/atuin — ro: shell history DB. The atuin daemon
+      # runs on the host (it's a host-only CLI per container/README.md);
+      # the container only reads it for command-recall queries from
+      # in-container tooling that supports `atuin search`. Read-only
+      # because writes would corrupt the host daemon's SQLite WAL.
+      - "${HOME}/.local/share/atuin:/home/hndrewaall/.local/share/atuin:ro"
+      # ~/signal-queue — ro: Signal attachment files (images, voice
+      # notes) referenced by signal-history output. Read-only because
+      # the host signal-api container is the sole writer; the
+      # in-container claude only needs to open the files for inline
+      # review.
+      - "${HOME}/signal-queue:/home/hndrewaall/signal-queue:ro"
       # Host ~/.config/session/queue.json — rw so session-task adds/removes
       # from inside claude-container flow to the SAME host file the
       # queue-minisite reads (it bind-mounts the same host path into its

@@ -66,6 +66,47 @@ Once up:
 - **http://localhost:8001/** — eichi search UI. Type a natural-language query, get top-K hits across whatever you've indexed.
 - **http://localhost:7681/** — ttyd browser terminal. Drops you directly into the claude-container's tmux session (same view as `docker compose exec claude-container tmux attach`).
 
+## Host state bind-mounts
+
+The `claude-container` service bind-mounts a curated subset of host state into
+the container so an in-container `claude` / `claude-watch` boots with the
+operator's real config instead of a vanilla blank slate. The mount set is
+deliberately narrow — only the paths that materially affect Claude Code
+behavior or claude-watch monitoring.
+
+| Host path | Container path | Mode | Why |
+|---|---|---|---|
+| `~/.claude` | `/home/hndrewaall/.claude` | `rw` | Session JSONLs, project state, cache, agent definitions (`agents/*.md`). Claude writes here continuously. |
+| `~/.claude.json` | `/home/hndrewaall/.claude.json` | `rw` | Top-level Claude Code config (MCP servers, model prefs, project allow-list). |
+| `~/repos` | `/home/hndrewaall/repos` | `ro` | Host repo trees. Read-only — confine container edits to `/workspace` or explicit clones. |
+| `~/bin` | `/home/hndrewaall/bin` | `ro` | Launcher / shim scripts (mostly symlinks into `~/repos/*/bin`). Resolves correctly because `~/repos` is also mounted. |
+| `~/claude-events` | `/home/hndrewaall/claude-events` | `rw` | claude-event JSONL spool. Host producers write, in-container `claude-event-watch` consumes. |
+| `~/.local/share/atuin` | `/home/hndrewaall/.local/share/atuin` | `ro` | Shell history DB. Read-only — concurrent writes would corrupt the host daemon's SQLite WAL. |
+| `~/signal-queue` | `/home/hndrewaall/signal-queue` | `ro` | Signal attachment files. Sole writer is the host signal-api container; the in-container claude only reads. |
+| `~/.config/session` | `/home/hndrewaall/.config/session` | `rw` | session-task queue.json (same path the queue-minisite mounts). |
+
+### macOS graceful no-op
+
+The compose file uses `${HOME}` interpolation on the host side, so the source
+paths resolve to `/Users/<you>/...` on macOS. Most of the host-state paths
+above (`~/claude-events`, `~/.local/share/atuin`, `~/signal-queue`, `~/bin`)
+don't exist on a fresh macOS workbot. Docker Desktop's bind-mount semantics
+auto-create empty directories at the source location when a mount references
+a missing path, so the container sees empty dirs — functionally equivalent to
+"no host state at all". The in-container claude-watch and claude tolerate
+empty/missing state gracefully (they create what they need on first use).
+
+If you're on macOS and want a specific host-state path to actually contain
+something, pre-create it on the host before the first `docker compose up`
+(e.g. `mkdir -p ~/claude-events`). Otherwise, expect empty mounts and
+"vanilla state" behavior for the missing surfaces — which is the same
+experience you had before this PR.
+
+(`~/.claude.json` is a file, not a directory; if it's missing on the host
+Docker Desktop auto-creates it as an empty directory, which the in-container
+claude then ignores. That's the intentional no-op path on a fresh macOS
+host.)
+
 ## Use the Claude Code shell
 
 The `claude-container` service runs in the foreground by default. To drop into the in-container tmux session:
