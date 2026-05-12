@@ -74,16 +74,57 @@ operator's real config instead of a vanilla blank slate. The mount set is
 deliberately narrow — only the paths that materially affect Claude Code
 behavior or claude-watch monitoring.
 
-| Host path | Container path | Mode | Why |
-|---|---|---|---|
-| `~/.claude` | `/home/hndrewaall/.claude` | `rw` | Session JSONLs, project state, cache, agent definitions (`agents/*.md`). Claude writes here continuously. |
-| `~/.claude.json` | `/home/hndrewaall/.claude.json` | `rw` | Top-level Claude Code config (MCP servers, model prefs, project allow-list). |
-| `~/repos` | `/home/hndrewaall/repos` | `ro` | Host repo trees. Read-only — confine container edits to `/workspace` or explicit clones. |
-| `~/bin` | `/home/hndrewaall/bin` | `ro` | Launcher / shim scripts (mostly symlinks into `~/repos/*/bin`). Resolves correctly because `~/repos` is also mounted. |
-| `~/claude-events` | `/home/hndrewaall/claude-events` | `rw` | claude-event JSONL spool. Host producers write, in-container `claude-event-watch` consumes. |
-| `~/.local/share/atuin` | `/home/hndrewaall/.local/share/atuin` | `ro` | Shell history DB. Read-only — concurrent writes would corrupt the host daemon's SQLite WAL. |
-| `~/signal-queue` | `/home/hndrewaall/signal-queue` | `ro` | Signal attachment files. Sole writer is the host signal-api container; the in-container claude only reads. |
-| `~/.config/session` | `/home/hndrewaall/.config/session` | `rw` | session-task queue.json (same path the queue-minisite mounts). |
+| Host path (default) | env-var override | Container path | Mode | Why |
+|---|---|---|---|---|
+| `/etc/claude-code` | `CLAUDE_HOST_MANAGED_SETTINGS_DIR` | `/etc/claude-code` | `ro` | Managed / enterprise Claude Code settings tier (`managed-settings.json`, etc.). macOS default is `/Library/Application Support/ClaudeCode` — override. |
+| `~/.claude` | `CLAUDE_HOST_CONFIG_DIR` | `/home/hndrewaall/.claude` | `rw` | User-global Claude Code state: session JSONLs, project state, cache, agent definitions (`agents/*.md`). Claude writes here continuously. |
+| `~/.claude.json` | `CLAUDE_HOST_CONFIG_FILE` | `/home/hndrewaall/.claude.json` | `rw` | User-global top-level Claude Code config (MCP servers, model prefs, project allow-list). |
+| `~/repos` | `CLAUDE_HOST_REPOS_DIR` | `/home/hndrewaall/repos` | `ro` | Host repo trees (also carries project-tier Claude Code config in each repo's `.claude/`). Read-only — confine container edits to `/workspace` or explicit clones. |
+| `~/bin` | `CLAUDE_HOST_BIN_DIR` | `/home/hndrewaall/bin` | `ro` | Launcher / shim scripts (mostly symlinks into `~/repos/*/bin`). Resolves correctly because `~/repos` is also mounted. |
+| `~/claude-events` | `CLAUDE_HOST_EVENTS_DIR` | `/home/hndrewaall/claude-events` | `rw` | claude-event JSONL spool. Host producers write, in-container `claude-event-watch` consumes. |
+| `~/.local/share/atuin` | `CLAUDE_HOST_ATUIN_DIR` | `/home/hndrewaall/.local/share/atuin` | `ro` | Shell history DB. Read-only — concurrent writes would corrupt the host daemon's SQLite WAL. |
+| `~/signal-queue` | `CLAUDE_HOST_SIGNAL_QUEUE_DIR` | `/home/hndrewaall/signal-queue` | `ro` | Signal attachment files. Sole writer is the host signal-api container; the in-container claude only reads. |
+| `~/.config/session` | _(not overridable; shared with queue-minisite)_ | `/home/hndrewaall/.config/session` | `rw` | session-task queue.json (same path the queue-minisite mounts). |
+
+### Host paths on non-default layouts (env-var overrides)
+
+Every Phase-2 mount source is overridable via a `CLAUDE_HOST_*` env var
+(see the "env-var override" column in the table above). Defaults resolve
+to the standard Linux locations under `${HOME}` (or `/etc` for the
+managed-settings tier). Override via `.env` in this directory — `docker
+compose up` auto-loads it. A starting `.env.example` ships in this
+directory; copy to `.env` and uncomment the lines you need.
+
+This is the recommended fix for any host whose Claude Code config or
+operator-tooling paths live somewhere other than the defaults. The
+most common case is **macOS**, where Claude Code's _managed_ settings
+tier lives at a different path than on Linux:
+
+| Tier | Linux default | macOS default |
+|---|---|---|
+| Managed / enterprise (`managed-settings.json`) | `/etc/claude-code/` | `/Library/Application Support/ClaudeCode/` |
+| User-global (`~/.claude/`) | `${HOME}/.claude` | `${HOME}/.claude` (same) |
+| User-global top-level (`~/.claude.json`) | `${HOME}/.claude.json` | `${HOME}/.claude.json` (same) |
+| Project-level (`.claude/` in a repo) | `${HOME}/repos/*/.claude` | `${HOME}/repos/*/.claude` (same; arrives via the repos mount) |
+
+The user-tier paths are the same on both OSes per the upstream
+[Claude Code settings docs](https://code.claude.com/docs/en/settings) —
+no override needed unless your host intentionally relocates them. The
+**managed-settings tier** is the one that does differ between Linux and
+macOS, and is the env var most macOS operators will want to set.
+
+A minimal macOS `.env`:
+
+```ini
+# Point at the macOS managed-settings location instead of /etc/claude-code.
+CLAUDE_HOST_MANAGED_SETTINGS_DIR=/Library/Application Support/ClaudeCode
+```
+
+`.env` values support whitespace literally — no quoting needed for the
+embedded space in `Application Support`. If a particular host-state
+path doesn't exist on your machine (e.g. no `~/signal-queue` because
+you don't run the Signal bot), leave it unset — see "macOS graceful
+no-op" below for the bind-mount behavior on missing source paths.
 
 ### macOS graceful no-op
 
