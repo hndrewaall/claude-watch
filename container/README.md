@@ -52,8 +52,10 @@ To pin to a different upstream revision:
 docker build --build-arg CLAUDE_WATCH_REF=<sha-or-tag> -t claude-container:dev container/
 ```
 
-The `entrypoint.sh` runs the real `claude-watch` daemon in pane 1.
-See the "Run" section below for the resulting pane layout.
+The `entrypoint.sh` creates a single-pane tmux session by default (claude
+only). Set `CLAUDE_CONTAINER_SIDEBAR=1` to enable the optional 2-pane
+layout with `claude-watch` in a 25%-wide right sidebar. See the "Pane
+layout" section below for both shapes.
 
 ## Run (without the wrapper)
 
@@ -86,14 +88,36 @@ docker run --rm -it claude-container:dev bash
 
 ## Pane layout
 
-The entrypoint creates a tmux session named `claude-container` with two panes:
+### Default (one full-screen pane)
+
+The entrypoint creates a tmux session named `claude-container` with a single
+full-screen pane:
+
+- **Pane 0 (`claude-container:0.0`)** — `claude` running interactively.
+  This is the pane the user types into.
+
+This matches the `dashboard` script's documented default in
+[`docs/dashboard-layout.md`](../docs/dashboard-layout.md): "no config file
+= claude-only single full-screen pane". A 2-pane layout with a 25%-wide
+sidebar renders as a too-narrow strip in typical browser terminals (the
+ttyd web console at `examples/compose/`), so the in-container daemon is
+opt-in.
+
+### Sidebar mode (`CLAUDE_CONTAINER_SIDEBAR=1`)
+
+Setting `CLAUDE_CONTAINER_SIDEBAR=1` in the container's environment
+restores the previous 2-pane layout:
 
 - **Pane 0 (`claude-container:0.0`, left, ~75%)** — `claude` running
-  interactively. This is the pane the user types into.
+  interactively.
 - **Pane 1 (`claude-container:0.1`, right, ~25%)** — the in-container
   `claude-watch` daemon (bare `claude-watch` invocation). Reads pane 0 via
   in-container `tmux capture-pane`, enforces token-stall / heartbeat /
   context-warning checks against the in-container claude.
+
+The daemon is still available outside sidebar mode — exec into the
+container and run `claude-watch` yourself, or inspect `tmux capture-pane`
+output directly.
 
 The daemon picks up its config from `/etc/claude-watch/config.toml` (baked
 into the image, sourced from `claude-watch.config.toml` in this directory).
@@ -106,7 +130,8 @@ Container-specific deltas from a typical host config:
 - `watcher_monitor`, `auto_update`, `reauth`, `task_watch`, `hybrid`
   disabled — those depend on host integrations.
 
-To inspect pane 1 from another shell on the host:
+To inspect pane 1 from another shell on the host (only meaningful when
+`CLAUDE_CONTAINER_SIDEBAR=1` was set at container start):
 
 ```
 sudo docker exec -it <container> tmux attach -t claude-container
@@ -114,9 +139,9 @@ sudo docker exec <container> tmux capture-pane -t claude-container:0.1 -p
 sudo docker exec <container> cat /tmp/claude-watch.jsonl
 ```
 
-If the daemon fails to start (config parse error, etc.) pane 1 drops to a
-bash prompt with the exit code printed, so the failure is visible on
-`tmux attach` instead of disappearing into a closed pane.
+In sidebar mode, if the daemon fails to start (config parse error, etc.)
+pane 1 drops to a bash prompt with the exit code printed, so the failure
+is visible on `tmux attach` instead of disappearing into a closed pane.
 
 ## In-container user name
 

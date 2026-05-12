@@ -1,15 +1,27 @@
 #!/usr/bin/env bash
-# claude-container entrypoint — sets up a 2-pane tmux session.
+# claude-container entrypoint — sets up a tmux session running claude.
 #
-# Pane 0 (main, left): runs `claude` interactively.
-# Pane 1 (right, ~25%): runs the in-container `claude-watch` daemon, observing
-#   pane 0 via in-container `tmux capture-pane`. Replaces the Phase 0
-#   placeholder bash banner (q-2026-05-11-8a96, Phase 1e).
+# Default layout: ONE window, ONE full-screen pane running `claude`.
+# Matches the `dashboard` script's documented default (docs/dashboard-layout.md):
+# "no config file = claude-only single full-screen pane". Anything beyond that
+# is opt-in via CLAUDE_CONTAINER_SIDEBAR=1 (which restores the prior 2-pane
+# layout with claude-watch in a 25%-wide right sidebar).
 #
-# Pane 1 invocation (bare `claude-watch` = daemon, same call as a host-side
-# `claude-watch.service` systemd unit). Daemon picks up config from the env
-# var below; the config pins it to this very tmux session
-# (`claude-container:0.0`) so it doesn't auto-detect across other sessions.
+# Sidebar mode (when CLAUDE_CONTAINER_SIDEBAR=1):
+#   Pane 0 (left, ~75%): runs `claude` interactively.
+#   Pane 1 (right, ~25%): runs the in-container `claude-watch` daemon,
+#     observing pane 0 via in-container `tmux capture-pane`. Bare
+#     `claude-watch` = daemon, same call as a host-side
+#     `claude-watch.service` systemd unit. The daemon's config pins it to
+#     this very tmux session so it doesn't auto-detect across other
+#     sessions.
+#
+# Why removed-by-default: the sidebar pane was rendering as a ~10-column
+# narrow strip in the ttyd browser console (q-2026-05-12-2e6c) with
+# rewrapped duplicate text — visually broken at typical browser-terminal
+# widths. The dashboard docs already say claude-only is the default;
+# this entrypoint now matches that contract. Set CLAUDE_CONTAINER_SIDEBAR=1
+# if you want the in-container daemon visible in its own pane.
 #
 # Env passthrough: CLAUDE_CODE_SSE_PORT, ANTHROPIC_API_KEY, plus any CLAUDE_*
 # and ANTHROPIC_* vars are already in the process env (docker -e or compose
@@ -89,18 +101,25 @@ fi
 tmux new-session -d -s "$SESSION" -x 200 -y 50 \
     "exec claude"
 
-# Pane 1 (right, ~25%): the in-container claude-watch daemon. Bare
+# Optional sidebar: when CLAUDE_CONTAINER_SIDEBAR=1, split off a 25%-wide
+# right pane running the in-container claude-watch daemon. Bare
 # `claude-watch` with no subcommand runs the daemon (same invocation as
 # the host's systemd unit). If the binary fails to start (config parse
 # error, missing tmux server, etc.) we surface stderr inline AND keep the
-# pane open with a shell prompt so Andrew can see the failure on
-# `tmux attach` instead of finding a closed pane and an empty session.
-tmux split-window -h -t "$SESSION:0" -p 25 \
-    "echo '[pane 1] starting claude-watch (config=$CLAUDE_WATCH_CONFIG)'; \
-     claude-watch 2>&1 || { ec=\$?; \
-        echo; echo '[pane 1] claude-watch exited with code '\$ec; \
-        echo '[pane 1] dropping to shell so you can inspect; exit to close'; \
-        exec bash; }"
+# pane open with a shell prompt so the failure is visible on
+# `tmux attach` instead of leaving a closed pane and an empty session.
+#
+# Default-off because the sidebar renders as a too-narrow strip in
+# typical browser terminals (the ttyd web console), and the dashboard
+# docs already say claude-only is the default single-pane shape.
+if [ "${CLAUDE_CONTAINER_SIDEBAR:-0}" = "1" ]; then
+    tmux split-window -h -t "$SESSION:0" -p 25 \
+        "echo '[pane 1] starting claude-watch (config=$CLAUDE_WATCH_CONFIG)'; \
+         claude-watch 2>&1 || { ec=\$?; \
+            echo; echo '[pane 1] claude-watch exited with code '\$ec; \
+            echo '[pane 1] dropping to shell so you can inspect; exit to close'; \
+            exec bash; }"
+fi
 
 # Focus the main claude pane.
 tmux select-pane -t "$SESSION:0.0"
