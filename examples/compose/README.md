@@ -2,7 +2,7 @@
 
 End-to-end `docker compose` example that wires:
 
-- [**claude-container**](https://github.com/hndrewaall/claude-container) (currently private — see [Caveats](#caveats)) — Claude Code + `claude-watch` + tmux baked into one image.
+- **claude-container** (this repo, under [`container/`](../../container/)) — Claude Code + `claude-watch` + tmux baked into one image.
 - **queue-minisite** (this repo, under `queue-minisite/`) — mobile-friendly Flask UI for the `session-task` work queue.
 - [**eichi**](https://github.com/hndrewaall/eichi) `search-minisite` — Flask UI for the local sqlite-vec + sentence-transformers semantic-search CLI.
 
@@ -17,14 +17,14 @@ Drop into a freshly cloned setup, run one command, get the integrated experience
 
 ## Sibling-repo layout
 
-The compose file uses sibling-repo build contexts (`../../../eichi`, `../../../claude-container`). Clone all three repos next to each other:
+The compose file uses an in-repo build context (`../../container`) for the
+claude-container service and a sibling-repo context (`../../../eichi`) for
+eichi search. Clone both repos next to each other:
 
 ```sh
 mkdir -p ~/code && cd ~/code
 git clone https://github.com/hndrewaall/claude-watch.git
 git clone https://github.com/hndrewaall/eichi.git
-# If you have access — see "Caveats" below.
-git clone <claude-container-url> claude-container
 ```
 
 Resulting layout:
@@ -32,12 +32,12 @@ Resulting layout:
 ```
 ~/code/
   claude-watch/
+    container/          <- claude-container source (this repo)
     examples/compose/   <- you run docker compose from here
   eichi/
-  claude-container/     (optional)
 ```
 
-Any parent directory works (`~/code/`, `~/src/`, `/srv/`, etc.) — only the sibling relationship matters.
+Any parent directory works (`~/code/`, `~/src/`, `/srv/`, etc.) — only the sibling relationship between `claude-watch/` and `eichi/` matters.
 
 ## Pre-flight (host side)
 
@@ -72,7 +72,7 @@ docker compose exec claude-container bash
 claude
 ```
 
-Or use the standalone `claude-tmux` wrapper that ships in the `claude-container` repo — it's a more ergonomic entrypoint than `docker compose exec` for interactive use. See the claude-container README for details.
+Or use the standalone `claude-tmux` wrapper at [`container/bin/claude-tmux`](../../container/bin/claude-tmux) — it's a more ergonomic entrypoint than `docker compose exec` for interactive use. See [`container/README.md`](../../container/README.md) for details.
 
 ## First-run indexing (eichi)
 
@@ -94,18 +94,9 @@ The container will see the updated index next request — no restart required (s
 
 In-container paths (right-hand side of `volumes:`) hardcode `/home/hndrewaall/...` because the `hndrewaall` user is baked into the `claude-container` and `eichi-search` Dockerfiles at uid 1000. Your **host** user can be anything — bind-mount left-hand sides use `${HOME}` interpolation. If your host UID is not 1000, the bind-mounted state directories will look root-owned to the container; the cleanest fix is to add `user: "$(id -u):$(id -g)"` to each service and `chown` the host directories before launching.
 
-### claude-container is currently private
+### Skipping services
 
-The `claude-container` repo isn't public yet (as of this writing). If you don't have access:
-
-1. Comment out the entire `claude-container:` service block in `docker-compose.yml`.
-2. Run `docker compose up queue-minisite eichi-search` instead.
-
-The queue UI and search UI work standalone. You'd then run `claude` natively (or via your own wrapper) on the host.
-
-### queue-minisite Dockerfile dependency
-
-This compose file references `queue-minisite/Dockerfile` and `tools/session-task/session-task` from the claude-watch repo root. Both land via [PR #100](https://github.com/hndrewaall/claude-watch/pull/100) ("Add queue-minisite (Flask UI for session-task queue)"). If you're on a branch that predates that merge, check out `feat/absorb-queue-minisite` or wait for it to land on `main`.
+`claude-container`, `queue-minisite`, and `eichi-search` are independent — comment any one out in `docker-compose.yml` and the rest still work. For example, `docker compose up queue-minisite eichi-search` skips the heavy Rust + Node build of the claude-container image.
 
 ### No upstream auth gate
 
