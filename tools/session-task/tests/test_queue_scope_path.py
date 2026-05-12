@@ -120,9 +120,8 @@ def test_path_overlaps_repo_when_path_added_first():
 
 
 def test_sibling_path_tokens_do_not_overlap():
-    """The real-world case Andrew flagged 2026-05-11:
-    monitoring/ + ecowitt-exporter on docker-gomorrah should NOT block
-    queue-minisite/ work on the same repo.
+    """Two unrelated subdirectories (e.g. monitoring/ + a sibling exporter
+    dir) on the same repo should NOT block each other's queue items.
     """
     with tempfile.TemporaryDirectory() as tmp:
         env = _env_for_tmp(tmp)
