@@ -93,6 +93,17 @@ The claude-container entrypoint creates the session on the default socket
 `tmux -S /tmp/tmux-1000/default attach-session -t claude-container`. Both
 services run as uid 1000 so socket permissions align.
 
+### Cross-platform volume perms
+
+On Docker Desktop (macOS / Windows), the bundled `tmux-socket-init` service
+chowns the shared `/tmp/tmux-1000` volume to uid 1000 mode 0700 on first
+start. This is necessary because Docker Desktop's volume layer does not
+propagate the image-side directory perms the way native Linux Docker does,
+so the named volume otherwise comes up root-owned and tmux refuses to
+bind its socket. Harmless no-op on Linux. `claude-container` and `ttyd`
+both `depends_on` the init service with `condition:
+service_completed_successfully`, so cold-start ordering is guaranteed.
+
 ### Theme + font
 
 The default theme is Solarized-dark (Ethan Schoonover's public-domain palette).
