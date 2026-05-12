@@ -108,11 +108,31 @@ service_completed_successfully`, so cold-start ordering is guaranteed.
 
 ### Theme + font
 
-The default theme is Solarized-dark (Ethan Schoonover's public-domain palette).
-The default font is `Menlo` with fallback to `monospace`. Override either by
-editing the `-t theme=…` / `-t fontFamily=…` flags in the `ttyd.command` list
-in `docker-compose.yml`, or by forking `ttyd/Dockerfile` to bundle a custom
-font into the image.
+The default xterm.js theme is Solarized-dark (Ethan Schoonover's public-domain
+palette). The default font is `Menlo` with fallback to `monospace`. Override
+either by editing the `-t theme=…` / `-t fontFamily=…` flags in the
+`ttyd.command` list in `docker-compose.yml`, or by forking
+`ttyd/Dockerfile` to bundle a custom font into the image.
+
+### Autodark (page chrome matches system color-scheme)
+
+The ttyd image bundles a build-time-patched `index.html` that adds a
+`prefers-color-scheme` media-query CSS block so the page background
+around the xterm.js terminal flips between Solarized base03 (dark) and
+base3 (light) to match the operator's system color-scheme. Without this,
+macOS Safari / Chrome in dark mode would render a white frame around the
+dark terminal.
+
+A small `<script>` block in the same patch flips the xterm.js runtime
+theme to match the system color-scheme on page load, and reapplies it on
+a 2-second `setInterval` to defend against ttyd's post-connect
+`SET_PREFERENCES` WebSocket message that otherwise overwrites the
+client-side theme. Full details in
+[`ttyd/inject-autodark.py`](ttyd/inject-autodark.py).
+
+If you don't want the autodark behavior, drop the `-I /usr/local/share/ttyd/index.html`
+line from `ttyd.command` in `docker-compose.yml`. ttyd will then serve
+its upstream bundled HTML unchanged.
 
 ### Security note
 
