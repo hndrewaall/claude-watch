@@ -41,6 +41,18 @@ export CLAUDE_WATCH_CONFIG="${CLAUDE_WATCH_CONFIG:-/etc/claude-watch/config.toml
 # writable by uid 1000. State dir is under ~/.cache; logs are in /tmp.
 mkdir -p "${HOME:-/home/hndrewaall}/.cache/claude-watch"
 
+# Bring in /etc/profile.d/claude-tools.sh so the bind-mounted Python CLIs
+# (session-task / claude-event / obligations) land on PATH for everything
+# the entrypoint spawns -- both tmux panes inherit this PATH. Bash login
+# + interactive shells started under `docker compose exec` pick the same
+# fragment up via /etc/profile or /etc/bash.bashrc independently; this
+# explicit source covers the entrypoint's own child processes (which are
+# neither). Graceful no-op if the file is missing.
+# shellcheck disable=SC1091
+if [ -r /etc/profile.d/claude-tools.sh ]; then
+    . /etc/profile.d/claude-tools.sh
+fi
+
 cleanup() {
     # Killing the tmux session terminates both panes' child processes
     # (pane 0's claude, pane 1's claude-watch daemon) via SIGHUP from the
