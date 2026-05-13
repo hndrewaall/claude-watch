@@ -39,6 +39,7 @@ WORKSPACE_PATH defaults to the value of the WORKSPACE env var, then to
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import shutil
@@ -114,7 +115,7 @@ def trust_workspace(workspace: str, config_path: Path) -> str:
     try:
         _write_atomic(config, config_path)
     except OSError as exc:
-        if getattr(exc, "errno", None) == 16:  # EBUSY — bind-mounted file
+        if getattr(exc, "errno", None) == errno.EBUSY:
             try:
                 _write_in_place(config, config_path)
             except OSError as exc2:
@@ -305,8 +306,6 @@ class _TrustWorkspaceTests(unittest.TestCase):
         # OSError(EBUSY) when renaming over a bind-mounted file. Force that
         # by monkeypatching os.replace for the duration of one call and
         # confirm the in-place fallback writes the change anyway.
-        import errno
-
         seed = {
             "numStartups": 7,
             "projects": {"/other": {"hasTrustDialogAccepted": True}},
@@ -345,8 +344,6 @@ class _TrustWorkspaceTests(unittest.TestCase):
         # we want them to surface as a "skip:" so the operator sees
         # what's broken instead of silently degrading to the non-atomic
         # path on every boot.
-        import errno
-
         self._config.write_text('{"projects": {}}', encoding="utf-8")
 
         original_replace = os.replace
