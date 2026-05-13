@@ -95,10 +95,38 @@ def trust_workspace(workspace: str, config_path: Path) -> str:
     # state across version bumps that re-check this key.
     entry.setdefault("projectOnboardingSeenCount", 1)
 
-    # Atomic write: tmpfile in the same dir + rename. .claude.json is
-    # bind-mounted in the compose example, so we MUST write the tmp on the
-    # SAME filesystem (the bind-mount target) so os.replace is a true
-    # atomic rename. tempfile.NamedTemporaryFile(dir=parent) guarantees that.
+    # Write strategy: try the safe atomic-rename path first (tmpfile in
+    # the same dir + os.replace), and on EBUSY fall back to in-place
+    # truncate+rewrite.
+    #
+    # Why the fallback exists: ~/.claude.json is bind-mounted as a FILE
+    # (not as part of a directory mount) in the example compose stack, and
+    # Linux refuses to rename() over an active bind-mount point with EBUSY
+    # ("Device or resource busy"). The atomic-rename path works fine when
+    # the file lives entirely in the container's overlay FS (a stripped-
+    # down `docker run` without the bind-mount) — we keep it as the
+    # preferred path so a crash mid-write there leaves no half-written
+    # file. The in-place path is non-atomic (a SIGKILL between truncate
+    # and final write could leave a partial JSON), but for a single
+    # boot-time write of a small file by a single process the window is
+    # microseconds — acceptable for the bind-mount case where we have no
+    # better option.
+    try:
+        _write_atomic(config, config_path)
+    except OSError as exc:
+        if getattr(exc, "errno", None) == 16:  # EBUSY — bind-mounted file
+            try:
+                _write_in_place(config, config_path)
+            except OSError as exc2:
+                return f"skip: write {config_path}: {exc2}"
+        else:
+            return f"skip: write {config_path}: {exc}"
+
+    return "trusted"
+
+
+def _write_atomic(config: dict, config_path: Path) -> None:
+    """Atomic write via tmpfile + os.replace. Raises OSError on failure."""
     tmp_path: Path | None = None
     try:
         with tempfile.NamedTemporaryFile(
@@ -114,15 +142,23 @@ def trust_workspace(workspace: str, config_path: Path) -> str:
             tmp.flush()
             os.fsync(tmp.fileno())
         os.replace(tmp_path, config_path)
-    except OSError as exc:
+        tmp_path = None  # ownership transferred
+    finally:
         if tmp_path is not None:
             try:
                 tmp_path.unlink(missing_ok=True)
             except Exception:
                 pass
-        return f"skip: write {config_path}: {exc}"
 
-    return "trusted"
+
+def _write_in_place(config: dict, config_path: Path) -> None:
+    """In-place truncate + rewrite. Non-atomic but works on Linux Docker
+    file bind-mounts where os.replace fails with EBUSY. Raises OSError
+    on failure."""
+    with config_path.open("w", encoding="utf-8") as f:
+        json.dump(config, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
 
 
 def main(argv: list[str]) -> int:
@@ -263,6 +299,82 @@ class _TrustWorkspaceTests(unittest.TestCase):
         self.assertEqual(
             cfg["projects"]["/custom/path"]["hasTrustDialogAccepted"], True
         )
+
+    def test_ebusy_fallback_uses_in_place_write(self) -> None:
+        # Simulate the Linux Docker file-bind-mount case: os.replace raises
+        # OSError(EBUSY) when renaming over a bind-mounted file. Force that
+        # by monkeypatching os.replace for the duration of one call and
+        # confirm the in-place fallback writes the change anyway.
+        import errno
+
+        seed = {
+            "numStartups": 7,
+            "projects": {"/other": {"hasTrustDialogAccepted": True}},
+        }
+        with self._config.open("w", encoding="utf-8") as f:
+            json.dump(seed, f)
+
+        original_replace = os.replace
+        replace_calls = {"n": 0}
+
+        def fake_replace(src, dst):
+            replace_calls["n"] += 1
+            raise OSError(errno.EBUSY, "Device or resource busy")
+
+        os.replace = fake_replace
+        try:
+            result = trust_workspace("/workspace", self._config)
+        finally:
+            os.replace = original_replace
+
+        self.assertEqual(result, "trusted")
+        self.assertGreaterEqual(replace_calls["n"], 1)
+        cfg = self._read()
+        # In-place fallback should have written through.
+        self.assertEqual(
+            cfg["projects"]["/workspace"]["hasTrustDialogAccepted"], True
+        )
+        # And preserved the other top-level + project entries.
+        self.assertEqual(cfg["numStartups"], 7)
+        self.assertEqual(
+            cfg["projects"]["/other"]["hasTrustDialogAccepted"], True
+        )
+
+    def test_non_ebusy_oserror_still_skips(self) -> None:
+        # Non-EBUSY OSErrors should NOT trigger the in-place fallback —
+        # we want them to surface as a "skip:" so the operator sees
+        # what's broken instead of silently degrading to the non-atomic
+        # path on every boot.
+        import errno
+
+        self._config.write_text('{"projects": {}}', encoding="utf-8")
+
+        original_replace = os.replace
+        in_place_called = {"n": 0}
+        original_in_place = _write_in_place
+
+        def fake_replace(src, dst):
+            raise OSError(errno.EACCES, "Permission denied")
+
+        # Track whether the in-place fallback runs (it should NOT for EACCES).
+        def tracking_in_place(cfg, path):
+            in_place_called["n"] += 1
+            return original_in_place(cfg, path)
+
+        os.replace = fake_replace
+        # Patch the module-level binding the helper resolves.
+        import sys
+
+        mod = sys.modules[__name__]
+        mod._write_in_place = tracking_in_place  # type: ignore[attr-defined]
+        try:
+            result = trust_workspace("/workspace", self._config)
+        finally:
+            os.replace = original_replace
+            mod._write_in_place = original_in_place  # type: ignore[attr-defined]
+
+        self.assertTrue(result.startswith("skip:"), result)
+        self.assertEqual(in_place_called["n"], 0)
 
 
 def _run_tests() -> int:

@@ -80,7 +80,7 @@ test-dashboard:
 
 # Run the trust-workspace embedded test suite (claude-container's
 # pre-seed for ~/.claude.json's projects[<workspace>].hasTrustDialogAccepted
-# entry; suppresses the in-container first-launch trust prompt). 9 cases,
+# entry; suppresses the in-container first-launch trust prompt). 11 cases,
 # <0.1s, all in-process against tmpdir HOMEs.
 test-trust-workspace:
 	python3 container/bin/trust-workspace.py --test

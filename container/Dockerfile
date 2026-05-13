@@ -161,7 +161,8 @@ RUN chmod 0644 /etc/profile.d/claude-tools.sh \
 # stripped-down `docker run` without ~/.claude.json mounted still works
 # (operator sees the trust prompt once and dismisses it manually). See
 # container/bin/trust-workspace.py for the full safety contract and the
-# embedded `--test` mode (9 unit tests).
+# embedded `--test` mode (11 unit tests, including the Linux file-bind-mount
+# EBUSY fallback path).
 COPY bin/trust-workspace.py /usr/local/bin/trust-workspace
 RUN chmod +x /usr/local/bin/trust-workspace
 
