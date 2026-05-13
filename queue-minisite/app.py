@@ -1596,7 +1596,12 @@ def _tail_workload_output(label: str) -> Iterator[bytes]:
     })
 
     try:
-        f = open(out_path, "r", encoding="utf-8", errors="replace")
+        # newline="" disables Python's universal-newlines translation so
+        # bare \r bytes survive into the buffer for _split_cr_lf_segments
+        # to see. Without this, the default newline=None mode rewrites
+        # both \r\n AND lone \r to \n during read(), erasing the very
+        # signal we need to detect rsync-style progress frames.
+        f = open(out_path, "r", encoding="utf-8", errors="replace", newline="")
     except OSError as exc:
         yield _format_sse({"type": "error", "kind": "open-failed", "error": str(exc)})
         return
@@ -1987,7 +1992,10 @@ def _replay_workload_output(path: Path) -> Iterator[bytes]:
 
     line_count = 0
     try:
-        with open(path, "r", encoding="utf-8", errors="replace") as f:
+        # newline="" disables universal-newlines translation so \r bytes
+        # survive into the buffer for _split_cr_lf_segments. See the
+        # matching note in _tail_workload_output.
+        with open(path, "r", encoding="utf-8", errors="replace", newline="") as f:
             data = f.read()
         # Replay an entire archive in one pass — splitting on \r AND \n
         # so producers that wrote in-place progress updates (rsync,

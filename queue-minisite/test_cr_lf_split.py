@@ -141,5 +141,49 @@ class SplitCrLfSegmentsTests(unittest.TestCase):
         self.assertEqual(rem, "")
 
 
+class WorkloadOutputCrFlavorTests(unittest.TestCase):
+    """Integration sanity for the file-open semantics.
+
+    The tail/replay paths MUST open workload output files with
+    ``newline=""`` so Python's universal-newlines translation doesn't
+    silently rewrite ``\\r`` and ``\\r\\n`` to ``\\n`` during read().
+    Without that flag the splitter never sees a ``\\r`` byte and every
+    rsync-style progress frame would be emitted as ``transient=False``,
+    defeating the whole point of the feature.
+    """
+
+    def test_universal_newlines_default_strips_cr(self) -> None:
+        # Sanity baseline: prove the default open() mode IS lossy. If
+        # this ever changes upstream we want to know.
+        import tempfile
+        with tempfile.NamedTemporaryFile("wb", delete=False) as tf:
+            tf.write(b"a\r10\r20\r30\n")
+            path = tf.name
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                self.assertNotIn("\r", f.read())
+        finally:
+            import os
+            os.unlink(path)
+
+    def test_newline_empty_preserves_cr(self) -> None:
+        import tempfile
+        with tempfile.NamedTemporaryFile("wb", delete=False) as tf:
+            tf.write(b"a\r10\r20\r30\n")
+            path = tf.name
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace", newline="") as f:
+                data = f.read()
+            self.assertEqual(data.count("\r"), 3)
+            segs, _ = _split_cr_lf_segments(data, flush_remainder=True)
+            self.assertEqual(
+                segs,
+                [("a", True), ("10", True), ("20", True), ("30", False)],
+            )
+        finally:
+            import os
+            os.unlink(path)
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main(verbosity=2)
