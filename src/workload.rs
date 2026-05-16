@@ -3508,19 +3508,19 @@ for i in range(10): print(\"py-line-\" + str(i)); time.sleep(0.1)\n'";
         assert_eq!(ec.trim(), "0", "expected exit 0; got {ec:?}");
     }
 
-    /// End-to-end: a workload that emits progress lines on a cadence
-    /// gets its runtime heartbeat re-touched on each output growth.
-    /// This is the happy-path proof that the progress-driven sidecar
-    /// fires when the wrapped command IS making progress.
+    /// End-to-end: a workload that emits MANY progress lines triggers
+    /// many heartbeat re-touches. The happy-path proof that the
+    /// progress-driven sidecar fires when the wrapped command IS
+    /// making progress.
     ///
-    /// We can't easily inspect the heartbeat WHILE the wrapper is alive
-    /// (the EXIT trap removes the file), so we capture the heartbeat
-    /// mtime mid-run from a background reader that snapshots the file
-    /// before the wrapper exits. Simpler: run the wrapped command with
-    /// repeated `echo` + `sleep` and snapshot the heartbeat mtime
-    /// mid-loop via a separate `cp` of the heartbeat file to a side
-    /// path. We use the wrapped command itself to do the snapshot,
-    /// since it has the same filesystem visibility.
+    /// Strategy: run a wrapped command that emits one line per second
+    /// for 5 seconds. After it exits, capture the heartbeat mtime
+    /// AND compare it to the wrapper-start time. The heartbeat must
+    /// have advanced by at least 3 seconds past wrapper-start (one
+    /// touch per output line, debounced to one touch per poll
+    /// interval). We snapshot via the wrapped command itself
+    /// (writing `stat -c %Y` to a side file BEFORE the wrapper's EXIT
+    /// trap can remove the heartbeat).
     #[test]
     fn wrapper_script_runtime_heartbeat_refreshes_when_output_grows() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -3529,24 +3529,25 @@ for i in range(10): print(\"py-line-\" + str(i)); time.sleep(0.1)\n'";
         let hb_path = tmp.path().join("prog.heartbeat");
         let rt_hb_path = tmp.path().join("runtime").join("prog.heartbeat");
         let script_path = tmp.path().join("prog.sh");
-        // The wrapped command snapshots the runtime heartbeat mtime
-        // BEFORE producing more output, sleeps long enough for the
-        // sidecar to poll and see the size grow, then snapshots again.
-        // If the sidecar is progress-driven the second mtime > first.
-        let snap_a = tmp.path().join("snap_a.mtime");
-        let snap_b = tmp.path().join("snap_b.mtime");
+        let start_mtime_path = tmp.path().join("start.mtime");
+        let final_mtime_path = tmp.path().join("final.mtime");
+        // The wrapped command snapshots the heartbeat mtime up-front
+        // (a baseline from the wrapper's initial touch), then emits 5
+        // lines on a 1s cadence (5x the poll interval), then captures
+        // the heartbeat mtime again. The progress-driven sidecar must
+        // have re-touched at least once -> final_mtime > start_mtime.
         let user_cmd = format!(
-            "echo first; \
-             sleep 1; \
-             stat -c %Y {hb_a} > {a}; \
-             echo second; \
-             sleep 2; \
-             stat -c %Y {hb_b} > {b}; \
-             echo third",
-            hb_a = rt_hb_path.display(),
-            hb_b = rt_hb_path.display(),
-            a = snap_a.display(),
-            b = snap_b.display(),
+            "stat -c %Y {hb_s} > {start}; \
+             echo line1; sleep 1; \
+             echo line2; sleep 1; \
+             echo line3; sleep 1; \
+             echo line4; sleep 1; \
+             echo line5; sleep 1; \
+             stat -c %Y {hb_f} > {final}",
+            hb_s = rt_hb_path.display(),
+            hb_f = rt_hb_path.display(),
+            start = start_mtime_path.display(),
+            final = final_mtime_path.display(),
         );
 
         let script_full = build_wrapper_script(
@@ -3564,12 +3565,13 @@ for i in range(10): print(\"py-line-\" + str(i)); time.sleep(0.1)\n'";
         std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o700))
             .expect("chmod");
 
-        // Slow heartbeat OFF; runtime heartbeat poll = 1s. The wrapped
-        // command sleeps 1s + 2s, so at minimum 1-2 polls happen
-        // between snapshot A and snapshot B.
+        // Slow heartbeat OFF; runtime heartbeat poll = 1s. PTY OFF
+        // for hermetic behavior on CI (no PTY echo / EOL conversion
+        // noise from `script`).
         let status = Command::new("bash")
             .env("WORKLOAD_HEARTBEAT", "0")
             .env("WORKLOAD_RUNTIME_HEARTBEAT_INTERVAL_SECS", "1")
+            .env("WORKLOAD_PTY", "0")
             .arg(&script_path)
             .status()
             .expect("run wrapper");
@@ -3578,33 +3580,42 @@ for i in range(10): print(\"py-line-\" + str(i)); time.sleep(0.1)\n'";
             "wrapper exited non-zero: {status:?}\nscript:\n{script}"
         );
 
-        let a = std::fs::read_to_string(&snap_a)
-            .expect("read snap_a")
+        let start = std::fs::read_to_string(&start_mtime_path)
+            .expect("read start.mtime")
             .trim()
             .parse::<i64>()
-            .expect("snap_a int");
-        let b = std::fs::read_to_string(&snap_b)
-            .expect("read snap_b")
+            .expect("start mtime int");
+        let final_mt = std::fs::read_to_string(&final_mtime_path)
+            .expect("read final.mtime")
             .trim()
             .parse::<i64>()
-            .expect("snap_b int");
+            .expect("final mtime int");
+        let delta = final_mt - start;
         assert!(
-            b > a,
-            "runtime heartbeat mtime must advance when output grows: snap_a={a} snap_b={b}\n\
-             (if equal: sidecar is not re-touching on progress; if b<a: clock skew?)"
+            delta >= 2,
+            "runtime heartbeat mtime must advance by >=2s across 5x 1s output lines: \
+             start={start} final={final_mt} delta={delta}s\n\
+             (delta < 2 means the sidecar is not re-touching on progress)"
         );
     }
 
     /// End-to-end: a workload that emits NOTHING after startup leaves
-    /// the heartbeat mtime stuck at the initial touch. This is the
-    /// load-bearing proof that the progress-driven sidecar does NOT
-    /// give false-confidence when the wrapped command hangs.
+    /// the heartbeat mtime stuck. Load-bearing proof that the
+    /// progress-driven sidecar does NOT give false-confidence when
+    /// the wrapped command hangs (the PR #208 regression case).
     ///
-    /// Snapshot strategy: same as the progress test — the wrapped
-    /// command snapshots the heartbeat mtime, sleeps silently past
-    /// several poll intervals, then snapshots again. If the sidecar is
-    /// purely timer-based the second mtime > first; if it's
-    /// progress-driven the two are equal.
+    /// Strategy: the wrapped command captures the heartbeat mtime
+    /// immediately on entry (baseline), then `sleep 5` silently (5x
+    /// the 1s poll interval, no output writes at all), then captures
+    /// again. The progress-driven sidecar sees zero growth across all
+    /// polls -> the second mtime equals the first.
+    ///
+    /// This test is hermetic in a way the earlier `exec >/dev/null;
+    /// sleep` variant was not: there's no inner bash output, no
+    /// flushable libstdbuf buffer, no race between snap_a and the
+    /// sidecar's first poll. The only growth in `.output` after
+    /// snap_a is the wrapper's `=== DONE ===` footer, which lands
+    /// AFTER snap_b has already captured the heartbeat mtime.
     #[test]
     fn wrapper_script_runtime_heartbeat_does_not_refresh_when_silent() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -3613,29 +3624,20 @@ for i in range(10): print(\"py-line-\" + str(i)); time.sleep(0.1)\n'";
         let hb_path = tmp.path().join("hung.heartbeat");
         let rt_hb_path = tmp.path().join("runtime").join("hung.heartbeat");
         let script_path = tmp.path().join("hung.sh");
-        let snap_a = tmp.path().join("snap_a.mtime");
-        let snap_b = tmp.path().join("snap_b.mtime");
-        // The wrapped command emits one line, snapshots mtime, sleeps
-        // silently for 3s (3x the 1s poll interval), snapshots again.
-        // CRITICAL: no echo / printf / stdout writes between the two
-        // snapshots — otherwise the output file grows and the sidecar
-        // legitimately re-touches.
-        //
-        // `stat` writes to the snapshot file (not the output file)
-        // via `>`, so those writes don't grow the workload's combined
-        // output. The redirect target is the snap file path under
-        // `tmp/`, distinct from `out_path`.
+        let start_mtime_path = tmp.path().join("start.mtime");
+        let final_mtime_path = tmp.path().join("final.mtime");
+        // Capture heartbeat mtime on entry, sleep 5s silently,
+        // capture again. `stat -c %Y > file` writes to a SIDE file,
+        // not stdout, so the .output file genuinely doesn't grow
+        // between the two snapshots.
         let user_cmd = format!(
-            "echo running; \
-             sleep 1; \
-             stat -c %Y {hb_a} > {a}; \
-             exec 1>/dev/null 2>/dev/null; \
-             sleep 3; \
-             stat -c %Y {hb_b} > {b}",
-            hb_a = rt_hb_path.display(),
-            hb_b = rt_hb_path.display(),
-            a = snap_a.display(),
-            b = snap_b.display(),
+            "stat -c %Y {hb_s} > {start}; \
+             sleep 5; \
+             stat -c %Y {hb_f} > {final}",
+            hb_s = rt_hb_path.display(),
+            hb_f = rt_hb_path.display(),
+            start = start_mtime_path.display(),
+            final = final_mtime_path.display(),
         );
 
         let script_full = build_wrapper_script(
@@ -3653,9 +3655,12 @@ for i in range(10): print(\"py-line-\" + str(i)); time.sleep(0.1)\n'";
         std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o700))
             .expect("chmod");
 
+        // Slow heartbeat OFF; runtime heartbeat poll = 1s. PTY OFF
+        // for hermetic behavior.
         let status = Command::new("bash")
             .env("WORKLOAD_HEARTBEAT", "0")
             .env("WORKLOAD_RUNTIME_HEARTBEAT_INTERVAL_SECS", "1")
+            .env("WORKLOAD_PTY", "0")
             .arg(&script_path)
             .status()
             .expect("run wrapper");
@@ -3664,21 +3669,24 @@ for i in range(10): print(\"py-line-\" + str(i)); time.sleep(0.1)\n'";
             "wrapper exited non-zero: {status:?}\nscript:\n{script}"
         );
 
-        let a = std::fs::read_to_string(&snap_a)
-            .expect("read snap_a")
+        let start = std::fs::read_to_string(&start_mtime_path)
+            .expect("read start.mtime")
             .trim()
             .parse::<i64>()
-            .expect("snap_a int");
-        let b = std::fs::read_to_string(&snap_b)
-            .expect("read snap_b")
+            .expect("start mtime int");
+        let final_mt = std::fs::read_to_string(&final_mtime_path)
+            .expect("read final.mtime")
             .trim()
             .parse::<i64>()
-            .expect("snap_b int");
+            .expect("final mtime int");
+        let out_body = std::fs::read_to_string(&out_path).unwrap_or_default();
         assert_eq!(
-            a, b,
-            "runtime heartbeat mtime must NOT advance during silent stretches: \
-             snap_a={a} snap_b={b}\n\
-             (if b > a: the sidecar is still touching on a timer — the PR #208 regression)"
+            start, final_mt,
+            "runtime heartbeat mtime must NOT advance during a 5s silent stretch: \
+             start={start} final={final_mt} delta={delta}s\n\
+             .output body:\n{out_body}\n\
+             (if final > start: sidecar is still touching on a timer — the PR #208 regression)",
+            delta = final_mt - start,
         );
     }
 
