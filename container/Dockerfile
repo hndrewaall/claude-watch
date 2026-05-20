@@ -93,9 +93,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # every spawn site for re-entrancy as the wrong uid. The narrow
 # sudo-for-cron carve-out is the minimum-change shape that lets
 # cron start without disturbing any existing uid-1000 invariant.
-RUN printf '%s\n%s\n' \
+RUN printf '%s\n%s\n%s\n%s\n' \
         'hndrewaall ALL=(root) NOPASSWD: /usr/sbin/cron' \
         'hndrewaall ALL=(root) NOPASSWD: /bin/kill' \
+        'hndrewaall ALL=(root) NOPASSWD: /usr/bin/tee /etc/cron.d/00-env' \
+        'hndrewaall ALL=(root) NOPASSWD: /bin/chmod 0644 /etc/cron.d/00-env' \
         > /etc/sudoers.d/hndrewaall-cron \
     && chmod 0440 /etc/sudoers.d/hndrewaall-cron
 
@@ -718,6 +720,14 @@ RUN chmod +x /usr/local/bin/pre-agent-queue-gate-hook \
             /usr/local/bin/obligations-init \
             /usr/local/bin/agent-msg \
             /usr/local/bin/agent-tail
+
+# eval-no-grep-watcher-output — obligations evaluator script that DENIES
+# Bash commands which pipe task/watcher output files through grep/sed/awk/
+# head/tail. Ensures the main loop reads ALL events unfiltered. Seeded as
+# a default obligation row by obligations-init (evaluator predicate,
+# decision_mode=exit_code, stdin_field=tool_input.command).
+COPY container/bin/eval-no-grep-watcher-output /usr/local/bin/eval-no-grep-watcher-output
+RUN chmod +x /usr/local/bin/eval-no-grep-watcher-output
 
 # trust-workspace — pre-seeds projects[<workspace>].hasTrustDialogAccepted=true
 # in ~/.claude.json so the in-container claude binary skips the first-launch
