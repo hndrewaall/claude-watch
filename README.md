@@ -58,7 +58,8 @@ main loop to handle the underlying issue immediately.
 
 > For the **conceptual** treatment — how events, obligations, and
 > interruptions *differ* (not just how they escalate), where watchers fit as
-> the event sources, and why a harness-injected tool rejection is NOT an
+> the immediate notifiers (and why their count stays near one), how cron acts
+> as an event producer, and why a harness-injected tool rejection is NOT an
 > interruption — see
 > [`docs/concepts/event-hierarchy.md`](docs/concepts/event-hierarchy.md). It is
 > the entry point that ties the otherwise-scattered per-subsystem docs together.

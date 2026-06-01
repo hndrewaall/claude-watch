@@ -16,18 +16,23 @@ cost*:
 | **When it reaches the loop** | At the next loop pass (next prompt) | At a tool-call boundary, before the call runs | Mid-generation, immediately |
 | **Can it be ignored?** | Yes — it's just a line in context | No — it BLOCKS the matching tool call until its predicate is satisfied | No — it cancels what the loop is currently doing |
 | **Granularity** | Per loop pass | Per tool call | Per keystroke / generation |
-| **Who emits it** | A watcher / producer via the event bus | A `PreToolUse` / `PostToolUse` hook evaluating a predicate | The monitoring daemon (out-of-band) |
+| **Who emits it** | A watcher / producer via the event bus | A `PreToolUse` / `PostToolUse` hook evaluating a predicate | The monitoring daemon, via tmux `send-keys` (out-of-band) |
 | **Cost of using it** | Cheap; adds context noise | Medium; blocks work, must be satisfied or overridden | High; discards partial work |
 | **Failure posture** | Best-effort; can be missed | Default-open on internal error, but otherwise blocks | Reserved for can't-wait cases |
 
-The one-line mnemonic:
+The one-line mnemonic — a single escalation ladder, lowest rung to highest:
 
 ```
-event        <  obligation     <  interruption
-(informational) (blocking)        (forced)
-"check this      "you may not    "stop what you're
- next pass"        do X until Y"   doing right now"
+event             →  obligation        →  interruption (tmux send-keys)
+(notify)             (forcing function)   (escalation beyond the gate)
+"check this           "you may not         "stop what you're
+ next pass"             do X until Y"        doing right now"
 ```
+
+Each rung is the forcing function for the one below it: an **event** notifies,
+an **obligation** turns "should" into "must" by blocking a tool call, and a
+**tmux send-keys interruption** is the rung beyond the gate — it preempts the
+turn outright when even a blocking gate isn't enough (or fires too late).
 
 ---
 
@@ -44,6 +49,13 @@ and is free to act, defer, or absorb it as context.
 - **Use it when** the right response is "next time you come around, look at
   this." Periodic ticks, queue state transitions, completed background jobs,
   scheduled reminders, non-blocking alerts.
+- **Cron is a first-class event *producer*.** A scheduled job is the simplest
+  way to get periodic or time-triggered work into the loop: the cron job runs
+  on its schedule, emits a claude-event, and the event-watcher surfaces that
+  event on the next loop pass — no dedicated long-lived process required. This
+  is the preferred shape for anything that doesn't need sub-minute reactivity
+  (health checks, promotion scans, scheduled reminders). See "Where watchers
+  fit" below for why cron-as-producer is what keeps the watcher count low.
 - **It can be ignored.** There is no enforcement *on the bus itself* — the
   bus only moves the signal into context. If a class of event MUST be handled
   before some other action proceeds, that "must" is not the event's job; it
@@ -88,27 +100,32 @@ auto-satisfaction, and the override / exempt mechanics.
 
 ---
 
-## interruption — a forced, mid-generation preemption
+## interruption — the forcing function beyond an obligation (tmux send-keys)
 
-An **interruption** is a real preemption signal that breaks into the current
-turn. Where an event waits for the next pass and an obligation waits for the
-next tool call, an interruption does not wait at all — it cancels in-flight
-generation and forces the loop to deal with something *now*.
+An **interruption** is the next rung up from an obligation. Where an event
+waits for the next pass and an obligation waits for the next tool call, an
+interruption does not wait at all — it preempts the current turn and forces
+the loop to deal with something *now*. It is what you reach for when even a
+blocking gate isn't enough, or fires too late to prevent the harm.
 
-- **Mechanism**: an out-of-band monitor (the daemon, or a genuine human
-  preemption) injects directly into the loop's running session, canceling the
-  current generation. This is the most disruptive mechanism and is reserved
-  for situations where letting the current turn finish would make recovery
-  harder or impossible.
+- **Mechanism: tmux `send-keys`.** claude-watch's interruption/preemption is
+  delivered by the monitoring daemon injecting keystrokes directly into the
+  main loop's tmux session — this is the daemon's one out-of-band action. The
+  injection seizes the current turn rather than gating a future tool call.
+  (A genuine human preemption arrives the same way, through the real input
+  channel.)
 - **Use it when** waiting for a turn boundary is too late: context-window
   exhaustion approaching (compaction with uncommitted state is worse than a
   cancelled message), a stalled / zombie session, a dead watcher pipeline, or
   prolonged unproductive generation.
-- **It is orthogonal to the event/obligation pair.** Events and obligations
-  are about *signal* and *enforcement on signal*; an interruption is about
-  *seizing the turn*. An obligation that consistently "fires too late" (the
-  bad state is already in motion by the time a tool call is attempted) is a
-  candidate to be backed by an interruption instead.
+- **It is the rung above the obligation, not a separate axis.** Event →
+  obligation → tmux send-keys is one ladder of increasing force: notify, then
+  block a tool call, then preempt the turn. An obligation that consistently
+  "fires too late" (the bad state is already in motion by the time a tool call
+  is attempted) is the canonical candidate to be *promoted* to a tmux
+  send-keys interruption. The nuance that distinguishes it from the lower
+  rungs: it **seizes the current turn** (cancels in-flight generation) instead
+  of gating a future tool call.
 
 ### CRITICAL: a harness-injected rejection is NOT an interruption
 
@@ -133,11 +150,12 @@ How to tell them apart:
   **re-attempt the same action** — do not change your plan. A "rejected" call
   may even have partially run; verify state before retrying so you don't
   double-execute.
-- **Real interruption:** a genuine human preemption arrives as an actual
-  cancellation of the current generation (e.g. an out-of-band stop), or — in
-  a messaging-driven loop — as a fresh inbound *message*, not as tool-rejection
-  text. If a human wants to redirect you, that redirect comes through the real
-  input channel, not disguised as a denied tool call.
+- **Real interruption:** a genuine preemption arrives as an actual
+  cancellation of the current generation — the daemon's tmux `send-keys`
+  injection into the loop's session — or, in a messaging-driven loop, as a
+  fresh inbound *message*, not as tool-rejection text. If a human wants to
+  redirect you, that redirect comes through the real input channel, not
+  disguised as a denied tool call.
 
 When in doubt: inspect the rejection body. If it is hook/gate/context text,
 treat it as an obligation to satisfy (or context to absorb) and continue;
@@ -145,55 +163,82 @@ do not read it as a veto of your approach.
 
 ---
 
-## Where watchers fit: they are the event *sources*
+## Where watchers fit: they are the *immediate notifiers*
 
-**Watchers are the background tasks that produce events.** They are not a
-fourth tier — they sit underneath the "event" mechanism as its source layer.
-A watcher is a long-lived, supervised process (a filesystem-event poller, an
-inbox tailer, a queue observer) owned by the main loop: the loop spawns it,
-the loop restarts it on resume, and the loop is the only thing that may start
-it. When a watcher observes an external state change it emits onto the event
-bus, which surfaces it as an event on the next loop pass.
+**Watchers are the live processes that surface state into the loop.** They are
+not a fourth tier — they sit underneath the "event" mechanism as its delivery
+layer: the immediate notifier that takes a producer's signal and pushes it
+into context on the next loop pass. A watcher is a long-lived, supervised
+process (a filesystem-event poller, an inbox tailer, a queue observer) owned
+by the main loop: the loop spawns it, the loop restarts it on resume, and the
+loop is the only thing that may start it. When a watcher observes an external
+state change — or picks up an event a producer emitted — it surfaces it as an
+event on the next loop pass.
 
 The ownership rule matters: because watchers belong to the main loop, after
 any resume / clear / compaction the loop must restart them (it keeps no handle
 across the boundary), and a watcher must never be started by anything other
-than the loop — otherwise its output goes nowhere. See
-[`../watchers.md`](../watchers.md) for the full lifecycle and hygiene rules,
-and [`../adding-watchers.md`](../adding-watchers.md) for authoring one.
+than the loop — otherwise its output goes nowhere.
+
+### Keep the watcher count near one
+
+**Prefer a single general-purpose event-watcher that multiplexes many event
+types over a watcher per concern.** Each watcher is a tax, not a feature: it
+consumes a background-task handle slot, generates restart noise on every
+resume / `/clear` / compaction, triggers DOWN-state alerts when it crashes,
+and adds mental load to track across sessions. The general case should stay
+near *one* live watcher: a single event-watcher tailing the event bus and
+surfacing every event type that lands on it.
+
+The way you keep that count low is **cron-as-producer**: route a new periodic
+or scheduled signal through a cron job that *emits a claude-event*, which the
+one event-watcher then surfaces — instead of standing up another long-lived
+watcher process for it. Reach for a dedicated watcher only when sub-minute
+reactivity is genuinely required *and* no kernel event mechanism (inotify,
+systemd path units) fits. See the "Watchers are a tax, not a feature" and
+"Watcher vs. cron" sections of [`../watchers.md`](../watchers.md) for the full
+rationale and decision criteria, and [`../adding-watchers.md`](../adding-watchers.md)
+for authoring one.
 
 ```
-watcher  ──emits──▶  event bus  ──surfaces──▶  event (next loop pass)
-                                                  │
+cron / external state change  ──emits──▶  event bus
+                                              │
+                          event-watcher (the immediate notifier) surfaces it as…
+                                              ▼
+                                    event (next loop pass)
+                                              │
                           (if an actionable event is repeatedly ignored,
                            an enforcement layer escalates it into…)
-                                                  ▼
-                                              obligation (blocks a tool call)
-
-   …and entirely separately, an out-of-band monitor may raise an
-   interruption that preempts the current turn regardless of the above.
+                                              ▼
+                                    obligation (blocks a tool call)
+                                              │
+                          (if even a blocking gate fires too late,
+                           promote it one rung further to…)
+                                              ▼
+                          interruption — tmux send-keys (preempts the turn)
 ```
 
 ---
 
-## Escalation relationship (and what is orthogonal)
+## Escalation relationship: one ladder
 
-Events and obligations form an escalation ladder; interruptions are a
-separate axis:
+Event, obligation, and interruption form a single escalation ladder of
+increasing force — each rung is the forcing function for the one below it:
 
-- An **event** is the lowest tier — it surfaces state and can be ignored.
-- An **obligation** is the next tier up — it *enforces* an invariant on
+- An **event** is the lowest rung — it surfaces state and can be ignored.
+- An **obligation** is the next rung up — it *enforces* an invariant on
   state, blocking a class of tool calls until satisfied. An actionable event
   that is repeatedly missed is the canonical thing to *promote* into an
   obligation.
-- An **interruption** is orthogonal: rather than informing or gating, it
-  seizes the turn. Promote toward an interruption only when a gate
-  demonstrably fires too late to prevent the harm.
+- An **interruption (tmux send-keys)** is the top rung — when even a blocking
+  gate isn't enough or fires too late, it preempts the turn outright rather
+  than gating a future tool call. Promote toward an interruption only when a
+  gate demonstrably fires too late to prevent the harm.
 
-Design rule: put each signal at the **lowest tier that actually works**.
+Design rule: put each signal at the **lowest rung that actually works**.
 Reach for an event first; promote to an obligation only when "can be ignored"
-is unacceptable; reach for an interruption only when "wait for the next tool
-call" is too late. The README's
+is unacceptable; promote to a tmux send-keys interruption only when "wait for
+the next tool call" is too late. The README's
 [Alerting hierarchy](../../README.md#alerting-hierarchy) section has the
 visual diagram and the mechanism table; this doc is the conceptual companion
 that focuses on *how the three differ* rather than on the wiring.
@@ -204,7 +249,7 @@ that focuses on *how the three differ* rather than on the wiring.
 
 - [`../events.md`](../events.md) — the claude-event bus: emit/read CLIs, schema, debounce.
 - [`../event-must-act.md`](../event-must-act.md) — the enforcement layer that escalates an ignored actionable event into a blocking gate.
-- [`../watchers.md`](../watchers.md) — watcher lifecycle, ownership, and operator hygiene (the event sources).
+- [`../watchers.md`](../watchers.md) — watcher lifecycle, ownership, hygiene, and the watcher-vs-cron decision (why the watcher count stays near one).
 - [`../adding-watchers.md`](../adding-watchers.md) — authoring a new watcher.
 - [`../hooks.md`](../hooks.md) — the hooks layer and the "Obligations gate" (predicate vocabulary, modes, overrides).
 - [`../two-channel-design.md`](../two-channel-design.md) — the session/observation channel split where mid-generation interruption mechanics live.
