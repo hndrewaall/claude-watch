@@ -6,63 +6,75 @@ loop, plus the watchers that feed them. If you are a fresh agent trying to
 understand "what kinds of things can reach into the loop, and how do they
 differ," start here, then follow the cross-links into the per-subsystem docs.
 
-The three mechanisms are **not** variations on one idea. They differ in
-*when* they reach the loop, *whether they can be ignored*, and *what they
-cost*:
+All three demand handling — none of them is a passive FYI. They differ in
+*when* the loop must handle them, *how* (judgment vs. mechanical gate vs.
+preemption), and *what they cost*:
 
 | | **event** | **obligation** | **interruption** |
 |---|---|---|---|
-| **What it is** | An informational signal surfaced into context | A hard gate on tool calls | A forced preemption of the current turn |
+| **What it is** | An actionable signal the loop must triage / act on | A hard gate on tool calls | A forced preemption of the current turn |
 | **When it reaches the loop** | At the next loop pass (next prompt) | At a tool-call boundary, before the call runs | Mid-generation, immediately |
-| **Can it be ignored?** | Yes — it's just a line in context | No — it BLOCKS the matching tool call until its predicate is satisfied | No — it cancels what the loop is currently doing |
+| **How it's handled** | By the loop's *judgment* on the next pass — decide and act | By a *mechanical* predicate at the tool-call boundary — no judgment, the call is blocked until the predicate passes | By seizing the turn — the loop must deal with it now |
+| **What if it's not handled?** | A failure: it's a dropped actionable signal (and the source of context noise). The `event-must-act` layer flags it and can escalate it into an obligation — events are not meant to be droppable | The matching tool call cannot proceed until its predicate is satisfied | The turn is already seized; in-flight generation is cancelled |
 | **Granularity** | Per loop pass | Per tool call | Per keystroke / generation |
 | **Who emits it** | A watcher / producer via the event bus | A `PreToolUse` / `PostToolUse` hook evaluating a predicate | The monitoring daemon, via tmux `send-keys` (out-of-band) |
-| **Cost of using it** | Cheap; adds context noise | Medium; blocks work, must be satisfied or overridden | High; discards partial work |
-| **Failure posture** | Best-effort; can be missed | Default-open on internal error, but otherwise blocks | Forced preemption reserved for can't-wait cases (same channel also does routine out-of-band injections) |
+| **Cost of using it** | Cheap to deliver, but every event spends loop attention — mint one only for things that truly need acting on | Medium; blocks work, must be satisfied or overridden | High; discards partial work |
 
-The one-line mnemonic — a single escalation ladder, lowest rung to highest:
+The one-line mnemonic — a single ladder of increasing force, all three of
+which the loop must handle:
 
 ```
 event             →  obligation        →  interruption (tmux send-keys)
-(notify)             (forcing function)   (escalation beyond the gate)
-"check this           "you may not         "stop what you're
+(act next pass)      (forcing function)   (escalation beyond the gate)
+"triage + act         "you may not         "stop what you're
  next pass"             do X until Y"        doing right now"
 ```
 
-Each rung is the forcing function for the one below it: an **event** notifies,
-an **obligation** turns "should" into "must" by blocking a tool call, and a
-**tmux send-keys interruption** is the rung beyond the gate — it preempts the
-turn outright when even a blocking gate isn't enough (or fires too late).
+All three require handling; the rungs differ in *how* that handling is forced.
+An **event** must be triaged and acted on by the loop's judgment on its next
+pass. An **obligation** turns "should" into "must" *mechanically* by blocking a
+tool call. A **tmux send-keys interruption** is the rung beyond the gate — it
+preempts the turn outright when even a blocking gate isn't enough (or fires too
+late). A signal that genuinely needs no action does not belong on this ladder
+at all — see the anti-noise rule below.
 
 ---
 
-## event — an informational signal for the next loop pass
+## event — an actionable signal to triage on the next loop pass
 
-An **event** is a piece of information surfaced into the main loop's context
-so that the loop can *decide* whether to act on it. It does not block
-anything and it does not preempt anything. The loop sees it on its next pass
-and is free to act, defer, or absorb it as context.
+An **event** is a signal the main loop **must act on** — it surfaces state
+into context so that the loop can triage it and respond on its next pass. It
+is not a passive FYI. It does not block a tool call and it does not preempt
+the turn, but it does demand a decision: act now, schedule the work, or
+explicitly dispatch it. Letting an event slide by unhandled is a failure mode,
+not a normal outcome.
 
 - **Mechanism**: a producer emits a small JSON record onto the event bus; a
   watcher debounces a burst of these and surfaces a one-line-per-event batch
   into the loop's context (typically at the next `UserPromptSubmit`).
-- **Use it when** the right response is "next time you come around, look at
-  this." Periodic ticks, queue state transitions, completed background jobs,
-  scheduled reminders, non-blocking alerts.
+- **Use it when** the loop genuinely needs to *do something* the next time it
+  comes around: queue state transitions that need follow-up, a completed
+  background job whose result must be processed, a scheduled task that must
+  run, an alert that warrants a response.
 - **Cron is a first-class event *producer*.** A scheduled job is the simplest
   way to get periodic or time-triggered work into the loop: the cron job runs
   on its schedule, emits a claude-event, and the event-watcher surfaces that
   event on the next loop pass — no dedicated long-lived process required. This
   is the preferred shape for anything that doesn't need sub-minute reactivity
-  (health checks, promotion scans, scheduled reminders). See "Where watchers
+  (health checks, promotion scans, scheduled tasks). See "Where watchers
   fit" below for why cron-as-producer is what keeps the watcher count low.
-- **It can be ignored.** There is no enforcement *on the bus itself* — the
-  bus only moves the signal into context. If a class of event MUST be handled
-  before some other action proceeds, that "must" is not the event's job; it
-  is an **obligation** (see below). A companion enforcement layer can be
-  layered on top of events to count missed opportunities and escalate an
-  ignored-but-actionable event into a blocking gate — that layer is itself an
-  obligation, not a property of the event bus.
+- **Every event must be handled.** The bus only moves the signal into context;
+  the *requirement* that an actionable event actually gets triaged is enforced
+  by a companion layer that watches for dropped/ignored actionable events and
+  escalates one into a blocking gate (an obligation). That escalation path is
+  what keeps "events must act" honest — events are not droppable by design.
+
+> **Anti-noise rule: if a signal is genuinely safe to ignore, it should not be
+> an event.** Minting ignorable things as events is exactly how the loop's
+> context fills with noise. Route a no-action-needed signal to a different
+> channel instead: a push-notification channel (for a human to glance at), a
+> plain log line, or a metric on a dashboard. Reserve events for things the
+> loop must actually act on.
 
 > "event → must act" is a deliberately separate concern: the bus delivers,
 > the enforcement layer (an obligation instance) ensures actionable ones
@@ -89,10 +101,11 @@ hook), so it is checked *before* the tool runs, never mid-generation.
   must-acknowledge-inbound before sending a message, must-read captured
   watcher output before restarting watchers, must-include a queue id before
   spawning a sub-agent, no-leakage gates on public-repo work.
-- **It cannot be ignored** the way an event can — it is the enforcement
-  layer. But it is also *narrowly scoped*: it only affects tool calls that
-  match its pattern, and its failure mode is conservative (default-open on
-  internal error) so a broken gate does not wedge the loop.
+- **It enforces mechanically.** Where an event relies on the loop's judgment
+  to get handled, an obligation needs no judgment at all — a failing predicate
+  denies the call outright. It is also *narrowly scoped*: it only affects tool
+  calls that match its pattern, and its failure mode is conservative
+  (default-open on internal error) so a broken gate does not wedge the loop.
 
 See the "Obligations gate" section of [`../hooks.md`](../hooks.md) for the
 predicate vocabulary, enforcement modes (`gate` vs. `inform`), scope guards,
@@ -230,13 +243,17 @@ cron / external state change  ──emits──▶  event bus
 
 ## Escalation relationship: one ladder
 
-Event, obligation, and interruption form a single escalation ladder of
-increasing force — each rung is the forcing function for the one below it:
+Event, obligation, and interruption form a single ladder of increasing force.
+All three must be handled; the rungs differ in *how* handling is forced — by
+judgment, by a mechanical gate, or by seizing the turn:
 
-- An **event** is the lowest rung — it surfaces state and can be ignored.
-- An **obligation** is the next rung up — it *enforces* an invariant on
-  state, blocking a class of tool calls until satisfied. An actionable event
-  that is repeatedly missed is the canonical thing to *promote* into an
+- An **event** is the lowest rung — it surfaces actionable state that the loop
+  must triage and act on by its own judgment on the next pass. (A signal that
+  needs no action is not an event at all — it goes to a push-notification
+  channel, a log, or a metric.)
+- An **obligation** is the next rung up — it *enforces* an invariant
+  mechanically, blocking a class of tool calls until satisfied. An actionable
+  event that is repeatedly missed is the canonical thing to *promote* into an
   obligation.
 - An **interruption (tmux send-keys)** is the top rung — when even a blocking
   gate isn't enough or fires too late, it preempts the turn outright rather
@@ -244,9 +261,12 @@ increasing force — each rung is the forcing function for the one below it:
   gate demonstrably fires too late to prevent the harm.
 
 Design rule: put each signal at the **lowest rung that actually works**.
-Reach for an event first; promote to an obligation only when "can be ignored"
-is unacceptable; promote to a tmux send-keys interruption only when "wait for
-the next tool call" is too late. The README's
+First decide whether the loop must act at all — if not, it is not an event;
+route it to a push notification, a log, or a metric. If it does need acting
+on, reach for an event; promote to an obligation only when relying on the
+loop's judgment to handle it is not enough and the "must" needs a mechanical
+gate; promote to a tmux send-keys interruption only when "wait for the next
+tool call" is too late. The README's
 [Alerting hierarchy](../../README.md#alerting-hierarchy) section has the
 visual diagram and the mechanism table; this doc is the conceptual companion
 that focuses on *how the three differ* rather than on the wiring.
