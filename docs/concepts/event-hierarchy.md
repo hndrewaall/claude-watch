@@ -18,7 +18,7 @@ cost*:
 | **Granularity** | Per loop pass | Per tool call | Per keystroke / generation |
 | **Who emits it** | A watcher / producer via the event bus | A `PreToolUse` / `PostToolUse` hook evaluating a predicate | The monitoring daemon, via tmux `send-keys` (out-of-band) |
 | **Cost of using it** | Cheap; adds context noise | Medium; blocks work, must be satisfied or overridden | High; discards partial work |
-| **Failure posture** | Best-effort; can be missed | Default-open on internal error, but otherwise blocks | Reserved for can't-wait cases |
+| **Failure posture** | Best-effort; can be missed | Default-open on internal error, but otherwise blocks | Forced preemption reserved for can't-wait cases (same channel also does routine out-of-band injections) |
 
 The one-line mnemonic — a single escalation ladder, lowest rung to highest:
 
@@ -114,6 +114,14 @@ blocking gate isn't enough, or fires too late to prevent the harm.
   injection seizes the current turn rather than gating a future tool call.
   (A genuine human preemption arrives the same way, through the real input
   channel.)
+- **send-keys is the general out-of-band injection channel, not only the
+  escalation rung.** Escalation/preemption (this rung, above) is one use, but
+  the *same* mechanism also carries routine operational injections — e.g.
+  triggering a controlled self-clear (orderly context compaction) or a
+  restart to pick up a freshly deployed binary. Just as an obligation has uses
+  beyond forcing an ignored event, send-keys has uses beyond escalation; the
+  forced-preemption framing below describes its highest-stakes use, not its
+  only one.
 - **Use it when** waiting for a turn boundary is too late: context-window
   exhaustion approaching (compaction with uncommitted state is worse than a
   cancelled message), a stalled / zombie session, a dead watcher pipeline, or
