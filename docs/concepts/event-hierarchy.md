@@ -13,7 +13,8 @@ preemption), and *what they cost*:
 | | **event** | **obligation** | **interruption** |
 |---|---|---|---|
 | **What it is** | An actionable signal the loop must triage / act on | A hard gate on tool calls | A forced preemption of the current turn |
-| **When it reaches the loop** | At the next loop pass (next prompt) | At a tool-call boundary, before the call runs | Mid-generation, immediately |
+| **When it reaches the loop** | At the next loop pass (next prompt) — but it can also be *injected* out-of-band to arrive proactively, ahead of the next natural pass | At a tool-call boundary, before the call runs — reactive, so it only fires once the loop attempts a matching call | Mid-generation, immediately |
+| **Reactive or proactive** | Proactive: the bus pushes it in, and it can be injected (the same out-of-band channel that carries a preemption can also push an event in), so it can reach the loop fast, not only at the next pass | Reactive: it waits for the loop to attempt a matching tool call, so it is inherently a bit slower to bite | Proactive: seizes the turn the instant it is delivered |
 | **How it's handled** | By the loop's *judgment* on the next pass — decide and act | By a *mechanical* predicate at the tool-call boundary — no judgment, the call is blocked until the predicate passes | By seizing the turn — the loop must deal with it now |
 | **What if it's not handled?** | A failure: it's a dropped actionable signal (and the source of context noise). The `event-must-act` layer flags it and can escalate it into an obligation — events are not meant to be droppable | The matching tool call cannot proceed until its predicate is satisfied | The turn is already seized; in-flight generation is cancelled |
 | **Granularity** | Per loop pass | Per tool call | Per keystroke / generation |
@@ -38,6 +39,14 @@ preempts the turn outright when even a blocking gate isn't enough (or fires too
 late). A signal that genuinely needs no action does not belong on this ladder
 at all — see the anti-noise rule below.
 
+But the ladder is *force of escalation*, not the normal flow. The normal flow
+sits between "event noticed" and "forced": **notice the event → park its work
+in the work queue → act on it when appropriate.** The work queue (covered
+below) is what lets the loop defer an actionable event without dropping it and
+without force-blocking itself — and an obligation is the *fallback* for that
+deferral, not the default. Don't reach up the force ladder when the queue
+already handles the signal.
+
 ---
 
 ## event — an actionable signal to triage on the next loop pass
@@ -45,9 +54,11 @@ at all — see the anti-noise rule below.
 An **event** is a signal the main loop **must act on** — it surfaces state
 into context so that the loop can triage it and respond on its next pass. It
 is not a passive FYI. It does not block a tool call and it does not preempt
-the turn, but it does demand a decision: act now, schedule the work, or
-explicitly dispatch it. Letting an event slide by unhandled is a failure mode,
-not a normal outcome.
+the turn, but it does demand a decision: act now, queue the work for later, or
+explicitly dispatch it (to a sub-agent or a background job). Letting an event
+slide by unhandled is a failure mode, not a normal outcome — but "handled"
+does **not** mean "done inline immediately." Parking the work in the work queue
+(see below) is a first-class way to handle an event.
 
 - **Mechanism**: a producer emits a small JSON record onto the event bus; a
   watcher debounces a burst of these and surfaces a one-line-per-event batch
@@ -82,6 +93,43 @@ not a normal outcome.
 
 See [`../events.md`](../events.md) for the bus, schema, and CLIs; see
 [`../watchers.md`](../watchers.md) for the watchers that produce them.
+
+---
+
+## the work queue — how the loop handles and defers work
+
+The **work queue** is a first-class part of this model — it is what makes the
+main loop an *async dispatch loop* rather than an inline worker. It plays two
+roles:
+
+- **The general mechanism for handling work.** The main loop should behave as a
+  dispatcher: it pulls in events and work, and *dispatches* each item — to a
+  sub-agent, to a background job, or to a later pass — rather than doing
+  everything inline as it arrives. The queue is the structure that lets it do
+  this: items land on it, the loop decides *when* and *how* to act on each, and
+  the loop stays free to keep triaging while long-running work proceeds
+  elsewhere.
+- **The default way to defer an event's work without losing it.** When the loop
+  notices an actionable event it can't (or shouldn't) handle right now, it
+  *parks the work on the queue* instead of dropping it or force-blocking
+  itself. The signal is preserved, and the loop keeps its flexibility and
+  judgment about ordering and dispatch.
+
+So the queue sits squarely between "event noticed" and "forced": **notice →
+queue the work → act when appropriate.** This is the normal path. Most
+actionable events should resolve this way — surfaced, parked on the queue, and
+acted on by the loop's judgment — without ever climbing the force ladder.
+
+> **Don't promote an event into an obligation too quickly.** Escalating every
+> actionable event into a blocking obligation is *over-forcing*: a gate
+> distracts the loop and costs it the flexibility that the queue is meant to
+> preserve. The normal response to an event is to queue the work and act when
+> appropriate. An **obligation is the fallback** — the safety net for work that
+> would otherwise be lost or dropped — **not the default reaction to an event.**
+> Reach for it only when "park it on the queue and trust the loop to get to it"
+> is demonstrably not safe enough.
+
+See [`../queue.md`](../queue.md) for the queue's structure, states, and CLIs.
 
 ---
 
@@ -135,6 +183,11 @@ blocking gate isn't enough, or fires too late to prevent the harm.
   beyond forcing an ignored event, send-keys has uses beyond escalation; the
   forced-preemption framing below describes its highest-stakes use, not its
   only one.
+- **send-keys is both slow and risky, so it is used rarely.** It injects into a
+  live session — it is comparatively slow to take effect, and it can disrupt
+  whatever the loop is mid-way through. That combination (slow *and* risky)
+  makes it the rung you reach for least often: reserve it for the cases where
+  no lower rung will do.
 - **Use it when** waiting for a turn boundary is too late: context-window
   exhaustion approaching (compaction with uncommitted state is worse than a
   cancelled message), a stalled / zombie session, a dead watcher pipeline, or
@@ -228,8 +281,12 @@ cron / external state change  ──emits──▶  event bus
                                               ▼
                                     event (next loop pass)
                                               │
-                          (if an actionable event is repeatedly ignored,
-                           an enforcement layer escalates it into…)
+                          (normal path: the loop parks the work on the…)
+                                              ▼
+                          work queue (defer without dropping; act when appropriate)
+                                              │
+                          (fallback — if the work would otherwise be lost, or
+                           an actionable event is repeatedly ignored, escalate to…)
                                               ▼
                                     obligation (blocks a tool call)
                                               │
@@ -250,7 +307,10 @@ judgment, by a mechanical gate, or by seizing the turn:
 - An **event** is the lowest rung — it surfaces actionable state that the loop
   must triage and act on by its own judgment on the next pass. (A signal that
   needs no action is not an event at all — it goes to a push-notification
-  channel, a log, or a metric.)
+  channel, a log, or a metric.) Note the force ladder is not the *normal* flow
+  off this rung: the everyday path is to **park the work on the queue** and act
+  when appropriate (notice → queue → act). The rungs below come into play only
+  when that ordinary deferral is not enough.
 - An **obligation** is the next rung up — it *enforces* an invariant
   mechanically, blocking a class of tool calls until satisfied. An actionable
   event that is repeatedly missed is the canonical thing to *promote* into an
@@ -260,13 +320,27 @@ judgment, by a mechanical gate, or by seizing the turn:
   than gating a future tool call. Promote toward an interruption only when a
   gate demonstrably fires too late to prevent the harm.
 
-Design rule: put each signal at the **lowest rung that actually works**.
-First decide whether the loop must act at all — if not, it is not an event;
-route it to a push notification, a log, or a metric. If it does need acting
-on, reach for an event; promote to an obligation only when relying on the
-loop's judgment to handle it is not enough and the "must" needs a mechanical
-gate; promote to a tmux send-keys interruption only when "wait for the next
-tool call" is too late. The README's
+**Design spine — prefer the lowest tier that works:**
+
+1. First decide whether the loop must act at all. If not, it is **not an
+   event** — route it to a push-notification channel, a log, or a metric.
+2. If it does need acting on, **surface it as an event** and let the loop act
+   on it by its own judgment.
+3. **Queue the work** as the default way to defer without forcing or losing it
+   — the work queue is the normal home for an actionable event the loop can't
+   handle this instant. Notice → queue → act when appropriate.
+4. Reach for an **obligation only as a fallback** — when something genuinely
+   must not be lost and queuing it is not safe enough. The obligation is the
+   safety net, not the default response to an event; over-escalating to a gate
+   costs the loop the flexibility the queue is meant to preserve.
+5. Use a **tmux send-keys interruption rarely** — it is slow *and* risky
+   (injecting into a live session can disrupt it), so it is reserved for the
+   cases where waiting for the next tool call is too late and no lower rung
+   will do.
+
+Put each signal at the lowest rung that actually works: an event handled via
+the queue is the common case; an obligation is the fallback; a send-keys
+interruption is the rare top rung. The README's
 [Alerting hierarchy](../../README.md#alerting-hierarchy) section has the
 visual diagram and the mechanism table; this doc is the conceptual companion
 that focuses on *how the three differ* rather than on the wiring.
@@ -276,6 +350,7 @@ that focuses on *how the three differ* rather than on the wiring.
 ## See also
 
 - [`../events.md`](../events.md) — the claude-event bus: emit/read CLIs, schema, debounce.
+- [`../queue.md`](../queue.md) — the work queue: how the loop parks and dispatches deferred work without dropping it.
 - [`../event-must-act.md`](../event-must-act.md) — the enforcement layer that escalates an ignored actionable event into a blocking gate.
 - [`../watchers.md`](../watchers.md) — watcher lifecycle, ownership, hygiene, and the watcher-vs-cron decision (why the watcher count stays near one).
 - [`../adding-watchers.md`](../adding-watchers.md) — authoring a new watcher.
