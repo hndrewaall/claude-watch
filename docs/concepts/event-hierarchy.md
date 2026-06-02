@@ -2,9 +2,38 @@
 
 This is the conceptual entry point for the three distinct signaling
 mechanisms claude-watch and its sibling tools expose to a Claude Code main
-loop, plus the watchers that feed them. If you are a fresh agent trying to
-understand "what kinds of things can reach into the loop, and how do they
-differ," start here, then follow the cross-links into the per-subsystem docs.
+loop. If you are a fresh agent trying to understand "what kinds of things can
+reach into the loop, and how do they differ," start here, then follow the
+cross-links into the per-subsystem docs.
+
+> ## Terminology: two things both get called "watcher" — keep them apart
+>
+> Two distinct roles are easy to conflate, and the rest of this doc depends on
+> keeping them separate. This doc reserves **watcher** for the first one only:
+>
+> 1. **A watcher** (the precise sense, used throughout this doc) is a
+>    **one-shot tool the main loop invokes** — `watcher-ctl run <name>`
+>    (`claude-event-watch`, `signal-wait-dm`, `signal-wait-group`,
+>    `torrent-wait`, `memory-remind`, `tv-remind`). Each invocation *blocks*
+>    until its event/message arrives, *prints* it to stdout, then **exits**
+>    (fire-and-exit). The main loop reads that printed stdout as its inbound
+>    event channel, and a supervisor respawns a fresh instance for the next
+>    burst. **A watcher is itself the signal-delivery mechanism** that carries
+>    a signal into the loop — it is *not* a long-lived poller, and it does
+>    *not* survive across sessions.
+> 2. **An event producer** (also called an *emitter* or *source*) is whatever
+>    *generates* a claude-event upstream: a cron job (`cron-tv-check`,
+>    `cron-security-check`, …), an alertmanager webhook, or the work queue.
+>    A producer drops a JSON record onto the event bus; the one
+>    `claude-event-watch` **watcher** is what then surfaces it to the loop.
+>    Producers are **not** watchers — they neither block-and-deliver nor get
+>    respawned by the main loop. Cron is the most common producer, but "a cron
+>    job" is never "a watcher" in the precise sense.
+>
+> When this doc says *watcher* it means sense (1). When it means the cron /
+> alertmanager / queue side it says *producer* (or *emitter* / *source*). The
+> [`../watchers.md`](../watchers.md) and [`../adding-watchers.md`](../adding-watchers.md)
+> docs use the same split.
 
 All three demand handling — none of them is a passive FYI. They differ in
 *when* the loop must handle them, *how* (judgment vs. mechanical gate vs.
@@ -18,7 +47,7 @@ preemption), and *what they cost*:
 | **How it's handled** | By the loop's *judgment* on the next pass — decide and act | By a *mechanical* predicate at the tool-call boundary — no judgment, the call is blocked until the predicate passes | By seizing the turn — the loop must deal with it now |
 | **What if it's not handled?** | A failure: it's a dropped actionable signal (and the source of context noise). The `event-must-act` layer flags it and can escalate it into an obligation — events are not meant to be droppable | The matching tool call cannot proceed until its predicate is satisfied | The turn is already seized; in-flight generation is cancelled |
 | **Granularity** | Per loop pass | Per tool call | Per keystroke / generation |
-| **Who emits it** | A watcher / producer via the event bus | A `PreToolUse` / `PostToolUse` hook evaluating a predicate | The monitoring daemon, via tmux `send-keys` (out-of-band) |
+| **Who emits / delivers it** | A *producer* (cron / alertmanager / queue) emits it onto the event bus; a *watcher* (`claude-event-watch`) delivers it into the loop | A `PreToolUse` / `PostToolUse` hook evaluating a predicate | The monitoring daemon, via tmux `send-keys` (out-of-band) |
 | **Cost of using it** | Cheap to deliver, but every event spends loop attention — mint one only for things that truly need acting on | Medium; blocks work, must be satisfied or overridden | High; discards partial work |
 
 The one-line mnemonic — a single ladder of increasing force, all three of
@@ -60,9 +89,15 @@ slide by unhandled is a failure mode, not a normal outcome — but "handled"
 does **not** mean "done inline immediately." Parking the work in the work queue
 (see below) is a first-class way to handle an event.
 
-- **Mechanism**: a producer emits a small JSON record onto the event bus; a
-  watcher debounces a burst of these and surfaces a one-line-per-event batch
-  into the loop's context (typically at the next `UserPromptSubmit`).
+- **Mechanism**: an *event producer* (a cron job, an alertmanager webhook, the
+  work queue) emits a small JSON record onto the event bus. A *watcher* — the
+  single `claude-event-watch` one-shot tool the main loop runs — then blocks
+  until events appear, debounces a burst of them, prints a one-line-per-event
+  batch to stdout (the loop's inbound channel), and exits; the loop reads that
+  batch into its context (typically at the next `UserPromptSubmit`) and
+  respawns the watcher. Note the two roles are distinct: the producer
+  *generates* the event, the watcher *delivers* it. The producer is not a
+  watcher and is not respawned by the loop.
 - **Use it when** the loop genuinely needs to *do something* the next time it
   comes around: queue state transitions that need follow-up, a completed
   background job whose result must be processed, a scheduled task that must
@@ -239,20 +274,38 @@ do not read it as a veto of your approach.
 
 ## Where watchers fit: they are the *immediate notifiers*
 
-**Watchers are the live processes that surface state into the loop.** They are
-not a fourth tier — they sit underneath the "event" mechanism as its delivery
+**A watcher is the one-shot tool that delivers an event into the loop.** It is
+not a fourth tier — it sits underneath the "event" mechanism as its delivery
 layer: the immediate notifier that takes a producer's signal and pushes it
-into context on the next loop pass. A watcher is a long-lived, supervised
-process (a filesystem-event poller, an inbox tailer, a queue observer) owned
-by the main loop: the loop spawns it, the loop restarts it on resume, and the
-loop is the only thing that may start it. When a watcher observes an external
-state change — or picks up an event a producer emitted — it surfaces it as an
-event on the next loop pass.
+into context on the next loop pass.
 
-The ownership rule matters: because watchers belong to the main loop, after
-any resume / clear / compaction the loop must restart them (it keeps no handle
+A watcher is **fire-and-exit, not a long-lived poller** (this is the lifecycle
+detail most often gotten wrong). A single `watcher-ctl run <name>` invocation:
+
+1. **blocks** on one external signal — `inotify`, an inbox tail, a queue poll,
+   or the event bus itself — until something fires;
+2. **drains** the pending burst, **printing one line per event to stdout** (and
+   appending full payloads to a ring-buffer log);
+3. **prints a restart banner and exits.**
+
+The main loop captures that stdout (the watcher was spawned with
+`run_in_background: true`), reads it as its inbound event channel, **respawns a
+fresh watcher instance** for the next burst, and then acts on the events. The
+exit *is* the delivery signal: a watcher that kept running and printed events
+in a `while` loop would silently buffer stdout the loop never sees until the
+next `/clear`. So a watcher does **not** survive across sessions or even across
+event bursts — each fire is one short-lived process; the supervisor (host:
+`watcher-ctl run`; container: `/start-watchers`) starts the next one.
+
+The single canonical watcher is `claude-event-watch`: it blocks on the event
+bus, debounces a burst, surfaces every event type that lands on it, and exits.
+The cron / alertmanager / queue side are **producers** that feed that bus —
+they are *not* watchers (see the terminology box at the top).
+
+The ownership rule matters: because a watcher belongs to the main loop, after
+any resume / clear / compaction the loop must restart it (it keeps no handle
 across the boundary), and a watcher must never be started by anything other
-than the loop — otherwise its output goes nowhere.
+than the loop — otherwise its stdout goes nowhere and the event is lost.
 
 ### Keep the watcher count near one
 
@@ -266,13 +319,13 @@ surfacing every event type that lands on it.
 
 The way you keep that count low is **cron-as-producer**: route a new periodic
 or scheduled signal through a cron job that *emits a claude-event*, which the
-one event-watcher then surfaces — instead of standing up another long-lived
-watcher process for it. Reach for a dedicated watcher only when sub-minute
+one event-watcher then surfaces — instead of standing up another supervised
+watcher slot for it. Reach for a dedicated watcher only when sub-minute
 reactivity is genuinely required *and* no kernel event mechanism (inotify,
 systemd path units) fits. See the "Watchers are a tax, not a feature" and
-"Watcher vs. cron" sections of [`../watchers.md`](../watchers.md) for the full
-rationale and decision criteria, and [`../adding-watchers.md`](../adding-watchers.md)
-for authoring one.
+"Watcher vs. producer (cron)" sections of [`../watchers.md`](../watchers.md)
+for the full rationale and decision criteria, and
+[`../adding-watchers.md`](../adding-watchers.md) for authoring one.
 
 ```
 cron / external state change  ──emits──▶  event bus

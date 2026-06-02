@@ -57,10 +57,11 @@ satisfied, and an **interruption** CANCELS in-flight generation and forces the
 main loop to handle the underlying issue immediately.
 
 > For the **conceptual** treatment — how events, obligations, and
-> interruptions *differ* (not just how they escalate), where watchers fit as
-> the immediate notifiers (and why their count stays near one), how cron acts
-> as an event producer, and why a harness-injected tool rejection is NOT an
-> interruption — see
+> interruptions *differ* (not just how they escalate), where a *watcher* (the
+> one-shot `claude-event-watch`-style tool) fits as the immediate notifier
+> versus an *event producer* (cron / alertmanager / queue) that feeds it (and
+> why the watcher count stays near one), and why a harness-injected tool
+> rejection is NOT an interruption — see
 > [`docs/concepts/event-hierarchy.md`](docs/concepts/event-hierarchy.md). It is
 > the entry point that ties the otherwise-scattered per-subsystem docs together.
 
@@ -69,8 +70,8 @@ flowchart LR
     EXT["external alerting<br/>(Prometheus / Alertmanager / etc)"]:::ext
     subgraph EV["events (informational)"]
         direction TB
-        W[watchers] --> E[claude-event CLI]
-        E --> EW[claude-event-watch]
+        W["producers<br/>(cron / alertmanager / queue)"] --> E[claude-event CLI]
+        E --> EW["claude-event-watch<br/>(the watcher)"]
         EW --> UPS[UserPromptSubmit context]
     end
     subgraph OB["obligations (blocking)"]
@@ -94,7 +95,7 @@ flowchart LR
 
 | Tier | Mechanism | Implementation surface | Use case |
 |------|-----------|------------------------|----------|
-| **events** (mild) | watchers | `claude-event` CLI emits JSON into `~/claude-events/`; `claude-event-watch` surfaces an `EVENT[source/tag]` one-liner in the next `UserPromptSubmit` context | Routine signaling — cron ticks, queue state changes, non-blocking alerts, completed-torrent notifications, scheduled reminders |
+| **events** (mild) | producers + a watcher | A *producer* (cron / alertmanager / queue) emits JSON into `~/claude-events/` via the `claude-event` CLI; the `claude-event-watch` *watcher* (a one-shot, fire-and-exit tool) surfaces an `EVENT[source/tag]` one-liner in the next `UserPromptSubmit` context | Routine signaling — cron ticks, queue state changes, non-blocking alerts, completed-torrent notifications, scheduled reminders |
 | **obligations** (blocking) | hooks (PreToolUse / PostToolUse) | `settings.json` hooks invoke the `obligations` CLI; predicates DENY a tool call when invariants are unmet; the agent must `obligations satisfy` or `obligations override` before retrying | Invariants and guardrails — must-ack inbox before sending, must-read captured watcher output before restarting, no-private-leakage gates, queue-spawn ordering, ack-gate enforcement |
 | **interruptions** (forced) | tmux `send-keys` | The `claude-watch` Rust daemon injects directly into the main-loop tmux pane when urgency demands mid-generation intervention (context approaching limit, dead watchers, prolonged thinking >300s, zombie session) | Forced, can't-wait-for-turn-boundary intervention — situations where letting the current generation finish would make recovery harder or impossible |
 
