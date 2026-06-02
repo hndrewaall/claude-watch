@@ -116,11 +116,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # every spawn site for re-entrancy as the wrong uid. The narrow
 # sudo-for-cron carve-out is the minimum-change shape that lets
 # cron start without disturbing any existing uid-1000 invariant.
-RUN printf '%s\n%s\n%s\n%s\n' \
+RUN printf '%s\n%s\n%s\n%s\n%s\n%s\n' \
         'hndrewaall ALL=(root) NOPASSWD: /usr/sbin/cron' \
         'hndrewaall ALL=(root) NOPASSWD: /bin/kill' \
         'hndrewaall ALL=(root) NOPASSWD: /usr/bin/tee /etc/cron.d/00-env' \
         'hndrewaall ALL=(root) NOPASSWD: /bin/chmod 0644 /etc/cron.d/00-env' \
+        'hndrewaall ALL=(root) NOPASSWD: /usr/bin/tee /etc/cron.d/private-*' \
+        'hndrewaall ALL=(root) NOPASSWD: /bin/chmod 0644 /etc/cron.d/private-*' \
         > /etc/sudoers.d/hndrewaall-cron \
     && chmod 0440 /etc/sudoers.d/hndrewaall-cron
 
@@ -720,6 +722,16 @@ COPY tools/claude-watch-dispatch/claude-watch-dispatch /usr/local/bin/claude-wat
 #     enumerates active subagent transcripts and `--follow` for live
 #     streaming.
 COPY tools/obligations/obligations /usr/local/bin/obligations
+# shell_ast.py -- dependency-free shell-structure parser imported by both
+# the obligations CLI (no_pipe_pattern predicate) and the
+# pre-tool-obligations-gate-hook (watcher-ctl bare gate) to make pattern
+# matching AST-aware: a forbidden pipe/operator that appears inside a
+# quoted argument or heredoc body no longer false-positive-denies. Both
+# importers fall back to the previous raw string-match if this module is
+# absent, so baking it alongside obligations keeps the AST behavior in the
+# container. Placed flat in /usr/local/bin/ so `obligations` (same dir)
+# and the hook (own-dir import candidate) both resolve it.
+COPY tools/obligations/shell_ast.py /usr/local/bin/shell_ast.py
 # obligations-init -- idempotent seed for the default-bundled obligations
 # rows. Invoked from the container entrypoint after the obligations CLI
 # is available on PATH. Currently seeds the
@@ -924,6 +936,14 @@ RUN chmod +x /usr/local/bin/xclip
 # same bytes.
 COPY container/bin/self-clear /usr/local/bin/self-clear
 RUN chmod +x /usr/local/bin/self-clear
+
+# cw-watcher-health-check — cron-driven dead-watcher detector.
+# Checks for unconsumed events in the queue dir older than 2 min;
+# if any exist, injects a [CLAUDE-WATCH] alert into the tmux pane
+# via send-keys (bypasses the event system, which is broken if
+# events are accumulating). Fired by the */2 cron entry in cw-default.
+COPY container/bin/cw-watcher-health-check /usr/local/bin/cw-watcher-health-check
+RUN chmod +x /usr/local/bin/cw-watcher-health-check
 
 # claude-event-watch — the canonical block-print-exit event watcher.
 # Session runs this as a `run_in_background` task; it blocks on inotifywait,

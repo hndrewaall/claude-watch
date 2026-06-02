@@ -1,4 +1,4 @@
-.PHONY: test test-verbose test-unit test-e2e test-live test-session-task test-hooks test-agent-msg test-agent-tail test-claude-event test-self-clear test-watchers test-dashboard test-trust-workspace test-claude-tmux-env test-hooks-shim test-entrypoint test-cw test-mcp-host-bash test-mcp-proxy-auth-shim test-install-host-deps test-launchd-plist test-load-bearer-from-keychain test-personal-mcp-host test-personal-mcp-host-plist test-personal-mcp-install test-ttyd-paste-handler build deploy install install-hooks compose-up compose-down compose-build container-build bootstrap clean
+.PHONY: test test-verbose test-unit test-e2e test-live test-session-task test-hooks test-agent-msg test-agent-tail test-claude-event test-self-clear test-watchers test-dashboard test-trust-workspace test-claude-tmux-env test-hooks-shim test-entrypoint test-cw test-mcp-host-bash test-mcp-proxy-auth-shim test-install-host-deps test-launchd-plist test-load-bearer-from-keychain test-personal-mcp-host test-personal-mcp-host-plist test-personal-mcp-install test-ttyd-paste-handler build deploy install install-hooks compose-up compose-down compose-build container-build bootstrap redeploy clean
 
 # Default: run all tests in parallel via nextest (preferred) or cargo test
 test:
@@ -42,11 +42,15 @@ test-session-task:
 # The pre-agent-queue-gate-hook test exercises the real `session-task`
 # binary; it must be on PATH (or installed via `make install`).
 test-hooks:
+	python3 tools/obligations/shell_ast.py --test
 	tools/hooks/tests/pre-tool-obligations-gate-hook.test
 	tools/hooks/tests/pre-agent-queue-gate-hook.test
 	tools/hooks/tests/pre-tool-claude-watch-alert-gate-hook.test
 	tools/hooks/tests/user-prompt-claude-watch-alert-record-hook.test
 	tools/hooks/tests/pre-tool-dispatch-gate-hook.test
+	tools/hooks/pre-agent-background-required-hook --test
+	tools/hooks/pre-agent-worktree-isolation-hook --test
+	tools/hooks/worktree-create-hook --test
 	tools/claude-watch-ack/tests/claude-watch-ack.test
 	tools/claude-watch-dispatch/tests/claude-watch-dispatch.test
 
@@ -272,6 +276,9 @@ deploy: build
 #   - pre-tool-obligations-gate-hook        : PreToolUse hook (* matcher)
 #   - post-tool-obligations-update-hook     : PostToolUse hook (* matcher)
 #   - post-tool-mark-attachment-read-hook   : PostToolUse hook (Read matcher)
+#   - pre-agent-background-required-hook    : PreToolUse hook (Agent matcher)
+#   - pre-agent-worktree-isolation-hook     : PreToolUse hook (Agent matcher)
+#   - worktree-create-hook                  : WorktreeCreate/Remove hook
 #
 # Install policy:
 #   - The claude-watch Rust daemon is a build artifact, so it's a real
@@ -294,6 +301,9 @@ install: build
 	@ln -sfn $(abspath tools/hooks/pre-tool-obligations-gate-hook) $(BIN_DIR)/pre-tool-obligations-gate-hook
 	@ln -sfn $(abspath tools/hooks/post-tool-obligations-update-hook) $(BIN_DIR)/post-tool-obligations-update-hook
 	@ln -sfn $(abspath tools/hooks/post-tool-mark-attachment-read-hook) $(BIN_DIR)/post-tool-mark-attachment-read-hook
+	@ln -sfn $(abspath tools/hooks/pre-agent-background-required-hook) $(BIN_DIR)/pre-agent-background-required-hook
+	@ln -sfn $(abspath tools/hooks/pre-agent-worktree-isolation-hook) $(BIN_DIR)/pre-agent-worktree-isolation-hook
+	@ln -sfn $(abspath tools/hooks/worktree-create-hook) $(BIN_DIR)/worktree-create-hook
 	@ln -sfn $(abspath tools/agent-msg/agent-msg) $(BIN_DIR)/agent-msg
 	@ln -sfn $(abspath tools/agent-tail/agent-tail) $(BIN_DIR)/agent-tail
 	@ln -sfn $(abspath tools/claude-event/claude-event) $(BIN_DIR)/claude-event
@@ -308,6 +318,9 @@ install: build
 	@echo "  - pre-tool-obligations-gate-hook (symlink -> tools/hooks/)"
 	@echo "  - post-tool-obligations-update-hook (symlink -> tools/hooks/)"
 	@echo "  - post-tool-mark-attachment-read-hook (symlink -> tools/hooks/)"
+	@echo "  - pre-agent-background-required-hook (symlink -> tools/hooks/)"
+	@echo "  - pre-agent-worktree-isolation-hook (symlink -> tools/hooks/)"
+	@echo "  - worktree-create-hook      (symlink -> tools/hooks/)"
 	@echo "  - agent-msg                 (symlink -> tools/agent-msg/)"
 	@echo "  - agent-tail                (symlink -> tools/agent-tail/)"
 	@echo "  - claude-event              (symlink -> tools/claude-event/)"
@@ -372,6 +385,16 @@ compose-up:
 # claude-container-versions).
 compose-down:
 	@cd examples/compose && docker compose down
+
+# Force-recreate the claude-container service (picks up new image / config).
+# Let docker-compose.yml's `stop_grace_period: 15s` govern the stop wait —
+# it's sized to fit process-compose's own graceful shutdown (per-process
+# shutdown.timeout 3s each). Do NOT pass a short `-t` here: a stop timeout
+# shorter than process-compose's total shutdown SIGKILLs PID 1 mid-teardown
+# and orphans cron / claude-watch grandchildren that pin the shared volumes
+# + tmux socket, which is what wedged the in-place recreate.
+redeploy:
+	@cd examples/compose && docker compose up -d --force-recreate claude-container
 
 # Clean build artifacts
 clean:
