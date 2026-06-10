@@ -8,7 +8,7 @@ WHY THIS EXISTS
 Operators bind-mount ~/.claude into the container, including
 ~/.claude/settings.json with its `hooks.<event>.[*].hooks[*].command`
 entries. When the host is macOS (or any non-Linux platform), those
-commands often point at host-native binaries — devbar's
+commands often point at host-native binaries — a corp tool's
 telemetry-hook, etc. — that Linux's exec() bounces with "Exec format
 error". Claude Code logs the failure on every hook event; the noise
 buries real diagnostics.
@@ -17,7 +17,7 @@ PR #135 shipped /usr/local/bin/exec-hook, a magic-byte sniffer that
 exec's ELF / shebang transparently and silently no-ops on Mach-O /
 unknown. The shim is opt-in: the operator has to MANUALLY edit each
 hook command in their settings.json to wrap it as
-  "command": "exec-hook /Users/me/.devbar/bin/telemetry-hook"
+  "command": "exec-hook /Users/me/.local/bin/telemetry-hook"
 On a Mac host where settings.json is bind-mounted in, that edit is
 load-bearing on the HOST and surprises the host install.
 
@@ -50,7 +50,7 @@ PATTERN FILTERING (--shim-patterns / CLAUDE_SHIM_PATTERNS)
 
 By default this helper wraps EVERY hook command it finds. Operators
 who only want a NARROW subset wrapped (e.g. just corp telemetry hooks
-under `/Users/*/.devbar/bin/*`) can pass `--shim-patterns` (or set
+under `/Users/*/.local/bin/*`) can pass `--shim-patterns` (or set
 `CLAUDE_SHIM_PATTERNS` in the env) to a colon-separated list of glob
 patterns. When the flag/env is set to a non-empty value, ONLY commands
 whose first token (the binary path) matches at least one pattern are
@@ -118,7 +118,7 @@ APIKEYHELPER SANITIZING
 
 `apiKeyHelper` is a top-level settings key: a shell command Claude Code
 runs to obtain an API key. On a macOS host it commonly points at a
-host-native binary (e.g. a corp `…/devbar auth claude` Mach-O). When
+host-native binary (e.g. a corp `…/get-api-key` Mach-O). When
 that host settings.json is bind-mounted into this Linux container, the
 helper path either doesn't exist or is a non-ELF binary, so Claude Code
 runs it on EVERY inference and logs `apiKeyHelper failed: exited 127 …`
@@ -349,7 +349,7 @@ def target_runnable_here(path: str) -> bool:
     PATH lookup we cannot reliably resolve at generation time; we treat
     it as runnable so we never strip a helper that might resolve at
     runtime. The strip is aimed squarely at the absolute-host-path leak
-    (e.g. /Applications/…/devbar) which is the only case that reliably
+    (e.g. /Applications/CorpTool.app/…/get-api-key) which is the only case that reliably
     reproduces the failure.
     """
     if not path or "/" not in path:
@@ -498,7 +498,7 @@ def main(argv: list[str]) -> int:
              "= wrap every command (default, backward-compatible). "
              "Falls back to CLAUDE_SHIM_PATTERNS env var if the flag "
              "isn't given. Example: "
-             "'/Users/*/.devbar/bin/*:/Users/*/.devbar/pkgs/*/bin/*'.",
+             "'/Users/*/.local/bin/*:/Users/*/.local/pkgs/*/bin/*'.",
     )
     p.add_argument(
         "--quiet", "-q",
