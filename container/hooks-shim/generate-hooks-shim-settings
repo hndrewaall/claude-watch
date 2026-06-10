@@ -111,7 +111,32 @@ INPUT FORMAT
 
 This script rewrites:
   - `hooks.<event>.[*].hooks[*].command`
+  - `apiKeyHelper` (see APIKEYHELPER SANITIZING below)
 All other top-level keys are passed through unchanged.
+
+APIKEYHELPER SANITIZING
+
+`apiKeyHelper` is a top-level settings key: a shell command Claude Code
+runs to obtain an API key. On a macOS host it commonly points at a
+host-native binary (e.g. a corp `…/devbar auth claude` Mach-O). When
+that host settings.json is bind-mounted into this Linux container, the
+helper path either doesn't exist or is a non-ELF binary, so Claude Code
+runs it on EVERY inference and logs `apiKeyHelper failed: exited 127 …`
+(or `… did not return a value`) each time. The noise is continuous and
+the helper can never actually return a key — a Mach-O binary cannot run
+under Linux exec().
+
+Mirroring the exec-hook magic-byte philosophy: at generation time we
+resolve the helper's target binary (its first shell token) and check
+whether it is runnable in THIS container — present AND ELF (or a
+shebang script). If it is not (missing path, Mach-O, unknown format),
+we DROP the `apiKeyHelper` key from the output with a one-line stderr
+heads-up. Claude Code then falls back to its normal env-based auth
+(`ANTHROPIC_API_KEY`, Bedrock/Vertex env, OAuth creds) — which is what
+container deployments use anyway. A genuinely runnable ELF/shebang
+helper (Linux host) is preserved verbatim. This is unconditional and
+operator-safe: a non-runnable helper is definitionally broken in the
+container, so dropping it only ever removes pure error noise.
 
 OUTPUT FORMAT
 
@@ -313,6 +338,59 @@ def command_matches_patterns(cmd: str, patterns: list[str]) -> bool:
     return any(fnmatch.fnmatchcase(head, p) for p in patterns)
 
 
+def target_runnable_here(path: str) -> bool:
+    """True iff `path` is a binary/script this Linux container can exec().
+
+    Mirrors the magic-byte sniff in container/hooks-shim/exec-hook:
+      - ELF (0x7f 'E' 'L' 'F')       -> runnable
+      - shebang script (0x23 0x21)   -> runnable (the OS handles #!)
+      - Mach-O / unknown / missing   -> NOT runnable
+    A relative path or bare command name (no '/') is assumed to be a
+    PATH lookup we cannot reliably resolve at generation time; we treat
+    it as runnable so we never strip a helper that might resolve at
+    runtime. The strip is aimed squarely at the absolute-host-path leak
+    (e.g. /Applications/…/devbar) which is the only case that reliably
+    reproduces the failure.
+    """
+    if not path or "/" not in path:
+        return True
+    try:
+        if not os.path.exists(path):
+            return False
+        with open(path, "rb") as f:
+            magic = f.read(4)
+    except OSError:
+        return False
+    if magic[:4] == b"\x7fELF":
+        return True
+    if magic[:2] == b"#!":
+        return True
+    return False
+
+
+def sanitize_api_key_helper(settings: dict) -> tuple[dict, str | None]:
+    """Drop `apiKeyHelper` when its target binary is not runnable here.
+
+    Returns (new_settings, dropped_command_or_None). The input is not
+    mutated. When the key is absent or its target IS runnable in this
+    container, the settings are returned unchanged and the second tuple
+    element is None.
+    """
+    helper = settings.get("apiKeyHelper")
+    if not isinstance(helper, str) or not helper.strip():
+        return settings, None
+    target = command_first_token(helper)
+    # apiKeyHelper targets are sometimes single-quoted to survive spaces
+    # in the path (e.g. "'/Applications/My App/bin' auth claude"). Strip
+    # a leading quote so the existence/magic check sees the real path.
+    target = target.strip("'\"")
+    if target_runnable_here(target):
+        return settings, None
+    out = dict(settings)
+    out.pop("apiKeyHelper", None)
+    return out, helper
+
+
 def wrap_command(cmd: str, patterns: list[str] | None = None) -> str:
     """Prefix `cmd` with `exec-hook ` unless already wrapped or filtered
     out by the operator's pattern list.
@@ -501,6 +579,19 @@ def main(argv: list[str]) -> int:
         rewritten = {"hooks": {}}
     else:
         rewritten = rewrite_hooks(settings, patterns)
+        # Drop a cross-arch / missing apiKeyHelper that would 127 on every
+        # inference inside the container (host-native binary leaked in via
+        # the bind-mounted settings.json). Only the rewrite path carries
+        # the host's top-level keys through; obligations-only emits a bare
+        # hooks dict with no apiKeyHelper to begin with.
+        rewritten, dropped_helper = sanitize_api_key_helper(rewritten)
+        if dropped_helper and not args.quiet:
+            print(
+                "generate-hooks-shim-settings: dropped apiKeyHelper "
+                f"(target not runnable in this container): {dropped_helper!r} "
+                "-- falling back to env-based auth",
+                file=sys.stderr,
+            )
     if inject_obligations:
         rewritten = inject_obligations_hooks(rewritten)
 
