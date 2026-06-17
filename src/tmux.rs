@@ -1543,7 +1543,88 @@ fn tag_name_attr_present(tag_body: &str) -> bool {
 /// `<invoke>` with NEITHER a `name=` attribute NOR any corroborating tag is
 /// treated as prose/noise and ignored. This is what cuts the false positives
 /// that a substring grep produced.
+/// How many lines after a bare `court` line we still consider a corroborating
+/// `<invoke` opener to belong to the same malformed construct. The confirmed
+/// signature has the opener on the very next line; a small window absorbs an
+/// occasional blank/wrapped line without admitting unrelated later tags.
+const COURT_INVOKE_WINDOW: usize = 3;
+
+/// High-confidence fast-path for the CONFIRMED 2026-06-17 literal signature.
+///
+/// When the model malforms a tool call, the control token that should open the
+/// call (the proper namespaced function-call opener) is instead sampled as the
+/// literal text `court`, rendered as a bare line, immediately followed by a
+/// NON-namespaced `<invoke name="...">` opener (and usually non-namespaced
+/// `<parameter ...>` tags). A correctly-formed call never renders `court` as
+/// text and always uses the `antml:`-namespaced tag forms, so a trimmed-`court`
+/// line directly preceding a bare (non-namespaced) `<invoke` opener is a
+/// definite malform with very high precision.
+///
+/// This is ADDITIVE to the general structural detector: it catches the exact
+/// captured signature even in edge cases the construct rules might miss (e.g. a
+/// `court` + bare `<invoke>` whose parameter/close scrolled off the tail).
+///
+/// Like the general detector, it RESPECTS the fenced-code-block exclusion: the
+/// signature gets pasted into chat/DMs while discussing this very bug, so a
+/// `court` + `<invoke` shown inside a ```...``` fence must NOT trigger.
+fn detect_court_invoke_fastpath(tail: &[&str]) -> bool {
+    let mut in_fence = false;
+    for (idx, line) in tail.iter().enumerate() {
+        let trimmed = line.trim();
+        // Track fence state so quoted occurrences (docs/chat) don't fire.
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence {
+            continue;
+        }
+        // A line that, trimmed, is exactly the bare token `court`.
+        if trimmed != "court" {
+            continue;
+        }
+        // Look ahead a small window for a bare (non-namespaced) `<invoke`
+        // opener. We must not cross into a fenced region, so we re-track the
+        // fence state across the look-ahead lines as well.
+        let mut look_fence = in_fence;
+        let upper = (idx + 1 + COURT_INVOKE_WINDOW).min(tail.len());
+        for next in &tail[idx + 1..upper] {
+            let next_trimmed = next.trim();
+            if next_trimmed.starts_with("```") || next_trimmed.starts_with("~~~") {
+                look_fence = !look_fence;
+                continue;
+            }
+            if look_fence {
+                continue;
+            }
+            if line_has_bare_invoke_opener(next) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// True if the line contains a NON-namespaced `<invoke` opening tag — the bare
+/// form that signals a malform. A correctly-namespaced `<word:invoke ...>` does
+/// NOT count (it is the well-formed form and is consumed by the harness).
+/// Reuses the same tokenizer that the structural detector relies on, so the
+/// namespace/boundary handling stays consistent.
+fn line_has_bare_invoke_opener(line: &str) -> bool {
+    tokenize_malformed_line(line)
+        .iter()
+        .any(|t| matches!(t, MalformedToken::OpenInvoke { .. }))
+}
+
 fn detect_malformed_construct(tail: &[&str]) -> bool {
+    // High-confidence fast-path: the confirmed 2026-06-17 literal signature.
+    // A trimmed line equal to the bare token `court` immediately followed
+    // (within a small window) by a non-namespaced `<invoke` opener is a
+    // definite malform. See `detect_court_invoke_fastpath` for the rationale.
+    if detect_court_invoke_fastpath(tail) {
+        return true;
+    }
+
     let mut in_fence = false;
     let mut tokens: Vec<MalformedToken> = Vec::new();
     for line in tail {
@@ -2913,6 +2994,80 @@ some quoted code\n\
     fn test_not_malformed_invokexyz_not_a_tag() {
         // `<invokexyz` / `<parameters` must not match — tag-name boundary check.
         let output = "<invokexyz name=\"x\"> and <parameters name=\"y\">\n";
+        assert!(!check_lines_for_malformed_tool_call(output));
+    }
+
+    // --- court-prefix fast-path tests (confirmed 2026-06-17 signature) ---
+
+    #[test]
+    fn test_malformed_court_prefix_fastpath_fires() {
+        // The CONFIRMED literal signature: a bare `court` line (the proper
+        // namespaced call-opener mis-sampled as text) immediately followed by a
+        // non-namespaced `<invoke` opener.
+        let output = "\
+some prior output\n\
+court\n\
+<invoke name=\"Bash\">\n\
+<parameter name=\"command\">watcher-ctl run claude-event-watch</parameter>\n";
+        assert!(check_lines_for_malformed_tool_call(output));
+        // The fast-path itself fires on the construct directly.
+        let tail: Vec<&str> = output.lines().collect();
+        assert!(detect_court_invoke_fastpath(&tail));
+    }
+
+    #[test]
+    fn test_court_prefix_fastpath_inside_fence_does_not_fire() {
+        // The signature pasted INSIDE a fenced code block (e.g. discussing this
+        // bug in a DM) must NOT fire.
+        let output = "\
+Here is the signature we are guarding against:\n\
+```\n\
+court\n\
+<invoke name=\"Bash\">\n\
+<parameter name=\"command\">ls</parameter>\n\
+```\n\
+end of discussion.\n";
+        assert!(!check_lines_for_malformed_tool_call(output));
+        let tail: Vec<&str> = output.lines().collect();
+        assert!(!detect_court_invoke_fastpath(&tail));
+    }
+
+    #[test]
+    fn test_court_prefix_fastpath_namespaced_invoke_does_not_fire() {
+        // A correctly NAMESPACED invoke (the well-formed form) preceded by a
+        // `court` line must NOT fire — only the bare non-namespaced opener is a
+        // malform. The namespaced opener is built by concatenation so it stays
+        // an inert literal and is never itself a tool call.
+        let namespaced = format!("<{}invoke name=\"Bash\">", "antml:");
+        let output = format!("court\n{namespaced}\n");
+        assert!(!check_lines_for_malformed_tool_call(&output));
+        let tail: Vec<&str> = output.lines().collect();
+        assert!(!detect_court_invoke_fastpath(&tail));
+    }
+
+    #[test]
+    fn test_court_prefix_fastpath_window_respected() {
+        // A `court` line with the bare `<invoke` too far away (beyond the small
+        // look-ahead window) is not joined by the fast-path. The general
+        // construct detector still won't fire without corroborating tags.
+        let output = "\
+court\n\
+filler 1\n\
+filler 2\n\
+filler 3\n\
+filler 4\n\
+<invoke name=\"Bash\">\n";
+        let tail: Vec<&str> = output.lines().collect();
+        assert!(!detect_court_invoke_fastpath(&tail));
+    }
+
+    #[test]
+    fn test_court_alone_does_not_fire() {
+        // A bare `court` line with no following invoke (ordinary prose that
+        // happens to contain the word) must NOT fire.
+        let output = "the supreme court ruled\ncourt\nmoving on\n";
+        let tail: Vec<&str> = output.lines().collect();
+        assert!(!detect_court_invoke_fastpath(&tail));
         assert!(!check_lines_for_malformed_tool_call(output));
     }
 
