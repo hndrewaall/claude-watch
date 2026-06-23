@@ -1604,35 +1604,15 @@ body.modal-open { overflow: hidden; }
   font-size: 0.78rem;
 }
 
-/* A dispatch attempt of the same queue item (the live owner is dropped
- * server-side; attempts surface as attempt N). When multiple attempts exist
- * they NEST: the latest is the un-dimmed HEAD (.subagent-attempt-head), the
- * SUPERSEDED older attempts nest under it dimmed. */
-.subagent-node.subagent-attempt {
-  opacity: 0.65;
-}
-
-/* The live HEAD of an attempt history — the current dispatch, NOT superseded.
- * Render it at full opacity (it sits above its dimmed superseded children)
- * and tint its badge with the accent so it reads as the active attempt. */
-.subagent-node.subagent-attempt.subagent-attempt-head {
+/* A co-bound subagent of the same queue item with NO spawn edge to the owner
+ * (the live owner is dropped server-side). These are FLAT NEUTRAL peers: the
+ * binding only associates them with the item, recording no retry/supersession
+ * relationship, so we do NOT dim them as "superseded" or badge them as
+ * "attempt N" — they read as plain sibling subagents, distinguished by their
+ * id / label / age. (Hook left in place for future per-peer affordances; no
+ * dimming today so peers are not visually demoted.) */
+.subagent-node.subagent-peer {
   opacity: 1;
-}
-
-.subagent-node.subagent-attempt-head > .subagent-attempt-badge {
-  background: var(--accent, #268bd2);
-  color: var(--bg, #002b36);
-}
-
-.subagent-attempt-badge {
-  flex: 0 0 auto;
-  font-size: 0.66rem;
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
-  padding: 0 5px;
-  border-radius: 3px;
-  background: var(--line);
-  color: var(--fg-muted, #93a1a1);
 }
 
 .subagent-node:hover,
