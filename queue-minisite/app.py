@@ -2344,7 +2344,7 @@ def _build_subagent_tree(
 
     _sort_children(roots)
 
-    # --- Collapse the genuine main-loop retries as attempt N. ---
+    # --- Group the genuine main-loop retries as a nested attempt history. ---
     # A retry is a same-item agent that is NOT the owner and is NOT one of the
     # owner'''s descendants (i.e. no session agent spawned it -> the main loop
     # dispatched it). Oldest first so attempt numbering reads chronologically
@@ -2367,7 +2367,35 @@ def _build_subagent_tree(
         node["children"] = []
         attempt_nodes.append(node)
 
-    # Retries (attempts) first, then the live dispatch'''s nested children.
+    # Attempt-supersession nesting. ``attempt_nodes`` is ordered oldest-first
+    # (attempt 1 = earliest). The HIGHEST-numbered attempt is the live HEAD —
+    # the most-recent dispatch that supersedes the earlier ones (the prior
+    # attempts were killed/restarted). The PRIOR tree returned every attempt as
+    # a FLAT sibling (attempt 1, attempt 2, ... side by side), which read as N
+    # unrelated peers rather than one logical agent's retry history. Instead we
+    # nest the SUPERSEDED (older) attempts UNDER the live HEAD, so the recursive
+    # subagent_node macro renders them indented + dimmed beneath the current
+    # dispatch — a real hierarchy, not a flat list. (Observed: q-2026-06-23-1ae2
+    # rendered attempts a464cd2cd527 + a43122a0f2f9 as flat ATTEMPT 1/2 peers;
+    # this groups the older one under the newer HEAD.)
+    #
+    # A single attempt (no supersession) stays a lone top-level ``attempt``
+    # node — unchanged from before. Zero attempts -> ``attempt_nodes`` is empty.
+    if len(attempt_nodes) >= 2:
+        head = attempt_nodes[-1]  # newest = live HEAD (highest attempt number)
+        superseded = attempt_nodes[:-1]  # older attempts, oldest-first
+        # ``attempt_head`` flags the live HEAD so the renderer can keep it
+        # un-dimmed (it is the CURRENT dispatch) while the superseded children
+        # render dimmed beneath it. Newest superseded attempt first so the
+        # HEAD's children read most-recent-first, matching the
+        # most-recently-active sort used everywhere else (roots,
+        # _list_session_subagents).
+        head["attempt_head"] = True
+        head["children"] = list(reversed(superseded))
+        attempt_nodes = [head]
+
+    # Retries (attempt history, HEAD with superseded attempts nested) first,
+    # then the live dispatch'''s nested children.
     return attempt_nodes + roots
 
 

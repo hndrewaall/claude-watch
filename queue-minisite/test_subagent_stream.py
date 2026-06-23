@@ -512,6 +512,63 @@ class SubagentTreeTest(unittest.TestCase):
         # And it carries an empty children list (uniform recursive shape).
         self.assertEqual(attempt.get("children"), [])
 
+    def test_multiple_attempts_nest_under_live_head(self):
+        """REGRESSION (q-2026-06-23-1ae2): when MULTIPLE main-loop retry
+        attempts of the same item exist, they must NOT render as a FLAT list
+        of sibling attempt nodes (attempt 1, attempt 2 side by side). The
+        latest attempt is the live HEAD; the SUPERSEDED older attempt(s) nest
+        UNDER it as dimmed children — a real hierarchy, not a flat list.
+        """
+        item = _add(self.env, "multi attempt nest", ["repo:subagent-multi"])
+        qid = item["id"]
+        _register(self.env, qid)
+
+        session_uuid = "ff66aa77-bb88-cc99-dd00-ee0000000006"
+        owner_id = "fff666aaa777bbb88"   # current live dispatch (dropped)
+        attempt_new = "aaa777bbb888ccc99"  # most recent superseding attempt
+        attempt_old = "bbb888ccc999ddd00"  # earliest abandoned attempt
+        _seed_agent_state(self.agent_state, owner_id, qid, alive=True, age=1)
+        self._seed_marked_subagent(self.jsonl_root, session_uuid, owner_id, qid)
+        new_path = self._seed_marked_subagent(
+            self.jsonl_root, session_uuid, attempt_new, qid)
+        old_path = self._seed_marked_subagent(
+            self.jsonl_root, session_uuid, attempt_old, qid)
+        # Backdate: attempt_old oldest (attempt 1), attempt_new newer (HEAD).
+        now = new_path.stat().st_mtime
+        os.utime(new_path, (now - 120, now - 120))
+        os.utime(old_path, (now - 600, now - 600))
+        # All three bound to the SAME item id.
+        self._seed_bindings(
+            {owner_id: qid, attempt_new: qid, attempt_old: qid})
+        self.appmod._cache.fetched_at = 0.0
+
+        r = self.client.get(f"/api/queue/{qid}/meta")
+        self.assertEqual(r.status_code, 200, r.get_data(as_text=True))
+        subs = r.get_json().get("subagents")
+        # Owner dropped. NOT a flat list of two — exactly one TOP-LEVEL node
+        # (the live HEAD) with the superseded attempt nested under it.
+        self.assertEqual(len(subs), 1,
+                         f"attempts must nest, not render flat: {subs}")
+        head = subs[0]
+        self.assertEqual(head.get("subagent_id"), attempt_new,
+                         f"newest attempt is the live HEAD: {head}")
+        self.assertEqual(head.get("kind"), "attempt")
+        self.assertEqual(head.get("attempt"), 2,
+                         f"newest attempt is attempt 2: {head}")
+        self.assertTrue(head.get("attempt_head"),
+                        f"HEAD must be flagged attempt_head: {head}")
+        # The superseded older attempt is nested UNDER the head as a child.
+        children = head.get("children") or []
+        self.assertEqual(len(children), 1,
+                         f"superseded attempt nests under HEAD: {head}")
+        superseded = children[0]
+        self.assertEqual(superseded.get("subagent_id"), attempt_old)
+        self.assertEqual(superseded.get("kind"), "attempt")
+        self.assertEqual(superseded.get("attempt"), 1,
+                         f"oldest is attempt 1, nested: {superseded}")
+        self.assertFalse(superseded.get("attempt_head"),
+                         f"superseded attempt is NOT the head: {superseded}")
+
     def _seed_parent_with_spawn(self, jsonl_root, session_uuid, agent_id, qid,
                                 child_agent_id):
         """Seed a transcript carrying the item marker AND a recorded

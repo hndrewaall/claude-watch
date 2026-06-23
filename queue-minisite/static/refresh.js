@@ -204,17 +204,27 @@
   // Jinja macro in templates/index.html so morphdom doesn't flap between
   // the server paint and the SPA refresh. Node shape (from app.py
   // _build_subagent_tree): { subagent_id, label, age, age_seconds,
-  // queue_id, kind: "attempt"|"child", attempt: <int?>, children: [...] }.
-  // `kind=="attempt"` nodes are prior dispatch attempts of the same queue
-  // item (owner dropped server-side) — labeled "attempt N".
+  // queue_id, kind: "attempt"|"child", attempt: <int?>,
+  // attempt_head: <bool?>, children: [...] }.
+  // `kind=="attempt"` nodes are dispatch attempts of the same queue item
+  // (live owner dropped server-side) — labeled "attempt N". When there are
+  // multiple attempts they NEST: the latest (attempt_head==true) is the
+  // un-dimmed top node, superseded older attempts nest under it as dimmed
+  // children.
   function renderSubagentNode(sa) {
     const sid = sa.subagent_id || '';
     const isAttempt = sa.kind === 'attempt';
-    const cls = 'subagent-node subagent-log-clickable' + (isAttempt ? ' subagent-attempt' : '');
+    const isHead = isAttempt && !!sa.attempt_head;
+    const cls = 'subagent-node subagent-log-clickable' +
+      (isAttempt ? ' subagent-attempt' : '') +
+      (isHead ? ' subagent-attempt-head' : '');
     let html =
       `<li class="${cls}" data-subagent-id="${attr(sid)}" data-log-mode="subagent" tabindex="0" role="button" aria-label="View live log for subagent ${attr(sid)}" title="Click to tail this subagent's live log">`;
     if (isAttempt) {
-      html += `<span class="subagent-attempt-badge" title="prior dispatch attempt of this queue item">attempt ${esc(sa.attempt)}</span>`;
+      const badgeTitle = isHead
+        ? 'latest dispatch attempt of this queue item'
+        : 'superseded dispatch attempt of this queue item';
+      html += `<span class="subagent-attempt-badge" title="${attr(badgeTitle)}">attempt ${esc(sa.attempt)}${isHead ? ' · latest' : ''}</span>`;
     }
     html +=
       `<code class="subagent-id">${esc(sid.slice(0, 12))}</code>` +

@@ -1604,10 +1604,24 @@ body.modal-open { overflow: hidden; }
   font-size: 0.78rem;
 }
 
-/* A collapsed prior dispatch attempt of the same queue item (the live
- * owner is dropped server-side; earlier attempts surface as attempt N). */
+/* A dispatch attempt of the same queue item (the live owner is dropped
+ * server-side; attempts surface as attempt N). When multiple attempts exist
+ * they NEST: the latest is the un-dimmed HEAD (.subagent-attempt-head), the
+ * SUPERSEDED older attempts nest under it dimmed. */
 .subagent-node.subagent-attempt {
-  opacity: 0.8;
+  opacity: 0.65;
+}
+
+/* The live HEAD of an attempt history — the current dispatch, NOT superseded.
+ * Render it at full opacity (it sits above its dimmed superseded children)
+ * and tint its badge with the accent so it reads as the active attempt. */
+.subagent-node.subagent-attempt.subagent-attempt-head {
+  opacity: 1;
+}
+
+.subagent-node.subagent-attempt-head > .subagent-attempt-badge {
+  background: var(--accent, #268bd2);
+  color: var(--bg, #002b36);
 }
 
 .subagent-attempt-badge {

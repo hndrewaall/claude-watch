@@ -35,19 +35,22 @@
       so morphdom doesn't flap between the server paint and the 5s SPA
       refresh. The macro is recursive so genuine multi-level nesting (when
       app.py ever attributes deeper edges) renders without template changes.
-      `kind=="attempt"` nodes are PRIOR dispatch attempts of the same queue
-      item (the owner is dropped in _build_subagent_tree) — labeled
-      "attempt N" so retries don't masquerade as distinct child work. -#}
+      `kind=="attempt"` nodes are dispatch attempts of the same queue item
+      (the live owner is dropped in _build_subagent_tree) — labeled
+      "attempt N" so retries don't masquerade as distinct child work. When
+      there are MULTIPLE attempts they NEST: the latest (live HEAD,
+      `attempt_head==true`) is the top node, un-dimmed, with the SUPERSEDED
+      older attempts nested under it as dimmed children. -#}
   {%- macro subagent_node(sa) -%}
     <li
-      class="subagent-node subagent-log-clickable{% if sa.kind == 'attempt' %} subagent-attempt{% endif %}"
+      class="subagent-node subagent-log-clickable{% if sa.kind == 'attempt' %} subagent-attempt{% if sa.attempt_head %} subagent-attempt-head{% endif %}{% endif %}"
       data-subagent-id="{{ sa.subagent_id }}"
       data-log-mode="subagent"
       tabindex="0"
       role="button"
       aria-label="View live log for subagent {{ sa.subagent_id }}"
       title="Click to tail this subagent's live log">
-      {% if sa.kind == 'attempt' %}<span class="subagent-attempt-badge" title="prior dispatch attempt of this queue item">attempt {{ sa.attempt }}</span>{% endif %}
+      {% if sa.kind == 'attempt' %}<span class="subagent-attempt-badge" title="{% if sa.attempt_head %}latest dispatch attempt of this queue item{% else %}superseded dispatch attempt of this queue item{% endif %}">attempt {{ sa.attempt }}{% if sa.attempt_head %} · latest{% endif %}</span>{% endif %}
       <code class="subagent-id">{{ sa.subagent_id[:12] }}</code>
       <span class="subagent-label">{{ sa.label }}</span>
       <span class="subagent-age">{{ sa.age }}</span>
