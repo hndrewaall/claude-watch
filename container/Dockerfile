@@ -629,6 +629,21 @@ RUN ln -s /usr/local/bin/claude-watch /usr/local/bin/watcher-ctl
 # container-runtime CLAUDE.md owns that slot.
 COPY container/baked-CLAUDE.md /etc/claude-code/CLAUDE.md
 
+# Make the managed-config DIRECTORY writable by uid 1000 so the entrypoint
+# (which runs as hndrewaall/uid 1000, NOT root — see the `USER hndrewaall`
+# directive below) can create/remove the managed-settings.json symlink at
+# RUNTIME. The entrypoint's conditional `ln -sf`/`rm -f` against
+# /etc/claude-code/managed-settings.json needs WRITE on the parent dir to
+# add/unlink that entry. /etc/claude-code is root-owned by default (the
+# COPY above lands CLAUDE.md as root:root), so without this chown the
+# entrypoint's symlink management fails with "Permission denied" — and with
+# `set -euo pipefail` that aborts the entrypoint entirely, leaving no tmux
+# session ("no session to connect to"): the exact redeploy wedge this PR
+# fixes, reintroduced. Chowning only the directory (not its contents) keeps
+# the baked CLAUDE.md root-owned/read-only — the entrypoint never writes it,
+# it only manages the sibling managed-settings.json entry.
+RUN chown 1000:1000 /etc/claude-code
+
 # Bake the docs the managed CLAUDE.md links to so its cross-references
 # resolve to LOCAL paths in-container instead of raw-GitHub URLs.
 # baked-CLAUDE.md lands at /etc/claude-code/CLAUDE.md and links to its
