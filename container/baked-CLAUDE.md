@@ -621,6 +621,28 @@ delivered-but-non-blocking. The subagent's next non-exempt tool call is
 HARD-DENIED by the existing `pre-tool-obligations-gate-hook` (already wired
 by the entrypoint), with the message body in the deny banner.
 
+**Don't know the agent id, only the QUEUE id?** The main loop usually
+knows the queue item (`q-2026-06-23-96a0`), not the agent id — and
+GUESSING the agent id misroutes corrections to the wrong inbox. Resolve
+it instead of guessing:
+
+```sh
+agent-msg resolve <q-id>                       # print the live agent id for a q-id
+agent-msg send --queue-id <q-id> "<message>"   # resolve + send in one step
+agent-msg whoami <agent-id>                    # reverse: print the q-id for an agent
+```
+
+`resolve` / `send --queue-id` read the `PostToolUse:Agent` arm hook's
+binding map (`~/.config/claude/agent-queue-bindings.json`, agent_id ->
+queue_id). A bound agent counts as **live** only while its inbox file
+exists; resolution requires EXACTLY ONE live agent and **errors loudly
+(non-zero exit) on zero or multiple** — never silently picks one (so a
+retry that spawned a second agent on the same q-id, or an already-exited
+agent, is a hard failure, not a misroute). `resolve --all` lists every
+match (live + stale) for diagnostics. The binding file is read
+defensively (a corrupt / empty / truncated file reads as empty, never a
+crash) and written atomically.
+
 **As a subagent, when you see a deny banner that includes the message
 text, run:**
 
@@ -641,6 +663,9 @@ agent-msg show <id>               # metadata for one agent
 agent-msg arm <id>                # main-loop-only: register inbox gate
 agent-msg disarm <id>             # main-loop-only: tear down gate
 agent-msg send <id> <text>        # main-loop-only: deliver a message (auto-arms the gate idempotently)
+agent-msg send --queue-id q-XXXX <text>   # resolve q-id -> single live agent, then send
+agent-msg resolve <q-id>          # main-loop: print the live agent id bound to a q-id
+agent-msg whoami <id>             # reverse lookup: print the q-id bound to an agent
 agent-msg inbox <id>              # read inbox (default: unread only)
 agent-msg ack <id>                # subagent-side: clear unread
 agent-msg gc <id>                 # drop read messages older than TTL
