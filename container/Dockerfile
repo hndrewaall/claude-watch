@@ -610,16 +610,24 @@ RUN ln -s /usr/local/bin/claude-watch /usr/local/bin/watcher-ctl
 # managed-settings dir (CLAUDE_HOST_MANAGED_SETTINGS_DIR; Linux default
 # /etc/claude-code, macOS /Library/Application Support/ClaudeCode) read-only
 # at the fixed staging path /mnt/host-managed-claude-config. The symlink
-# below makes the host's managed-settings.json visible at the documented
-# Linux path the in-container claude actually reads, REGARDLESS of where
-# the host OS keeps the file. When the env var is unset the compose mounts
-# /dev/null at the staging path and the symlink dangles — Claude Code
-# treats the managed-settings tier as absent. The host's own managed
-# CLAUDE.md (if any) is intentionally NOT propagated: the baked
+# /etc/claude-code/managed-settings.json -> <staging>/managed-settings.json
+# makes the host's managed-settings.json visible at the documented Linux
+# path the in-container claude actually reads, REGARDLESS of where the host
+# OS keeps the file.
+#
+# We do NOT bake that symlink here. When CLAUDE_HOST_MANAGED_SETTINGS_DIR
+# is unset the compose mounts /dev/null at the staging path; a baked
+# symlink would then traverse a NON-directory and resolve to ENOTDIR (a
+# HARD read error, not the dangling-ENOENT one might assume) — which sends
+# Claude Code into its blocking "Settings Error" modal and wedges the
+# detached tmux pane on launch ("no session to connect to"). Instead the
+# entrypoint (container/entrypoint.sh) creates the symlink CONDITIONALLY
+# at startup — only when the staging mount is a real dir holding a readable
+# managed-settings.json — and otherwise removes it so the managed tier is
+# genuinely absent (ENOENT, which Claude Code tolerates). The host's own
+# managed CLAUDE.md (if any) is intentionally NOT propagated: the baked
 # container-runtime CLAUDE.md owns that slot.
 COPY container/baked-CLAUDE.md /etc/claude-code/CLAUDE.md
-RUN ln -s /mnt/host-managed-claude-config/managed-settings.json \
-        /etc/claude-code/managed-settings.json
 
 # Bake the docs the managed CLAUDE.md links to so its cross-references
 # resolve to LOCAL paths in-container instead of raw-GitHub URLs.
