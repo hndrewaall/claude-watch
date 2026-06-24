@@ -1,4 +1,4 @@
-.PHONY: test test-verbose test-unit test-e2e test-live test-session-task test-hooks test-agent-msg test-agent-tail test-claude-event test-event-must-act test-self-clear test-watchers test-dashboard test-trust-workspace test-claude-tmux-env test-cron-toggle test-hooks-shim test-doc-links test-install-hooks test-entrypoint test-cw test-mcp-host-bash test-hostjob test-mcp-proxy-auth-shim test-install-host-deps test-launchd-plist test-load-bearer-from-keychain test-personal-mcp-host test-personal-mcp-host-plist test-personal-mcp-install test-ttyd-paste-handler test-claude-md-size build deploy install install-hooks compose-up compose-down compose-build container-build bootstrap redeploy clean
+.PHONY: test test-verbose test-unit test-e2e test-live test-session-task test-hooks test-agent-msg test-agent-tail test-claude-event test-event-must-act test-self-clear test-watchers test-dashboard test-trust-workspace test-claude-tmux-env test-cron-toggle test-hooks-shim test-doc-links test-install-hooks test-entrypoint test-cw test-mcp-host-bash test-hostjob test-mcp-proxy-auth-shim test-install-host-deps test-launchd-plist test-load-bearer-from-keychain test-personal-mcp-host test-personal-mcp-host-plist test-personal-mcp-install test-ttyd-paste-handler test-claude-md-size build deploy deploy-systemd install install-hooks compose-up compose-down compose-build container-build bootstrap redeploy deploy-container clean
 
 # Default: run all tests in parallel via nextest (preferred) or cargo test
 test:
@@ -184,6 +184,7 @@ test-entrypoint:
 	container/tests/baked-dirs.test
 	container/tests/baked-obligations-hooks.test
 	container/tests/config-dir-uid-1000.test
+	container/tests/claude-code-dir-uid-1000.test
 	container/tests/queue-gate-wired.test
 	container/tests/claude-watch-alert-gate-wired.test
 	container/tests/dispatch-gate-wired.test
@@ -312,9 +313,15 @@ test-ttyd-paste-handler:
 build:
 	cargo build --release
 
-# Build + restart systemd service
-deploy: build
+# Build + restart systemd service (HOST / systemd install — NOT used in the
+# Docker-container setup; see `deploy-container` for that).
+deploy-systemd: build
 	sudo systemctl restart claude-watch
+
+# DEPRECATED alias — kept so any docs / muscle-memory invoking `make deploy`
+# keep working. Prefer `make deploy-systemd` (self-documenting). No recipe body;
+# just depends on the renamed target.
+deploy: deploy-systemd
 
 # Install built binaries + scripts onto $PATH ($BIN_DIR, default ~/bin).
 # Targets:
@@ -415,11 +422,23 @@ bootstrap:
 # operators who want origin/main should `git pull --rebase` before
 # invoking this target (the Dockerfile no longer pins a remote SHA — it
 # COPYs the local working tree).
+# Host-computed build identity passed to container/Dockerfile's
+# claude-watch-builder stage (CW_BUILD_COMMIT / CW_BUILD_PR), which build.rs
+# bakes into the `claude_watch_build_info` Prometheus gauge. The Docker build
+# context prunes `.git/` (.dockerignore), so build.rs cannot run git inside
+# the image — we resolve commit + PR HERE on the host (git available) and feed
+# them in. CW_BUILD_PR parses the trailing `(#N)` squash-merge convention from
+# the HEAD subject (empty if none — matches build.rs's "" fallback).
+CW_BUILD_COMMIT = $(shell git rev-parse --short HEAD 2>/dev/null)
+CW_BUILD_PR = $(shell git log -1 --format=%s 2>/dev/null | grep -oE '\#[0-9]+' | tail -1 | tr -d '\#')
+
 compose-build:
 	@cd examples/compose && \
 	  GIT_SHA="$$(git rev-parse HEAD 2>/dev/null || echo)" \
 	  docker compose build \
-	    --build-arg GIT_SHA="$$(git rev-parse HEAD 2>/dev/null || echo)"
+	    --build-arg GIT_SHA="$$(git rev-parse HEAD 2>/dev/null || echo)" \
+	    --build-arg CW_BUILD_COMMIT="$(CW_BUILD_COMMIT)" \
+	    --build-arg CW_BUILD_PR="$(CW_BUILD_PR)"
 
 # Build just the claude-container image directly (no compose). Same
 # GIT_SHA plumbing as compose-build. Context is the repo root because the
@@ -429,6 +448,8 @@ compose-build:
 container-build:
 	docker build \
 	  --build-arg GIT_SHA="$$(git rev-parse HEAD 2>/dev/null || echo)" \
+	  --build-arg CW_BUILD_COMMIT="$(CW_BUILD_COMMIT)" \
+	  --build-arg CW_BUILD_PR="$(CW_BUILD_PR)" \
 	  -t claude-container:dev \
 	  -f container/Dockerfile \
 	  .
@@ -442,7 +463,10 @@ compose-up:
 compose-down:
 	@cd examples/compose && docker compose down
 
-# Redeploy the claude-container service (picks up new image / config).
+# Deploy/recreate the claude-container service (picks up new image / config).
+# This is the ONLY correct deploy for the Docker-container setup (the host/
+# systemd variant is `deploy-systemd`). `make redeploy` remains a working
+# DEPRECATED alias of this target.
 #
 # A SINGLE `docker compose up -d --force-recreate claude-container`.
 # This is deliberately one host-daemon operation so the target works
@@ -507,14 +531,43 @@ compose-down:
 COMPOSE_BASE := $(CURDIR)/examples/compose/docker-compose.yml
 COMPOSE_OVERRIDE := $(HOME)/.config/claude-container/docker-compose.override.yml
 
-redeploy:
+# DEPLOY_ENV_FILE wiring (same worktree-invisibility class of bug as the
+# COMPOSE_OVERRIDE above): docker compose auto-loads `.env` from the
+# project dir (examples/compose/), but `.env` is gitignored — it exists in
+# the main clone's examples/compose/.env but NOT in a worktree's. Since the
+# workflow convention deploys from the build worktree
+# `~/repos/.worktrees/claude-watch/main`, that auto-loaded `.env` is EMPTY,
+# so deploy-critical vars (notably CLAUDE_HOST_MANAGED_SETTINGS_DIR) default
+# to their fallbacks (e.g. the managed-settings dir → /dev/null mount).
+#
+# Fix: keep the deploy-critical vars in a LOCATION-INDEPENDENT config-dir
+# env-file and pass it explicitly with `--env-file`, mirroring how
+# COMPOSE_FILE resolves the override from the config dir. Operators migrate
+# the relevant vars into this file once (see the PR / README note); a host
+# without it still recreates cleanly (compose falls back to the project
+# `.env` if present, else the in-file defaults).
+DEPLOY_ENV_FILE := $(HOME)/.config/claude-container/deploy.env
+
+deploy-container:
 	@cd examples/compose && \
 	  if [ -x bin/prepare-host-claude-state ]; then ./bin/prepare-host-claude-state; fi && \
+	  env_flag=""; \
+	  if [ -f "$(DEPLOY_ENV_FILE)" ]; then env_flag="--env-file $(DEPLOY_ENV_FILE)"; fi; \
+	  export CW_BUILD_COMMIT="$(CW_BUILD_COMMIT)"; \
+	  export CW_BUILD_PR="$(CW_BUILD_PR)"; \
+	  export GIT_SHA="$$(git rev-parse HEAD 2>/dev/null || echo)"; \
 	  if [ -f "$(COMPOSE_OVERRIDE)" ]; then \
-	    COMPOSE_FILE="$(COMPOSE_BASE):$(COMPOSE_OVERRIDE)" docker compose up -d --force-recreate claude-container; \
+	    COMPOSE_FILE="$(COMPOSE_BASE):$(COMPOSE_OVERRIDE)" docker compose $$env_flag up -d --force-recreate claude-container; \
 	  else \
-	    docker compose up -d --force-recreate claude-container; \
+	    docker compose $$env_flag up -d --force-recreate claude-container; \
 	  fi
+
+# DEPRECATED alias — kept so the baked image's own scripts/docs (entrypoint,
+# cwsr, container/tests/redeploy-self-recreate.test, baked-CLAUDE.md) and the
+# self-redeploy contract keep working until an image rebuild bakes the new name
+# `deploy-container` everywhere. `make redeploy` MUST keep working. No recipe
+# body; just depends on the renamed target.
+redeploy: deploy-container
 
 # Clean build artifacts
 clean:

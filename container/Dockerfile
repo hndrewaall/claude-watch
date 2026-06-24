@@ -34,6 +34,22 @@ FROM rust:1-bookworm AS claude-watch-builder
 
 WORKDIR /build
 
+# Build-time git identity for the `claude_watch_build_info` Prometheus gauge.
+#
+# build.rs stamps CW_GIT_COMMIT / CW_GIT_PR into the binary. It prefers live
+# git, but `.dockerignore` prunes `.git/` from this build context (see the
+# repo-root .dockerignore — shipping the pack files to the daemon is wasteful),
+# so live git is UNAVAILABLE here and would otherwise fall back to
+# `commit="unknown"`. We therefore plumb the host-computed commit + PR in as
+# build args and expose them as env vars build.rs reads as its fallback. The
+# Makefile (compose-build / container-build) computes these on the host where
+# git IS present; a bare `docker build` with no args cleanly degrades to
+# "unknown" (same as before).
+ARG CW_BUILD_COMMIT=
+ARG CW_BUILD_PR=
+ENV CW_BUILD_COMMIT=${CW_BUILD_COMMIT} \
+    CW_BUILD_PR=${CW_BUILD_PR}
+
 # COPY the working tree from the build context (the repo root). The
 # .dockerignore at the repo root prunes target/, __pycache__/, .git/,
 # editor swap files, etc. — only the source files Cargo + the rest of
@@ -594,16 +610,39 @@ RUN ln -s /usr/local/bin/claude-watch /usr/local/bin/watcher-ctl
 # managed-settings dir (CLAUDE_HOST_MANAGED_SETTINGS_DIR; Linux default
 # /etc/claude-code, macOS /Library/Application Support/ClaudeCode) read-only
 # at the fixed staging path /mnt/host-managed-claude-config. The symlink
-# below makes the host's managed-settings.json visible at the documented
-# Linux path the in-container claude actually reads, REGARDLESS of where
-# the host OS keeps the file. When the env var is unset the compose mounts
-# /dev/null at the staging path and the symlink dangles — Claude Code
-# treats the managed-settings tier as absent. The host's own managed
-# CLAUDE.md (if any) is intentionally NOT propagated: the baked
+# /etc/claude-code/managed-settings.json -> <staging>/managed-settings.json
+# makes the host's managed-settings.json visible at the documented Linux
+# path the in-container claude actually reads, REGARDLESS of where the host
+# OS keeps the file.
+#
+# We do NOT bake that symlink here. When CLAUDE_HOST_MANAGED_SETTINGS_DIR
+# is unset the compose mounts /dev/null at the staging path; a baked
+# symlink would then traverse a NON-directory and resolve to ENOTDIR (a
+# HARD read error, not the dangling-ENOENT one might assume) — which sends
+# Claude Code into its blocking "Settings Error" modal and wedges the
+# detached tmux pane on launch ("no session to connect to"). Instead the
+# entrypoint (container/entrypoint.sh) creates the symlink CONDITIONALLY
+# at startup — only when the staging mount is a real dir holding a readable
+# managed-settings.json — and otherwise removes it so the managed tier is
+# genuinely absent (ENOENT, which Claude Code tolerates). The host's own
+# managed CLAUDE.md (if any) is intentionally NOT propagated: the baked
 # container-runtime CLAUDE.md owns that slot.
 COPY container/baked-CLAUDE.md /etc/claude-code/CLAUDE.md
-RUN ln -s /mnt/host-managed-claude-config/managed-settings.json \
-        /etc/claude-code/managed-settings.json
+
+# Make the managed-config DIRECTORY writable by uid 1000 so the entrypoint
+# (which runs as hndrewaall/uid 1000, NOT root — see the `USER hndrewaall`
+# directive below) can create/remove the managed-settings.json symlink at
+# RUNTIME. The entrypoint's conditional `ln -sf`/`rm -f` against
+# /etc/claude-code/managed-settings.json needs WRITE on the parent dir to
+# add/unlink that entry. /etc/claude-code is root-owned by default (the
+# COPY above lands CLAUDE.md as root:root), so without this chown the
+# entrypoint's symlink management fails with "Permission denied" — and with
+# `set -euo pipefail` that aborts the entrypoint entirely, leaving no tmux
+# session ("no session to connect to"): the exact redeploy wedge this PR
+# fixes, reintroduced. Chowning only the directory (not its contents) keeps
+# the baked CLAUDE.md root-owned/read-only — the entrypoint never writes it,
+# it only manages the sibling managed-settings.json entry.
+RUN chown 1000:1000 /etc/claude-code
 
 # Bake the docs the managed CLAUDE.md links to so its cross-references
 # resolve to LOCAL paths in-container instead of raw-GitHub URLs.

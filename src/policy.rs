@@ -468,6 +468,28 @@ pub(crate) fn workload_heartbeat_suppresses_stuck(config: &Config) -> bool {
     )
 }
 
+/// Pure decision: should the heartbeat-stale `stuck` flag be suppressed
+/// for THIS cycle?
+///
+/// Two independent proof-of-life conditions suppress the flag:
+///   * `workload_fresh` -- a `workload run` (stv-promote, rsync, ffmpeg)
+///     emitted a fresh per-label heartbeat (see
+///     `workload_heartbeat_suppresses_stuck`).
+///   * `active_subagents > 0` -- the main loop is legitimately blocked
+///     dispatcher-waiting on long-running background subagents (5-15min,
+///     few counted tool calls). Firing the Escape interrupt here would
+///     cancel the in-flight turn AND kill those healthy subagents. This
+///     mirrors the auto-respawn guard in `respawn::should_respawn`
+///     (active subagents veto a respawn) -- applied at detection time so
+///     it fixes BOTH the destructive interrupt AND the downstream
+///     `HangSignal::HeartbeatStale` fed to the respawn collector.
+///
+/// Kept pure (no /proc, no Config) so it is unit-testable; the caller
+/// computes the two inputs.
+pub(crate) fn stuck_suppressed_by_activity(workload_fresh: bool, active_subagents: u32) -> bool {
+    workload_fresh || active_subagents > 0
+}
+
 /// Reason a force-inject escalation should fire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum EscalationReason {
@@ -819,7 +841,28 @@ async fn restart_claude(pane: &str, state: &mut State, config: &crate::config::C
         );
     }
 
-    tmux::inject_shell(pane, &format!("bash {}", config.relaunch_script)).await;
+    // Verify the script actually landed on disk before injecting. If the
+    // write somehow didn't stick (tmpfs gone, race) do NOT type a broken
+    // `bash <path>` into the pane -- bail and let the crash-recovery path
+    // try again on the next loop pass.
+    if !std::path::Path::new(&config.relaunch_script).exists() {
+        tracing::error!(
+            path = %config.relaunch_script,
+            "relaunch script missing immediately after write -- aborting inject (would hit a dead shell)"
+        );
+        return;
+    }
+
+    // Inject a self-healing guarded one-liner: run the script if present at
+    // exec time, else run the claude launch argv inline (the script could
+    // still vanish between this write and the pane shell executing it --
+    // tmpfs wipe / respawn.rs remove_file race). The inline fallback gets a
+    // `cd $HOME &&` prefix to match the script's `cd $HOME` so resume/continue
+    // resolves correctly. (Resume PROMPT text -- which has parens -- is NOT
+    // included; only the shell-safe `claude` argv is.)
+    let inline_launch = format!("cd $HOME && {}", launch);
+    let inject_cmd = build_relaunch_inject_cmd(&config.relaunch_script, &inline_launch);
+    tmux::inject_shell(pane, &inject_cmd).await;
 
     state.last_restart = Some(now);
     state.restart_count += 1;
@@ -2318,6 +2361,77 @@ pub async fn check_auto_update(config: &Config, state: &mut State, pane: &str) {
     });
 }
 
+/// Build the `claude ...` relaunch command line for the auto-update
+/// relaunch script, mirroring the entrypoint's CLAUDE_CMD shape
+/// (`container/entrypoint.sh` + `container/bin/cwsr` `build_claude_cmd`).
+///
+/// Shape, in order (each flag conditional on the matching env var, exactly
+/// like the entrypoint so the relaunched claude is identical to the one the
+/// container booted):
+///   - `--setting-sources project,local --settings <CLAUDE_SHIM_SETTINGS_PATH>`
+///     when `CLAUDE_SHIM_SETTINGS_PATH` is set (drops the host user tier and
+///     loads the MCP-settings shim). On the host this env var is unset, so
+///     the flags are omitted and we degrade to bare `claude` — the previous
+///     behavior.
+///   - `--plugin-dir /opt/claude-container/plugin` when that plugin dir
+///     exists (baked container skills + agents). Absent on the host.
+///   - `--dangerously-skip-permissions` always (harness-managed instances
+///     run in permanent permission-bypass mode).
+///   - `--resume <sid>` when a session id was captured, else `--continue`
+///     (the resume / continue selector the caller already computed).
+///
+/// Pure modulo env + a filesystem existence check; no I/O side effects.
+fn build_relaunch_claude_argv(session_id: Option<&str>) -> String {
+    let mut cmd = String::from("claude");
+    if let Ok(shim) = std::env::var("CLAUDE_SHIM_SETTINGS_PATH") {
+        if !shim.is_empty() {
+            cmd.push_str(" --setting-sources project,local --settings ");
+            cmd.push_str(&shim);
+        }
+    }
+    // Mirror entrypoint.sh / cwsr: append the baked container plugin dir
+    // when present so the relaunched claude keeps the /claude-container:*
+    // skills + agents. Falls back gracefully (no flag) on the host or on
+    // images that predate the plugin bake.
+    let plugin_dir = std::env::var("CWSR_PLUGIN_DIR")
+        .unwrap_or_else(|_| "/opt/claude-container/plugin".to_string());
+    if std::path::Path::new(&plugin_dir).join(".claude-plugin").is_dir() {
+        cmd.push_str(" --plugin-dir ");
+        cmd.push_str(&plugin_dir);
+    }
+    cmd.push_str(" --dangerously-skip-permissions");
+    match session_id {
+        Some(sid) => {
+            cmd.push_str(" --resume ");
+            cmd.push_str(sid);
+        }
+        None => cmd.push_str(" --continue"),
+    }
+    cmd
+}
+
+/// Build the shell one-liner injected into the pane to relaunch Claude.
+///
+/// The daemon writes a relaunch script (`config.relaunch_script`, default
+/// `/var/run/claude/claude-relaunch.sh`) then types `bash <path>` into the
+/// pane shell. But `/var/run` is a tmpfs: it is wiped on every container
+/// start and `respawn.rs` also `remove_file`s the script. If the file is
+/// absent at the moment the pane shell runs the command, a bare
+/// `bash <path>` dies with `No such file or directory`, leaving a dead
+/// `/bin/sh` pane -> recreate loop (operator-observed bug; PR #412 fixed
+/// post-relaunch detection/argv but NOT this script-write/exec path).
+///
+/// So inject a SELF-HEALING guarded one-liner instead: run the script if it
+/// exists at exec time, else run the `claude` launch argv directly inline so
+/// Claude still comes up. POSIX-safe (`[ -f X ] && bash X || { CMD; }`)
+/// so it works in both `/bin/sh` and bash panes. `launch` is the same
+/// `claude ...` argv computed by the caller (flags + a uuid, no
+/// shell-hostile chars), so the inline fallback is safe to type verbatim.
+/// Pure (no I/O) so it is unit-testable in parallel.
+fn build_relaunch_inject_cmd(script_path: &str, launch: &str) -> String {
+    format!("[ -f {p} ] && bash {p} || {{ {launch}; }}", p = script_path, launch = launch)
+}
+
 /// Execute the auto-update sequence: interrupt → /exit → wait → relaunch → resume.
 async fn run_auto_update(pane: &str, old_version: &str, new_version: &str, config: &Config) {
     info!("auto-update: interrupting Claude Code...");
@@ -2391,11 +2505,20 @@ async fn run_auto_update(pane: &str, old_version: &str, new_version: &str, confi
     //
     // --dangerously-skip-permissions: harness-managed instances run in permanent
     // permission-bypass mode (see also crash-recovery launch above).
-    let launch = if let Some(ref sid) = session_id {
-        format!("claude --dangerously-skip-permissions --resume {}", sid)
-    } else {
-        "claude --dangerously-skip-permissions --continue".to_string()
-    };
+    //
+    // The launch argv MUST mirror the entrypoint's CLAUDE_CMD shape
+    // (container/entrypoint.sh + container/bin/cwsr build_claude_cmd):
+    // when CLAUDE_SHIM_SETTINGS_PATH is set the in-container claude is
+    // launched with `--setting-sources project,local --settings <shim>`
+    // (drops the host user tier, loads the MCP-settings shim) and a
+    // `--plugin-dir` for the baked container plugin (skills + agents).
+    // A bare `claude` relaunch loses those: it would load the wrong
+    // settings tier (host user settings, whose macOS apiKeyHelper can't
+    // exec on Linux) and silently drop the baked /claude-container:<name>
+    // commands. `build_relaunch_claude_argv` reconstructs the correct
+    // shape from the same env vars; on the host (no shim env) it degrades
+    // to the previous bare-`claude` behavior.
+    let launch = build_relaunch_claude_argv(session_id.as_deref());
 
     // Ensure the relaunch-script parent dir exists (see crash-recovery
     // note above): `/var/run/claude/` is tmpfs and may be gone after a
@@ -2422,9 +2545,29 @@ async fn run_auto_update(pane: &str, old_version: &str, new_version: &str, confi
         );
     }
 
-    // Step 6: Inject relaunch command into shell
+    // Verify the script landed before injecting; if not, abort the inject
+    // rather than type a broken `bash <path>` into the pane. The clean-restart
+    // fallback (Step 7, on binary-not-found) recovers a dead pane, but skipping
+    // a write that didn't stick avoids the doomed inject entirely.
+    if !std::path::Path::new(&config.claude.relaunch_script).exists() {
+        tracing::error!(
+            path = %config.claude.relaunch_script,
+            "auto-update: relaunch script missing immediately after write -- aborting inject"
+        );
+        return;
+    }
+
+    // Step 6: Inject the self-healing guarded relaunch one-liner. If the
+    // script vanishes (tmpfs wipe / respawn.rs remove_file race) between this
+    // write and the pane shell running it, the `|| { <launch>; }` fallback
+    // runs the same claude argv inline so Claude still comes up rather than
+    // dying with "No such file or directory". `launch` already has the right
+    // `cd $HOME` semantics baked into the script; for the inline fallback we
+    // prefix `cd $HOME &&` to match.
     info!("auto-update: injecting relaunch command...");
-    tmux::inject_shell(pane, &format!("bash {}", config.claude.relaunch_script)).await;
+    let inline_launch = format!("cd $HOME && {}", launch);
+    let inject_cmd = build_relaunch_inject_cmd(&config.claude.relaunch_script, &inline_launch);
+    tmux::inject_shell(pane, &inject_cmd).await;
 
     // Step 7: Wait for claude binary to appear in process tree.
     //
@@ -2450,23 +2593,70 @@ async fn run_auto_update(pane: &str, old_version: &str, new_version: &str, confi
         warn!(
             "auto-update: claude binary not detected after 120s -- \
              relaunch likely failed (missing relaunch script or boot error); \
-             ABORTING resume-inject so the resume prompt is never typed into a raw shell"
+             attempting a CLEAN restart via the configured restart command \
+             before giving up (never leave a dead pane)"
         );
         write_jsonl_log(
             &config.general.log_file,
-            "auto_update_failed",
-            serde_json::json!({"reason": "binary_not_found_resume_inject_aborted"}),
+            "auto_update_relaunch_retry",
+            serde_json::json!({"reason": "binary_not_found_after_script_relaunch"}),
         );
-        alert::notify(crate::event_bus::ClaudeWatchAlert {
-            alert_type: "auto-update-failed",
-            stuck_reason: "auto-update: claude binary never started after relaunch; resume-inject aborted to avoid corrupting the shell",
-            stale_minutes: None,
-            affected_watchers: vec![],
-            severity: crate::event_bus::Severity::High,
-            message: "claude-watch: auto-update FAILED -- Claude did not restart; resume prompt NOT injected (would have hit a raw shell). Operator must relaunch manually.",
-        })
-        .await;
-        return;
+
+        // CLEAN-RESTART FALLBACK. The shell-injected relaunch script didn't
+        // bring Claude up. Rather than abort into a dead `/bin/sh` pane,
+        // try the same in-place roll the container's auto-respawn path uses:
+        // `cwsr --no-upgrade` (tmux respawn-pane -k) — the upgrade already
+        // landed via npm's atomic symlink swap, so we only need to respawn
+        // the pane. cwsr reconstructs the correct entrypoint argv itself
+        // (settings shim, plugin-dir, --continue). On the host (no cwsr on
+        // PATH) this is a best-effort no-op and we fall through to the
+        // hard-fail alert below. The fallback command is configurable via
+        // `[auto_respawn_on_hang] respawn_command` (container default
+        // `["cwsr", "--no-upgrade"]`).
+        let restart_argv: Vec<&str> = config
+            .auto_respawn_on_hang
+            .respawn_command
+            .iter()
+            .map(|s| s.as_str())
+            .collect();
+        let mut clean_restart_ok = false;
+        if !restart_argv.is_empty() {
+            info!(
+                restart_command = ?config.auto_respawn_on_hang.respawn_command,
+                "auto-update: shell relaunch failed -- invoking clean-restart fallback"
+            );
+            let (_out, ok) = crate::cmd::run_cmd_any(&restart_argv, 60).await;
+            if ok {
+                // Give the respawned pane time to bring claude up.
+                clean_restart_ok = tmux::wait_for_claude_binary(pane, 120).await;
+            } else {
+                warn!("auto-update: clean-restart fallback command exited non-zero");
+            }
+        }
+
+        if !clean_restart_ok {
+            warn!(
+                "auto-update: claude binary still not detected after clean-restart \
+                 fallback -- ABORTING resume-inject so the resume prompt is never \
+                 typed into a raw shell"
+            );
+            write_jsonl_log(
+                &config.general.log_file,
+                "auto_update_failed",
+                serde_json::json!({"reason": "binary_not_found_resume_inject_aborted"}),
+            );
+            alert::notify(crate::event_bus::ClaudeWatchAlert {
+                alert_type: "auto-update-failed",
+                stuck_reason: "auto-update: claude binary never started after relaunch (incl. clean-restart fallback); resume-inject aborted to avoid corrupting the shell",
+                stale_minutes: None,
+                affected_watchers: vec![],
+                severity: crate::event_bus::Severity::High,
+                message: "claude-watch: auto-update FAILED -- Claude did not restart even after a clean-restart fallback; resume prompt NOT injected (would have hit a raw shell). Operator must relaunch manually.",
+            })
+            .await;
+            return;
+        }
+        info!("auto-update: clean-restart fallback brought Claude back up");
     }
 
     // Step 8: Wait for the idle prompt (Claude Code is ready for input).
@@ -3619,12 +3809,37 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                     // cycle. The heartbeat-stale counter is also held
                     // back so a long workload doesn't accumulate
                     // suppressed-fire history.
-                    if workload_heartbeat_suppresses_stuck(config) {
+                    // Two proof-of-life conditions suppress the stuck flag for
+                    // this cycle: a fresh workload heartbeat (as before) OR
+                    // active background subagents. The main loop is often
+                    // LEGITIMATELY dispatcher-waiting on long-running (5-15min)
+                    // subagents with few counted tool calls -- firing the
+                    // Escape interrupt here would cancel the in-flight turn
+                    // AND kill those healthy agents. The active-subagent count
+                    // mirrors the auto-respawn guard
+                    // (`respawn::should_respawn`); applying it at DETECTION
+                    // time fixes both the destructive interrupt and the
+                    // downstream `HangSignal::HeartbeatStale` (so no stuck flag
+                    // is set and no hang-signal is fed to the respawn
+                    // collector). The count is cheap (one /proc scan) and
+                    // fail-open (returns 0 when no Claude PID is detectable).
+                    let workload_fresh = workload_heartbeat_suppresses_stuck(config);
+                    let active_subagents =
+                        crate::respawn::count_active_subagents_with_versions_dir(None);
+                    if stuck_suppressed_by_activity(workload_fresh, active_subagents) {
                         let age_min = age / 60;
+                        let reason = if workload_fresh {
+                            "workload_heartbeat_fresh"
+                        } else {
+                            "active_subagents"
+                        };
                         debug!(
                             stale_age_min = age_min,
                             threshold_min = config.heartbeat.stale_minutes,
-                            "heartbeat-stale suppressed by fresh workload heartbeat"
+                            workload_fresh,
+                            active_subagents,
+                            reason,
+                            "heartbeat-stale suppressed (proof-of-life)"
                         );
                         write_jsonl_log(
                             &config.general.log_file,
@@ -3632,7 +3847,9 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                             serde_json::json!({
                                 "stale_age_min": age_min,
                                 "threshold_min": config.heartbeat.stale_minutes,
-                                "reason": "workload_heartbeat_fresh",
+                                "reason": reason,
+                                "workload_fresh": workload_fresh,
+                                "active_subagents": active_subagents,
                                 "dir": &config.stuck_detection.workload_heartbeat_dir,
                                 "max_age_secs": config.stuck_detection.workload_heartbeat_max_age_secs,
                             }),
@@ -4119,12 +4336,29 @@ pub async fn check_cycle(config: &Config, state: &mut State) {
                 // Default 90s; tunable via [watcher_monitor].grace_secs (0 in
                 // the e2e auto-restart test for fast firing).
                 let grace_secs = config.watcher_monitor.grace_secs as f64;
-                let in_grace = health
+                // Anchor the grace window on RECENT PROOF-OF-LIFE that does NOT
+                // require the daemon to catch the short-lived (fire-and-exit)
+                // watcher mid-flight. `last_seen_running` is refreshed ONLY on a
+                // poll cycle that happens to observe the watcher genuinely alive
+                // — but claude-event-watch is alive only a few seconds per
+                // restart cycle, so the poll frequently MISSES the live window
+                // and `last_seen_running` goes stale even while the main loop is
+                // faithfully restarting the watcher. That stale anchor expired
+                // the grace window and produced a false-DOWN inject storm.
+                //
+                // The watcher's `.lock`/`.pid` (and `.runlock`) are rewritten on
+                // EVERY restart, so the freshest pidfile mtime is independent
+                // proof the watcher was (re)spawned recently. Treat the watcher
+                // as in-grace if EITHER `last_seen_running` OR its freshest
+                // pidfile is within grace_secs. A GENUINELY dead watcher (main
+                // loop stopped restarting) has its pidfiles age past grace_secs
+                // → DOWN still fires correctly.
+                let last_seen_age = health
                     .last_seen_running
                     .as_deref()
-                    .and_then(elapsed_since)
-                    .is_some_and(|e| e < grace_secs);
-                if in_grace {
+                    .and_then(elapsed_since);
+                let pidfile_age = status::watcher_runtime_file_age_secs(&pid_dir, &entry.name);
+                if status::watcher_in_grace(last_seen_age, pidfile_age, grace_secs) {
                     continue;
                 }
                 health.consecutive_missing += 1;
@@ -4763,7 +4997,7 @@ mod tests {
     // liveness) — NOT off a separately-recorded PID file that drifts out of
     // sync after a restart. A watcher that `pgrep` finds genuinely alive must
     // NEVER be reported DOWN, even when its `/var/run/claude/<name>.pid` file
-    // is stale (points at a now-reaped PID from before a `make deploy` /
+    // is stale (points at a now-reaped PID from before a `make deploy-systemd` /
     // watcher respawn). The zombie guard preserves the original orphan-
     // detection intent: a `<defunct>` match does not count as alive.
 
@@ -4808,7 +5042,7 @@ mod tests {
     ///
     /// Before the fix, the monitor read a recorded PID from
     /// `/var/run/claude/<name>.pid`, found it dead (the watcher had been
-    /// respawned under a fresh PID by `make deploy` / watchmen), and reported
+    /// respawned under a fresh PID by `make deploy-systemd` / watchmen), and reported
     /// the watcher DOWN — while `pgrep` (and `watcher-status`, and `ps`) all
     /// saw it genuinely running. Now the monitor probes the matched PIDs
     /// directly, so the genuinely-running watcher is NEVER reported DOWN
@@ -7644,6 +7878,47 @@ pane_unchanged_secs = 600
         assert!(suppressed_on, "master switch on must let fresh hb suppress");
     }
 
+    // -------------------------------------------------------------------
+    // Active-subagent heartbeat-stale suppression (2026-06-24).
+    //
+    // The heartbeat-stale detection block fires a destructive Escape
+    // interrupt that kills healthy background subagents when the main
+    // loop is legitimately dispatcher-waiting on them. `stuck_suppressed_
+    // by_activity` is the pure decision the detection block uses: stuck
+    // is suppressed when EITHER a workload heartbeat is fresh OR any
+    // subagents are active. This mirrors the auto-respawn active-subagent
+    // guard (`respawn::should_respawn`), tested in `respawn.rs`.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn stuck_suppressed_by_activity_truth_table() {
+        // Neither proof-of-life condition -> not suppressed (stuck may fire).
+        assert!(
+            !stuck_suppressed_by_activity(false, 0),
+            "no workload + 0 subagents must NOT suppress"
+        );
+        // Fresh workload heartbeat alone suppresses (pre-existing behavior).
+        assert!(
+            stuck_suppressed_by_activity(true, 0),
+            "fresh workload heartbeat must suppress"
+        );
+        // Active subagents alone suppress (the NEW guard -- prevents the
+        // false-positive Escape that kills healthy dispatcher-waited agents).
+        assert!(
+            stuck_suppressed_by_activity(false, 1),
+            "one active subagent must suppress"
+        );
+        assert!(
+            stuck_suppressed_by_activity(false, 5),
+            "many active subagents must suppress"
+        );
+        // Both conditions -> suppressed.
+        assert!(
+            stuck_suppressed_by_activity(true, 3),
+            "both conditions must suppress"
+        );
+    }
+
 
     // --- fresh-external-session inject gate (interactive-prompt suppression) ---
 
@@ -7777,4 +8052,95 @@ pane_unchanged_secs = 600
         assert!(!state.ask_question_alerted);
     }
 
+    // -------------------------------------------------------------------
+    // build_relaunch_claude_argv — auto-update relaunch argv shape.
+    //
+    // These assert the env-INdependent parts of the argv (always present
+    // regardless of CLAUDE_SHIM_SETTINGS_PATH / plugin-dir), so they stay
+    // stable under nextest's parallel execution (no process-env mutation).
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn relaunch_argv_always_skips_permissions_and_continues() {
+        let cmd = build_relaunch_claude_argv(None);
+        assert!(cmd.starts_with("claude"), "argv must start with claude: {cmd}");
+        assert!(
+            cmd.contains("--dangerously-skip-permissions"),
+            "harness-managed relaunch must skip permissions: {cmd}"
+        );
+        assert!(
+            cmd.trim_end().ends_with("--continue"),
+            "no session id => --continue: {cmd}"
+        );
+        assert!(!cmd.contains("--resume"), "no session id => no --resume: {cmd}");
+    }
+
+    #[test]
+    fn relaunch_argv_resumes_with_session_id() {
+        let sid = "12345678-1234-1234-1234-123456789abc";
+        let cmd = build_relaunch_claude_argv(Some(sid));
+        assert!(
+            cmd.contains(&format!("--resume {sid}")),
+            "session id => --resume <sid>: {cmd}"
+        );
+        assert!(!cmd.contains("--continue"), "session id => no --continue: {cmd}");
+        assert!(
+            cmd.contains("--dangerously-skip-permissions"),
+            "skip-permissions present on resume path too: {cmd}"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // build_relaunch_inject_cmd — self-healing guarded relaunch one-liner.
+    //
+    // Pure (no I/O), so parallel-safe like the argv tests above. Guards the
+    // second bug PR #412 didn't touch: a missing/vanished relaunch script
+    // must NOT leave a dead `bash <path>: No such file or directory` pane.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn relaunch_inject_cmd_runs_script_when_present() {
+        let path = "/var/run/claude/claude-relaunch.sh";
+        let launch = "cd $HOME && claude --dangerously-skip-permissions --continue";
+        let cmd = build_relaunch_inject_cmd(path, launch);
+        // (a) references the script path with bash
+        assert!(
+            cmd.contains(&format!("bash {path}")),
+            "must bash the script path: {cmd}"
+        );
+        assert!(
+            cmd.contains(&format!("[ -f {path} ]")),
+            "must guard on the file existing: {cmd}"
+        );
+    }
+
+    #[test]
+    fn relaunch_inject_cmd_falls_back_to_inline_launch() {
+        let path = "/var/run/claude/claude-relaunch.sh";
+        let launch = "cd $HOME && claude --dangerously-skip-permissions --resume abc";
+        let cmd = build_relaunch_inject_cmd(path, launch);
+        // (b) contains the inline launch fallback after `||`
+        let (_before, after) = cmd.split_once("||").expect("must have an || fallback");
+        assert!(
+            after.contains(launch),
+            "inline launch must appear after ||: {cmd}"
+        );
+        assert!(
+            after.contains('{') && after.contains('}'),
+            "fallback must be brace-grouped for sh/bash: {cmd}"
+        );
+    }
+
+    #[test]
+    fn relaunch_inject_cmd_is_single_line() {
+        let cmd = build_relaunch_inject_cmd(
+            "/var/run/claude/claude-relaunch.sh",
+            "cd $HOME && claude --dangerously-skip-permissions --continue",
+        );
+        // (c) single line — tmux inject_shell types the literal then Enter.
+        assert!(
+            !cmd.contains('\n'),
+            "injected command must be a single line: {cmd}"
+        );
+    }
 }

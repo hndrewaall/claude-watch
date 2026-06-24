@@ -805,7 +805,7 @@ def _shape(
                 session_subagents = _list_session_subagents(session_id)
                 # Real spawn hierarchy (child -> parent) reconstructed from
                 # the transcripts' Agent/Task launch records. Distinguishes a
-                # nested child from a main-loop retry attempt.
+                # nested spawn-child from a co-bound peer (no spawn edge).
                 parent_map = _session_subagent_parent_map(session_id)
         iid = item.get("id", "")
         # Bindings map is loaded once per render pass and threaded in; load
@@ -1869,12 +1869,15 @@ def _find_parent_session_jsonl(session_id: str) -> Path | None:
 #   2. read its first record to recover the parent ``sessionId``,
 #   3. enumerate EVERY ``agent-*.jsonl`` in that same ``subagents/`` dir.
 #
-# LIMITATION (documented honestly): the on-disk layout is FLAT per-session --
-# subagents spawned BY a subagent are not nested on disk; they sit as siblings
-# under the same session dir. So the tree we render groups subagents by their
-# PARENT MAIN-LOOP SESSION, not by which specific agent spawned each one.
-# There is no on-disk signal to reconstruct deeper parent->child edges, so we
-# don't pretend to.
+# DEPTH: the on-disk layout is FLAT per-session -- subagents spawned BY a
+# subagent are NOT nested on disk; every descendant (child, grandchild, ...)
+# of a main-loop session sits as a SIBLING ``agent-*.jsonl`` under that one
+# session dir, each carrying the same parent ``sessionId``. The REAL spawn
+# hierarchy is reconstructed from each transcript'''s Agent/Task launch records
+# (the ``agentId: <child>`` marker) into a ``child -> parent`` map
+# (``_session_subagent_parent_map``). ``_build_subagent_tree`` then walks that
+# graph from the owner agent to ARBITRARY DEPTH, so grandchildren and beyond
+# render nested under their real parent -- not flattened to one level.
 
 # Session UUIDs are dashed alphanum (same guard _find_parent_session_jsonl
 # uses). Path-traversal guard for the directory walk below.
@@ -1890,7 +1893,7 @@ _SUBAGENT_LABEL_MAX_CHARS = 80
 # ``agentId: <id> (internal ID - do not mention to user...)``. We scan each
 # session subagent transcript for this marker to reconstruct the REAL
 # parent->child spawn edges (which agent spawned which) — the signal that
-# distinguishes a NESTED child from a main-loop retry attempt. See
+# distinguishes a NESTED spawn-child from a co-bound peer. See
 # ``_session_subagent_parent_map`` + ``_build_subagent_tree``.
 _LAUNCHED_AGENT_RE = re.compile(r"agentId:\s*([a-z0-9-]{4,64})")
 # Bound on bytes read per transcript when scanning for launch markers, so a
@@ -2006,7 +2009,7 @@ def _session_subagent_parent_map(session_id: str) -> dict[str, str]:
     whose transcript carries that record is the child's PARENT.
 
     This is the authoritative signal that tells a NESTED child apart from a
-    main-loop retry attempt: a nested child appears in this map (some session
+    co-bound peer: a nested child appears in this map (some session
     agent spawned it); a genuine retry was dispatched by the MAIN LOOP and so
     appears in NO subagent's transcript.
 
@@ -2174,18 +2177,26 @@ def _build_subagent_tree(
     ``_session_subagent_parent_map`` — the REAL spawn hierarchy reconstructed
     from the transcripts' Agent/Task launch records. ``None`` / ``{}`` means
     no hierarchy signal (legacy callers / pre-this-fix transcripts), in which
-    case we degrade to the old flat attempt-collapse.
+    case we degrade to a flat peer list (no spawn nesting available).
 
     The PRIOR tree kept every subagent bound to ``item_id`` (minus the owner)
     and labeled them ALL as ``kind="attempt"`` retry siblings. That was wrong
-    for NESTED agents: when the owner agent (or one of its descendants) spawns
-    a child agent, that child inherits the ``Queue item: q-XXXX`` line in its
-    prompt, so it binds to the SAME ``item_id`` — and got mislabeled as
-    "attempt 2", a false peer-retry of the owner. But it is the owner's CHILD,
-    not a competing dispatch of the same work. (Observed: q-2026-06-19-7aa6
-    rendered owner ``a63d61`` + nested grandchild ``aaa255`` as ATTEMPT 1/2.)
+    on two counts. (1) For NESTED agents: when the owner agent (or one of its
+    descendants) spawns a child agent, that child inherits the
+    ``Queue item: q-XXXX`` line in its prompt, so it binds to the SAME
+    ``item_id`` — and got mislabeled as "attempt 2", a false peer-retry of the
+    owner. But it is the owner's CHILD, not a competing dispatch of the same
+    work. (Observed: q-2026-06-19-7aa6 rendered owner ``a63d61`` + nested
+    grandchild ``aaa255`` as ATTEMPT 1/2.) (2) For co-bound agents with NO
+    spawn edge between them: labeling them "attempt N" (and later nesting the
+    "older" under a "newer" live HEAD) inferred a retry/supersession
+    relationship the data never recorded — they could just be DIFFERENT agents
+    doing DIFFERENT work under the same q-id. (q-2026-06-23-1ae2: a464cd2cd527
+    + a43122a0f2f9 had no parent->child edge — they are flat peers, not
+    attempt 1/2.)
 
-    The fix distinguishes the two using ``parent_map``:
+    The fix distinguishes spawn-children from co-bound peers using
+    ``parent_map``:
 
       * **Authoritative attribution** — each subagent's owning queue id is
         ``bindings[agent_id]`` (falls back to the transcript-parsed marker
@@ -2194,28 +2205,38 @@ def _build_subagent_tree(
       * **Drop the self-nested owner** — the ``owner_agent_id`` agent IS
         this item's live dispatch; it is never emitted as a child node, but
         it IS the ROOT under which genuine nested children hang.
-      * **Nested children → real hierarchy** — any same-item agent that was
-        SPAWNED BY another session agent (``agent_id in parent_map``) is a
-        nested child, NOT a retry. We render it as ``kind="child"`` nested
-        under its actual parent (walking ``parent_map`` up to the owner). A
-        child whose parent chain does not reach the owner still surfaces as a
-        top-level child rather than being mislabeled an attempt.
-      * **Genuine retry attempts** — a same-item agent that is NOT in
-        ``parent_map`` (no session agent spawned it) was dispatched by the
-        MAIN LOOP — a real earlier attempt of this item. Those collapse to
-        ``kind="attempt"`` nodes labeled ``attempt N`` (oldest = attempt 1).
-      * **Other-item agents** — bound to a DIFFERENT queue id render their
-        own top-level card; excluded here.
+      * **Nested children → full spawn graph, ARBITRARY DEPTH** — every
+        transcript that transitively descends from ``owner_agent_id`` in the
+        spawn graph (reachable by walking ``parent_map`` parent links up to
+        the owner) is a nested child. We BFS the owner'''s descendants and
+        render each as ``kind="child"`` nested under its REAL parent, to full
+        depth (grandchildren, great-grandchildren, ...). A descendant may bind
+        to a DIFFERENT queue item than the owner (a subagent that re-seeded a
+        fresh ``Queue item:`` line for its own child); it is STILL the owner'''s
+        descendant on the spawn graph, so it nests here -- it is NOT severed
+        and dropped. (That severing was the depth-1-only bug: the prior code
+        kept only SAME-item agents as children, so the tree was pruned at the
+        first descendant bound to a different item.)
+      * **Co-bound peers (no spawn edge)** — a same-item agent that is NOT a
+        descendant of the owner (no session agent spawned it). The binding
+        data only records that these agent-ids were ASSOCIATED with this queue
+        item; it does NOT encode a retry/supersession relationship, so we make
+        NO such inference. They render as FLAT ``kind="peer"`` siblings,
+        labeled neutrally (short id / first-prompt-line / timestamp) — never
+        "attempt N", never nested under one another.
+      * **Unrelated agents** — agents that are neither descendants of this
+        owner nor same-item peers (e.g. another item'''s subtree) render under
+        their own item'''s card; excluded here.
 
     Returns a list of node dicts. Each node carries the same display keys
     the template/refresh.js expect (``subagent_id``, ``label``, ``age``,
     ``age_seconds``, ``queue_id``) plus:
 
-      * ``kind``     — ``"attempt"`` (collapsed main-loop retry) or
-        ``"child"`` (genuine nested spawn).
-      * ``attempt``  — 1-based attempt ordinal (attempt nodes only).
+      * ``kind``     — ``"peer"`` (co-bound, no spawn edge to the owner) or
+        ``"child"`` (genuine nested spawn descendant of the owner).
       * ``children`` — nested node list (always present, possibly empty) so
-        the recursive template has a uniform shape to walk.
+        the recursive template has a uniform shape to walk. Peers are flat
+        (always ``[]``); only genuine spawn-children nest.
 
     Fail-soft fallback: when NO subagent has either a binding or a parsed
     marker (pre-arm-hook transcripts), keep the prior unfiltered behaviour
@@ -2250,59 +2271,82 @@ def _build_subagent_tree(
             nodes.append(node)
         return nodes
 
-    # Authoritative path: keep only the agents bound to THIS item, drop the
-    # owner.
-    own: list[dict[str, Any]] = [
-        sa
-        for sa in session_subagents
-        if _auth_qid(sa) == item_id and sa.get("subagent_id") != owner_agent_id
-    ]
-    own_ids = {sa.get("subagent_id", "") for sa in own}
+    # Authoritative path. The subagent tree is the REAL spawn graph rooted at
+    # the owner agent, walked to ARBITRARY DEPTH. ``parent_map`` (pmap) is the
+    # authoritative ``child -> parent`` edge set reconstructed from the
+    # transcripts''' Agent/Task launch records, so a descendant N levels deep is
+    # reachable by walking parent links up to the owner — REGARDLESS of which
+    # queue item each descendant binds to.
+    #
+    # Two node classes:
+    #
+    #   * **Nested children** — every transcript that transitively descends
+    #     from ``owner_agent_id`` in the spawn graph. These render as
+    #     ``kind="child"`` nested under their REAL parent, to full depth. A
+    #     descendant may carry a DIFFERENT ``Queue item: q-XXXX`` marker than
+    #     the owner (a subagent that re-seeded a fresh queue line for its own
+    #     child); it is still the owner'''s descendant on the spawn graph, so it
+    #     MUST nest here rather than being severed and dropped. (This was the
+    #     depth-1-only bug: the prior code filtered children to same-item
+    #     agents only, pruning the graph wherever a descendant bound to a
+    #     different item — so grandchildren/great-grandchildren vanished.)
+    #   * **Co-bound peers (no spawn edge)** — agents bound to THIS item that
+    #     are NOT descendants of the owner (no session agent spawned them). The
+    #     binding only associates them with the q-id; it records no retry or
+    #     supersession relationship, so we render them as FLAT ``kind="peer"``
+    #     siblings, labeled neutrally — NOT "attempt N", NOT nested.
+    #
+    # Cycle-guarded (a child is spawned by exactly one parent on disk, so
+    # cycles are impossible — but we guard defensively against a corrupt map).
+    sa_by_id: dict[str, dict[str, Any]] = {
+        sa.get("subagent_id", ""): sa for sa in session_subagents
+    }
 
-    def _is_nested_child(aid: str) -> bool:
-        """True when some OTHER session agent spawned ``aid`` (not the main
-        loop). We treat a spawn edge as hierarchy whenever the parent is the
-        owner or itself one of this item's same-item agents — i.e. the child
-        descends from this item's dispatch tree rather than being an
-        independent main-loop retry."""
-        seen: set[str] = set()
-        cur = aid
-        while cur in pmap and cur not in seen:
-            seen.add(cur)
-            parent = pmap[cur]
-            if parent == owner_agent_id or parent in own_ids:
-                return True
-            cur = parent
-        return False
+    # Inverse graph: parent -> [children], restricted to agents we actually
+    # have a transcript for.
+    children_of: dict[str, list[str]] = {}
+    for child_id, parent_id in pmap.items():
+        if child_id == parent_id:
+            continue  # never self-edge
+        if child_id not in sa_by_id:
+            continue  # no transcript for this child; can't render a node
+        children_of.setdefault(parent_id, []).append(child_id)
 
-    # Partition: nested children (hierarchy) vs genuine main-loop retries.
-    nested_children = [
-        sa for sa in own if _is_nested_child(sa.get("subagent_id", ""))
-    ]
-    retries = [
-        sa for sa in own if not _is_nested_child(sa.get("subagent_id", ""))
-    ]
+    # BFS the owner'''s descendants, building nested nodes as we go. ``visited``
+    # both dedups and breaks any cycle. The owner itself is never emitted (it
+    # IS the live dispatch of this item), but it anchors the tree.
+    visited: set[str] = {owner_agent_id}
+    descendant_ids: set[str] = set()
+    roots: list[dict[str, Any]] = []
+    node_for: dict[str, dict[str, Any]] = {}
 
-    # --- Build the nested hierarchy for the children. ---
-    # Map each child to a node dict and link it under its parent. Parents not
-    # in our child set (e.g. the owner) anchor a child at the top level.
-    child_nodes: dict[str, dict[str, Any]] = {}
-    for sa in nested_children:
+    def _make_child_node(aid: str) -> dict[str, Any]:
+        sa = sa_by_id.get(aid, {"subagent_id": aid, "label": aid})
         node = dict(sa)
-        node["queue_id"] = item_id
+        # Preserve the descendant'''s OWN owning-item attribution for display
+        # (it may differ from item_id when a subagent re-seeded a queue line).
+        node["queue_id"] = _auth_qid(sa) or item_id
         node["kind"] = "child"
         node["children"] = []
-        child_nodes[sa.get("subagent_id", "")] = node
-    roots: list[dict[str, Any]] = []
-    for cid, node in child_nodes.items():
-        parent = pmap.get(cid, "")
-        parent_node = child_nodes.get(parent)
-        if parent_node is not None and parent != cid:
-            parent_node["children"].append(node)
-        else:
-            # Parent is the owner (dropped) or outside this item's set:
-            # surface this child at the top level of the owner's tree.
-            roots.append(node)
+        return node
+
+    # stack of (agent_id, parent_node_or_None). Parent None => top-level root.
+    stack: list[tuple[str, dict[str, Any] | None]] = [(owner_agent_id, None)]
+    while stack:
+        cur, parent_node = stack.pop()
+        for child_id in children_of.get(cur, []):
+            if child_id in visited:
+                continue
+            visited.add(child_id)
+            descendant_ids.add(child_id)
+            node = _make_child_node(child_id)
+            node_for[child_id] = node
+            if parent_node is None:
+                roots.append(node)
+            else:
+                parent_node["children"].append(node)
+            stack.append((child_id, node))
+
     # Stable, chronological ordering at every level (most-recent first to
     # match _list_session_subagents).
     def _sort_children(nodes: list[dict[str, Any]]) -> None:
@@ -2312,21 +2356,46 @@ def _build_subagent_tree(
 
     _sort_children(roots)
 
-    # --- Collapse the genuine main-loop retries as attempt N. ---
-    # Oldest first so attempt numbering reads chronologically (attempt 1 =
-    # earliest dispatch). ``session_subagents`` came in most-recent-first.
-    retries.sort(key=lambda sa: sa.get("age_seconds", 0.0), reverse=True)
-    attempt_nodes: list[dict[str, Any]] = []
-    for idx, sa in enumerate(retries, start=1):
+    # --- Co-bound subagents with NO spawn edge -> FLAT NEUTRAL PEERS. ---
+    # A "peer" is a same-item agent that is NOT the owner and is NOT one of the
+    # owner's spawn descendants. The binding data (agent_id -> queue_id) only
+    # records that these agent-ids were ASSOCIATED with this queue item; it does
+    # NOT encode any retry / supersession / ordering relationship between them.
+    # Multiple agents under one queue id could just be DIFFERENT agents doing
+    # DIFFERENT things (e.g. the main loop dispatched two independent agents
+    # against the same scope, or rotated the q-id) -- there is NO basis to infer
+    # one is a reiteration/supersession of another.
+    #
+    # So we render them as FLAT siblings (no nesting between them), labeled
+    # NEUTRALLY by what actually distinguishes them -- short agent-id, first-
+    # prompt-line/role (``label``), and timestamp (``age``). We do NOT label
+    # them "attempt N", do NOT mark one a "live HEAD", and do NOT nest the
+    # "older" ones under a "newer" one -- all of that was an unjustified
+    # supersession inference (removed; see q-2026-06-23-7144). Genuine
+    # parent->child spawn edges DO nest (handled above via ``parent_map`` ->
+    # ``roots``, arbitrary depth) -- that is a real hierarchy and is kept.
+    #
+    # Most-recently-active first (matches the ``roots`` sort and
+    # ``_list_session_subagents``).
+    peers = [
+        sa
+        for sa in session_subagents
+        if _auth_qid(sa) == item_id
+        and sa.get("subagent_id") != owner_agent_id
+        and sa.get("subagent_id", "") not in descendant_ids
+    ]
+    peers.sort(key=lambda sa: sa.get("age_seconds", 0.0))
+    peer_nodes: list[dict[str, Any]] = []
+    for sa in peers:
         node = dict(sa)
         node["queue_id"] = item_id
-        node["kind"] = "attempt"
-        node["attempt"] = idx
-        node["children"] = []
-        attempt_nodes.append(node)
+        node["kind"] = "peer"
+        node["children"] = []  # flat -- no supersession nesting
+        peer_nodes.append(node)
 
-    # Retries (attempts) first, then the live dispatch's nested children.
-    return attempt_nodes + roots
+    # Co-bound peers first (flat, neutral), then the live dispatch's genuine
+    # nested spawn-children.
+    return peer_nodes + roots
 
 
 def _format_sse(data: dict[str, Any]) -> bytes:
